@@ -19,6 +19,8 @@ pub struct Progress {
     pub source: String,
     pub position: f64,
     pub duration: f64,
+    /// Poster URL for the Continue Watching card, if known.
+    pub poster: Option<String>,
 }
 
 impl Db {
@@ -36,6 +38,8 @@ impl Db {
              CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, title TEXT NOT NULL, source TEXT NOT NULL,
                  position REAL NOT NULL, duration REAL NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()));",
         )?;
+        // Migrate databases created before posters were stored; fails harmlessly if the column exists.
+        let _ = conn.execute("ALTER TABLE progress ADD COLUMN poster TEXT", []);
         Ok(Self { conn })
     }
 
@@ -98,28 +102,34 @@ impl Db {
 
     pub fn save_progress(&self, p: &Progress) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO progress (key, title, source, position, duration, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())",
-            params![p.key, p.title, p.source, p.position, p.duration],
+            "INSERT OR REPLACE INTO progress (key, title, source, position, duration, poster, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())",
+            params![p.key, p.title, p.source, p.position, p.duration, p.poster],
         )?;
+        Ok(())
+    }
+
+    /// Set the poster without bumping `updated_at`, so Continue Watching order is kept.
+    pub fn set_progress_poster(&self, key: &str, poster: &str) -> Result<()> {
+        self.conn.execute("UPDATE progress SET poster = ?2 WHERE key = ?1", [key, poster])?;
         Ok(())
     }
 
     pub fn progress(&self, key: &str) -> Result<Option<Progress>> {
         Ok(self
             .conn
-            .query_row("SELECT key, title, source, position, duration FROM progress WHERE key = ?1", [key], row_progress)
+            .query_row("SELECT key, title, source, position, duration, poster FROM progress WHERE key = ?1", [key], row_progress)
             .optional()?)
     }
 
     pub fn recent_progress(&self, limit: usize) -> Result<Vec<Progress>> {
         let mut st = self.conn.prepare(
-            "SELECT key, title, source, position, duration FROM progress ORDER BY updated_at DESC, key LIMIT ?1",
+            "SELECT key, title, source, position, duration, poster FROM progress ORDER BY updated_at DESC, key LIMIT ?1",
         )?;
         Ok(st.query_map([limit as i64], row_progress)?.filter_map(|r| r.ok()).collect())
     }
 }
 
 fn row_progress(r: &rusqlite::Row) -> rusqlite::Result<Progress> {
-    Ok(Progress { key: r.get(0)?, title: r.get(1)?, source: r.get(2)?, position: r.get(3)?, duration: r.get(4)? })
+    Ok(Progress { key: r.get(0)?, title: r.get(1)?, source: r.get(2)?, position: r.get(3)?, duration: r.get(4)?, poster: r.get(5)? })
 }

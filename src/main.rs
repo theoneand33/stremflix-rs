@@ -34,6 +34,8 @@ enum Msg {
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs
     Play(String, String, String, String, Vec<String>),
+    /// progress key, poster URL found for a Continue Watching entry
+    RecentPoster(String, String),
 }
 
 /// One horizontal catalog row on the home screen.
@@ -46,6 +48,56 @@ struct Row {
 
 const RED: Color32 = Color32::from_rgb(229, 9, 20);
 const CARD: egui::Vec2 = egui::Vec2::new(150.0, 225.0);
+
+/// Netflix-style card: no border, grows on hover/focus, shrinks while pressed.
+/// Returns the click response and the animated rect to paint into.
+fn card(ui: &mut egui::Ui, size: egui::Vec2, label: &str) -> (egui::Response, egui::Rect) {
+    const GROW: f32 = 1.06;
+    // Reserve room for the grown card so the scroll area doesn't clip it.
+    let (slot, r) = ui.allocate_exact_size(size * GROW, Sense::click());
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    let target = if r.is_pointer_button_down_on() { 0.96 } else if r.hovered() || r.has_focus() { GROW } else { 1.0 };
+    let s = ui.ctx().animate_value_with_time(r.id, target, 0.15);
+    (r, egui::Rect::from_center_size(slot.center(), size * s))
+}
+
+/// Bold weight of the UI font (egui's `strong()` only brightens the color).
+fn bold() -> egui::FontFamily {
+    egui::FontFamily::Name("bold".into())
+}
+
+/// Inter (OFL) as the UI font: the closest free match to Netflix Sans, which is proprietary.
+/// egui's default fonts stay as fallbacks for symbols and emoji.
+fn install_fonts(ctx: &egui::Context) {
+    let mut f = egui::FontDefinitions::default();
+    for (name, bytes) in [("Inter", &include_bytes!("../assets/fonts/Inter-Regular.ttf")[..]), ("Inter-Bold", &include_bytes!("../assets/fonts/Inter-Bold.ttf")[..])] {
+        f.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(bytes)));
+    }
+    let fallback = f.families[&egui::FontFamily::Proportional].clone();
+    f.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0, "Inter".into());
+    f.families.insert(bold(), std::iter::once("Inter-Bold".into()).chain(fallback).collect());
+    ctx.set_fonts(f);
+}
+
+/// Netflix hero button: flat pill, `fill` = [normal, hovered], no outline.
+fn hero_button(ui: &mut egui::Ui, text: &str, fill: [Color32; 2], text_color: Color32) -> egui::Response {
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        for (st, f) in [(&mut w.inactive, fill[0]), (&mut w.hovered, fill[1]), (&mut w.active, fill[1])] {
+            (st.weak_bg_fill, st.fg_stroke.color) = (f, text_color);
+        }
+        ui.add(egui::Button::new(RichText::new(text).size(18.0).strong().family(bold())).min_size(vec2(130.0, 46.0)).corner_radius(23))
+    })
+    .inner
+}
+
+/// Gray card with centered, wrapped text (used when there's no poster).
+fn card_text(ui: &egui::Ui, rect: egui::Rect, text: &str) {
+    let p = ui.painter();
+    p.rect_filled(rect, 6, Color32::from_gray(40));
+    let g = p.layout(text.to_owned(), egui::FontId::proportional(15.0), ui.visuals().text_color(), rect.width() - 16.0);
+    p.galley(rect.center() - g.size() / 2.0, g, Color32::WHITE);
+}
 
 fn kind_label(kind: &str) -> &str {
     match kind {
@@ -64,6 +116,13 @@ fn stream_source(s: &Stream) -> Option<String> {
     })
 }
 
+/// The playable source when there is exactly one; `None` when there's a choice (or nothing).
+fn only_source(streams: &[Stream]) -> Option<String> {
+    let mut it = streams.iter().filter_map(stream_source);
+    let first = it.next();
+    if it.next().is_some() { None } else { first }
+}
+
 struct Playing {
     player: Player,
     key: String,
@@ -71,6 +130,7 @@ struct Playing {
     source: String,
     pos: f64,
     dur: f64,
+    poster: Option<String>,
 }
 
 struct App {
@@ -88,6 +148,8 @@ struct App {
     search_results: Option<(String, Vec<MetaPreview>)>,
     selected: Option<(MetaPreview, Vec<Stream>, Vec<String>)>,
     scroll_top: bool,
+    /// Scroll the stream picker into view on the next frame.
+    show_streams: bool,
     magnet: String,
     search: String,
     /// Poster bytes by URL; `None` while loading, empty if the fetch failed.
@@ -95,6 +157,8 @@ struct App {
     folder: String,
     library: Vec<LibraryItem>,
     recent: Vec<Progress>,
+    /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
+    pill: Option<(Tab, egui::Rect, egui::Rect, f64)>,
     player: Option<Playing>,
     status: String,
     last_poll: Instant,
@@ -139,10 +203,12 @@ impl App {
             search_results: None,
             selected: None,
             scroll_top: false,
+            show_streams: false,
             magnet: String::new(),
             search: String::new(),
             posters: HashMap::new(),
             player: None,
+            pill: None,
             status: "Ready".into(),
             last_poll: Instant::now(),
         };
@@ -189,6 +255,7 @@ impl App {
                 self.addons.push((url, m));
                 self.addon_url.clear();
                 self.build_rows(ctx);
+                self.fetch_recent_posters(ctx);
             }
             Msg::Catalog(name, items) => {
                 self.status = format!("{name}: {} items", items.len());
@@ -203,26 +270,43 @@ impl App {
             }
             Msg::Streams(meta, streams, subs, autoplay) => {
                 self.status = format!("{}: {} streams", meta.name, streams.len());
-                let first = autoplay.then(|| streams.iter().find_map(stream_source)).flatten();
-                if let Some(src) = first {
-                    self.play(ctx, format!("{}:{}", meta.kind, meta.id), meta.name.clone(), src, subs.clone());
+                // Autoplay only when there's no choice to make; otherwise show the stream picker.
+                if autoplay {
+                    match only_source(&streams) {
+                        Some(src) => self.play(ctx, format!("{}:{}", meta.kind, meta.id), meta.name.clone(), src, subs.clone()),
+                        None => self.show_streams = true,
+                    }
                 }
                 self.selected = Some((meta, streams, subs));
                 self.scroll_top = true;
+            }
+            Msg::RecentPoster(key, url) => {
+                if let Err(e) = self.db.set_progress_poster(&key, &url) {
+                    self.status = format!("Error saving poster: {e:#}");
+                }
+                for p in self.recent.iter_mut().filter(|p| p.key == key) {
+                    p.poster = Some(url.clone());
+                }
             }
             Msg::Poster(url, bytes) => {
                 self.posters.insert(url, Some(bytes.into()));
             }
             Msg::Play(key, title, source, url, subs) => {
                 self.stop_player();
-                let start = match self.db.progress(&key) {
-                    Ok(Some(p)) if p.position > 3.0 && (p.duration <= 0.0 || p.position < p.duration - 5.0) => p.position,
+                let prev = self.db.progress(&key).ok().flatten();
+                let start = match &prev {
+                    Some(p) if p.position > 3.0 && (p.duration <= 0.0 || p.position < p.duration - 5.0) => p.position,
                     _ => 0.0,
                 };
+                // Poster of the opened title, else the one saved earlier for this key.
+                let poster = (self.selected.as_ref())
+                    .filter(|(m, ..)| format!("{}:{}", m.kind, m.id) == key)
+                    .and_then(|(m, ..)| m.poster.clone())
+                    .or(prev.and_then(|p| p.poster));
                 match Player::launch(&url, &title, start, &subs) {
                     Ok(player) => {
                         self.status = if start > 0.0 { format!("Resuming at {}", fmt_time(start)) } else { "Playing".into() };
-                        self.player = Some(Playing { player, key, title, source, pos: start, dur: 0.0 });
+                        self.player = Some(Playing { player, key, title, source, pos: start, dur: 0.0, poster });
                     }
                     Err(e) => self.status = format!("Error: {e:#}"),
                 }
@@ -234,7 +318,7 @@ impl App {
     fn save_progress(&mut self) {
         if let Some(p) = &self.player {
             if p.pos > 0.0 {
-                let prog = Progress { key: p.key.clone(), title: p.title.clone(), source: p.source.clone(), position: p.pos, duration: p.dur };
+                let prog = Progress { key: p.key.clone(), title: p.title.clone(), source: p.source.clone(), position: p.pos, duration: p.dur, poster: p.poster.clone() };
                 if let Err(e) = self.db.save_progress(&prog) {
                     self.status = format!("Error saving progress: {e:#}");
                 }
@@ -263,6 +347,25 @@ impl App {
             (p.pos, p.dur) = (pos, dur);
             self.save_progress();
         }
+    }
+
+    /// Nav pill position: eases (cubic out) from where it is to the selected tab.
+    fn pill_rect(&mut self, ctx: &egui::Context, target: egui::Rect) -> egui::Rect {
+        const DURATION: f64 = 0.35;
+        let now = ctx.input(|i| i.time);
+        let (tab, from, to, start) = self.pill.get_or_insert((self.tab, target, target, now));
+        if *tab != self.tab {
+            // Restart from the pill's current spot, so a mid-slide click doesn't jump.
+            let t = ((now - *start) / DURATION).clamp(0.0, 1.0) as f32;
+            *from = from.lerp_towards(to, egui::emath::easing::cubic_out(t));
+            (*tab, *start) = (self.tab, now);
+        }
+        *to = target; // follows small layout shifts (bold text) without restarting
+        let t = ((now - *start) / DURATION).clamp(0.0, 1.0) as f32;
+        if t < 1.0 {
+            ctx.request_repaint();
+        }
+        from.lerp_towards(to, egui::emath::easing::cubic_out(t))
     }
 
     /// Rebuild home rows from installed catalogs: generic Trending/Popular rows first, then the rest.
@@ -352,15 +455,44 @@ impl App {
         });
     }
 
+    /// URLs of installed addons serving `res` for this type and id.
+    fn addons_for(&self, res: &str, kind: &str, id: &str) -> Vec<String> {
+        let matches = |m: &Manifest| {
+            m.has_resource(res) && m.types.iter().any(|t| t == kind) && m.id_prefixes.as_ref().is_none_or(|ps| ps.iter().any(|p| id.starts_with(p.as_str())))
+        };
+        self.addons.iter().filter(|(_, m)| matches(m)).map(|(u, _)| u.clone()).collect()
+    }
+
+    /// Look up posters for Continue Watching entries saved without one (older history).
+    /// Torrent/file keys never match an addon type, so they are skipped.
+    fn fetch_recent_posters(&self, ctx: &egui::Context) {
+        for p in self.recent.iter().filter(|p| p.poster.is_none()) {
+            let Some((kind, id)) = p.key.split_once(':') else { continue };
+            let addons = self.addons_for("meta", kind, id);
+            if addons.is_empty() {
+                continue;
+            }
+            let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), ctx.clone());
+            let (key, kind, id) = (p.key.clone(), kind.to_owned(), id.to_owned());
+            // Not `spawn`: a missing poster is not worth an error in the status bar.
+            self.rt.spawn(async move {
+                for u in &addons {
+                    if let Ok(m) = client.meta(u, &kind, &id).await
+                        && let Some(poster) = m.poster
+                    {
+                        let _ = tx.send(Msg::RecentPoster(key, poster));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
     fn open_meta(&mut self, ctx: &egui::Context, meta: MetaPreview, autoplay: bool) {
         let client = self.client.clone();
-        let matches = |m: &Manifest, res: &str| {
-            m.has_resource(res)
-                && m.types.contains(&meta.kind)
-                && m.id_prefixes.as_ref().is_none_or(|ps| ps.iter().any(|p| meta.id.starts_with(p.as_str())))
-        };
-        let stream_addons: Vec<String> = self.addons.iter().filter(|(_, m)| matches(m, "stream")).map(|(u, _)| u.clone()).collect();
-        let sub_addons: Vec<String> = self.addons.iter().filter(|(_, m)| matches(m, "subtitles")).map(|(u, _)| u.clone()).collect();
+        let stream_addons = self.addons_for("stream", &meta.kind, &meta.id);
+        let sub_addons = self.addons_for("subtitles", &meta.kind, &meta.id);
         self.status = format!("Loading streams for {}...", meta.name);
         self.spawn(ctx, async move {
             let (mut streams, mut subs, mut errors) = (Vec::new(), Vec::new(), Vec::new());
@@ -417,7 +549,10 @@ impl App {
         if let Some((meta, streams, subs)) = &self.selected {
             ui.add_space(16.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Streams for {}", meta.name)).size(20.0).strong().color(Color32::WHITE));
+                let r = ui.label(RichText::new(format!("Streams for {}", meta.name)).size(20.0).strong().family(bold()).color(Color32::WHITE));
+                if std::mem::take(&mut self.show_streams) {
+                    r.scroll_to_me(Some(Align::TOP));
+                }
                 ui.label(format!("{} subtitle track(s)", subs.len()));
             });
             for s in streams {
@@ -433,12 +568,11 @@ impl App {
             egui::ScrollArea::horizontal().id_salt("recent").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for p in &self.recent {
-                        let text = format!("{}\n{} / {}", p.title, fmt_time(p.position), fmt_time(p.duration));
-                        let r = ui
-                            .add_sized(vec2(260.0, 90.0), egui::Button::new(RichText::new(text).size(15.0)).wrap().fill(Color32::from_gray(40)).corner_radius(6))
-                            .on_hover_text(format!("Resume {}", p.title));
+                        let (r, rect) = card(ui, CARD, &p.title);
+                        self.paint_poster(ui, &r, rect, &p.poster, &p.title, &mut want);
+                        let r = r.on_hover_text(format!("Resume {} ({} / {})", p.title, fmt_time(p.position), fmt_time(p.duration)));
                         let frac = if p.duration > 0.0 { (p.position / p.duration).clamp(0.0, 1.0) as f32 } else { 0.0 };
-                        let bar = egui::Rect::from_min_max(pos2(r.rect.left() + 10.0, r.rect.bottom() - 10.0), pos2(r.rect.right() - 10.0, r.rect.bottom() - 6.0));
+                        let bar = egui::Rect::from_min_max(pos2(rect.left() + 10.0, rect.bottom() - 10.0), pos2(rect.right() - 10.0, rect.bottom() - 6.0));
                         ui.painter().rect_filled(bar, 2, Color32::from_gray(90));
                         ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, bar.height())), 2, RED);
                         if r.clicked() {
@@ -452,7 +586,7 @@ impl App {
         if let Some((title, items)) = &self.search_results {
             ui.add_space(18.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(title).size(20.0).strong().color(Color32::WHITE));
+                ui.label(RichText::new(title).size(20.0).strong().family(bold()).color(Color32::WHITE));
                 clear = ui.button("Clear").clicked();
             });
             if items.is_empty() {
@@ -491,7 +625,7 @@ impl App {
 
     fn row_title(ui: &mut egui::Ui, title: &str) {
         ui.add_space(22.0);
-        ui.label(RichText::new(title).size(20.0).strong().color(Color32::WHITE));
+        ui.label(RichText::new(title).size(20.0).strong().family(bold()).color(Color32::WHITE));
         ui.add_space(4.0);
     }
 
@@ -500,27 +634,26 @@ impl App {
         egui::ScrollArea::horizontal().id_salt(salt).show(ui, |ui| {
             ui.horizontal(|ui| {
                 for m in items {
-                    // Only fetch posters of cards that are on screen.
-                    let (rect, _) = ui.allocate_exact_size(CARD, Sense::hover());
-                    let mut lazy = Vec::new();
-                    let img = if ui.is_rect_visible(rect) { self.image(&m.poster, &mut lazy) } else { None };
-                    want.extend(lazy);
-                    let r = match img {
-                        Some((u, b)) => {
-                            let img = egui::Image::from_bytes(format!("bytes://{u}"), b).alt_text(&m.name).fit_to_exact_size(CARD).corner_radius(6);
-                            ui.put(rect, egui::Button::image(img).frame(false))
-                        }
-                        None => ui.put(rect, egui::Button::new(RichText::new(&m.name).size(15.0)).wrap().fill(Color32::from_gray(40)).corner_radius(6)),
-                    };
-                    if r.hovered() {
-                        ui.painter().rect_stroke(r.rect, 6, egui::Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Outside);
-                    }
+                    let (r, rect) = card(ui, CARD, &m.name);
+                    self.paint_poster(ui, &r, rect, &m.poster, &m.name, want);
                     if r.on_hover_text(m.description.as_deref().unwrap_or(&m.name)).clicked() {
                         *open = Some((m.clone(), false));
                     }
                 }
             });
         });
+    }
+
+    /// Poster image in `rect`, or the title on a gray card until it loads.
+    fn paint_poster(&self, ui: &egui::Ui, r: &egui::Response, rect: egui::Rect, poster: &Option<String>, name: &str, want: &mut Vec<String>) {
+        // Only fetch posters of cards that are on screen.
+        let mut lazy = Vec::new();
+        let img = if ui.is_rect_visible(r.rect) { self.image(poster, &mut lazy) } else { None };
+        want.extend(lazy);
+        match img {
+            Some((u, b)) => egui::Image::from_bytes(format!("bytes://{u}"), b).alt_text(name).corner_radius(6).paint_at(ui, rect),
+            None => card_text(ui, rect, name),
+        }
     }
 
     /// Big banner: backdrop (or poster at the right), title, description, Play / More info.
@@ -562,8 +695,10 @@ impl App {
             egui::Image::from_bytes(format!("bytes://{u}"), b).alt_text(&meta.name).corner_radius(12).paint_at(ui, prect);
         }
         if self.selected.is_some() {
-            let back = egui::Button::new(RichText::new("← Back").size(15.0).color(Color32::WHITE)).fill(Color32::from_black_alpha(160)).corner_radius(18);
-            if ui.put(egui::Rect::from_min_size(rect.min + vec2(20.0, 20.0), vec2(90.0, 34.0)), back).clicked() {
+            // Same translucent gray pill as "More info".
+            let gray = |a| Color32::from_rgba_unmultiplied(109, 109, 110, a);
+            let at = egui::Rect::from_min_size(rect.min + vec2(20.0, 20.0), rect.size());
+            if ui.scope_builder(UiBuilder::new().max_rect(at), |ui| hero_button(ui, "←  Back", [gray(179), gray(102)], Color32::WHITE)).inner.clicked() {
                 self.selected = None;
             }
         }
@@ -571,25 +706,19 @@ impl App {
         let col = egui::Rect::from_min_max(inner.min, pos2(inner.left() + (inner.width() * 0.55).min(620.0), inner.bottom()));
         ui.scope_builder(UiBuilder::new().max_rect(col).layout(Layout::bottom_up(Align::LEFT)), |ui| {
             ui.horizontal(|ui| {
-                let playb = egui::Button::new(RichText::new("▶  Play").size(18.0).strong().color(Color32::BLACK))
-                    .fill(Color32::WHITE)
-                    .corner_radius(24)
-                    .min_size(vec2(120.0, 46.0));
-                if ui.add(playb).clicked() {
+                let mut show_streams = false;
+                if hero_button(ui, "▶  Play", [Color32::WHITE, Color32::from_white_alpha(191)], Color32::BLACK).clicked() {
                     match &self.selected {
-                        Some((m, streams, subs)) if m == meta => {
-                            if let Some(src) = streams.iter().find_map(stream_source) {
-                                *play = Some((format!("{}:{}", m.kind, m.id), m.name.clone(), src, subs.clone()));
-                            }
-                        }
+                        Some((m, streams, subs)) if m == meta => match only_source(streams) {
+                            Some(src) => *play = Some((format!("{}:{}", m.kind, m.id), m.name.clone(), src, subs.clone())),
+                            None => show_streams = true,
+                        },
                         _ => *open = Some((meta.clone(), true)),
                     }
                 }
-                let info = egui::Button::new(RichText::new("More info").size(18.0).color(Color32::WHITE))
-                    .fill(Color32::from_rgba_unmultiplied(109, 109, 110, 200))
-                    .corner_radius(24)
-                    .min_size(vec2(120.0, 46.0));
-                if ui.add(info).clicked() {
+                self.show_streams |= show_streams;
+                let gray = |a| Color32::from_rgba_unmultiplied(109, 109, 110, a);
+                if hero_button(ui, "More info", [gray(179), gray(102)], Color32::WHITE).clicked() {
                     *open = Some((meta.clone(), false));
                 }
             });
@@ -605,8 +734,8 @@ impl App {
                 "series" => "Show",
                 k => k,
             };
-            ui.label(RichText::new(kind).size(15.0).strong().color(Color32::from_gray(220)));
-            ui.add(egui::Label::new(RichText::new(&meta.name).size(46.0).strong().color(Color32::WHITE)).wrap());
+            ui.label(RichText::new(kind).size(15.0).strong().family(bold()).color(Color32::from_gray(220)));
+            ui.add(egui::Label::new(RichText::new(&meta.name).size(46.0).strong().family(bold()).color(Color32::WHITE)).wrap());
         });
     }
 
@@ -704,22 +833,44 @@ impl eframe::App for App {
 
         egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(40, 14)).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("STREMIO LITE").size(26.0).strong().color(RED));
+            // Fixed-height row so the nav and search pills share one center line.
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 44.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.label(RichText::new("STREMIO LITE").size(26.0).strong().family(bold()).color(RED));
                 ui.add_space(20.0);
+                // Netflix nav: current tab is bold white on a dark gray pill that slides between tabs.
+                let pill_slot = ui.painter().add(egui::Shape::Noop);
+                let mut sel_rect = None;
                 for (tab, name) in [(Tab::Home, "Home"), (Tab::Addons, "Addons"), (Tab::Library, "Library")] {
-                    let sel = self.tab == tab;
-                    let b = egui::Button::new(RichText::new(name).size(15.0).color(if sel { Color32::WHITE } else { Color32::from_gray(200) }))
-                        .fill(if sel { Color32::from_white_alpha(40) } else { Color32::TRANSPARENT })
-                        .corner_radius(18)
-                        .min_size(vec2(0.0, 34.0));
-                    if ui.add(b).clicked() {
+                    let text = RichText::new(name).size(15.0);
+                    let text = if self.tab == tab { text.strong().family(bold()).color(Color32::WHITE) } else { text.color(Color32::from_gray(180)) };
+                    let r = ui.add(egui::Button::new(text).fill(Color32::TRANSPARENT).min_size(vec2(0.0, 34.0))).on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if self.tab == tab {
+                        sel_rect = Some(r.rect);
+                    }
+                    if r.clicked() {
                         self.tab = tab;
                     }
                 }
+                if let Some(target) = sel_rect {
+                    let rect = self.pill_rect(&ctx, target);
+                    ui.painter().set(pill_slot, egui::epaint::RectShape::filled(rect, 17, Color32::from_gray(51)));
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let b = ui.add(egui::Button::new(RichText::new("Search").size(15.0)).frame(false));
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Titles...").desired_width(240.0)).labelled_by(b.id);
+                    // Search in the same dark gray pill; Enter or the icon runs it.
+                    // Right-to-left: the field is added first so the icon sits on its left.
+                    let bg = ui.painter().add(egui::Shape::Noop);
+                    ui.add_space(12.0);
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Titles, people, genres").frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 2, ..Default::default() })).desired_width(220.0)); // top margin: optically center the text
+                    // Painted magnifier: the emoji glyph sits off-center in its line box.
+                    let (icon, b) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                    b.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Search"));
+                    let (c, stroke) = (icon.center() - vec2(1.5, 1.5), egui::Stroke::new(1.8, Color32::from_gray(180)));
+                    ui.painter().circle_stroke(c, 5.5, stroke);
+                    ui.painter().line_segment([c + vec2(4.0, 4.0), icon.center() + vec2(7.0, 7.0)], stroke);
+                    let b = b.on_hover_text("Search").on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let pill = r.rect.union(b.rect);
+                    ui.painter().set(bg, egui::epaint::RectShape::filled(egui::Rect::from_center_size(pos2(pill.center().x, icon.center().y), vec2(pill.width() + 24.0, 34.0)), 17, Color32::from_gray(51)));
+                    let r = r.labelled_by(b.id);
                     if b.clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                         self.tab = Tab::Home;
                         self.search(&ctx);
@@ -763,15 +914,38 @@ fn main() -> eframe::Result {
         opts,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            install_fonts(&cc.egui_ctx);
             let mut v = egui::Visuals::dark();
             v.panel_fill = Color32::from_rgb(20, 20, 20);
             v.window_fill = v.panel_fill;
             v.extreme_bg_color = Color32::from_gray(32);
             v.selection.bg_fill = RED;
+            // Netflix-style flat buttons: no outline or grow on hover, gray that dims when hovered.
+            let w = &mut v.widgets;
+            for (st, gray) in [(&mut w.inactive, 82), (&mut w.hovered, 56), (&mut w.active, 45), (&mut w.open, 56)] {
+                (st.weak_bg_fill, st.bg_stroke, st.corner_radius, st.expansion) = (Color32::from_gray(gray), egui::Stroke::NONE, 4.into(), 0.0);
+                st.fg_stroke.color = Color32::WHITE;
+            }
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             cc.egui_ctx.set_visuals_of(egui::Theme::Dark, v);
+            cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| s.spacing.button_padding = vec2(14.0, 6.0));
             app.build_rows(&cc.egui_ctx);
+            app.fetch_recent_posters(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_source_autoplays_only_without_a_choice() {
+        let s = |u: &str| Stream { url: Some(u.into()), ..Default::default() };
+        let bad = s("ftp://x.example/a"); // unplayable, doesn't count as a choice
+        assert_eq!(only_source(&[]), None);
+        assert_eq!(only_source(&[bad.clone(), s("https://x.example/a")]).as_deref(), Some("https://x.example/a"));
+        assert_eq!(only_source(&[s("https://x.example/a"), s("https://x.example/b")]), None);
+    }
 }
