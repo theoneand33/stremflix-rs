@@ -396,6 +396,10 @@ impl App {
                         self.status = if start > 0.0 { format!("Resuming at {}", fmt_time(start)) } else { "Playing".into() };
                         let p = Playing { player, key, title, source, pos: start, dur: 0.0, poster, osd_until: 0.0, menu: false, scrub: None };
                         self.player = Some(p);
+                        // Force a fresh render so the previous video's last frame never flashes.
+                        if let Some(v) = &mut self.video {
+                            v.3 = [0, 0];
+                        }
                     }
                     Err(e) => self.status = format!("Error: {e:#}"),
                 }

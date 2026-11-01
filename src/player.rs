@@ -53,6 +53,7 @@ unsafe extern "C" {
     fn mpv_set_option_string(h: *mut c_void, name: *const c_char, data: *const c_char) -> c_int;
     fn mpv_command_async(h: *mut c_void, reply: u64, args: *const *const c_char) -> c_int;
     fn mpv_observe_property(h: *mut c_void, reply: u64, name: *const c_char, format: c_int) -> c_int;
+    fn mpv_set_wakeup_callback(h: *mut c_void, cb: Option<extern "C" fn(*mut c_void)>, data: *mut c_void);
     fn mpv_wait_event(h: *mut c_void, timeout: f64) -> *mut MpvEvent;
     fn mpv_error_string(err: c_int) -> *const c_char;
     fn mpv_terminate_destroy(h: *mut c_void);
@@ -230,6 +231,8 @@ impl Player {
             bail!("mpv render context: {}", err_text(rc));
         }
         unsafe { mpv_render_context_set_update_callback(p.render, Some(on_update), p.wake as *mut c_void) };
+        // Also wake on events (pause, volume, tracks), not only on new frames, so a paused UI updates at once.
+        unsafe { mpv_set_wakeup_callback(mpv, Some(on_update), p.wake as *mut c_void) };
         for (i, (name, fmt)) in PROPS.iter().enumerate() {
             unsafe { mpv_observe_property(mpv, i as u64, cstr(name).as_ptr(), *fmt) };
         }
