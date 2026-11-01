@@ -37,6 +37,20 @@ Environment variables:
 | `STREMIO_LITE_IPC` | mpv IPC socket path. Default: `$TMPDIR/stremio-lite-mpv.sock` |
 | `STREMIO_LITE_NO_DHT` | Set to disable the BitTorrent DHT (offline/CI use) |
 
+### Import from Stremio
+
+**Addons → Import from Stremio** copies your installed addons, watched movies and episodes, and in-progress titles from a local Stremio install. Watched titles show in **Watch It Again** and progress shows in **Continue Watching**. Leave the path empty to auto-detect, or point it at a Stremio data folder. Stremio's files are read from a temp copy and never changed. Re-importing is safe: newer local progress is kept.
+
+Auto-detect searches these locations:
+
+| OS | Location (format) |
+|---|---|
+| Linux | `~/.var/app/com.stremio.Stremio`, `~/.local/share/*stremio*` (WebKit SQLite) |
+| macOS | `~/Library/WebKit/*stremio*`, `~/Library/Application Support/*stremio*` (WebKit SQLite / Chromium LevelDB) |
+| Windows | `%APPDATA%`, `%LOCALAPPDATA%`, `%LOCALAPPDATA%\Programs` `*stremio*` folders (Chromium LevelDB) |
+
+Only the Linux Flatpak build (Stremio 5) has been tested against a real install; the other formats are covered by fixture tests.
+
 ## Test
 
 ```sh
@@ -50,6 +64,7 @@ The tests cover:
 - URL safety: only `http`/`https` URLs and valid magnets are accepted
 - SQLite persistence across reopen
 - library scanning of `tests/fixtures/library`
+- Stremio import from WebKit SQLite and Chromium LevelDB fixtures. `cargo test --test stremio_import -- --ignored --nocapture` also reads this machine's Stremio, into a temp DB.
 - an integration test that starts `test-addon` in-process and runs the real addon client against it
 
 ## End-to-end demo
