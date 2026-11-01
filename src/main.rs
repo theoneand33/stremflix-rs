@@ -79,16 +79,38 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(f);
 }
 
-/// Netflix hero button: flat pill, `fill` = [normal, hovered], no outline.
-fn hero_button(ui: &mut egui::Ui, text: &str, fill: [Color32; 2], text_color: Color32) -> egui::Response {
+/// Netflix flat pill: `fill` = [normal, hovered], no outline; fully rounded ends.
+fn pill_button(ui: &mut egui::Ui, text: &str, size: f32, min: egui::Vec2, fill: [Color32; 2], fg: Color32) -> egui::Response {
     ui.scope(|ui| {
         let w = &mut ui.visuals_mut().widgets;
         for (st, f) in [(&mut w.inactive, fill[0]), (&mut w.hovered, fill[1]), (&mut w.active, fill[1])] {
-            (st.weak_bg_fill, st.fg_stroke.color) = (f, text_color);
+            (st.weak_bg_fill, st.bg_stroke, st.fg_stroke.color) = (f, egui::Stroke::NONE, fg);
         }
-        ui.add(egui::Button::new(RichText::new(text).size(18.0).strong().family(bold())).min_size(vec2(130.0, 46.0)).corner_radius(23))
+        ui.add(egui::Button::new(RichText::new(text).size(size).strong().family(bold())).min_size(min).corner_radius((min.y / 2.0) as u8))
     })
     .inner
+}
+
+/// White primary pill (Netflix "Play") and translucent gray secondary pill.
+fn white_fill() -> [Color32; 2] {
+    [Color32::WHITE, Color32::from_white_alpha(191)]
+}
+fn gray_fill() -> [Color32; 2] {
+    [Color32::from_rgba_unmultiplied(109, 109, 110, 179), Color32::from_rgba_unmultiplied(109, 109, 110, 102)]
+}
+
+fn hero_button(ui: &mut egui::Ui, text: &str, fill: [Color32; 2], text_color: Color32) -> egui::Response {
+    pill_button(ui, text, 18.0, vec2(130.0, 46.0), fill, text_color)
+}
+
+/// Small secondary pill for toolbar actions (Uninstall, Clear, Stop …).
+fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    pill_button(ui, text, 14.0, vec2(0.0, 32.0), gray_fill(), Color32::WHITE)
+}
+
+/// Small white pill for the main action in a row (Install, Play …).
+fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    pill_button(ui, text, 14.0, vec2(0.0, 32.0), white_fill(), Color32::BLACK)
 }
 
 /// Gray card with centered, wrapped text (used when there's no poster).
@@ -618,7 +640,7 @@ impl App {
             ui.add_space(18.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new(title).size(20.0).strong().family(bold()).color(Color32::WHITE));
-                clear = ui.button("Clear").clicked();
+                clear = small_button(ui, "Clear").clicked();
             });
             if items.is_empty() {
                 ui.label("No results.");
@@ -725,14 +747,6 @@ impl App {
             let prect = egui::Rect::from_min_max(pos2(rect.right() - pw, rect.top()), rect.max);
             egui::Image::from_bytes(format!("bytes://{u}"), b).alt_text(&meta.name).corner_radius(12).paint_at(ui, prect);
         }
-        if self.selected.is_some() {
-            // Same translucent gray pill as "More info".
-            let gray = |a| Color32::from_rgba_unmultiplied(109, 109, 110, a);
-            let at = egui::Rect::from_min_size(rect.min + vec2(20.0, 20.0), rect.size());
-            if ui.scope_builder(UiBuilder::new().max_rect(at), |ui| hero_button(ui, "←  Back", [gray(179), gray(102)], Color32::WHITE)).inner.clicked() {
-                self.selected = None;
-            }
-        }
         let inner = rect.shrink(36.0);
         let col = egui::Rect::from_min_max(inner.min, pos2(inner.left() + (inner.width() * 0.55).min(620.0), inner.bottom()));
         ui.scope_builder(UiBuilder::new().max_rect(col).layout(Layout::bottom_up(Align::LEFT)), |ui| {
@@ -776,7 +790,7 @@ impl App {
             let l = ui.label("Manifest URL:");
             ui.add(egui::TextEdit::singleline(&mut self.addon_url).hint_text("http://127.0.0.1:7070/manifest.json").desired_width(400.0))
                 .labelled_by(l.id);
-            if ui.button("Install").clicked() {
+            if primary_button(ui, "Install").clicked() {
                 let (client, url) = (self.client.clone(), self.addon_url.trim().to_string());
                 self.status = format!("Installing {url}...");
                 self.spawn(&ctx, async move {
@@ -790,7 +804,7 @@ impl App {
         for (url, m) in &self.addons {
             ui.horizontal(|ui| {
                 ui.label(format!("{} {} ({})", m.name, m.version, url));
-                if ui.button("Uninstall").clicked() {
+                if small_button(ui, "Uninstall").clicked() {
                     remove = Some(url.clone());
                 }
             });
@@ -808,7 +822,7 @@ impl App {
             let l = ui.label("Magnet link:");
             ui.add(egui::TextEdit::singleline(&mut self.magnet).hint_text("magnet:?xt=urn:btih:...").desired_width(500.0))
                 .labelled_by(l.id);
-            if ui.button("Play magnet").clicked() {
+            if primary_button(ui, "Play magnet").clicked() {
                 match parse_magnet_hash(self.magnet.trim()) {
                     Some(h) => {
                         let m = self.magnet.trim().to_string();
@@ -821,7 +835,7 @@ impl App {
         ui.horizontal(|ui| {
             let l = ui.label("Folder path:");
             ui.add(egui::TextEdit::singleline(&mut self.folder).hint_text("/path/to/videos").desired_width(400.0)).labelled_by(l.id);
-            if ui.button("Add folder").clicked() {
+            if primary_button(ui, "Add folder").clicked() {
                 let dir = PathBuf::from(self.folder.trim());
                 match scan(&dir).map_err(anyhow::Error::from).and_then(|items| {
                     self.db.add_library_folder(&dir, &items)?;
@@ -840,7 +854,7 @@ impl App {
         let mut play = None;
         for it in &self.library {
             ui.horizontal(|ui| {
-                if ui.button(format!("Play {}", it.title)).clicked() {
+                if primary_button(ui, &format!("Play {}", it.title)).clicked() {
                     play = Some(it.clone());
                 }
                 ui.label(it.path.display().to_string());
@@ -915,12 +929,20 @@ impl eframe::App for App {
             };
             ui.horizontal(|ui| {
                 ui.label(RichText::new(state).color(Color32::from_gray(160)));
-                if self.player.is_some() && ui.button("Stop").clicked() {
+                if self.player.is_some() && small_button(ui, "Stop").clicked() {
                     self.stop_player();
                 }
                 ui.label(RichText::new(format!("Status: {}", self.status)).color(Color32::from_gray(160)));
             });
             ui.add_space(8.0);
+            // Back lives outside the scroll area, so it stays put while the detail page scrolls.
+            if self.selected.is_some() {
+                if pill_button(ui, "←  Back", 16.0, vec2(0.0, 40.0), white_fill(), Color32::BLACK).on_hover_text("Back to browse").clicked() {
+                    self.selected = None;
+                    self.scroll_top = true;
+                }
+                ui.add_space(6.0);
+            }
             egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
                 Tab::Home => self.ui_home(ui),
                 Tab::Addons => self.ui_addons(ui),
