@@ -1,8 +1,8 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<img src="assets/icon.png" width="64" height="64" alt="">
 
-# Stremio Lite
+# Scarlet
 
-A minimal Stremio-style desktop client written in Rust. It installs [Stremio addons](https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/protocol.md) by manifest URL, browses their catalogs, and plays their HTTP and torrent streams. It also plays files from local folders. Playback progress is saved in SQLite, so it survives restarts.
+Scarlet (formerly Stremio Lite) is a minimal Stremio-style desktop client written in Rust. It installs [Stremio addons](https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/protocol.md) by manifest URL, browses their catalogs, and plays their HTTP and torrent streams. It also plays files from local folders. Playback progress is saved in SQLite, so it survives restarts.
 
 The client ships with no content sources. You install every addon yourself, and all media in this repo is generated locally.
 
