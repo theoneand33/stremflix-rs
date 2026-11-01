@@ -18,6 +18,12 @@ async fn client_against_test_addon() {
 
     let metas = c.catalog(&url, &cat.kind, &cat.id).await.unwrap();
     assert_eq!(metas.len(), 1);
+    assert_eq!(metas[0].poster.as_deref(), Some(format!("{base}/media/poster.jpg").as_str()));
+    assert!(cat.supports("search") && !cat.requires_extra());
+    assert_eq!(c.search(&url, &cat.kind, &cat.id, "test pat").await.unwrap().len(), 1);
+    assert!(c.search(&url, &cat.kind, &cat.id, "nothing").await.unwrap().is_empty());
+    assert!(c.poster(&format!("{base}/media/poster.jpg")).await.is_err(), "no media_dir: 404");
+    assert!(c.poster("file:///etc/passwd").await.is_err());
     let meta = c.meta(&url, "movie", &metas[0].id).await.unwrap();
     assert_eq!(meta.name, "Test Pattern");
 

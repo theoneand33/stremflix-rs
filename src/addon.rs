@@ -40,6 +40,38 @@ pub struct CatalogDef {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub extra: Vec<ExtraDef>,
+    /// Legacy form of `extra`.
+    #[serde(default, rename = "extraSupported")]
+    pub extra_supported: Vec<String>,
+    #[serde(default, rename = "extraRequired")]
+    pub extra_required: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExtraDef {
+    pub name: String,
+    #[serde(default, rename = "isRequired")]
+    pub is_required: bool,
+}
+
+impl CatalogDef {
+    pub fn supports(&self, extra: &str) -> bool {
+        self.extra.iter().any(|e| e.name == extra) || self.extra_supported.iter().chain(&self.extra_required).any(|e| e == extra)
+    }
+
+    /// Supports search and needs no other required extra (e.g. a required genre we can't supply).
+    pub fn searchable(&self) -> bool {
+        self.supports("search")
+            && self.extra.iter().all(|e| !e.is_required || e.name == "search")
+            && self.extra_required.iter().all(|e| e == "search")
+    }
+
+    /// True for catalogs that can't be browsed without an extra arg (e.g. search-only catalogs).
+    pub fn requires_extra(&self) -> bool {
+        self.extra.iter().any(|e| e.is_required) || !self.extra_required.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -310,6 +342,17 @@ pub fn parse_subtitles(body: &[u8]) -> Result<Vec<Subtitle>> {
         .collect())
 }
 
+/// Largest poster side accepted; GPU texture limits can be as low as 2048 and egui_glow asserts on them.
+pub const MAX_POSTER_SIDE: u32 = 2048;
+
+/// Reject posters that aren't a decodable image or whose dimensions (not byte size) are too big,
+/// since a few-KB image can declare huge dimensions.
+pub fn check_poster(body: &[u8]) -> Result<()> {
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(body)).with_guessed_format()?.into_dimensions()?;
+    ensure!(w > 0 && h > 0 && w <= MAX_POSTER_SIDE && h <= MAX_POSTER_SIDE, "poster too large: {w}x{h}");
+    Ok(())
+}
+
 // ---------- client ----------
 
 /// Base URL of an addon given its transport (manifest) URL.
@@ -368,6 +411,18 @@ impl AddonClient {
 
     pub async fn catalog(&self, transport_url: &str, kind: &str, id: &str) -> Result<Vec<MetaPreview>> {
         parse_catalog(&self.get(Self::resource_url(transport_url, "catalog", kind, id)?).await?)
+    }
+
+    pub async fn search(&self, transport_url: &str, kind: &str, id: &str, query: &str) -> Result<Vec<MetaPreview>> {
+        let path = format!("catalog/{}/{}/search={}.json", enc(kind), enc(id), enc(query));
+        parse_catalog(&self.get(addon_base(transport_url)?.join(&path)?).await?)
+    }
+
+    /// Raw image bytes for a poster URL, capped at `MAX_BODY`.
+    pub async fn poster(&self, url: &str) -> Result<Vec<u8>> {
+        let body = self.get(safe_http_url(url).context("poster URL must be http(s)")?).await?;
+        check_poster(&body)?;
+        Ok(body)
     }
 
     pub async fn meta(&self, transport_url: &str, kind: &str, id: &str) -> Result<Meta> {

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 pub const META_ID: &str = "tt-test1";
 pub const VIDEO_FILE: &str = "test-pattern.mp4";
+pub const POSTER_FILE: &str = "poster.jpg";
 
 #[derive(Clone, Default)]
 pub struct Config {
@@ -46,13 +47,14 @@ fn manifest() -> serde_json::Value {
         "resources": ["catalog", "meta", "stream", "subtitles"],
         "types": ["movie"],
         "idPrefixes": ["tt-test"],
-        "catalogs": [{"type": "movie", "id": "test-movies", "name": "Test Movies"}]
+        "catalogs": [{"type": "movie", "id": "test-movies", "name": "Test Movies", "extra": [{"name": "search"}]}]
     })
 }
 
-fn meta_preview() -> serde_json::Value {
+fn meta_preview(host: &str) -> serde_json::Value {
     serde_json::json!({
         "id": META_ID, "type": "movie", "name": "Test Pattern",
+        "poster": format!("http://{host}/media/{POSTER_FILE}"),
         "description": "Generated SMPTE-style test pattern with a 440 Hz tone (ffmpeg testsrc)."
     })
 }
@@ -63,9 +65,15 @@ fn route(path: &str, host: &str, cfg: &Config) -> Option<(&'static str, Vec<u8>)
     let p = path.split('?').next().unwrap_or("");
     match p {
         "/manifest.json" => json(manifest()),
-        "/catalog/movie/test-movies.json" => json(serde_json::json!({ "metas": [meta_preview()] })),
+        "/catalog/movie/test-movies.json" => json(serde_json::json!({ "metas": [meta_preview(host)] })),
+        _ if p.starts_with("/catalog/movie/test-movies/search=") => {
+            let q = p["/catalog/movie/test-movies/search=".len()..].trim_end_matches(".json").to_ascii_lowercase();
+            let metas: Vec<_> = if "test pattern".contains(q.replace("%20", " ").as_str()) { vec![meta_preview(host)] } else { vec![] };
+            json(serde_json::json!({ "metas": metas }))
+        }
+        _ if p == format!("/media/{POSTER_FILE}") => Some(("image/jpeg", std::fs::read(cfg.media_dir.as_ref()?.join(POSTER_FILE)).ok()?)),
         _ if p.starts_with(&format!("/meta/movie/{META_ID}")) => {
-            let mut m = meta_preview();
+            let mut m = meta_preview(host);
             m["releaseInfo"] = "2026".into();
             json(serde_json::json!({ "meta": m }))
         }
