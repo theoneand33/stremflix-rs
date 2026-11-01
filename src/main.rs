@@ -1258,11 +1258,13 @@ impl eframe::App for App {
 fn main() -> eframe::Result {
     let mut app = App::new().expect("failed to initialise app data");
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]).with_title("Stremio Lite"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0])
+            .with_title("Scarlet")
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("bundled icon is a valid PNG")),
         ..Default::default()
     };
     eframe::run_native(
-        "Stremio Lite",
+        "Scarlet",
         opts,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
