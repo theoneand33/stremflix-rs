@@ -23,6 +23,17 @@ pub struct Progress {
     pub poster: Option<String>,
 }
 
+/// A title marked watched in Stremio (Watch It Again row).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Watched {
+    /// `<type>:<id>`, like addon progress keys.
+    pub key: String,
+    pub title: String,
+    pub poster: Option<String>,
+    /// Watched episode count for series; 0 for movies.
+    pub episodes: u32,
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -36,7 +47,9 @@ impl Db {
              CREATE TABLE IF NOT EXISTS library_items (path TEXT PRIMARY KEY, folder TEXT NOT NULL, title TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, title TEXT NOT NULL, source TEXT NOT NULL,
-                 position REAL NOT NULL, duration REAL NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()));",
+                 position REAL NOT NULL, duration REAL NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
+             CREATE TABLE IF NOT EXISTS watched (key TEXT PRIMARY KEY, title TEXT NOT NULL, poster TEXT,
+                 episodes INTEGER NOT NULL, watched_at INTEGER NOT NULL);",
         )?;
         // Migrate databases created before posters were stored; fails harmlessly if the column exists.
         let _ = conn.execute("ALTER TABLE progress ADD COLUMN poster TEXT", []);
@@ -120,6 +133,34 @@ impl Db {
             .conn
             .query_row("SELECT key, title, source, position, duration, poster FROM progress WHERE key = ?1", [key], row_progress)
             .optional()?)
+    }
+
+    /// Imported progress keeps its original time (ISO 8601 `at`) and never overwrites newer local progress.
+    pub fn import_progress(&self, p: &Progress, at: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO progress (key, title, source, position, duration, poster, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, coalesce(unixepoch(?7), 0))
+             ON CONFLICT(key) DO UPDATE SET title = excluded.title, source = excluded.source, position = excluded.position,
+                 duration = excluded.duration, poster = coalesce(excluded.poster, poster), updated_at = excluded.updated_at
+             WHERE excluded.updated_at > progress.updated_at",
+            params![p.key, p.title, p.source, p.position, p.duration, p.poster, at],
+        )?;
+        Ok(())
+    }
+
+    /// `at` is when it was last watched (ISO 8601), used for ordering.
+    pub fn save_watched(&self, w: &Watched, at: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO watched (key, title, poster, episodes, watched_at) VALUES (?1, ?2, ?3, ?4, coalesce(unixepoch(?5), 0))",
+            params![w.key, w.title, w.poster, w.episodes, at],
+        )?;
+        Ok(())
+    }
+
+    pub fn watched(&self, limit: usize) -> Result<Vec<Watched>> {
+        let mut st = self.conn.prepare("SELECT key, title, poster, episodes FROM watched ORDER BY watched_at DESC, key LIMIT ?1")?;
+        let rows = st.query_map([limit as i64], |r| Ok(Watched { key: r.get(0)?, title: r.get(1)?, poster: r.get(2)?, episodes: r.get(3)? }))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn recent_progress(&self, limit: usize) -> Result<Vec<Progress>> {

@@ -1,0 +1,140 @@
+use std::collections::HashMap;
+use stremio_lite::db::Db;
+use stremio_lite::stremio_import::{import, parse, read_storage, watched_episodes};
+
+/// A Stremio 5 localStorage snapshot: 2 addons (1 invalid), a movie in progress, a watched series,
+/// a watched movie, and an item with a `javascript:` poster.
+fn storage() -> HashMap<String, String> {
+    let manifest = r#"{"id":"a","version":"1","name":"Addon A","resources":["stream"],"types":["movie"]}"#;
+    let profile = format!(
+        r#"{{"addons":[{{"transportUrl":"https://a.example/manifest.json","manifest":{manifest}}},
+                       {{"transportUrl":"file:///etc/manifest.json","manifest":{manifest}}}]}}"#
+    );
+    // 3 of 5 episodes watched: bits 0b10101 zlib-compressed, base64.
+    let bits = {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&[0b10101]).unwrap();
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, z.finish().unwrap())
+    };
+    let library = format!(
+        r#"{{"items":{{
+        "tt1":{{"_id":"tt1","name":"Movie One","type":"movie","poster":"https://p.example/1.jpg","_mtime":"2026-01-02T00:00:00.000Z",
+               "state":{{"lastWatched":"2026-01-02T00:00:00.000Z","timeOffset":61500,"duration":120000,"timesWatched":0,"video_id":"tt1"}}}},
+        "tt2":{{"_id":"tt2","name":"Show Two","type":"series","poster":"javascript:alert(1)","_mtime":"2026-01-03T00:00:00.000Z",
+               "state":{{"lastWatched":"2026-01-03T00:00:00.000Z","timeOffset":30000,"duration":60000,"video_id":"tt2:1:3","watched":"tt2:1:1:5:{bits}"}}}},
+        "tt3":{{"_id":"tt3","name":"Movie Three","type":"movie","_mtime":"2026-01-01T00:00:00.000Z",
+               "state":{{"lastWatched":"2026-01-01T00:00:00.000Z","flaggedWatched":1}}}},
+        "bad/id":{{"_id":"bad/id","name":"X","type":"movie","state":{{"flaggedWatched":1}}}}}}}}"#
+    );
+    let streams = r#"{"items":[[{"metaId":"tt1","videoId":"tt1"},{"stream":{"url":"https://s.example/1.mp4"}}],
+                              [{"metaId":"tt2","videoId":"tt2:1:2"},{"stream":{"url":"https://s.example/wrong-episode.mp4"}}],
+                              [{"metaId":"tt2","videoId":"tt2:1:3"},{"stream":{"infoHash":"0123456789abcdef0123456789abcdef01234567","fileIdx":2}}],
+                              [{"metaId":"tt3","videoId":"tt3"},{"stream":{"url":"javascript:alert(1)"}}]]}"#;
+    [("profile", profile), ("library_recent", library), ("streams", streams.to_string())]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+}
+
+fn utf16(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+#[test]
+fn bitfield_counts_watched_episodes() {
+    assert_eq!(watched_episodes("tt0:not-base64"), 0);
+    assert_eq!(watched_episodes("garbage"), 0);
+    let s = storage();
+    let lib = &s["library_recent"];
+    let field = lib.split(r#""watched":""#).nth(1).unwrap().split('"').next().unwrap();
+    assert_eq!(watched_episodes(field), 3);
+}
+
+#[test]
+fn parses_and_saves_without_clobbering_newer_progress() {
+    let mut imp = parse(&storage()).unwrap();
+    assert_eq!(imp.addons.len(), 1, "file: transport URL is rejected");
+    assert_eq!(imp.progress.len(), 2);
+    imp.progress.sort_by(|a, b| a.0.key.cmp(&b.0.key));
+    let ep = &imp.progress[1].0;
+    assert_eq!((ep.key.as_str(), ep.source.as_str()), ("series:tt2", "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&so=2"));
+    let p = &imp.progress[0].0;
+    assert_eq!((p.key.as_str(), p.source.as_str(), p.position, p.duration), ("movie:tt1", "https://s.example/1.mp4", 61.5, 120.0));
+    let mut w: Vec<_> = imp.watched.iter().map(|(w, _)| (w.key.as_str(), w.episodes, w.poster.is_some())).collect();
+    w.sort();
+    assert_eq!(w, [("movie:tt3", 0, false), ("series:tt2", 3, false)]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("a.db")).unwrap();
+    imp.save(&db).unwrap();
+    imp.save(&db).unwrap(); // re-import is idempotent
+    assert_eq!(db.addons().unwrap().len(), 1);
+    assert_eq!(db.recent_progress(10).unwrap().len(), 2);
+    // Newest watched first.
+    assert_eq!(db.watched(10).unwrap().iter().map(|w| w.key.as_str()).collect::<Vec<_>>(), ["series:tt2", "movie:tt3"]);
+    // Local progress saved now is newer than the 2026-01-02 import and survives a re-import.
+    db.save_progress(&stremio_lite::db::Progress { position: 99.0, ..p.clone() }).unwrap();
+    imp.save(&db).unwrap();
+    assert_eq!(db.progress("movie:tt1").unwrap().unwrap().position, 99.0);
+}
+
+#[test]
+fn reads_webkit_sqlite_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("LocalStorage/localstorage.sqlite3");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB NOT NULL ON CONFLICT FAIL)").unwrap();
+    for (k, v) in storage() {
+        conn.execute("INSERT INTO ItemTable VALUES (?1, ?2)", rusqlite::params![k, utf16(&v)]).unwrap();
+    }
+    // Left open: uncheckpointed WAL data must be read too, like with a running Stremio.
+    assert_eq!(read_storage(&path).unwrap(), storage());
+    let (found, imp) = import(Some(dir.path())).unwrap();
+    assert_eq!(found, path);
+    assert_eq!(imp.progress.len(), 2);
+    drop(conn);
+}
+
+#[test]
+fn reads_chromium_leveldb_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Default/Local Storage/leveldb");
+    {
+        let mut db = rusty_leveldb::DB::open(&path, rusty_leveldb::Options::default()).unwrap();
+        let key = |origin: &str, k: &str| [format!("_{origin}\0\x01{k}").into_bytes()].concat();
+        db.put(&key("https://other.example", "profile"), b"\x01{}").unwrap(); // another origin is ignored
+        db.put(b"VERSION", b"1").unwrap();
+        for (k, v) in storage() {
+            db.put(&key("https://web.stremio.com", &k), &[&[0u8][..], &utf16(&v)].concat()).unwrap();
+        }
+        db.flush().unwrap();
+    }
+    assert_eq!(read_storage(&path).unwrap(), storage());
+    let (found, imp) = import(Some(dir.path())).unwrap();
+    assert_eq!(found, path);
+    assert_eq!(imp.watched.len(), 2);
+}
+
+#[test]
+fn missing_storage_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(import(Some(dir.path())).is_err());
+}
+
+/// Manual check against this machine's Stremio: `cargo test --test stremio_import -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn local_install() {
+    let (path, imp) = import(None).unwrap();
+    println!("{}: {} addons, {} in progress, {} watched", path.display(), imp.addons.len(), imp.progress.len(), imp.watched.len());
+    for (p, at) in imp.progress.iter().take(5) {
+        println!("  progress {} {:?} {:.0}/{:.0}s {at}", p.key, p.title, p.position, p.duration);
+    }
+    for (w, _) in imp.watched.iter().take(5) {
+        println!("  watched {} {:?} episodes={}", w.key, w.title, w.episodes);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    imp.save(&Db::open(&dir.path().join("a.db")).unwrap()).unwrap();
+}

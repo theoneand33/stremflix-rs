@@ -6,6 +6,7 @@ src/db.rs       SQLite (rusqlite, bundled): addons, library folders/items, setti
 src/library.rs  Recursive media-file scan (walkdir)
 src/player.rs   mpv process + JSON IPC (time-pos / duration polling)
 src/torrent.rs  librqbit session + its HTTP streaming API on 127.0.0.1
+src/stremio_import.rs  Reads a local Stremio's localStorage (WebKit SQLite or Chromium LevelDB via rusty-leveldb)
 src/main.rs     egui/eframe GUI; tokio runtime for network/torrent work, results via mpsc
 test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed via librqbit.
 ```
