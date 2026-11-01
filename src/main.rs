@@ -99,6 +99,37 @@ fn card_text(ui: &egui::Ui, rect: egui::Rect, text: &str) {
     p.galley(rect.center() - g.size() / 2.0, g, Color32::WHITE);
 }
 
+/// Netflix episode-list row: index, bold name, gray details, play circle; highlights on hover.
+fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream) -> egui::Response {
+    let mut parts = [&s.name, &s.title, &s.description].into_iter().flatten().map(|x| x.trim()).filter(|x| !x.is_empty());
+    let head = parts.next().unwrap_or("Stream").replace('\n', " ");
+    let details = parts.collect::<Vec<_>>().join("\n");
+    let (w, text_x, pad) = (ui.available_width().min(960.0), 84.0, 18.0);
+    let p = ui.painter();
+    let hg = p.layout(head.clone(), egui::FontId::new(17.0, bold()), Color32::WHITE, w - text_x - 96.0);
+    let dg = p.layout(details, egui::FontId::proportional(14.0), Color32::from_gray(170), w - text_x - 96.0);
+    let block = hg.size().y + if dg.size().y > 0.0 { 6.0 + dg.size().y } else { 0.0 };
+    let h = (pad * 2.0 + block).max(88.0);
+    let (rect, r) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Play {head}")));
+    let t = ui.ctx().animate_bool(r.id, r.hovered() || r.has_focus());
+    let p = ui.painter();
+    p.rect_filled(rect, 4, Color32::from_gray(51).gamma_multiply(t));
+    p.hline(rect.x_range(), rect.bottom(), (1.0, Color32::from_gray(64)));
+    let num = p.layout_no_wrap(n.to_string(), egui::FontId::proportional(24.0), Color32::from_gray(210));
+    p.galley(pos2(rect.left() + text_x / 2.0 - num.size().x / 2.0, rect.center().y - num.size().y / 2.0), num, Color32::WHITE);
+    let top = rect.center().y - block / 2.0;
+    p.galley(pos2(rect.left() + text_x, top), hg.clone(), Color32::WHITE);
+    p.galley(pos2(rect.left() + text_x, top + hg.size().y + 6.0), dg, Color32::WHITE);
+    // Play button: outlined circle that fills white on hover.
+    let c = pos2(rect.right() - 48.0, rect.center().y);
+    let fg = Color32::from_gray(160).lerp_to_gamma(Color32::WHITE, t);
+    p.circle(c, 20.0, Color32::WHITE.gamma_multiply(t), (2.0, fg));
+    let tri = Color32::WHITE.lerp_to_gamma(Color32::BLACK, t);
+    p.add(egui::Shape::convex_polygon(vec![c + vec2(-6.0, -9.0), c + vec2(10.0, 0.0), c + vec2(-6.0, 9.0)], tri, egui::Stroke::NONE));
+    r
+}
+
 fn kind_label(kind: &str) -> &str {
     match kind {
         "movie" => "Movies",
@@ -549,16 +580,16 @@ impl App {
         if let Some((meta, streams, subs)) = &self.selected {
             ui.add_space(16.0);
             ui.horizontal(|ui| {
-                let r = ui.label(RichText::new(format!("Streams for {}", meta.name)).size(20.0).strong().family(bold()).color(Color32::WHITE));
+                let r = ui.label(RichText::new("Streams").size(24.0).strong().family(bold()).color(Color32::WHITE));
                 if std::mem::take(&mut self.show_streams) {
                     r.scroll_to_me(Some(Align::TOP));
                 }
-                ui.label(format!("{} subtitle track(s)", subs.len()));
+                ui.label(RichText::new(format!("{}  ·  {} subtitle track(s)", meta.name, subs.len())).size(15.0).color(Color32::from_gray(170)));
             });
-            for s in streams {
-                if let Some(src) = stream_source(s)
-                    && ui.button(format!("Play: {}", s.label())).clicked()
-                {
+            ui.add_space(8.0);
+            let playable = streams.iter().filter_map(|s| Some((s, stream_source(s)?)));
+            for (i, (s, src)) in playable.enumerate() {
+                if stream_row(ui, i + 1, s).clicked() {
                     play = Some((format!("{}:{}", meta.kind, meta.id), meta.name.clone(), src, subs.clone()));
                 }
             }
