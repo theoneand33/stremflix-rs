@@ -93,14 +93,18 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then
             # the exe imports libmpv-2.dll by that exact name, so ship it unrenamed next to the exe
             cp target/release/stremio-lite.exe "$MPV_DIR/libmpv-2.dll" README.md "$NAME/"
+            7z a -tzip "$NAME.zip" "$NAME" > /dev/null
           else
             cp target/release/stremio-lite README.md "$NAME/"
+            tar czf "$NAME.tar.gz" "$NAME"
           fi
-          tar czf "$NAME.tar.gz" "$NAME"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: "*.tar.gz"
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
 
   release:
     needs: build
@@ -115,9 +119,9 @@ jobs:
         run: |
           if [ "$TAG" = nightly ]; then
             gh release delete nightly --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
-            gh release create nightly *.tar.gz --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            gh release create nightly *.tar.gz *.zip --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --title "Nightly ($(date -u +%F' '%H:%M) UTC, ${GITHUB_SHA::7})" --notes "Automated build of $GITHUB_SHA." --prerelease
           else
-            gh release create "$TAG" *.tar.gz --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            gh release create "$TAG" *.tar.gz *.zip --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --title "$TAG" --generate-notes
           fi
