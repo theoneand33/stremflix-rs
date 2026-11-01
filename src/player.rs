@@ -1,5 +1,6 @@
-//! Playback backend: libmpv embedded in-process. Frames come from mpv's software
-//! render API so the GUI can draw them as a texture under its own controls.
+//! Playback backend: libmpv embedded in-process. mpv renders through its OpenGL render
+//! API into a framebuffer the GUI owns (GPU scaling, hardware decoding via `hwdec`),
+//! so the video is a texture under the GUI's own controls.
 //! `STREMIO_LITE_MPV_ARGS` adds mpv options (e.g. `--ao=null` for headless CI).
 //! mpv's JSON IPC server stays on at [`ipc_socket_path`] so tools can query player state.
 
@@ -21,6 +22,23 @@ struct MpvEventProperty {
     format: c_int,
     data: *mut c_void,
 }
+
+#[repr(C)]
+struct GlInitParams {
+    get_proc_address: extern "C" fn(*mut c_void, *const c_char) -> *mut c_void,
+    ctx: *mut c_void,
+}
+
+#[repr(C)]
+struct GlFbo {
+    fbo: c_int,
+    w: c_int,
+    h: c_int,
+    internal_format: c_int,
+}
+
+/// Resolves GL function names in the GUI's current GL context.
+pub type GlProc = std::sync::Arc<dyn Fn(&CStr) -> *const c_void + Send + Sync>;
 
 #[repr(C)]
 struct RenderParam {
@@ -97,6 +115,8 @@ pub struct Player {
     render: *mut c_void,
     /// Repaint callback handed to mpv; freed after the render context.
     wake: *mut Box<dyn Fn() + Send + Sync>,
+    /// Handed to mpv as the `get_proc_address` context; boxed so its address is stable.
+    gl_proc: Box<GlProc>,
     subs: Vec<String>,
     alive: bool,
     pub state: State,
@@ -116,6 +136,11 @@ fn cstr(s: &str) -> CString {
 
 fn err_text(code: c_int) -> String {
     unsafe { CStr::from_ptr(mpv_error_string(code)) }.to_string_lossy().into_owned()
+}
+
+extern "C" fn gl_proc_address(ctx: *mut c_void, name: *const c_char) -> *mut c_void {
+    let f = unsafe { &*(ctx as *const GlProc) };
+    f(unsafe { CStr::from_ptr(name) }) as *mut c_void
 }
 
 extern "C" fn on_update(data: *mut c_void) {
@@ -158,12 +183,13 @@ pub fn parse_tracks(json: &str) -> Vec<Track> {
 impl Player {
     /// `source` is a URL or local path, passed to `loadfile` as a plain argument (never parsed as options).
     /// `wake` is called from mpv's thread whenever a new frame is ready.
-    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[String], wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
+    /// Must be called, rendered and dropped with the GUI's GL context current.
+    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[String], gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
         let mpv = unsafe { mpv_create() };
         if mpv.is_null() {
             bail!("failed to create mpv instance");
         }
-        let mut p = Self { mpv, render: std::ptr::null_mut(), wake: Box::into_raw(Box::new(wake)), subs: subtitles.to_vec(), alive: true, state: State::default() };
+        let mut p = Self { mpv, render: std::ptr::null_mut(), wake: Box::into_raw(Box::new(wake)), gl_proc: Box::new(gl_proc), subs: subtitles.to_vec(), alive: true, state: State::default() };
         let socket = ipc_socket_path();
         let _ = std::fs::remove_file(&socket);
         let mut opts: Vec<(String, String)> = [
@@ -174,7 +200,8 @@ impl Player {
             ("ytdl", "no"),
             ("terminal", "no"),
             ("input-default-bindings", "no"),
-            ("hwdec", "auto-safe"),
+            // GPU decoders with zero-copy OpenGL interop only; copy-back ones (e.g. vulkan-copy) corrupted frames in testing.
+            ("hwdec", "nvdec,vaapi,videotoolbox,d3d11va"),
             ("force-media-title", title),
             ("start", &format!("{start:.1}")),
         ]
@@ -192,8 +219,12 @@ impl Player {
         if rc < 0 {
             bail!("mpv init: {}", err_text(rc));
         }
-        let sw = c"sw";
-        let mut params = [RenderParam { kind: 1, data: sw.as_ptr() as *mut c_void }, RenderParam { kind: 0, data: std::ptr::null_mut() }];
+        let mut init = GlInitParams { get_proc_address: gl_proc_address, ctx: &*p.gl_proc as *const GlProc as *mut c_void };
+        let mut params = [
+            RenderParam { kind: 1, data: c"opengl".as_ptr() as *mut c_void },
+            RenderParam { kind: 2, data: &mut init as *mut GlInitParams as *mut c_void },
+            RenderParam { kind: 0, data: std::ptr::null_mut() },
+        ];
         let rc = unsafe { mpv_render_context_create(&mut p.render, mpv, params.as_mut_ptr()) };
         if rc < 0 {
             bail!("mpv render context: {}", err_text(rc));
@@ -277,31 +308,22 @@ impl Player {
         (self.state.pos > 0.0).then_some((self.state.pos, self.state.dur))
     }
 
-    /// Renders the current frame into `out` (RGBA, `size` pixels) when mpv has a new one,
-    /// or always when `force` is set (e.g. after a resize). Returns whether `out` changed.
-    pub fn render(&mut self, size: [usize; 2], force: bool, out: &mut [u8]) -> bool {
-        assert_eq!(out.len(), size[0] * size[1] * 4);
+    /// Renders the current frame into GL framebuffer `fbo` (`size` pixels) when mpv has a new
+    /// one, or always when `force` is set (e.g. after a resize). Returns whether it rendered.
+    pub fn render(&mut self, fbo: u32, size: [usize; 2], force: bool) -> bool {
         let fresh = unsafe { mpv_render_context_update(self.render) } & 1 != 0;
         if !(fresh || force) || size[0] == 0 || size[1] == 0 {
             return false;
         }
-        let mut dims = [size[0] as c_int, size[1] as c_int];
-        let mut stride = size[0] * 4;
-        let fmt = c"rgb0";
+        let mut target = GlFbo { fbo: fbo as c_int, w: size[0] as c_int, h: size[1] as c_int, internal_format: 0 };
+        // No flip: mpv's unflipped output already has the top row where egui samples v = 0.
+        let mut flip: c_int = 0;
         let mut params = [
-            RenderParam { kind: 1, data: c"sw".as_ptr() as *mut c_void },
-            RenderParam { kind: 17, data: dims.as_mut_ptr() as *mut c_void },
-            RenderParam { kind: 18, data: fmt.as_ptr() as *mut c_void },
-            RenderParam { kind: 19, data: &mut stride as *mut usize as *mut c_void },
-            RenderParam { kind: 20, data: out.as_mut_ptr() as *mut c_void },
+            RenderParam { kind: 3, data: &mut target as *mut GlFbo as *mut c_void },
+            RenderParam { kind: 4, data: &mut flip as *mut c_int as *mut c_void },
             RenderParam { kind: 0, data: std::ptr::null_mut() },
         ];
-        if unsafe { mpv_render_context_render(self.render, params.as_mut_ptr()) } < 0 {
-            return false;
-        }
-        // "rgb0" leaves the 4th byte undefined; make it opaque.
-        out.iter_mut().skip(3).step_by(4).for_each(|a| *a = 255);
-        true
+        unsafe { mpv_render_context_render(self.render, params.as_mut_ptr()) >= 0 }
     }
 
     pub fn stop(&mut self) {

@@ -11,7 +11,8 @@ use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, MetaPreview, PlayTarget, Stream, parse_magnet_hash};
 use stremio_lite::db::{Db, Progress};
 use stremio_lite::library::{LibraryItem, scan};
-use stremio_lite::player::Player;
+use eframe::glow::{self, HasContext};
+use stremio_lite::player::{GlProc, Player};
 use stremio_lite::torrent::TorrentEngine;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -184,10 +185,6 @@ struct Playing {
     pos: f64,
     dur: f64,
     poster: Option<String>,
-    /// Video frame texture, its RGBA buffer and pixel size.
-    tex: Option<egui::TextureHandle>,
-    buf: Vec<u8>,
-    size: [usize; 2],
     /// Controls stay visible until this time (seconds, egui clock).
     osd_until: f64,
     /// Audio & Subtitles panel open.
@@ -225,6 +222,10 @@ struct App {
     player: Option<Playing>,
     status: String,
     last_poll: Instant,
+    /// GL function loader of eframe's context, for libmpv's OpenGL renderer.
+    gl_proc: Option<GlProc>,
+    /// Video framebuffer, its texture (owned by egui once registered) and pixel size; reused across playbacks.
+    video: Option<(glow::Framebuffer, glow::Texture, egui::TextureId, [usize; 2])>,
 }
 
 fn data_dir() -> PathBuf {
@@ -274,6 +275,8 @@ impl App {
             pill: None,
             status: "Ready".into(),
             last_poll: Instant::now(),
+            gl_proc: None,
+            video: None,
         };
         if app.addons.is_empty() {
             app.tab = Tab::Addons;
@@ -367,10 +370,14 @@ impl App {
                     .and_then(|(m, ..)| m.poster.clone())
                     .or(prev.and_then(|p| p.poster));
                 let wake = ctx.clone();
-                match Player::launch(&url, &title, start, &subs, Box::new(move || wake.request_repaint())) {
+                let Some(gl_proc) = self.gl_proc.clone() else {
+                    self.status = "Error: no OpenGL context for the player".into();
+                    return;
+                };
+                match Player::launch(&url, &title, start, &subs, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         self.status = if start > 0.0 { format!("Resuming at {}", fmt_time(start)) } else { "Playing".into() };
-                        let p = Playing { player, key, title, source, pos: start, dur: 0.0, poster, tex: None, buf: Vec::new(), size: [0, 0], osd_until: 0.0, menu: false, scrub: None };
+                        let p = Playing { player, key, title, source, pos: start, dur: 0.0, poster, osd_until: 0.0, menu: false, scrub: None };
                         self.player = Some(p);
                     }
                     Err(e) => self.status = format!("Error: {e:#}"),
@@ -798,7 +805,7 @@ impl App {
 
     /// Full-window Netflix-style player: letterboxed video, controls that fade out after
     /// 3 s without input, red seek bar, ±10 s skips, volume, Audio & Subtitles panel.
-    fn ui_player(&mut self, ui: &mut egui::Ui) {
+    fn ui_player(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let rect = ui.max_rect();
         let Some(p) = &mut self.player else { return };
@@ -809,26 +816,54 @@ impl App {
         let (mut back, mut toggle_fs) = (false, false);
         ui.painter().rect_filled(rect, 0, Color32::BLACK);
 
-        // Video: render at on-screen pixel size, never above the video's own size.
+        // Video: mpv renders on the GPU into our framebuffer at on-screen pixel size.
         let [vw, vh] = p.player.state.video;
-        if vw > 0 && vh > 0 {
+        if let (true, Some(gl)) = (vw > 0 && vh > 0, frame.gl().cloned()) {
             let fit = (rect.width() / vw as f32).min(rect.height() / vh as f32);
             let vrect = egui::Rect::from_center_size(rect.center(), vec2(vw as f32, vh as f32) * fit);
-            let scale = (fit * ctx.pixels_per_point()).min(1.0);
-            let size = [((vw as f32 * scale) as usize).max(1), ((vh as f32 * scale) as usize).max(1)];
-            let resized = size != p.size;
-            if resized {
-                (p.size, p.buf) = (size, vec![0; size[0] * size[1] * 4]);
-            }
-            if p.player.render(size, resized, &mut p.buf) {
-                let img = egui::ColorImage::from_rgba_premultiplied(size, &p.buf);
-                match &mut p.tex {
-                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                    None => p.tex = Some(ctx.load_texture("video", img, egui::TextureOptions::LINEAR)),
+            let px = vrect.size() * ctx.pixels_per_point();
+            let size = [(px.x as usize).max(1), (px.y as usize).max(1)];
+            let video = match self.video {
+                Some(v) => Some(v),
+                None => unsafe {
+                    match (gl.create_framebuffer(), gl.create_texture()) {
+                        (Ok(fbo), Ok(tex)) => Some((fbo, tex, frame.register_native_glow_texture(tex), [0, 0])),
+                        (a, b) => {
+                            self.status = format!("Error: GL setup failed: {:?}", a.err().or(b.err()));
+                            None
+                        }
+                    }
+                },
+            };
+            if let Some((fbo, tex, id, cur)) = video {
+                let resized = cur != size;
+                unsafe {
+                    if resized {
+                        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                        // The default min filter wants mipmaps; without them the texture samples black.
+                        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+                        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+                        gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, size[0] as i32, size[1] as i32, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
+                        gl.bind_texture(glow::TEXTURE_2D, None);
+                    }
+                    // egui leaves scissor/blend enabled; mpv draws assuming they are off.
+                    gl.disable(glow::SCISSOR_TEST);
+                    gl.disable(glow::BLEND);
+                    p.player.render(fbo.0.get(), size, resized);
+                    // Undo the GL state mpv leaves behind that egui's painter assumes is default.
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    gl.active_texture(glow::TEXTURE0);
+                    gl.bind_texture(glow::TEXTURE_2D, None);
+                    gl.use_program(None);
+                    gl.bind_vertex_array(None);
+                    gl.bind_buffer(glow::ARRAY_BUFFER, None);
+                    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+                    gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
                 }
-            }
-            if let Some(t) = &p.tex {
-                ui.painter().image(t.id(), vrect, egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                self.video = Some((fbo, tex, id, size));
+                ui.painter().image(id, vrect, egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             }
         }
         let st = p.player.state.clone();
@@ -1076,7 +1111,7 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         while let Ok(msg) = self.rx.try_recv() {
             self.handle(&ctx, msg);
@@ -1084,7 +1119,7 @@ impl eframe::App for App {
         self.poll_player();
         ctx.request_repaint_after(Duration::from_millis(500));
         if self.player.is_some() {
-            self.ui_player(ui);
+            self.ui_player(ui, frame);
             return;
         }
 
@@ -1163,7 +1198,7 @@ impl eframe::App for App {
         });
     }
 
-    fn on_exit(&mut self) {
+    fn on_exit(&mut self, _gl: Option<&glow::Context>) {
         self.stop_player();
     }
 }
@@ -1194,6 +1229,7 @@ fn main() -> eframe::Result {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             cc.egui_ctx.set_visuals_of(egui::Theme::Dark, v);
             cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| s.spacing.button_padding = vec2(14.0, 6.0));
+            app.gl_proc = cc.get_proc_address.clone();
             app.build_rows(&cc.egui_ctx);
             app.fetch_recent_posters(&cc.egui_ctx);
             Ok(Box::new(app))
