@@ -103,6 +103,9 @@ pub struct MetaPreview {
     pub name: String,
     #[serde(default)]
     pub poster: Option<String>,
+    /// Wide backdrop image, used for the hero banner.
+    #[serde(default)]
+    pub background: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
 }
@@ -270,6 +273,7 @@ fn clean_preview(mut p: MetaPreview) -> Option<MetaPreview> {
     }
     p.name = sanitize_text(&p.name, MAX_TEXT);
     opt_url(&mut p.poster);
+    opt_url(&mut p.background);
     opt_text(&mut p.description, MAX_LONG_TEXT);
     (!p.name.is_empty()).then_some(p)
 }
