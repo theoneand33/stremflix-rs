@@ -40,6 +40,31 @@ pub struct CatalogDef {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub extra: Vec<ExtraDef>,
+    /// Legacy form of `extra`.
+    #[serde(default, rename = "extraSupported")]
+    pub extra_supported: Vec<String>,
+    #[serde(default, rename = "extraRequired")]
+    pub extra_required: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExtraDef {
+    pub name: String,
+    #[serde(default, rename = "isRequired")]
+    pub is_required: bool,
+}
+
+impl CatalogDef {
+    pub fn supports(&self, extra: &str) -> bool {
+        self.extra.iter().any(|e| e.name == extra) || self.extra_supported.iter().any(|e| e == extra)
+    }
+
+    /// True for catalogs that can't be browsed without an extra arg (e.g. search-only catalogs).
+    pub fn requires_extra(&self) -> bool {
+        self.extra.iter().any(|e| e.is_required) || !self.extra_required.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -368,6 +393,16 @@ impl AddonClient {
 
     pub async fn catalog(&self, transport_url: &str, kind: &str, id: &str) -> Result<Vec<MetaPreview>> {
         parse_catalog(&self.get(Self::resource_url(transport_url, "catalog", kind, id)?).await?)
+    }
+
+    pub async fn search(&self, transport_url: &str, kind: &str, id: &str, query: &str) -> Result<Vec<MetaPreview>> {
+        let path = format!("catalog/{}/{}/search={}.json", enc(kind), enc(id), enc(query));
+        parse_catalog(&self.get(addon_base(transport_url)?.join(&path)?).await?)
+    }
+
+    /// Raw image bytes for a poster URL, capped at `MAX_BODY`.
+    pub async fn poster(&self, url: &str) -> Result<Vec<u8>> {
+        self.get(safe_http_url(url).context("poster URL must be http(s)")?).await
     }
 
     pub async fn meta(&self, transport_url: &str, kind: &str, id: &str) -> Result<Meta> {

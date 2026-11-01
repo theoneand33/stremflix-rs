@@ -13,6 +13,16 @@ fn valid_manifest() {
     assert_eq!(m.name, "Example"); // control char stripped, trimmed
     assert!(m.has_resource("catalog") && m.has_resource("stream") && !m.has_resource("meta"));
     assert_eq!(m.catalogs.len(), 1, "catalog with empty id dropped");
+    assert!(!m.catalogs[0].supports("search") && !m.catalogs[0].requires_extra());
+}
+
+#[test]
+fn catalog_extras() {
+    let m = parse_manifest(br#"{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"],"catalogs":[
+      {"type":"movie","id":"s","extra":[{"name":"search","isRequired":true}]},
+      {"type":"movie","id":"legacy","extraSupported":["search","genre"]}]}"#).unwrap();
+    assert!(m.catalogs[0].supports("search") && m.catalogs[0].requires_extra());
+    assert!(m.catalogs[1].supports("search") && m.catalogs[1].supports("genre") && !m.catalogs[1].requires_extra());
 }
 
 #[test]

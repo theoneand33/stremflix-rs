@@ -2,6 +2,7 @@
 //! runtime; results come back to the UI thread over a channel.
 
 use eframe::egui;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -24,6 +25,8 @@ enum Msg {
     Installed(String, Manifest),
     Catalog(String, Vec<(String, MetaPreview)>),
     Streams(MetaPreview, Vec<Stream>, Vec<String>),
+    /// poster URL, image bytes (empty on failure)
+    Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs
     Play(String, String, String, String, Vec<String>),
 }
@@ -51,6 +54,9 @@ struct App {
     catalog: Option<(String, Vec<(String, MetaPreview)>)>,
     selected: Option<(MetaPreview, Vec<Stream>, Vec<String>)>,
     magnet: String,
+    search: String,
+    /// Poster bytes by URL; `None` while loading, empty if the fetch failed.
+    posters: HashMap<String, Option<Arc<[u8]>>>,
     folder: String,
     library: Vec<LibraryItem>,
     recent: Vec<Progress>,
@@ -97,6 +103,8 @@ impl App {
             catalog: None,
             selected: None,
             magnet: String::new(),
+            search: String::new(),
+            posters: HashMap::new(),
             player: None,
             status: "Ready".into(),
             last_poll: Instant::now(),
@@ -152,6 +160,9 @@ impl App {
             Msg::Streams(meta, streams, subs) => {
                 self.status = format!("{}: {} streams", meta.name, streams.len());
                 self.selected = Some((meta, streams, subs));
+            }
+            Msg::Poster(url, bytes) => {
+                self.posters.insert(url, Some(bytes.into()));
             }
             Msg::Play(key, title, source, url, subs) => {
                 self.stop_player();
@@ -214,6 +225,47 @@ impl App {
         });
     }
 
+    fn search(&mut self, ctx: &egui::Context) {
+        let query = self.search.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        let targets: Vec<(String, String, String)> = self
+            .addons
+            .iter()
+            .filter(|(_, m)| m.has_resource("catalog"))
+            .flat_map(|(u, m)| m.catalogs.iter().filter(|c| c.supports("search")).map(move |c| (u.clone(), c.kind.clone(), c.id.clone())))
+            .collect();
+        if targets.is_empty() {
+            self.status = "Error: no installed addon supports search".into();
+            return;
+        }
+        let client = self.client.clone();
+        self.status = format!("Searching for \"{query}\"...");
+        self.spawn(ctx, async move {
+            let (mut items, mut errors) = (Vec::new(), Vec::new());
+            for (u, kind, id) in &targets {
+                match client.search(u, kind, id, &query).await {
+                    Ok(ms) => items.extend(ms.into_iter().map(|m| (u.clone(), m))),
+                    Err(e) => errors.push(format!("{e:#}")),
+                }
+            }
+            if errors.len() == targets.len() {
+                anyhow::bail!("search failed: {}", errors.join("; "));
+            }
+            Ok(Msg::Catalog(format!("Search \"{query}\""), items))
+        });
+    }
+
+    fn fetch_poster(&mut self, ctx: &egui::Context, url: String) {
+        self.posters.insert(url.clone(), None);
+        let client = self.client.clone();
+        self.spawn(ctx, async move {
+            let bytes = client.poster(&url).await.unwrap_or_default();
+            Ok(Msg::Poster(url, bytes))
+        });
+    }
+
     fn open_meta(&mut self, ctx: &egui::Context, meta: MetaPreview) {
         let client = self.client.clone();
         let matches = |m: &Manifest, res: &str| {
@@ -261,6 +313,14 @@ impl App {
                 }
             }
         });
+        ui.horizontal(|ui| {
+            let l = ui.label("Search:");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Title...").desired_width(400.0)).labelled_by(l.id);
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.button("Search").clicked() || enter {
+                self.search(&ctx);
+            }
+        });
         ui.separator();
         ui.heading("Catalogs");
         let mut open = None;
@@ -269,7 +329,7 @@ impl App {
                 if !m.has_resource("catalog") {
                     continue;
                 }
-                for c in &m.catalogs {
+                for c in m.catalogs.iter().filter(|c| !c.requires_extra()) {
                     let name = format!("{} - {}", m.name, c.name.as_deref().unwrap_or(&c.id));
                     if ui.button(&name).clicked() {
                         open = Some((url.clone(), name, c.kind.clone(), c.id.clone()));
@@ -282,14 +342,38 @@ impl App {
         }
         if let Some((name, items)) = &self.catalog {
             ui.label(format!("Catalog: {name}"));
-            let mut pick = None;
+            let (mut pick, mut want) = (None, Vec::new());
+            let size = egui::vec2(120.0, 180.0);
             ui.horizontal_wrapped(|ui| {
                 for (_, m) in items {
-                    if ui.button(&m.name).on_hover_text(m.description.as_deref().unwrap_or("")).clicked() {
+                    let poster = m.poster.as_ref().map(|u| (u, self.posters.get(u)));
+                    let r = ui
+                        .vertical(|ui| {
+                            ui.set_width(size.x);
+                            let r = match poster {
+                                Some((u, Some(Some(b)))) if !b.is_empty() => {
+                                    let img = egui::Image::from_bytes(format!("bytes://{u}"), b.clone()).alt_text(&m.name).fit_to_exact_size(size);
+                                    ui.add(egui::Button::image(img))
+                                }
+                                _ => ui.add_sized(size, egui::Button::new(&m.name).wrap()),
+                            };
+                            ui.add(egui::Label::new(&m.name).truncate());
+                            r
+                        })
+                        .inner;
+                    if let Some((u, None)) = poster
+                        && ui.is_rect_visible(r.rect)
+                    {
+                        want.push(u.clone());
+                    }
+                    if r.on_hover_text(m.description.as_deref().unwrap_or(&m.name)).clicked() {
                         pick = Some(m.clone());
                     }
                 }
             });
+            for u in want {
+                self.fetch_poster(&ctx, u);
+            }
             if let Some(m) = pick {
                 self.open_meta(&ctx, m);
             }
@@ -450,5 +534,12 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]).with_title("Stremio Lite"),
         ..Default::default()
     };
-    eframe::run_native("Stremio Lite", opts, Box::new(|_cc| Ok(Box::new(app))))
+    eframe::run_native(
+        "Stremio Lite",
+        opts,
+        Box::new(|cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    )
 }
