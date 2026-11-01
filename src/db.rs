@@ -56,6 +56,14 @@ impl Db {
         Ok(Self { conn })
     }
 
+    /// Run `f` in one transaction: all of it is saved, or none (and one fsync instead of many).
+    pub fn transaction(&self, f: impl FnOnce() -> Result<()>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        f()?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn add_addon(&self, transport_url: &str, manifest: &Manifest) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO addons (transport_url, manifest) VALUES (?1, ?2)",

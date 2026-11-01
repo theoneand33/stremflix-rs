@@ -30,6 +30,10 @@ pub struct Import {
 impl Import {
     /// Save into the app DB. Already installed addons are kept as they are.
     pub fn save(&self, db: &Db) -> Result<()> {
+        db.transaction(|| self.save_rows(db))
+    }
+
+    fn save_rows(&self, db: &Db) -> Result<()> {
         let have: Vec<String> = db.addons()?.into_iter().map(|(u, _)| u).collect();
         for (u, m) in self.addons.iter().filter(|(u, _)| !have.contains(u)) {
             db.add_addon(u, m)?;
@@ -95,11 +99,14 @@ fn candidates(roots: &[PathBuf], stremio_only: bool) -> Vec<PathBuf> {
             if e.depth() == 1 && stremio_only {
                 return name.contains("stremio") && !name.contains("stremio-lite") || name.contains("smart code");
             }
-            // Skip video caches and downloads: large and never hold localStorage.
-            !(e.file_type().is_dir() && (name.contains("cache") || name.contains("server") || name == "downloads"))
+            // Skip video caches and downloads: large and never hold localStorage. Never skip the root itself.
+            e.depth() == 0 || !(e.file_type().is_dir() && (name.contains("cache") || name.contains("server") || name == "downloads"))
         });
         found.extend(walk.filter_map(|e| e.ok()).map(|e| e.into_path()).filter(|p| is_storage(p)));
     }
+    // XDG_DATA_HOME is usually ~/.local/share, already a root.
+    found.sort();
+    found.dedup();
     let mtime = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
     found.sort_by_key(|p| std::cmp::Reverse(mtime(p)));
     found
@@ -113,11 +120,8 @@ fn is_storage(p: &Path) -> bool {
     p.is_dir() && name == "leveldb" && p.parent().and_then(|q| q.file_name()).is_some_and(|n| n == "Local Storage")
 }
 
-/// Copy `src` (a file plus its SQLite `-wal`/`-shm`, or a LevelDB folder without its LOCK) to a fresh temp dir.
-fn copy_to_temp(src: &Path) -> Result<PathBuf> {
-    let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
-    let dir = std::env::temp_dir().join(format!("stremio-lite-import-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
+/// Copy `src` (a file plus its SQLite `-wal`/`-shm`, or a LevelDB folder without its LOCK) into `dir`.
+fn copy_to(src: &Path, dir: &Path) -> Result<PathBuf> {
     if src.is_dir() {
         for e in std::fs::read_dir(src)? {
             let e = e?;
@@ -125,7 +129,7 @@ fn copy_to_temp(src: &Path) -> Result<PathBuf> {
                 std::fs::copy(e.path(), dir.join(e.file_name()))?;
             }
         }
-        return Ok(dir);
+        return Ok(dir.to_path_buf());
     }
     let name = src.file_name().context("no file name")?.to_string_lossy().into_owned();
     std::fs::copy(src, dir.join(&name))?;
@@ -140,9 +144,15 @@ fn copy_to_temp(src: &Path) -> Result<PathBuf> {
 
 /// localStorage key/values of the origin that holds a Stremio `profile`.
 pub fn read_storage(src: &Path) -> Result<HashMap<String, String>> {
-    let copy = copy_to_temp(src)?;
-    let res = if src.is_dir() { read_leveldb(&copy) } else { read_sqlite(&copy) };
-    let _ = std::fs::remove_dir_all(if src.is_dir() { &copy } else { copy.parent().unwrap_or(&copy) });
+    let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
+    let dir = std::env::temp_dir().join(format!("stremio-lite-import-{}-{nanos}", std::process::id()));
+    // Owner-only and must not exist yet: the copy holds Stremio's auth key.
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(&dir)?;
+    let res = copy_to(src, &dir).and_then(|copy| if src.is_dir() { read_leveldb(&copy) } else { read_sqlite(&copy) });
+    let _ = std::fs::remove_dir_all(&dir);
     res
 }
 

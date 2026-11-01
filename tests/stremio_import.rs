@@ -118,6 +118,20 @@ fn reads_chromium_leveldb_storage() {
 }
 
 #[test]
+fn manual_path_named_like_a_cache_is_searched() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("stremio-cache-backup");
+    let path = root.join("localstorage.sqlite3");
+    std::fs::create_dir_all(&root).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE ItemTable (key TEXT, value BLOB)").unwrap();
+    for (k, v) in storage() {
+        conn.execute("INSERT INTO ItemTable VALUES (?1, ?2)", rusqlite::params![k, utf16(&v)]).unwrap();
+    }
+    assert_eq!(import(Some(&root)).unwrap().0, path);
+}
+
+#[test]
 fn missing_storage_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     assert!(import(Some(dir.path())).is_err());
