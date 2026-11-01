@@ -70,7 +70,7 @@ fn malformed_manifests_rejected() {
 fn catalog_parsing_drops_bad_entries() {
     let body = r#"{"metas": [
         {"id": "tt1", "type": "movie", "name": "One", "poster": "https://img.example/1.jpg"},
-        {"id": "tt2", "type": "movie", "name": "Two", "poster": "javascript:alert(1)"},
+        {"id": "tt2", "type": "movie", "name": "Two", "poster": "javascript:alert(1)", "background": "file:///etc/passwd"},
         {"id": "tt3", "type": "movie"},
         {"id": "", "type": "movie", "name": "Empty id"},
         42
@@ -79,6 +79,7 @@ fn catalog_parsing_drops_bad_entries() {
     assert_eq!(metas.len(), 2);
     assert_eq!(metas[0].poster.as_deref(), Some("https://img.example/1.jpg"));
     assert_eq!(metas[1].poster, None, "unsafe poster URL removed");
+    assert_eq!(metas[1].background, None, "unsafe background URL removed");
     assert!(parse_catalog(br#"{"metas": {}}"#).is_err());
 }
 

@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
-use stremio_lite::addon::{AddonClient, Manifest, MetaPreview, PlayTarget, Stream, parse_magnet_hash};
+use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
+use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, MetaPreview, PlayTarget, Stream, parse_magnet_hash};
 use stremio_lite::db::{Db, Progress};
 use stremio_lite::library::{LibraryItem, scan};
 use stremio_lite::player::Player;
@@ -15,7 +16,7 @@ use stremio_lite::torrent::TorrentEngine;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
-    Discover,
+    Home,
     Addons,
     Library,
 }
@@ -23,12 +24,156 @@ enum Tab {
 enum Msg {
     Status(String),
     Installed(String, Manifest),
-    Catalog(String, Vec<(String, MetaPreview)>),
-    Streams(MetaPreview, Vec<Stream>, Vec<String>),
+    /// Search title and results.
+    Catalog(String, Vec<MetaPreview>),
+    /// Row source (addon URL, type, catalog id) and its items or error.
+    Row((String, String, String), Result<Vec<MetaPreview>, String>),
+    /// meta, streams, subtitle URLs, play the first stream on arrival
+    Streams(MetaPreview, Vec<Stream>, Vec<String>, bool),
     /// poster URL, image bytes (empty on failure)
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs
     Play(String, String, String, String, Vec<String>),
+    /// progress key, poster URL found for a Continue Watching entry
+    RecentPoster(String, String),
+}
+
+/// One horizontal catalog row on the home screen.
+struct Row {
+    title: String,
+    src: (String, String, String),
+    /// `None` while loading; empty rows are hidden.
+    items: Option<Vec<MetaPreview>>,
+}
+
+const RED: Color32 = Color32::from_rgb(229, 9, 20);
+const CARD: egui::Vec2 = egui::Vec2::new(150.0, 225.0);
+
+/// Netflix-style card: no border, grows on hover/focus, shrinks while pressed.
+/// Returns the click response and the animated rect to paint into.
+fn card(ui: &mut egui::Ui, size: egui::Vec2, label: &str) -> (egui::Response, egui::Rect) {
+    const GROW: f32 = 1.06;
+    // Reserve room for the grown card so the scroll area doesn't clip it.
+    let (slot, r) = ui.allocate_exact_size(size * GROW, Sense::click());
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    let target = if r.is_pointer_button_down_on() { 0.96 } else if r.hovered() || r.has_focus() { GROW } else { 1.0 };
+    let s = ui.ctx().animate_value_with_time(r.id, target, 0.15);
+    (r, egui::Rect::from_center_size(slot.center(), size * s))
+}
+
+/// Bold weight of the UI font (egui's `strong()` only brightens the color).
+fn bold() -> egui::FontFamily {
+    egui::FontFamily::Name("bold".into())
+}
+
+/// Inter (OFL) as the UI font: the closest free match to Netflix Sans, which is proprietary.
+/// egui's default fonts stay as fallbacks for symbols and emoji.
+fn install_fonts(ctx: &egui::Context) {
+    let mut f = egui::FontDefinitions::default();
+    for (name, bytes) in [("Inter", &include_bytes!("../assets/fonts/Inter-Regular.ttf")[..]), ("Inter-Bold", &include_bytes!("../assets/fonts/Inter-Bold.ttf")[..])] {
+        f.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(bytes)));
+    }
+    let fallback = f.families[&egui::FontFamily::Proportional].clone();
+    f.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0, "Inter".into());
+    f.families.insert(bold(), std::iter::once("Inter-Bold".into()).chain(fallback).collect());
+    ctx.set_fonts(f);
+}
+
+/// Netflix flat pill: `fill` = [normal, hovered], no outline; fully rounded ends.
+fn pill_button(ui: &mut egui::Ui, text: &str, size: f32, min: egui::Vec2, fill: [Color32; 2], fg: Color32) -> egui::Response {
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        for (st, f) in [(&mut w.inactive, fill[0]), (&mut w.hovered, fill[1]), (&mut w.active, fill[1])] {
+            (st.weak_bg_fill, st.bg_stroke, st.fg_stroke.color) = (f, egui::Stroke::NONE, fg);
+        }
+        ui.add(egui::Button::new(RichText::new(text).size(size).strong().family(bold())).min_size(min).corner_radius((min.y / 2.0) as u8))
+    })
+    .inner
+}
+
+/// White primary pill (Netflix "Play") and translucent gray secondary pill.
+fn white_fill() -> [Color32; 2] {
+    [Color32::WHITE, Color32::from_white_alpha(191)]
+}
+fn gray_fill() -> [Color32; 2] {
+    [Color32::from_rgba_unmultiplied(109, 109, 110, 179), Color32::from_rgba_unmultiplied(109, 109, 110, 102)]
+}
+
+fn hero_button(ui: &mut egui::Ui, text: &str, fill: [Color32; 2], text_color: Color32) -> egui::Response {
+    pill_button(ui, text, 18.0, vec2(130.0, 46.0), fill, text_color)
+}
+
+/// Small secondary pill for toolbar actions (Uninstall, Clear, Stop …).
+fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    pill_button(ui, text, 14.0, vec2(0.0, 32.0), gray_fill(), Color32::WHITE)
+}
+
+/// Small white pill for the main action in a row (Install, Play …).
+fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    pill_button(ui, text, 14.0, vec2(0.0, 32.0), white_fill(), Color32::BLACK)
+}
+
+/// Gray card with centered, wrapped text (used when there's no poster).
+fn card_text(ui: &egui::Ui, rect: egui::Rect, text: &str) {
+    let p = ui.painter();
+    p.rect_filled(rect, 6, Color32::from_gray(40));
+    let g = p.layout(text.to_owned(), egui::FontId::proportional(15.0), ui.visuals().text_color(), rect.width() - 16.0);
+    p.galley(rect.center() - g.size() / 2.0, g, Color32::WHITE);
+}
+
+/// Netflix episode-list row: index, bold name, gray details, play circle; highlights on hover.
+fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream) -> egui::Response {
+    let mut parts = [&s.name, &s.title, &s.description].into_iter().flatten().map(|x| x.trim()).filter(|x| !x.is_empty());
+    let head = parts.next().unwrap_or("Stream").replace('\n', " ");
+    let details = parts.collect::<Vec<_>>().join("\n");
+    let (w, text_x, pad) = (ui.available_width().min(960.0), 84.0, 18.0);
+    let p = ui.painter();
+    let hg = p.layout(head.clone(), egui::FontId::new(17.0, bold()), Color32::WHITE, w - text_x - 96.0);
+    let dg = p.layout(details, egui::FontId::proportional(14.0), Color32::from_gray(170), w - text_x - 96.0);
+    let block = hg.size().y + if dg.size().y > 0.0 { 6.0 + dg.size().y } else { 0.0 };
+    let h = (pad * 2.0 + block).max(88.0);
+    let (rect, r) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Play {head}")));
+    let t = ui.ctx().animate_bool(r.id, r.hovered() || r.has_focus());
+    let p = ui.painter();
+    p.rect_filled(rect, 4, Color32::from_gray(51).gamma_multiply(t));
+    p.hline(rect.x_range(), rect.bottom(), (1.0, Color32::from_gray(64)));
+    let num = p.layout_no_wrap(n.to_string(), egui::FontId::proportional(24.0), Color32::from_gray(210));
+    p.galley(pos2(rect.left() + text_x / 2.0 - num.size().x / 2.0, rect.center().y - num.size().y / 2.0), num, Color32::WHITE);
+    let top = rect.center().y - block / 2.0;
+    p.galley(pos2(rect.left() + text_x, top), hg.clone(), Color32::WHITE);
+    p.galley(pos2(rect.left() + text_x, top + hg.size().y + 6.0), dg, Color32::WHITE);
+    // Play button: outlined circle that fills white on hover.
+    let c = pos2(rect.right() - 48.0, rect.center().y);
+    let fg = Color32::from_gray(160).lerp_to_gamma(Color32::WHITE, t);
+    p.circle(c, 20.0, Color32::WHITE.gamma_multiply(t), (2.0, fg));
+    let tri = Color32::WHITE.lerp_to_gamma(Color32::BLACK, t);
+    p.add(egui::Shape::convex_polygon(vec![c + vec2(-6.0, -9.0), c + vec2(10.0, 0.0), c + vec2(-6.0, 9.0)], tri, egui::Stroke::NONE));
+    r
+}
+
+fn kind_label(kind: &str) -> &str {
+    match kind {
+        "movie" => "Movies",
+        "series" => "Shows",
+        k => k,
+    }
+}
+
+/// Playable source string for a stream (http URL or magnet with BEP 53 file index).
+fn stream_source(s: &Stream) -> Option<String> {
+    Some(match s.target()? {
+        PlayTarget::Http(u) => u.to_string(),
+        PlayTarget::Magnet(m, Some(idx)) => format!("{m}&so={idx}"),
+        PlayTarget::Magnet(m, None) => m,
+    })
+}
+
+/// The playable source when there is exactly one; `None` when there's a choice (or nothing).
+fn only_source(streams: &[Stream]) -> Option<String> {
+    let mut it = streams.iter().filter_map(stream_source);
+    let first = it.next();
+    if it.next().is_some() { None } else { first }
 }
 
 struct Playing {
@@ -38,6 +183,7 @@ struct Playing {
     source: String,
     pos: f64,
     dur: f64,
+    poster: Option<String>,
 }
 
 struct App {
@@ -51,8 +197,12 @@ struct App {
     tab: Tab,
     addons: Vec<(String, Manifest)>,
     addon_url: String,
-    catalog: Option<(String, Vec<(String, MetaPreview)>)>,
+    rows: Vec<Row>,
+    search_results: Option<(String, Vec<MetaPreview>)>,
     selected: Option<(MetaPreview, Vec<Stream>, Vec<String>)>,
+    scroll_top: bool,
+    /// Scroll the stream picker into view on the next frame.
+    show_streams: bool,
     magnet: String,
     search: String,
     /// Poster bytes by URL; `None` while loading, empty if the fetch failed.
@@ -60,6 +210,8 @@ struct App {
     folder: String,
     library: Vec<LibraryItem>,
     recent: Vec<Progress>,
+    /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
+    pill: Option<(Tab, egui::Rect, egui::Rect, f64)>,
     player: Option<Playing>,
     status: String,
     last_poll: Instant,
@@ -98,14 +250,18 @@ impl App {
             torrent: Default::default(),
             tx,
             rx,
-            tab: Tab::Discover,
+            tab: Tab::Home,
             addon_url: String::new(),
-            catalog: None,
+            rows: Vec::new(),
+            search_results: None,
             selected: None,
+            scroll_top: false,
+            show_streams: false,
             magnet: String::new(),
             search: String::new(),
             posters: HashMap::new(),
             player: None,
+            pill: None,
             status: "Ready".into(),
             last_poll: Instant::now(),
         };
@@ -151,29 +307,59 @@ impl App {
                 self.addons.retain(|(u, _)| *u != url);
                 self.addons.push((url, m));
                 self.addon_url.clear();
+                self.build_rows(ctx);
+                self.fetch_recent_posters(ctx);
             }
             Msg::Catalog(name, items) => {
                 self.status = format!("{name}: {} items", items.len());
-                self.catalog = Some((name, items));
-                self.selected = None;
+                self.search_results = Some((name, items));
             }
-            Msg::Streams(meta, streams, subs) => {
+            Msg::Row(src, res) => {
+                let Some(row) = self.rows.iter_mut().find(|r| r.src == src) else { return };
+                row.items = Some(res.unwrap_or_else(|e| {
+                    self.status = format!("Error loading {}: {e}", row.title);
+                    Vec::new()
+                }));
+            }
+            Msg::Streams(meta, streams, subs, autoplay) => {
                 self.status = format!("{}: {} streams", meta.name, streams.len());
+                // Autoplay only when there's no choice to make; otherwise show the stream picker.
+                if autoplay {
+                    match only_source(&streams) {
+                        Some(src) => self.play(ctx, format!("{}:{}", meta.kind, meta.id), meta.name.clone(), src, subs.clone()),
+                        None => self.show_streams = true,
+                    }
+                }
                 self.selected = Some((meta, streams, subs));
+                self.scroll_top = true;
+            }
+            Msg::RecentPoster(key, url) => {
+                if let Err(e) = self.db.set_progress_poster(&key, &url) {
+                    self.status = format!("Error saving poster: {e:#}");
+                }
+                for p in self.recent.iter_mut().filter(|p| p.key == key) {
+                    p.poster = Some(url.clone());
+                }
             }
             Msg::Poster(url, bytes) => {
                 self.posters.insert(url, Some(bytes.into()));
             }
             Msg::Play(key, title, source, url, subs) => {
                 self.stop_player();
-                let start = match self.db.progress(&key) {
-                    Ok(Some(p)) if p.position > 3.0 && (p.duration <= 0.0 || p.position < p.duration - 5.0) => p.position,
+                let prev = self.db.progress(&key).ok().flatten();
+                let start = match &prev {
+                    Some(p) if p.position > 3.0 && (p.duration <= 0.0 || p.position < p.duration - 5.0) => p.position,
                     _ => 0.0,
                 };
+                // Poster of the opened title, else the one saved earlier for this key.
+                let poster = (self.selected.as_ref())
+                    .filter(|(m, ..)| format!("{}:{}", m.kind, m.id) == key)
+                    .and_then(|(m, ..)| m.poster.clone())
+                    .or(prev.and_then(|p| p.poster));
                 match Player::launch(&url, &title, start, &subs) {
                     Ok(player) => {
                         self.status = if start > 0.0 { format!("Resuming at {}", fmt_time(start)) } else { "Playing".into() };
-                        self.player = Some(Playing { player, key, title, source, pos: start, dur: 0.0 });
+                        self.player = Some(Playing { player, key, title, source, pos: start, dur: 0.0, poster });
                     }
                     Err(e) => self.status = format!("Error: {e:#}"),
                 }
@@ -185,7 +371,7 @@ impl App {
     fn save_progress(&mut self) {
         if let Some(p) = &self.player {
             if p.pos > 0.0 {
-                let prog = Progress { key: p.key.clone(), title: p.title.clone(), source: p.source.clone(), position: p.pos, duration: p.dur };
+                let prog = Progress { key: p.key.clone(), title: p.title.clone(), source: p.source.clone(), position: p.pos, duration: p.dur, poster: p.poster.clone() };
                 if let Err(e) = self.db.save_progress(&prog) {
                     self.status = format!("Error saving progress: {e:#}");
                 }
@@ -216,13 +402,69 @@ impl App {
         }
     }
 
-    fn open_catalog(&mut self, ctx: &egui::Context, url: String, name: String, kind: String, id: String) {
-        let client = self.client.clone();
-        self.status = format!("Loading {name}...");
-        self.spawn(ctx, async move {
-            let items = client.catalog(&url, &kind, &id).await?;
-            Ok(Msg::Catalog(name, items.into_iter().map(|m| (url.clone(), m)).collect()))
-        });
+    /// Nav pill position: eases (cubic out) from where it is to the selected tab.
+    fn pill_rect(&mut self, ctx: &egui::Context, target: egui::Rect) -> egui::Rect {
+        const DURATION: f64 = 0.35;
+        let now = ctx.input(|i| i.time);
+        let (tab, from, to, start) = self.pill.get_or_insert((self.tab, target, target, now));
+        if *tab != self.tab {
+            // Restart from the pill's current spot, so a mid-slide click doesn't jump.
+            let t = ((now - *start) / DURATION).clamp(0.0, 1.0) as f32;
+            *from = from.lerp_towards(to, egui::emath::easing::cubic_out(t));
+            (*tab, *start) = (self.tab, now);
+        }
+        *to = target; // follows small layout shifts (bold text) without restarting
+        let t = ((now - *start) / DURATION).clamp(0.0, 1.0) as f32;
+        if t < 1.0 {
+            ctx.request_repaint();
+        }
+        from.lerp_towards(to, egui::emath::easing::cubic_out(t))
+    }
+
+    /// Rebuild home rows from installed catalogs: generic Trending/Popular rows first, then the rest.
+    fn build_rows(&mut self, ctx: &egui::Context) {
+        let cats: Vec<(&String, &String, &CatalogDef)> = self
+            .addons
+            .iter()
+            .filter(|(_, m)| m.has_resource("catalog"))
+            .flat_map(|(u, m)| m.catalogs.iter().filter(|c| !c.requires_extra()).map(move |c| (u, &m.name, c)))
+            .collect();
+        let text = |c: &CatalogDef| format!("{} {}", c.id, c.name.as_deref().unwrap_or("")).to_lowercase();
+        // Cinemeta names its popular catalog "top".
+        let matches = |c: &CatalogDef, word: &str| text(c).contains(word) || (word == "popular" && c.id == "top");
+        let generic = [
+            ("Movies - Trending", "movie", "trending"),
+            ("Shows - Trending", "series", "trending"),
+            ("Movies - Popular", "movie", "popular"),
+            ("Shows - Popular", "series", "popular"),
+        ];
+        let (mut rows, mut used) = (Vec::new(), Vec::new());
+        for (title, kind, word) in generic {
+            if let Some(i) = (0..cats.len()).find(|&i| !used.contains(&i) && cats[i].2.kind == kind && matches(cats[i].2, word)) {
+                used.push(i);
+                rows.push((title.to_string(), i));
+            }
+        }
+        for i in (0..cats.len()).filter(|i| !used.contains(i)) {
+            let (_, addon, c) = cats[i];
+            let (name, kind) = (c.name.as_deref().unwrap_or(&c.id), kind_label(&c.kind));
+            let suffix = if name.to_lowercase().contains(&kind.to_lowercase()) { String::new() } else { format!(" ({kind})") };
+            rows.push((format!("{addon} - {name}{suffix}"), i));
+        }
+        self.rows = rows
+            .into_iter()
+            .map(|(title, i)| {
+                let (u, _, c) = cats[i];
+                Row { title, src: (u.clone(), c.kind.clone(), c.id.clone()), items: None }
+            })
+            .collect();
+        for src in self.rows.iter().map(|r| r.src.clone()).collect::<Vec<_>>() {
+            let client = self.client.clone();
+            self.spawn(ctx, async move {
+                let res = client.catalog(&src.0, &src.1, &src.2).await.map_err(|e| format!("{e:#}"));
+                Ok(Msg::Row(src, res))
+            });
+        }
     }
 
     fn search(&mut self, ctx: &egui::Context) {
@@ -246,14 +488,14 @@ impl App {
             let (mut items, mut errors) = (Vec::new(), Vec::new());
             for (u, kind, id) in &targets {
                 match client.search(u, kind, id, &query).await {
-                    Ok(ms) => items.extend(ms.into_iter().map(|m| (u.clone(), m))),
+                    Ok(ms) => items.extend(ms),
                     Err(e) => errors.push(format!("{e:#}")),
                 }
             }
             if errors.len() == targets.len() {
                 anyhow::bail!("search failed: {}", errors.join("; "));
             }
-            Ok(Msg::Catalog(format!("Search \"{query}\""), items))
+            Ok(Msg::Catalog(format!("Results for \"{query}\""), items))
         });
     }
 
@@ -266,15 +508,44 @@ impl App {
         });
     }
 
-    fn open_meta(&mut self, ctx: &egui::Context, meta: MetaPreview) {
-        let client = self.client.clone();
-        let matches = |m: &Manifest, res: &str| {
-            m.has_resource(res)
-                && m.types.contains(&meta.kind)
-                && m.id_prefixes.as_ref().is_none_or(|ps| ps.iter().any(|p| meta.id.starts_with(p.as_str())))
+    /// URLs of installed addons serving `res` for this type and id.
+    fn addons_for(&self, res: &str, kind: &str, id: &str) -> Vec<String> {
+        let matches = |m: &Manifest| {
+            m.has_resource(res) && m.types.iter().any(|t| t == kind) && m.id_prefixes.as_ref().is_none_or(|ps| ps.iter().any(|p| id.starts_with(p.as_str())))
         };
-        let stream_addons: Vec<String> = self.addons.iter().filter(|(_, m)| matches(m, "stream")).map(|(u, _)| u.clone()).collect();
-        let sub_addons: Vec<String> = self.addons.iter().filter(|(_, m)| matches(m, "subtitles")).map(|(u, _)| u.clone()).collect();
+        self.addons.iter().filter(|(_, m)| matches(m)).map(|(u, _)| u.clone()).collect()
+    }
+
+    /// Look up posters for Continue Watching entries saved without one (older history).
+    /// Torrent/file keys never match an addon type, so they are skipped.
+    fn fetch_recent_posters(&self, ctx: &egui::Context) {
+        for p in self.recent.iter().filter(|p| p.poster.is_none()) {
+            let Some((kind, id)) = p.key.split_once(':') else { continue };
+            let addons = self.addons_for("meta", kind, id);
+            if addons.is_empty() {
+                continue;
+            }
+            let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), ctx.clone());
+            let (key, kind, id) = (p.key.clone(), kind.to_owned(), id.to_owned());
+            // Not `spawn`: a missing poster is not worth an error in the status bar.
+            self.rt.spawn(async move {
+                for u in &addons {
+                    if let Ok(m) = client.meta(u, &kind, &id).await
+                        && let Some(poster) = m.poster
+                    {
+                        let _ = tx.send(Msg::RecentPoster(key, poster));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    fn open_meta(&mut self, ctx: &egui::Context, meta: MetaPreview, autoplay: bool) {
+        let client = self.client.clone();
+        let stream_addons = self.addons_for("stream", &meta.kind, &meta.id);
+        let sub_addons = self.addons_for("subtitles", &meta.kind, &meta.id);
         self.status = format!("Loading streams for {}...", meta.name);
         self.spawn(ctx, async move {
             let (mut streams, mut subs, mut errors) = (Vec::new(), Vec::new(), Vec::new());
@@ -293,115 +564,224 @@ impl App {
             if streams.is_empty() && !errors.is_empty() {
                 anyhow::bail!("no streams: {}", errors.join("; "));
             }
-            Ok(Msg::Streams(meta, streams, subs))
+            Ok(Msg::Streams(meta, streams, subs, autoplay))
         });
     }
 
-    fn ui_discover(&mut self, ui: &mut egui::Ui) {
+    /// Poster/background bytes if loaded; queues a fetch on first sight.
+    fn image(&self, url: &Option<String>, want: &mut Vec<String>) -> Option<(String, Arc<[u8]>)> {
+        let u = url.as_ref()?;
+        match self.posters.get(u) {
+            Some(Some(b)) if !b.is_empty() => Some((u.clone(), b.clone())),
+            None => {
+                want.push(u.clone());
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn ui_home(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        ui.horizontal(|ui| {
-            let l = ui.label("Magnet link:");
-            ui.add(egui::TextEdit::singleline(&mut self.magnet).hint_text("magnet:?xt=urn:btih:...").desired_width(500.0))
-                .labelled_by(l.id);
-            if ui.button("Play magnet").clicked() {
-                match parse_magnet_hash(self.magnet.trim()) {
-                    Some(h) => {
-                        let m = self.magnet.trim().to_string();
-                        self.play(&ctx, format!("btih:{h}"), format!("Torrent {}", &h[..8]), m, vec![]);
-                    }
-                    None => self.status = "Error: invalid magnet link".into(),
-                }
+        let (mut want, mut open, mut play) = (Vec::new(), None, None);
+        let featured = match &self.selected {
+            Some((m, ..)) => Some(m.clone()),
+            None => self.rows.iter().find_map(|r| r.items.as_ref()?.first().cloned()),
+        };
+        match featured {
+            Some(meta) => self.ui_hero(ui, &meta, &mut want, &mut open, &mut play),
+            None if self.rows.is_empty() => {
+                ui.add_space(40.0);
+                ui.label(RichText::new("Install an addon with a catalog in Addons to start browsing.").size(18.0));
             }
-        });
-        ui.horizontal(|ui| {
-            let l = ui.label("Search:");
-            let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Title...").desired_width(400.0)).labelled_by(l.id);
-            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button("Search").clicked() || enter {
-                self.search(&ctx);
-            }
-        });
-        ui.separator();
-        ui.heading("Catalogs");
-        let mut open = None;
-        ui.horizontal_wrapped(|ui| {
-            for (url, m) in &self.addons {
-                if !m.has_resource("catalog") {
-                    continue;
-                }
-                for c in m.catalogs.iter().filter(|c| !c.requires_extra()) {
-                    let name = format!("{} - {}", m.name, c.name.as_deref().unwrap_or(&c.id));
-                    if ui.button(&name).clicked() {
-                        open = Some((url.clone(), name, c.kind.clone(), c.id.clone()));
-                    }
-                }
-            }
-        });
-        if let Some((u, n, k, i)) = open {
-            self.open_catalog(&ctx, u, n, k, i);
-        }
-        if let Some((name, items)) = &self.catalog {
-            ui.label(format!("Catalog: {name}"));
-            let (mut pick, mut want) = (None, Vec::new());
-            let size = egui::vec2(120.0, 180.0);
-            ui.horizontal_wrapped(|ui| {
-                for (_, m) in items {
-                    let poster = m.poster.as_ref().map(|u| (u, self.posters.get(u)));
-                    let r = ui
-                        .vertical(|ui| {
-                            ui.set_width(size.x);
-                            let r = match poster {
-                                Some((u, Some(Some(b)))) if !b.is_empty() => {
-                                    let img = egui::Image::from_bytes(format!("bytes://{u}"), b.clone()).alt_text(&m.name).fit_to_exact_size(size);
-                                    ui.add(egui::Button::image(img))
-                                }
-                                _ => ui.add_sized(size, egui::Button::new(&m.name).wrap()),
-                            };
-                            ui.add(egui::Label::new(&m.name).truncate());
-                            r
-                        })
-                        .inner;
-                    if let Some((u, None)) = poster
-                        && ui.is_rect_visible(r.rect)
-                    {
-                        want.push(u.clone());
-                    }
-                    if r.on_hover_text(m.description.as_deref().unwrap_or(&m.name)).clicked() {
-                        pick = Some(m.clone());
-                    }
-                }
-            });
-            want.dedup(); // shortcut: only adjacent duplicates, enough to stop same-frame refetch of repeated posters
-            for u in want {
-                self.fetch_poster(&ctx, u);
-            }
-            if let Some(m) = pick {
-                self.open_meta(&ctx, m);
+            None => {
+                ui.add_space(40.0);
+                ui.spinner();
             }
         }
-        let mut play = None;
         if let Some((meta, streams, subs)) = &self.selected {
-            ui.separator();
-            ui.heading(&meta.name);
-            if let Some(d) = &meta.description {
-                ui.label(d);
-            }
-            ui.label(format!("{} subtitle track(s)", subs.len()));
-            for s in streams {
-                if ui.button(format!("Play: {}", s.label())).clicked() {
-                    let source = match s.target() {
-                        Some(PlayTarget::Http(u)) => u.to_string(),
-                        Some(PlayTarget::Magnet(m, Some(idx))) => format!("{m}&so={idx}"),
-                        Some(PlayTarget::Magnet(m, None)) => m,
-                        None => continue,
-                    };
-                    play = Some((format!("{}:{}", meta.kind, meta.id), meta.name.clone(), source, subs.clone()));
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                let r = ui.label(RichText::new("Streams").size(24.0).strong().family(bold()).color(Color32::WHITE));
+                if std::mem::take(&mut self.show_streams) {
+                    r.scroll_to_me(Some(Align::TOP));
+                }
+                ui.label(RichText::new(format!("{}  ·  {} subtitle track(s)", meta.name, subs.len())).size(15.0).color(Color32::from_gray(170)));
+            });
+            ui.add_space(8.0);
+            let playable = streams.iter().filter_map(|s| Some((s, stream_source(s)?)));
+            for (i, (s, src)) in playable.enumerate() {
+                if stream_row(ui, i + 1, s).clicked() {
+                    play = Some((format!("{}:{}", meta.kind, meta.id), meta.name.clone(), src, subs.clone()));
                 }
             }
+        }
+        if !self.recent.is_empty() {
+            Self::row_title(ui, "Continue Watching");
+            egui::ScrollArea::horizontal().id_salt("recent").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for p in &self.recent {
+                        let (r, rect) = card(ui, CARD, &p.title);
+                        self.paint_poster(ui, &r, rect, &p.poster, &p.title, &mut want);
+                        let r = r.on_hover_text(format!("Resume {} ({} / {})", p.title, fmt_time(p.position), fmt_time(p.duration)));
+                        let frac = if p.duration > 0.0 { (p.position / p.duration).clamp(0.0, 1.0) as f32 } else { 0.0 };
+                        let bar = egui::Rect::from_min_max(pos2(rect.left() + 10.0, rect.bottom() - 10.0), pos2(rect.right() - 10.0, rect.bottom() - 6.0));
+                        ui.painter().rect_filled(bar, 2, Color32::from_gray(90));
+                        ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, bar.height())), 2, RED);
+                        if r.clicked() {
+                            play = Some((p.key.clone(), p.title.clone(), p.source.clone(), vec![]));
+                        }
+                    }
+                });
+            });
+        }
+        let mut clear = false;
+        if let Some((title, items)) = &self.search_results {
+            ui.add_space(18.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).size(20.0).strong().family(bold()).color(Color32::WHITE));
+                clear = small_button(ui, "Clear").clicked();
+            });
+            if items.is_empty() {
+                ui.label("No results.");
+            }
+            self.ui_cards(ui, "search", items, &mut want, &mut open);
+        }
+        if clear {
+            self.search_results = None;
+        }
+        for row in &self.rows {
+            match &row.items {
+                Some(items) if items.is_empty() => continue,
+                Some(items) => {
+                    Self::row_title(ui, &row.title);
+                    self.ui_cards(ui, &row.title, items, &mut want, &mut open);
+                }
+                None => {
+                    Self::row_title(ui, &row.title);
+                    ui.spinner();
+                }
+            }
+        }
+        want.sort();
+        want.dedup();
+        for u in want {
+            self.fetch_poster(&ctx, u);
+        }
+        if let Some((m, autoplay)) = open {
+            self.open_meta(&ctx, m, autoplay);
         }
         if let Some((k, t, s, subs)) = play {
             self.play(&ctx, k, t, s, subs);
         }
+    }
+
+    fn row_title(ui: &mut egui::Ui, title: &str) {
+        ui.add_space(22.0);
+        ui.label(RichText::new(title).size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.add_space(4.0);
+    }
+
+    /// Horizontally scrolling poster cards; a click selects the title.
+    fn ui_cards(&self, ui: &mut egui::Ui, salt: &str, items: &[MetaPreview], want: &mut Vec<String>, open: &mut Option<(MetaPreview, bool)>) {
+        egui::ScrollArea::horizontal().id_salt(salt).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for m in items {
+                    let (r, rect) = card(ui, CARD, &m.name);
+                    self.paint_poster(ui, &r, rect, &m.poster, &m.name, want);
+                    if r.on_hover_text(m.description.as_deref().unwrap_or(&m.name)).clicked() {
+                        *open = Some((m.clone(), false));
+                    }
+                }
+            });
+        });
+    }
+
+    /// Poster image in `rect`, or the title on a gray card until it loads.
+    fn paint_poster(&self, ui: &egui::Ui, r: &egui::Response, rect: egui::Rect, poster: &Option<String>, name: &str, want: &mut Vec<String>) {
+        // Only fetch posters of cards that are on screen.
+        let mut lazy = Vec::new();
+        let img = if ui.is_rect_visible(r.rect) { self.image(poster, &mut lazy) } else { None };
+        want.extend(lazy);
+        match img {
+            Some((u, b)) => egui::Image::from_bytes(format!("bytes://{u}"), b).alt_text(name).corner_radius(6).paint_at(ui, rect),
+            None => card_text(ui, rect, name),
+        }
+    }
+
+    /// Big banner: backdrop (or poster at the right), title, description, Play / More info.
+    fn ui_hero(
+        &mut self,
+        ui: &mut egui::Ui,
+        meta: &MetaPreview,
+        want: &mut Vec<String>,
+        open: &mut Option<(MetaPreview, bool)>,
+        play: &mut Option<(String, String, String, Vec<String>)>,
+    ) {
+        let w = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(vec2(w, (w * 0.42).clamp(320.0, 560.0)), Sense::hover());
+        if std::mem::take(&mut self.scroll_top) {
+            ui.scroll_to_rect(rect, Some(Align::TOP));
+        }
+        ui.painter().rect_filled(rect, 12, Color32::from_gray(28));
+        // Background first; fall back to the poster when it is missing or rejected.
+        let bg = self.image(&meta.background, want);
+        let poster = if bg.is_none() { self.image(&meta.poster, want) } else { None };
+        if let Some((u, b)) = bg {
+            let img = egui::Image::from_bytes(format!("bytes://{u}"), b).corner_radius(12);
+            if let Ok(egui::load::TexturePoll::Ready { texture }) = img.load_for_size(ui.ctx(), rect.size()) {
+                // Cover-fit: crop the image to the banner's aspect ratio.
+                let (ra, ia) = (rect.aspect_ratio(), texture.size.x / texture.size.y);
+                let uv = if ia > ra {
+                    let f = ra / ia;
+                    egui::Rect::from_min_max(pos2((1.0 - f) / 2.0, 0.0), pos2((1.0 + f) / 2.0, 1.0))
+                } else {
+                    let f = ia / ra;
+                    egui::Rect::from_min_max(pos2(0.0, (1.0 - f) / 2.0), pos2(1.0, (1.0 + f) / 2.0))
+                };
+                img.uv(uv).paint_at(ui, rect);
+                ui.painter().rect_filled(rect, 12, Color32::from_black_alpha(120));
+            }
+        } else if let Some((u, b)) = poster {
+            let pw = rect.height() * 2.0 / 3.0;
+            let prect = egui::Rect::from_min_max(pos2(rect.right() - pw, rect.top()), rect.max);
+            egui::Image::from_bytes(format!("bytes://{u}"), b).alt_text(&meta.name).corner_radius(12).paint_at(ui, prect);
+        }
+        let inner = rect.shrink(36.0);
+        let col = egui::Rect::from_min_max(inner.min, pos2(inner.left() + (inner.width() * 0.55).min(620.0), inner.bottom()));
+        ui.scope_builder(UiBuilder::new().max_rect(col).layout(Layout::bottom_up(Align::LEFT)), |ui| {
+            ui.horizontal(|ui| {
+                let mut show_streams = false;
+                if hero_button(ui, "▶  Play", [Color32::WHITE, Color32::from_white_alpha(191)], Color32::BLACK).clicked() {
+                    match &self.selected {
+                        Some((m, streams, subs)) if m == meta => match only_source(streams) {
+                            Some(src) => *play = Some((format!("{}:{}", m.kind, m.id), m.name.clone(), src, subs.clone())),
+                            None => show_streams = true,
+                        },
+                        _ => *open = Some((meta.clone(), true)),
+                    }
+                }
+                self.show_streams |= show_streams;
+                let gray = |a| Color32::from_rgba_unmultiplied(109, 109, 110, a);
+                if hero_button(ui, "More info", [gray(179), gray(102)], Color32::WHITE).clicked() {
+                    *open = Some((meta.clone(), false));
+                }
+            });
+            ui.add_space(12.0);
+            if let Some(d) = &meta.description {
+                let short: String = d.chars().take(240).collect();
+                let short = if short.len() < d.len() { format!("{}…", short.trim_end()) } else { short };
+                ui.label(RichText::new(short).size(17.0).color(Color32::WHITE));
+            }
+            ui.add_space(6.0);
+            let kind = match meta.kind.as_str() {
+                "movie" => "Movie",
+                "series" => "Show",
+                k => k,
+            };
+            ui.label(RichText::new(kind).size(15.0).strong().family(bold()).color(Color32::from_gray(220)));
+            ui.add(egui::Label::new(RichText::new(&meta.name).size(46.0).strong().family(bold()).color(Color32::WHITE)).wrap());
+        });
     }
 
     fn ui_addons(&mut self, ui: &mut egui::Ui) {
@@ -410,7 +790,7 @@ impl App {
             let l = ui.label("Manifest URL:");
             ui.add(egui::TextEdit::singleline(&mut self.addon_url).hint_text("http://127.0.0.1:7070/manifest.json").desired_width(400.0))
                 .labelled_by(l.id);
-            if ui.button("Install").clicked() {
+            if primary_button(ui, "Install").clicked() {
                 let (client, url) = (self.client.clone(), self.addon_url.trim().to_string());
                 self.status = format!("Installing {url}...");
                 self.spawn(&ctx, async move {
@@ -424,7 +804,7 @@ impl App {
         for (url, m) in &self.addons {
             ui.horizontal(|ui| {
                 ui.label(format!("{} {} ({})", m.name, m.version, url));
-                if ui.button("Uninstall").clicked() {
+                if small_button(ui, "Uninstall").clicked() {
                     remove = Some(url.clone());
                 }
             });
@@ -432,15 +812,30 @@ impl App {
         if let Some(u) = remove {
             let _ = self.db.remove_addon(&u);
             self.addons.retain(|(x, _)| *x != u);
+            self.build_rows(&ctx);
         }
     }
 
     fn ui_library(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
+            let l = ui.label("Magnet link:");
+            ui.add(egui::TextEdit::singleline(&mut self.magnet).hint_text("magnet:?xt=urn:btih:...").desired_width(500.0))
+                .labelled_by(l.id);
+            if primary_button(ui, "Play magnet").clicked() {
+                match parse_magnet_hash(self.magnet.trim()) {
+                    Some(h) => {
+                        let m = self.magnet.trim().to_string();
+                        self.play(&ctx, format!("btih:{h}"), format!("Torrent {}", &h[..8]), m, vec![]);
+                    }
+                    None => self.status = "Error: invalid magnet link".into(),
+                }
+            }
+        });
+        ui.horizontal(|ui| {
             let l = ui.label("Folder path:");
             ui.add(egui::TextEdit::singleline(&mut self.folder).hint_text("/path/to/videos").desired_width(400.0)).labelled_by(l.id);
-            if ui.button("Add folder").clicked() {
+            if primary_button(ui, "Add folder").clicked() {
                 let dir = PathBuf::from(self.folder.trim());
                 match scan(&dir).map_err(anyhow::Error::from).and_then(|items| {
                     self.db.add_library_folder(&dir, &items)?;
@@ -459,7 +854,7 @@ impl App {
         let mut play = None;
         for it in &self.library {
             ui.horizontal(|ui| {
-                if ui.button(format!("Play {}", it.title)).clicked() {
+                if primary_button(ui, &format!("Play {}", it.title)).clicked() {
                     play = Some(it.clone());
                 }
                 ui.label(it.path.display().to_string());
@@ -481,43 +876,75 @@ impl eframe::App for App {
         self.poll_player();
         ctx.request_repaint_after(Duration::from_millis(500));
 
-        egui::Frame::central_panel(ui.style()).show(ui, |ui| {
+        egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(40, 14)).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Discover, "Discover");
-                ui.selectable_value(&mut self.tab, Tab::Addons, "Addons");
-                ui.selectable_value(&mut self.tab, Tab::Library, "Library");
+            // Fixed-height row so the nav and search pills share one center line.
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 44.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.label(RichText::new("STREMIO LITE").size(26.0).strong().family(bold()).color(RED));
+                ui.add_space(20.0);
+                // Netflix nav: current tab is bold white on a dark gray pill that slides between tabs.
+                let pill_slot = ui.painter().add(egui::Shape::Noop);
+                let mut sel_rect = None;
+                for (tab, name) in [(Tab::Home, "Home"), (Tab::Addons, "Addons"), (Tab::Library, "Library")] {
+                    let text = RichText::new(name).size(15.0);
+                    let text = if self.tab == tab { text.strong().family(bold()).color(Color32::WHITE) } else { text.color(Color32::from_gray(180)) };
+                    let r = ui.add(egui::Button::new(text).fill(Color32::TRANSPARENT).min_size(vec2(0.0, 34.0))).on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if self.tab == tab {
+                        sel_rect = Some(r.rect);
+                    }
+                    if r.clicked() {
+                        self.tab = tab;
+                    }
+                }
+                if let Some(target) = sel_rect {
+                    let rect = self.pill_rect(&ctx, target);
+                    ui.painter().set(pill_slot, egui::epaint::RectShape::filled(rect, 17, Color32::from_gray(51)));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // Search in the same dark gray pill; Enter or the icon runs it.
+                    // Right-to-left: the field is added first so the icon sits on its left.
+                    let bg = ui.painter().add(egui::Shape::Noop);
+                    ui.add_space(12.0);
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Titles, people, genres").frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 2, ..Default::default() })).desired_width(220.0)); // top margin: optically center the text
+                    // Painted magnifier: the emoji glyph sits off-center in its line box.
+                    let (icon, b) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                    b.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Search"));
+                    let (c, stroke) = (icon.center() - vec2(1.5, 1.5), egui::Stroke::new(1.8, Color32::from_gray(180)));
+                    ui.painter().circle_stroke(c, 5.5, stroke);
+                    ui.painter().line_segment([c + vec2(4.0, 4.0), icon.center() + vec2(7.0, 7.0)], stroke);
+                    let b = b.on_hover_text("Search").on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let pill = r.rect.union(b.rect);
+                    ui.painter().set(bg, egui::epaint::RectShape::filled(egui::Rect::from_center_size(pos2(pill.center().x, icon.center().y), vec2(pill.width() + 24.0, 34.0)), 17, Color32::from_gray(51)));
+                    let r = r.labelled_by(b.id);
+                    if b.clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                        self.tab = Tab::Home;
+                        self.search(&ctx);
+                    }
+                });
             });
-            ui.separator();
             // Player / status line: OCR- and screen-reader-friendly state.
             let state = match &self.player {
                 Some(p) => format!("Player: playing \"{}\" at {} / {}", p.title, fmt_time(p.pos), fmt_time(p.dur)),
                 None => "Player: stopped".into(),
             };
             ui.horizontal(|ui| {
-                ui.label(state);
-                if self.player.is_some() && ui.button("Stop").clicked() {
+                ui.label(RichText::new(state).color(Color32::from_gray(160)));
+                if self.player.is_some() && small_button(ui, "Stop").clicked() {
                     self.stop_player();
                 }
+                ui.label(RichText::new(format!("Status: {}", self.status)).color(Color32::from_gray(160)));
             });
-            ui.label(format!("Status: {}", self.status));
-            ui.separator();
-            ui.heading("Continue watching");
-            let mut resume = None;
-            for p in self.recent.iter().take(5) {
-                ui.horizontal(|ui| {
-                    if ui.button(format!("Resume {}", p.title)).clicked() {
-                        resume = Some(p.clone());
-                    }
-                    ui.label(format!("{} / {}", fmt_time(p.position), fmt_time(p.duration)));
-                });
+            ui.add_space(8.0);
+            // Back lives outside the scroll area, so it stays put while the detail page scrolls.
+            if self.selected.is_some() {
+                if pill_button(ui, "←  Back", 16.0, vec2(0.0, 40.0), white_fill(), Color32::BLACK).on_hover_text("Back to browse").clicked() {
+                    self.selected = None;
+                    self.scroll_top = true;
+                }
+                ui.add_space(6.0);
             }
-            if let Some(p) = resume {
-                self.play(&ctx, p.key, p.title, p.source, vec![]);
-            }
-            ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
-                Tab::Discover => self.ui_discover(ui),
+                Tab::Home => self.ui_home(ui),
                 Tab::Addons => self.ui_addons(ui),
                 Tab::Library => self.ui_library(ui),
             });
@@ -530,7 +957,7 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result {
-    let app = App::new().expect("failed to initialise app data");
+    let mut app = App::new().expect("failed to initialise app data");
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]).with_title("Stremio Lite"),
         ..Default::default()
@@ -540,7 +967,38 @@ fn main() -> eframe::Result {
         opts,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            install_fonts(&cc.egui_ctx);
+            let mut v = egui::Visuals::dark();
+            v.panel_fill = Color32::from_rgb(20, 20, 20);
+            v.window_fill = v.panel_fill;
+            v.extreme_bg_color = Color32::from_gray(32);
+            v.selection.bg_fill = RED;
+            // Netflix-style flat buttons: no outline or grow on hover, gray that dims when hovered.
+            let w = &mut v.widgets;
+            for (st, gray) in [(&mut w.inactive, 82), (&mut w.hovered, 56), (&mut w.active, 45), (&mut w.open, 56)] {
+                (st.weak_bg_fill, st.bg_stroke, st.corner_radius, st.expansion) = (Color32::from_gray(gray), egui::Stroke::NONE, 4.into(), 0.0);
+                st.fg_stroke.color = Color32::WHITE;
+            }
+            cc.egui_ctx.set_theme(egui::Theme::Dark);
+            cc.egui_ctx.set_visuals_of(egui::Theme::Dark, v);
+            cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| s.spacing.button_padding = vec2(14.0, 6.0));
+            app.build_rows(&cc.egui_ctx);
+            app.fetch_recent_posters(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_source_autoplays_only_without_a_choice() {
+        let s = |u: &str| Stream { url: Some(u.into()), ..Default::default() };
+        let bad = s("ftp://x.example/a"); // unplayable, doesn't count as a choice
+        assert_eq!(only_source(&[]), None);
+        assert_eq!(only_source(&[bad.clone(), s("https://x.example/a")]).as_deref(), Some("https://x.example/a"));
+        assert_eq!(only_source(&[s("https://x.example/a"), s("https://x.example/b")]), None);
+    }
 }

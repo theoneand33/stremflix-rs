@@ -68,10 +68,10 @@ The tests cover:
    ```sh
    STREMIO_LITE_DATA=/tmp/stremio-lite-demo STREMIO_LITE_NO_DHT=1 cargo run --bin stremio-lite
    ```
-4. **Install an addon and play from it.** Open **Addons**, enter `http://127.0.0.1:7070/manifest.json`, and click **Install**. Open **Discover**, click **Test Addon - Test Movies**, then **Test Pattern**, then **Play: Test Addon - Test pattern (HTTP)**. mpv opens with the test subtitle loaded.
-5. **Play a torrent.** On **Discover**, click **Play: Test Addon - Test pattern (torrent)**. Alternatively, paste the printed magnet into **Magnet link** and click **Play magnet**. librqbit downloads the file from the local seeder and streams it to mpv over `http://127.0.0.1:<port>/torrents/<id>/stream/<file>`.
+4. **Install an addon and play from it.** Open **Addons**, enter `http://127.0.0.1:7070/manifest.json`, and click **Install**. Open **Home**, click the **Test Pattern** card in the **Test Addon - Test Movies** row, then **Play: Test Addon - Test pattern (HTTP)**. mpv opens with the test subtitle loaded.
+5. **Play a torrent.** On **Home**, click **Play: Test Addon - Test pattern (torrent)**. Alternatively, open **Library**, paste the printed magnet into **Magnet link**, and click **Play magnet**. librqbit downloads the file from the local seeder and streams it to mpv over `http://127.0.0.1:<port>/torrents/<id>/stream/<file>`.
 6. **Play a local file.** Open **Library**, enter the absolute path of `demo-media/library`, click **Add folder**, then **Play test-pattern-local**.
-7. **Check that progress persists.** Let a video play for a while, then close the app. Restart it with the same command. **Continue watching** lists the item with its saved position. **Resume** reopens the video at that position.
+7. **Check that progress persists.** Let a video play for a while, then close the app. Restart it with the same command. The **Continue Watching** row on **Home** shows the item with its saved position. Click its card to resume at that position.
 
 You can query player state from outside the app at any time:
 
