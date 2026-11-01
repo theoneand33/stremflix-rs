@@ -234,7 +234,7 @@ impl App {
             .addons
             .iter()
             .filter(|(_, m)| m.has_resource("catalog"))
-            .flat_map(|(u, m)| m.catalogs.iter().filter(|c| c.supports("search")).map(move |c| (u.clone(), c.kind.clone(), c.id.clone())))
+            .flat_map(|(u, m)| m.catalogs.iter().filter(|c| c.searchable()).map(move |c| (u.clone(), c.kind.clone(), c.id.clone())))
             .collect();
         if targets.is_empty() {
             self.status = "Error: no installed addon supports search".into();
@@ -371,6 +371,7 @@ impl App {
                     }
                 }
             });
+            want.dedup(); // shortcut: only adjacent duplicates, enough to stop same-frame refetch of repeated posters
             for u in want {
                 self.fetch_poster(&ctx, u);
             }

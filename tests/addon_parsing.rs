@@ -23,6 +23,27 @@ fn catalog_extras() {
       {"type":"movie","id":"legacy","extraSupported":["search","genre"]}]}"#).unwrap();
     assert!(m.catalogs[0].supports("search") && m.catalogs[0].requires_extra());
     assert!(m.catalogs[1].supports("search") && m.catalogs[1].supports("genre") && !m.catalogs[1].requires_extra());
+    assert!(m.catalogs[0].searchable() && m.catalogs[1].searchable());
+    let m = parse_manifest(br#"{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"],"catalogs":[
+      {"type":"movie","id":"legacy","extraRequired":["search"]},
+      {"type":"movie","id":"genre","extra":[{"name":"search"},{"name":"genre","isRequired":true}]}]}"#).unwrap();
+    assert!(m.catalogs[0].searchable() && m.catalogs[0].requires_extra());
+    assert!(m.catalogs[1].supports("search") && !m.catalogs[1].searchable());
+}
+
+#[test]
+fn poster_dimension_limits() {
+    let png = |w, h| {
+        let mut b = Vec::new();
+        image::RgbImage::new(w, h).write_to(&mut std::io::Cursor::new(&mut b), image::ImageFormat::Png).unwrap();
+        b
+    };
+    assert!(check_poster(&png(240, 360)).is_ok());
+    let wide = png(MAX_POSTER_SIDE + 1, 1);
+    assert!(wide.len() < 4096, "tiny file, huge dimensions");
+    assert!(check_poster(&wide).is_err());
+    assert!(check_poster(b"<html>not an image</html>").is_err());
+    assert!(check_poster(b"").is_err());
 }
 
 #[test]
