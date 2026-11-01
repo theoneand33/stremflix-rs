@@ -11,9 +11,14 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design choices: egui UI, mpv play
 ## Requirements
 
 - Rust 1.85 or newer (edition 2024)
-- `mpv` on `PATH`, used for playback
+- libmpv (`libmpv.so.2` and headers, e.g. `pacman -S mpv` / `apt install libmpv-dev`), linked for the built-in player
 - `ffmpeg`, only needed to generate demo media
 - Linux or macOS (player IPC uses Unix sockets)
+
+## Player controls
+
+Playback runs inside the app window with Netflix-style controls that fade after 3 s without input.
+Click the video or press Space/K to pause, ←/→ to skip 10 s, ↑/↓ for volume, M to mute, F or double-click for full screen, Esc to leave full screen or go back. 💬 opens the Audio & Subtitles panel.
 
 ## Build
 
@@ -32,8 +37,7 @@ Environment variables:
 | Variable | Purpose |
 |---|---|
 | `STREMIO_LITE_DATA` | Data directory for the DB and torrent downloads. Default: `$XDG_DATA_HOME/stremio-lite` |
-| `STREMIO_LITE_MPV` | mpv binary to use. Default: `mpv` |
-| `STREMIO_LITE_MPV_ARGS` | Extra mpv arguments, e.g. `--vo=null --ao=null` for headless runs |
+| `STREMIO_LITE_MPV_ARGS` | Extra mpv options, e.g. `--ao=null` for headless runs |
 | `STREMIO_LITE_IPC` | mpv IPC socket path. Default: `$TMPDIR/stremio-lite-mpv.sock` |
 | `STREMIO_LITE_NO_DHT` | Set to disable the BitTorrent DHT (offline/CI use) |
 
@@ -83,8 +87,8 @@ The tests cover:
    ```sh
    STREMIO_LITE_DATA=/tmp/stremio-lite-demo STREMIO_LITE_NO_DHT=1 cargo run --bin stremio-lite
    ```
-4. **Install an addon and play from it.** Open **Addons**, enter `http://127.0.0.1:7070/manifest.json`, and click **Install**. Open **Home**, click the **Test Pattern** card in the **Test Addon - Test Movies** row, then **Play: Test Addon - Test pattern (HTTP)**. mpv opens with the test subtitle loaded.
-5. **Play a torrent.** On **Home**, click **Play: Test Addon - Test pattern (torrent)**. Alternatively, open **Library**, paste the printed magnet into **Magnet link**, and click **Play magnet**. librqbit downloads the file from the local seeder and streams it to mpv over `http://127.0.0.1:<port>/torrents/<id>/stream/<file>`.
+4. **Install an addon and play from it.** Open **Addons**, enter `http://127.0.0.1:7070/manifest.json`, and click **Install**. Open **Home**, click the **Test Pattern** card in the **Test Addon - Test Movies** row, then **Play: Test Addon - Test pattern (HTTP)**. The built-in player opens with the test subtitle loaded.
+5. **Play a torrent.** On **Home**, click **Play: Test Addon - Test pattern (torrent)**. Alternatively, open **Library**, paste the printed magnet into **Magnet link**, and click **Play magnet**. librqbit downloads the file from the local seeder and streams it to the player over `http://127.0.0.1:<port>/torrents/<id>/stream/<file>`.
 6. **Play a local file.** Open **Library**, enter the absolute path of `demo-media/library`, click **Add folder**, then **Play test-pattern-local**.
 7. **Check that progress persists.** Let a video play for a while, then close the app. Restart it with the same command. The **Continue Watching** row on **Home** shows the item with its saved position. Click its card to resume at that position.
 

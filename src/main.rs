@@ -11,7 +11,8 @@ use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, MetaPreview, Stream, parse_magnet_hash};
 use stremio_lite::db::{Db, Progress, Watched};
 use stremio_lite::library::{LibraryItem, scan};
-use stremio_lite::player::Player;
+use eframe::glow::{self, HasContext};
+use stremio_lite::player::{GlProc, Player};
 use stremio_lite::stremio_import::{self, Import};
 use stremio_lite::torrent::TorrentEngine;
 
@@ -178,6 +179,12 @@ struct Playing {
     pos: f64,
     dur: f64,
     poster: Option<String>,
+    /// Controls stay visible until this time (seconds, egui clock).
+    osd_until: f64,
+    /// Audio & Subtitles panel open.
+    menu: bool,
+    /// Seek-bar position while dragging, in seconds.
+    scrub: Option<f64>,
 }
 
 struct App {
@@ -212,6 +219,10 @@ struct App {
     player: Option<Playing>,
     status: String,
     last_poll: Instant,
+    /// GL function loader of eframe's context, for libmpv's OpenGL renderer.
+    gl_proc: Option<GlProc>,
+    /// Video framebuffer, its texture (owned by egui once registered) and pixel size; reused across playbacks.
+    video: Option<(glow::Framebuffer, glow::Texture, egui::TextureId, [usize; 2])>,
 }
 
 fn data_dir() -> PathBuf {
@@ -263,6 +274,8 @@ impl App {
             pill: None,
             status: "Ready".into(),
             last_poll: Instant::now(),
+            gl_proc: None,
+            video: None,
         };
         if app.addons.is_empty() {
             app.tab = Tab::Addons;
@@ -373,10 +386,20 @@ impl App {
                     .filter(|(m, ..)| format!("{}:{}", m.kind, m.id) == key)
                     .and_then(|(m, ..)| m.poster.clone())
                     .or(prev.and_then(|p| p.poster));
-                match Player::launch(&url, &title, start, &subs) {
+                let wake = ctx.clone();
+                let Some(gl_proc) = self.gl_proc.clone() else {
+                    self.status = "Error: no OpenGL context for the player".into();
+                    return;
+                };
+                match Player::launch(&url, &title, start, &subs, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         self.status = if start > 0.0 { format!("Resuming at {}", fmt_time(start)) } else { "Playing".into() };
-                        self.player = Some(Playing { player, key, title, source, pos: start, dur: 0.0, poster });
+                        let p = Playing { player, key, title, source, pos: start, dur: 0.0, poster, osd_until: 0.0, menu: false, scrub: None };
+                        self.player = Some(p);
+                        // Force a fresh render so the previous video's last frame never flashes.
+                        if let Some(v) = &mut self.video {
+                            v.3 = [0, 0];
+                        }
                     }
                     Err(e) => self.status = format!("Error: {e:#}"),
                 }
@@ -403,16 +426,16 @@ impl App {
     }
 
     fn poll_player(&mut self) {
+        let Some(p) = &mut self.player else { return };
+        if !p.player.poll() || p.player.state.error.is_some() {
+            self.status = p.player.state.error.clone().unwrap_or_else(|| "Player closed".into());
+            self.stop_player();
+            return;
+        }
         if self.last_poll.elapsed() < Duration::from_secs(1) {
             return;
         }
         self.last_poll = Instant::now();
-        let Some(p) = &mut self.player else { return };
-        if !p.player.is_running() {
-            self.status = "Player closed".into();
-            self.stop_player();
-            return;
-        }
         if let Some((pos, dur)) = p.player.position() {
             (p.pos, p.dur) = (pos, dur);
             self.save_progress();
@@ -819,6 +842,230 @@ impl App {
         });
     }
 
+    /// Full-window Netflix-style player: letterboxed video, controls that fade out after
+    /// 3 s without input, red seek bar, ±10 s skips, volume, Audio & Subtitles panel.
+    fn ui_player(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let rect = ui.max_rect();
+        let Some(p) = &mut self.player else { return };
+        let now = ctx.input(|i| i.time);
+        let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let mut cmds: Vec<Vec<String>> = Vec::new();
+        let mut cmd = |a: &[&str]| cmds.push(a.iter().map(|s| s.to_string()).collect());
+        let (mut back, mut toggle_fs) = (false, false);
+        ui.painter().rect_filled(rect, 0, Color32::BLACK);
+
+        // Video: mpv renders on the GPU into our framebuffer at on-screen pixel size.
+        let [vw, vh] = p.player.state.video;
+        if let (true, Some(gl)) = (vw > 0 && vh > 0, frame.gl().cloned()) {
+            let fit = (rect.width() / vw as f32).min(rect.height() / vh as f32);
+            let vrect = egui::Rect::from_center_size(rect.center(), vec2(vw as f32, vh as f32) * fit);
+            let px = vrect.size() * ctx.pixels_per_point();
+            let size = [(px.x as usize).max(1), (px.y as usize).max(1)];
+            let video = match self.video {
+                Some(v) => Some(v),
+                None => unsafe {
+                    match (gl.create_framebuffer(), gl.create_texture()) {
+                        (Ok(fbo), Ok(tex)) => Some((fbo, tex, frame.register_native_glow_texture(tex), [0, 0])),
+                        (a, b) => {
+                            self.status = format!("Error: GL setup failed: {:?}", a.err().or(b.err()));
+                            None
+                        }
+                    }
+                },
+            };
+            if let Some((fbo, tex, id, cur)) = video {
+                let resized = cur != size;
+                unsafe {
+                    if resized {
+                        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                        // The default min filter wants mipmaps; without them the texture samples black.
+                        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+                        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+                        gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, size[0] as i32, size[1] as i32, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
+                        gl.bind_texture(glow::TEXTURE_2D, None);
+                    }
+                    // egui leaves scissor/blend enabled; mpv draws assuming they are off.
+                    gl.disable(glow::SCISSOR_TEST);
+                    gl.disable(glow::BLEND);
+                    p.player.render(fbo.0.get(), size, resized);
+                    // Undo the GL state mpv leaves behind that egui's painter assumes is default.
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    gl.active_texture(glow::TEXTURE0);
+                    gl.bind_texture(glow::TEXTURE_2D, None);
+                    gl.use_program(None);
+                    gl.bind_vertex_array(None);
+                    gl.bind_buffer(glow::ARRAY_BUFFER, None);
+                    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+                    gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+                }
+                self.video = Some((fbo, tex, id, size));
+                ui.painter().image(id, vrect, egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            }
+        }
+        let st = p.player.state.clone();
+        if st.buffering || vw == 0 {
+            egui::Spinner::new().size(56.0).color(RED).paint_at(ui, egui::Rect::from_center_size(rect.center(), vec2(56.0, 56.0)));
+        }
+
+        // Click toggles pause, double-click fullscreen; registered first so controls on top win.
+        let bg = ui.interact(rect, ui.scope_id().with("video"), Sense::CLICK);
+        if bg.clicked() {
+            if p.menu { p.menu = false } else { cmd(&["cycle", "pause"]) }
+        }
+        toggle_fs |= bg.double_clicked();
+        ctx.input(|i| {
+            use egui::Key::*;
+            let k = |key| i.key_pressed(key);
+            if k(Space) || k(K) { cmd(&["cycle", "pause"]) }
+            if k(ArrowLeft) { cmd(&["seek", "-10"]) }
+            if k(ArrowRight) { cmd(&["seek", "10"]) }
+            if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
+            if k(ArrowDown) { cmd(&["add", "volume", "-5"]) }
+            if k(M) { cmd(&["cycle", "mute"]) }
+            toggle_fs |= k(F);
+            if k(Escape) {
+                if fs { toggle_fs = true } else { back = true }
+            }
+            if i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_pressed() || !i.events.is_empty() {
+                p.osd_until = now + 3.0;
+            }
+        });
+        let show = st.paused || p.menu || p.scrub.is_some() || now < p.osd_until;
+        if now < p.osd_until {
+            ctx.request_repaint_after(Duration::from_secs_f64(p.osd_until - now));
+        }
+        let a = ctx.animate_bool_with_time(ui.scope_id().with("osd"), show, 0.25);
+        if !show {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+        if a > 0.01 {
+            let paint = ui.painter().clone().with_layer_id(ui.layer_id());
+            let white = Color32::WHITE.gamma_multiply(a);
+            // Icon button: glyph that grows on hover, like Netflix's control bar.
+            let icon = |ui: &mut egui::Ui, c: egui::Pos2, glyph: &str, label: &str| {
+                let r = ui.interact(egui::Rect::from_center_size(c, vec2(48.0, 48.0)), ui.scope_id().with(label), Sense::CLICK);
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+                let s = ui.ctx().animate_value_with_time(r.id, if r.hovered() { 1.2 } else { 1.0 }, 0.12);
+                paint.text(c, egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(30.0 * s), white);
+                r.on_hover_cursor(egui::CursorIcon::PointingHand)
+            };
+            // Scrims behind the top and bottom controls.
+            paint.rect_filled(egui::Rect::from_min_size(rect.min, vec2(rect.width(), 80.0)), 0, Color32::from_black_alpha((110.0 * a) as u8));
+            paint.rect_filled(egui::Rect::from_min_max(pos2(rect.left(), rect.bottom() - 130.0), rect.max), 0, Color32::from_black_alpha((150.0 * a) as u8));
+            back |= icon(ui, rect.min + vec2(44.0, 40.0), "←", "Back to browse").clicked();
+
+            // Seek bar: gray track, red progress and knob; drag or click to seek.
+            let bar = egui::Rect::from_min_max(pos2(rect.left() + 28.0, rect.bottom() - 104.0), pos2(rect.right() - 130.0, rect.bottom() - 80.0));
+            let r = ui.interact(bar, ui.scope_id().with("seek"), Sense::CLICK | Sense::DRAG);
+            r.widget_info(|| egui::WidgetInfo::slider(true, st.pos, "Seek"));
+            let at = |x: f32| (((x - bar.left()) / bar.width()).clamp(0.0, 1.0) as f64) * st.dur;
+            if (r.dragged() || r.drag_started()) && st.dur > 0.0 {
+                p.scrub = r.interact_pointer_pos().map(|q| at(q.x));
+            }
+            if let Some(t) = (r.clicked() || r.drag_stopped()).then(|| r.interact_pointer_pos().map(|q| at(q.x)).or(p.scrub)).flatten() {
+                cmd(&["seek", &format!("{t:.1}"), "absolute"]);
+            }
+            if !r.dragged() {
+                p.scrub = None;
+            }
+            let pos = p.scrub.unwrap_or(st.pos);
+            let frac = if st.dur > 0.0 { (pos / st.dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
+            let hot = r.hovered() || r.dragged();
+            let th = ctx.animate_value_with_time(r.id.with("h"), if hot { 7.0 } else { 4.0 }, 0.1);
+            let track = egui::Rect::from_center_size(bar.center(), vec2(bar.width(), th));
+            paint.rect_filled(track, 2, Color32::from_gray(128).gamma_multiply(a * 0.7));
+            paint.rect_filled(egui::Rect::from_min_size(track.min, vec2(track.width() * frac, th)), 2, RED.gamma_multiply(a));
+            paint.circle_filled(pos2(track.left() + track.width() * frac, track.center().y), if hot { 10.0 } else { 7.0 }, RED.gamma_multiply(a));
+            if let Some(h) = r.hover_pos().filter(|_| st.dur > 0.0) {
+                paint.text(pos2(h.x, bar.top() - 8.0), egui::Align2::CENTER_BOTTOM, fmt_time(at(h.x)), egui::FontId::proportional(14.0), white);
+            }
+            paint.text(pos2(rect.right() - 28.0, bar.center().y), egui::Align2::RIGHT_CENTER, fmt_time(st.dur - pos), egui::FontId::proportional(16.0), white);
+
+            // Control row.
+            let y = rect.bottom() - 44.0;
+            let x = |i: f32| rect.left() + 52.0 + i * 68.0;
+            if icon(ui, pos2(x(0.0), y), if st.paused { "▶" } else { "⏸" }, if st.paused { "Play" } else { "Pause" }).clicked() {
+                cmd(&["cycle", "pause"]);
+            }
+            if icon(ui, pos2(x(1.0), y), "↺", "Back 10 seconds").clicked() {
+                cmd(&["seek", "-10"]);
+            }
+            if icon(ui, pos2(x(2.0), y), "↻", "Forward 10 seconds").clicked() {
+                cmd(&["seek", "10"]);
+            }
+            let vol = icon(ui, pos2(x(3.0), y), if st.muted || st.volume <= 0.0 { "🔇" } else { "🔊" }, "Mute");
+            if vol.clicked() {
+                cmd(&["cycle", "mute"]);
+            }
+            // Volume slider next to the speaker.
+            let vbar = egui::Rect::from_min_size(pos2(x(3.0) + 30.0, y - 12.0), vec2(110.0, 24.0));
+            let vr = ui.interact(vbar, ui.scope_id().with("volume"), Sense::CLICK | Sense::DRAG);
+            vr.widget_info(|| egui::WidgetInfo::slider(true, st.volume, "Volume"));
+            if let Some(q) = vr.interact_pointer_pos().filter(|_| vr.dragged() || vr.clicked()) {
+                let v = ((q.x - vbar.left()) / vbar.width()).clamp(0.0, 1.0) * 100.0;
+                cmd(&["set", "volume", &format!("{v:.0}")]);
+            }
+            let vt = egui::Rect::from_center_size(vbar.center(), vec2(vbar.width(), 4.0));
+            let vf = if st.muted { 0.0 } else { (st.volume / 100.0).clamp(0.0, 1.0) as f32 };
+            paint.rect_filled(vt, 2, Color32::from_gray(128).gamma_multiply(a * 0.7));
+            paint.rect_filled(egui::Rect::from_min_size(vt.min, vec2(vt.width() * vf, 4.0)), 2, white);
+            paint.circle_filled(pos2(vt.left() + vt.width() * vf, vt.center().y), 6.0, white);
+            paint.text(pos2(rect.center().x, y), egui::Align2::CENTER_CENTER, &p.title, egui::FontId::new(18.0, bold()), white);
+            let cc = icon(ui, pos2(rect.right() - 120.0, y), "💬", "Audio & Subtitles");
+            if cc.clicked() {
+                p.menu = !p.menu;
+            }
+            toggle_fs |= icon(ui, pos2(rect.right() - 52.0, y), "⛶", if fs { "Exit full screen" } else { "Full screen" }).clicked();
+
+            // Audio & Subtitles panel: two columns, selected track marked with a check.
+            if p.menu {
+                egui::Area::new(ui.scope_id().with("tracks")).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_BOTTOM).fixed_pos(pos2(rect.right() - 24.0, y - 76.0)).show(&ctx, |ui| {
+                    egui::Frame::new().fill(Color32::from_rgba_unmultiplied(38, 38, 38, 240)).corner_radius(6).inner_margin(20).show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            for (kind, head, prop) in [("audio", "Audio", "aid"), ("sub", "Subtitles", "sid")] {
+                                ui.vertical(|ui| {
+                                    ui.set_min_width(200.0);
+                                    ui.label(RichText::new(head).size(20.0).family(bold()).color(Color32::WHITE));
+                                    ui.add_space(8.0);
+                                    let tracks: Vec<_> = st.tracks.iter().filter(|t| t.kind == kind).collect();
+                                    let off = !tracks.iter().any(|t| t.selected);
+                                    let entries = (kind == "sub").then_some((None, "Off", off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.selected)));
+                                    for (id, label, sel) in entries {
+                                        let text = RichText::new(format!("{}  {label}", if sel { "✓" } else { "   " })).size(16.0);
+                                        let text = if sel { text.color(Color32::WHITE).family(bold()) } else { text.color(Color32::from_gray(180)) };
+                                        if ui.add(egui::Button::new(text).frame(false)).clicked() {
+                                            let v = id.map_or("no".to_string(), |i| i.to_string());
+                                            cmd(&["set", prop, &v]);
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                    });
+                });
+            }
+        }
+        for c in &cmds {
+            let args: Vec<&str> = c.iter().map(String::as_str).collect();
+            if let Err(e) = p.player.command(&args) {
+                self.status = format!("Error: {e:#}");
+            }
+        }
+        if toggle_fs {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
+        }
+        if back {
+            if fs {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
+            self.stop_player();
+            self.status = "Stopped".into();
+        }
+    }
+
     fn ui_addons(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
@@ -916,13 +1163,17 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         while let Ok(msg) = self.rx.try_recv() {
             self.handle(&ctx, msg);
         }
         self.poll_player();
         ctx.request_repaint_after(Duration::from_millis(500));
+        if self.player.is_some() {
+            self.ui_player(ui, frame);
+            return;
+        }
 
         egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(40, 14)).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
@@ -999,7 +1250,7 @@ impl eframe::App for App {
         });
     }
 
-    fn on_exit(&mut self) {
+    fn on_exit(&mut self, _gl: Option<&glow::Context>) {
         self.stop_player();
     }
 }
@@ -1030,6 +1281,7 @@ fn main() -> eframe::Result {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             cc.egui_ctx.set_visuals_of(egui::Theme::Dark, v);
             cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| s.spacing.button_padding = vec2(14.0, 6.0));
+            app.gl_proc = cc.get_proc_address.clone();
             app.build_rows(&cc.egui_ctx);
             app.fetch_recent_posters(&cc.egui_ctx);
             Ok(Box::new(app))

@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23"
-eframe = "0.37.0"
+# glow (OpenGL) instead of the default wgpu: libmpv renders through OpenGL into our framebuffer.
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "system_fonts", "wayland", "x11"] }
 egui_extras = { version = "0.37", features = ["image"] }
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

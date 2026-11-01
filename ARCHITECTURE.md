@@ -4,7 +4,7 @@
 src/addon.rs    Stremio addon protocol: types, sanitizing parsers, async HTTP client
 src/db.rs       SQLite (rusqlite, bundled): addons, library folders/items, settings, progress
 src/library.rs  Recursive media-file scan (walkdir)
-src/player.rs   mpv process + JSON IPC (time-pos / duration polling)
+src/player.rs   libmpv (FFI) in-process: OpenGL-rendered frames, observed properties, IPC server
 src/torrent.rs  librqbit session + its HTTP streaming API on 127.0.0.1
 src/stremio_import.rs  Reads a local Stremio's localStorage (WebKit SQLite or Chromium LevelDB via rusty-leveldb)
 src/main.rs     egui/eframe GUI; tokio runtime for network/torrent work, results via mpsc
@@ -13,15 +13,15 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 
 ## Choices
 
-**UI: egui (eframe 0.37).** Immediate-mode UI keeps the app to one small file with no widget-state plumbing. It builds with only system GL/X11/Wayland libraries, with no GTK or webview dependency. It runs on Xvfb. eframe also exposes an AccessKit tree, which is useful for automated GUI checks. Iced is similar. Slint would need a separate markup language. Dioxus desktop would pull in a webview and make native video harder.
+**UI: egui (eframe 0.37, glow/OpenGL backend).** Immediate-mode UI keeps the app to one small file with no widget-state plumbing. It builds with only system GL/X11/Wayland libraries, with no GTK or webview dependency. It runs on Xvfb. eframe also exposes an AccessKit tree, which is useful for automated GUI checks. Iced is similar. Slint would need a separate markup language. Dioxus desktop would pull in a webview and make native video harder.
 
-**Playback: external `mpv` driven over JSON IPC.** mpv plays nearly every container and codec, as well as HTTP URLs with Range seeking and external subtitle files (`--sub-file`). It needs no Rust FFI. The app reads `time-pos` and `duration` once per second over the IPC socket and saves them to SQLite. Resuming passes `--start=<pos>`. The same socket lets tests and CI check player state from outside the app.
+**Playback: libmpv embedded in-process.** mpv plays nearly every container and codec, as well as HTTP URLs with Range seeking and external subtitle files (`sub-add`). The app links libmpv through a small `extern "C"` block (no extra crate) and uses its OpenGL render API to draw each frame into a framebuffer the app owns. The framebuffer's texture is registered with egui and drawn under the app's own Netflix-style controls, so scaling and color conversion run on the GPU. Hardware decoding uses only zero-copy GL-interop decoders (`nvdec,vaapi,videotoolbox,d3d11va`) and falls back to software decoding. Copy-back decoders such as `vulkan-copy` produced corrupted frames when the Vulkan device differed from the GL one. Player state (`time-pos`, `duration`, `pause`, volume, tracks) arrives as observed-property events, so the UI thread never blocks on mpv. Position is saved to SQLite once per second; resuming sets `start`. mpv's JSON IPC server stays enabled, so tests and CI can still check player state from outside the app.
 
 **Torrents: librqbit 9 (embedded).** It is a pure-Rust BitTorrent engine with magnet/DHT support and sequential, streamable file reads. Its built-in HTTP API (`/torrents/{id}/stream/{file}`, Range-aware) is bound to 127.0.0.1 on a random port. This turns any torrent into an HTTP URL that mpv already knows how to play, so the player sees only one kind of input.
 
 ## Awkward pairings (stated honestly)
 
-- **egui + video surface.** egui renders through its own GL/wgpu painter and has no native video widget. The options are (a) libmpv's render API into an egui texture or GL callback, which needs unsafe FFI, a libmpv dev dependency, and GL context sharing with eframe's glow backend, or (b) mpv's `--wid` embedding, which only works on X11 and breaks on Wayland/macOS. For the MVP, mpv opens **its own window** and the egui window acts as the browser and remote. This is the main UX compromise. libmpv rendering into an eframe `PaintCallback` is the upgrade path.
+- **egui + video surface.** egui renders through its own GL/wgpu painter and has no native video widget. The options are (a) libmpv's render API into an egui texture or GL callback, which needs unsafe FFI, a libmpv dev dependency, and GL context sharing with eframe's glow backend, or (b) mpv's `--wid` embedding, which only works on X11 and breaks on Wayland/macOS. eframe runs on its glow (OpenGL) backend instead of the default wgpu, so libmpv can render into eframe's own GL context. eframe exposes that context's `get_proc_address`, and libmpv uses it to load GL functions. mpv renders during `App::ui` into an app-owned framebuffer at on-screen pixel size. The app then resets the GL state that mpv changes and egui's painter relies on: framebuffer, active texture, program, VAO, unpack alignment, scissor and blend. This works on X11, Wayland, macOS and Xvfb (Mesa llvmpipe).
 - **librqbit + tokio vs. egui's synchronous loop.** The app owns a tokio runtime. UI events spawn async tasks, and results return over `std::sync::mpsc` with `ctx.request_repaint()`. The UI thread never blocks.
 - **librqbit's HTTP API** needs the `http-api` feature and also `tracing-subscriber-utils` (librqbit 9.1 fails to compile without it). It also needs `librqbit-dualstack-sockets` for its listener type.
 - **mpv IPC on Windows** uses named pipes. Only Unix sockets are implemented, so Windows playback-progress tracking is unsupported for now.
@@ -38,7 +38,7 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 - Parsers never panic. Structurally invalid responses are errors. Individually invalid catalog, stream, or subtitle entries are dropped.
 - Text has control and bidi-override characters stripped, and lengths are capped. egui renders plain text only, so markup cannot inject anything.
 - URLs must be `http`/`https` with a host. `file:`, `javascript:`, `data:`, and similar schemes are rejected. Info hashes must be 40 hex characters. Ids may not contain `/` or control characters.
-- The media source is passed to mpv after `--`, so it can never be read as an option. `--no-ytdl` stops mpv from running youtube-dl on addon URLs.
+- The media source is passed to mpv as a `loadfile` argument, so it can never be read as an option. `--no-ytdl` stops mpv from running youtube-dl on addon URLs.
 
 ## Persistence
 
