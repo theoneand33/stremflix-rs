@@ -1,0 +1,384 @@
+//! Stremio addon protocol: types, validation/sanitization, and an HTTP client.
+//! All addon output is untrusted: every response goes through `parse_*`, which
+//! never panics, rejects structurally invalid data, and drops invalid entries.
+
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use url::Url;
+
+/// Upper bound on any addon response body.
+pub const MAX_BODY: usize = 4 * 1024 * 1024;
+const MAX_TEXT: usize = 300;
+const MAX_LONG_TEXT: usize = 4000;
+const MAX_ITEMS: usize = 500;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum Resource {
+    Name(String),
+    Full {
+        name: String,
+        #[serde(default)]
+        types: Vec<String>,
+        #[serde(default, rename = "idPrefixes")]
+        id_prefixes: Option<Vec<String>>,
+    },
+}
+
+impl Resource {
+    pub fn name(&self) -> &str {
+        match self {
+            Resource::Name(n) | Resource::Full { name: n, .. } => n,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CatalogDef {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Manifest {
+    pub id: String,
+    pub version: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub resources: Vec<Resource>,
+    pub types: Vec<String>,
+    #[serde(default)]
+    pub catalogs: Vec<CatalogDef>,
+    #[serde(default, rename = "idPrefixes")]
+    pub id_prefixes: Option<Vec<String>>,
+}
+
+impl Manifest {
+    pub fn has_resource(&self, name: &str) -> bool {
+        self.resources.iter().any(|r| r.name() == name)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MetaPreview {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    #[serde(default)]
+    pub poster: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Meta {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    #[serde(default)]
+    pub poster: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default, rename = "releaseInfo")]
+    pub release_info: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Stream {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default, rename = "infoHash")]
+    pub info_hash: Option<String>,
+    #[serde(default, rename = "fileIdx")]
+    pub file_idx: Option<usize>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// e.g. "tracker:<url>", "dht:<hash>"; "peer:<host:port>" is a local extension.
+    #[serde(default)]
+    pub sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Subtitle {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub url: String,
+    pub lang: String,
+}
+
+/// What the player should open for a stream.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlayTarget {
+    Http(Url),
+    Magnet(String, Option<usize>),
+}
+
+impl Stream {
+    pub fn label(&self) -> String {
+        let parts: Vec<&str> = [&self.name, &self.title, &self.description]
+            .into_iter()
+            .flatten()
+            .map(|s| s.as_str())
+            .collect();
+        if parts.is_empty() { "Stream".into() } else { parts.join(" - ").replace('\n', " ") }
+    }
+
+    pub fn target(&self) -> Option<PlayTarget> {
+        if let Some(u) = &self.url {
+            if u.starts_with("magnet:") {
+                return parse_magnet_hash(u).map(|_| PlayTarget::Magnet(u.clone(), self.file_idx));
+            }
+            return safe_http_url(u).map(PlayTarget::Http);
+        }
+        let hash = self.info_hash.as_deref().filter(|h| is_info_hash(h))?;
+        let mut magnet = format!("magnet:?xt=urn:btih:{}", hash.to_ascii_lowercase());
+        for s in &self.sources {
+            if let Some(tr) = s.strip_prefix("tracker:").and_then(safe_http_url) {
+                magnet.push_str("&tr=");
+                magnet.push_str(&url::form_urlencoded::byte_serialize(tr.as_str().as_bytes()).collect::<String>());
+            } else if let Some(p) = s.strip_prefix("peer:").and_then(|p| p.parse::<std::net::SocketAddr>().ok()) {
+                magnet.push_str(&format!("&x.pe={p}"));
+            }
+        }
+        Some(PlayTarget::Magnet(magnet, self.file_idx))
+    }
+}
+
+// ---------- sanitization ----------
+
+/// Strip control characters (keeps newlines/tabs), trim, and cap length.
+pub fn sanitize_text(s: &str, max: usize) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .filter(|c| !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+        .take(max)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Only plain http/https URLs with a host are allowed (no file:, javascript:, data:, ...).
+pub fn safe_http_url(s: &str) -> Option<Url> {
+    let u = Url::parse(s.trim()).ok()?;
+    (matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())).then_some(u)
+}
+
+pub fn is_info_hash(h: &str) -> bool {
+    h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+pub fn parse_magnet_hash(m: &str) -> Option<String> {
+    let u = Url::parse(m).ok()?;
+    if u.scheme() != "magnet" {
+        return None;
+    }
+    u.query_pairs()
+        .find(|(k, v)| k == "xt" && v.starts_with("urn:btih:"))
+        .map(|(_, v)| v["urn:btih:".len()..].to_ascii_lowercase())
+        .filter(|h| is_info_hash(h))
+}
+
+/// Peer hints (`x.pe=host:port`) embedded in a magnet link.
+pub fn magnet_peers(m: &str) -> Vec<std::net::SocketAddr> {
+    Url::parse(m)
+        .map(|u| u.query_pairs().filter(|(k, _)| k == "x.pe").filter_map(|(_, v)| v.parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+fn opt_text(s: &mut Option<String>, max: usize) {
+    *s = s.as_deref().map(|v| sanitize_text(v, max)).filter(|v| !v.is_empty());
+}
+
+fn opt_url(s: &mut Option<String>) {
+    *s = s.as_deref().and_then(safe_http_url).map(String::from);
+}
+
+fn valid_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_TEXT && !s.chars().any(|c| c.is_control() || c == '/')
+}
+
+fn from_json<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
+    ensure!(body.len() <= MAX_BODY, "response too large ({} bytes)", body.len());
+    serde_json::from_slice(body).context("malformed addon response")
+}
+
+// ---------- parsers ----------
+
+pub fn parse_manifest(body: &[u8]) -> Result<Manifest> {
+    let mut m: Manifest = from_json(body)?;
+    ensure!(valid_id(&m.id), "manifest: invalid id");
+    m.name = sanitize_text(&m.name, MAX_TEXT);
+    m.version = sanitize_text(&m.version, 64);
+    ensure!(!m.name.is_empty(), "manifest: empty name");
+    ensure!(!m.version.is_empty(), "manifest: empty version");
+    ensure!(!m.resources.is_empty(), "manifest: no resources");
+    ensure!(!m.types.is_empty(), "manifest: no types");
+    opt_text(&mut m.description, MAX_LONG_TEXT);
+    m.catalogs.retain(|c| valid_id(&c.id) && valid_id(&c.kind));
+    m.catalogs.truncate(100);
+    for c in &mut m.catalogs {
+        opt_text(&mut c.name, MAX_TEXT);
+    }
+    Ok(m)
+}
+
+fn clean_preview(mut p: MetaPreview) -> Option<MetaPreview> {
+    if !valid_id(&p.id) || !valid_id(&p.kind) {
+        return None;
+    }
+    p.name = sanitize_text(&p.name, MAX_TEXT);
+    opt_url(&mut p.poster);
+    opt_text(&mut p.description, MAX_LONG_TEXT);
+    (!p.name.is_empty()).then_some(p)
+}
+
+pub fn parse_catalog(body: &[u8]) -> Result<Vec<MetaPreview>> {
+    #[derive(Deserialize)]
+    struct R {
+        metas: Vec<serde_json::Value>,
+    }
+    let r: R = from_json(body)?;
+    // Drop individual malformed entries instead of failing the whole catalog.
+    Ok(r.metas
+        .into_iter()
+        .take(MAX_ITEMS)
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .filter_map(clean_preview)
+        .collect())
+}
+
+pub fn parse_meta(body: &[u8]) -> Result<Meta> {
+    #[derive(Deserialize)]
+    struct R {
+        meta: Meta,
+    }
+    let mut m = from_json::<R>(body)?.meta;
+    ensure!(valid_id(&m.id) && valid_id(&m.kind), "meta: invalid id/type");
+    m.name = sanitize_text(&m.name, MAX_TEXT);
+    ensure!(!m.name.is_empty(), "meta: empty name");
+    opt_url(&mut m.poster);
+    opt_text(&mut m.description, MAX_LONG_TEXT);
+    opt_text(&mut m.release_info, 64);
+    Ok(m)
+}
+
+pub fn parse_streams(body: &[u8]) -> Result<Vec<Stream>> {
+    #[derive(Deserialize)]
+    struct R {
+        streams: Vec<serde_json::Value>,
+    }
+    let r: R = from_json(body)?;
+    Ok(r.streams
+        .into_iter()
+        .take(MAX_ITEMS)
+        .filter_map(|v| serde_json::from_value::<Stream>(v).ok())
+        .filter_map(|mut s| {
+            opt_text(&mut s.name, MAX_TEXT);
+            opt_text(&mut s.title, MAX_LONG_TEXT);
+            opt_text(&mut s.description, MAX_LONG_TEXT);
+            s.target().is_some().then_some(s)
+        })
+        .collect())
+}
+
+pub fn parse_subtitles(body: &[u8]) -> Result<Vec<Subtitle>> {
+    #[derive(Deserialize)]
+    struct R {
+        subtitles: Vec<serde_json::Value>,
+    }
+    let r: R = from_json(body)?;
+    Ok(r.subtitles
+        .into_iter()
+        .take(MAX_ITEMS)
+        .filter_map(|v| serde_json::from_value::<Subtitle>(v).ok())
+        .filter_map(|mut s| {
+            s.url = safe_http_url(&s.url)?.into();
+            s.lang = sanitize_text(&s.lang, 16);
+            opt_text(&mut s.id, MAX_TEXT);
+            Some(s)
+        })
+        .collect())
+}
+
+// ---------- client ----------
+
+/// Base URL of an addon given its transport (manifest) URL.
+pub fn addon_base(transport_url: &str) -> Result<Url> {
+    let u = safe_http_url(transport_url).context("addon URL must be http(s)")?;
+    let s = u.as_str();
+    let Some(base) = s.strip_suffix("/manifest.json") else { bail!("addon URL must end with /manifest.json") };
+    Ok(Url::parse(&format!("{base}/"))?)
+}
+
+fn enc(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>().replace('+', "%20")
+}
+
+#[derive(Clone)]
+pub struct AddonClient {
+    http: reqwest::Client,
+}
+
+impl Default for AddonClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AddonClient {
+    pub fn new() -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::limited(3))
+            .build()
+            .expect("reqwest client");
+        Self { http }
+    }
+
+    async fn get(&self, url: Url) -> Result<Vec<u8>> {
+        let mut resp = self.http.get(url.clone()).send().await.with_context(|| format!("GET {url}"))?;
+        ensure!(resp.status().is_success(), "GET {url}: HTTP {}", resp.status());
+        ensure!(resp.content_length().unwrap_or(0) <= MAX_BODY as u64, "response too large");
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            body.extend_from_slice(&chunk);
+            ensure!(body.len() <= MAX_BODY, "response too large");
+        }
+        Ok(body)
+    }
+
+    pub async fn fetch_manifest(&self, transport_url: &str) -> Result<Manifest> {
+        addon_base(transport_url)?;
+        parse_manifest(&self.get(safe_http_url(transport_url).unwrap()).await?)
+    }
+
+    fn resource_url(transport_url: &str, resource: &str, kind: &str, id: &str) -> Result<Url> {
+        Ok(addon_base(transport_url)?.join(&format!("{resource}/{}/{}.json", enc(kind), enc(id)))?)
+    }
+
+    pub async fn catalog(&self, transport_url: &str, kind: &str, id: &str) -> Result<Vec<MetaPreview>> {
+        parse_catalog(&self.get(Self::resource_url(transport_url, "catalog", kind, id)?).await?)
+    }
+
+    pub async fn meta(&self, transport_url: &str, kind: &str, id: &str) -> Result<Meta> {
+        parse_meta(&self.get(Self::resource_url(transport_url, "meta", kind, id)?).await?)
+    }
+
+    pub async fn streams(&self, transport_url: &str, kind: &str, id: &str) -> Result<Vec<Stream>> {
+        parse_streams(&self.get(Self::resource_url(transport_url, "stream", kind, id)?).await?)
+    }
+
+    pub async fn subtitles(&self, transport_url: &str, kind: &str, id: &str) -> Result<Vec<Subtitle>> {
+        parse_subtitles(&self.get(Self::resource_url(transport_url, "subtitles", kind, id)?).await?)
+    }
+}
