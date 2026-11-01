@@ -168,6 +168,15 @@ impl Stream {
         if parts.is_empty() { "Stream".into() } else { parts.join(" - ").replace('\n', " ") }
     }
 
+    /// Playable source string (http URL or magnet with BEP 53 file index).
+    pub fn source(&self) -> Option<String> {
+        Some(match self.target()? {
+            PlayTarget::Http(u) => u.to_string(),
+            PlayTarget::Magnet(m, Some(idx)) => format!("{m}&so={idx}"),
+            PlayTarget::Magnet(m, None) => m,
+        })
+    }
+
     pub fn target(&self) -> Option<PlayTarget> {
         if let Some(u) = &self.url {
             if u.starts_with("magnet:") {
@@ -238,7 +247,7 @@ fn opt_url(s: &mut Option<String>) {
     *s = s.as_deref().and_then(safe_http_url).map(String::from);
 }
 
-fn valid_id(s: &str) -> bool {
+pub fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_TEXT && !s.chars().any(|c| c.is_control() || c == '/')
 }
 

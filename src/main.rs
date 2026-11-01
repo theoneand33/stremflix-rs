@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
-use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, MetaPreview, PlayTarget, Stream, parse_magnet_hash};
-use stremio_lite::db::{Db, Progress};
+use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, MetaPreview, Stream, parse_magnet_hash};
+use stremio_lite::db::{Db, Progress, Watched};
 use stremio_lite::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
 use stremio_lite::player::{GlProc, Player};
+use stremio_lite::stremio_import::{self, Import};
 use stremio_lite::torrent::TorrentEngine;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -37,6 +38,8 @@ enum Msg {
     Play(String, String, String, String, Vec<String>),
     /// progress key, poster URL found for a Continue Watching entry
     RecentPoster(String, String),
+    /// Stremio storage that was read, and what it holds.
+    Imported(PathBuf, Import),
 }
 
 /// One horizontal catalog row on the home screen.
@@ -161,18 +164,9 @@ fn kind_label(kind: &str) -> &str {
     }
 }
 
-/// Playable source string for a stream (http URL or magnet with BEP 53 file index).
-fn stream_source(s: &Stream) -> Option<String> {
-    Some(match s.target()? {
-        PlayTarget::Http(u) => u.to_string(),
-        PlayTarget::Magnet(m, Some(idx)) => format!("{m}&so={idx}"),
-        PlayTarget::Magnet(m, None) => m,
-    })
-}
-
 /// The playable source when there is exactly one; `None` when there's a choice (or nothing).
 fn only_source(streams: &[Stream]) -> Option<String> {
-    let mut it = streams.iter().filter_map(stream_source);
+    let mut it = streams.iter().filter_map(Stream::source);
     let first = it.next();
     if it.next().is_some() { None } else { first }
 }
@@ -217,6 +211,9 @@ struct App {
     folder: String,
     library: Vec<LibraryItem>,
     recent: Vec<Progress>,
+    watched: Vec<Watched>,
+    /// Stremio data path to import from; empty = auto-detect.
+    import_path: String,
     /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
     pill: Option<(Tab, egui::Rect, egui::Rect, f64)>,
     player: Option<Playing>,
@@ -254,6 +251,8 @@ impl App {
             addons: db.addons()?,
             library: db.library_items()?,
             recent: db.recent_progress(20)?,
+            watched: db.watched(50)?,
+            import_path: String::new(),
             folder: db.setting("last_folder")?.unwrap_or_default(),
             db,
             data_dir,
@@ -353,6 +352,24 @@ impl App {
                 for p in self.recent.iter_mut().filter(|p| p.key == key) {
                     p.poster = Some(url.clone());
                 }
+            }
+            Msg::Imported(path, imp) => {
+                if let Err(e) = imp.save(&self.db) {
+                    self.status = format!("Error saving import: {e:#}");
+                    return;
+                }
+                self.status = format!(
+                    "Imported {} addons, {} in progress, {} watched from {}",
+                    imp.addons.len(),
+                    imp.progress.len(),
+                    imp.watched.len(),
+                    path.display()
+                );
+                self.addons = self.db.addons().unwrap_or_default();
+                self.recent = self.db.recent_progress(20).unwrap_or_default();
+                self.watched = self.db.watched(50).unwrap_or_default();
+                self.build_rows(ctx);
+                self.fetch_recent_posters(ctx);
             }
             Msg::Poster(url, bytes) => {
                 self.posters.insert(url, Some(bytes.into()));
@@ -628,7 +645,7 @@ impl App {
                 ui.label(RichText::new(format!("{}  ·  {} subtitle track(s)", meta.name, subs.len())).size(15.0).color(Color32::from_gray(170)));
             });
             ui.add_space(8.0);
-            let playable = streams.iter().filter_map(|s| Some((s, stream_source(s)?)));
+            let playable = streams.iter().filter_map(|s| Some((s, s.source()?)));
             for (i, (s, src)) in playable.enumerate() {
                 if stream_row(ui, i + 1, s).clicked() {
                     play = Some((format!("{}:{}", meta.kind, meta.id), meta.name.clone(), src, subs.clone()));
@@ -649,6 +666,24 @@ impl App {
                         ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, bar.height())), 2, RED);
                         if r.clicked() {
                             play = Some((p.key.clone(), p.title.clone(), p.source.clone(), vec![]));
+                        }
+                    }
+                });
+            });
+        }
+        if !self.watched.is_empty() {
+            Self::row_title(ui, "Watch It Again");
+            egui::ScrollArea::horizontal().id_salt("watched").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for w in &self.watched {
+                        let (r, rect) = card(ui, CARD, &w.title);
+                        self.paint_poster(ui, &r, rect, &w.poster, &w.title, &mut want);
+                        let hint = if w.episodes > 0 { format!("{} · {} episodes watched", w.title, w.episodes) } else { format!("{} · Watched", w.title) };
+                        if r.on_hover_text(hint).clicked()
+                            && let Some((kind, id)) = w.key.split_once(':')
+                        {
+                            let meta = MetaPreview { id: id.into(), kind: kind.into(), name: w.title.clone(), poster: w.poster.clone(), background: None, description: None };
+                            open = Some((meta, false));
                         }
                     }
                 });
@@ -1039,6 +1074,19 @@ impl App {
                 self.spawn(&ctx, async move {
                     let m = client.fetch_manifest(&url).await?;
                     Ok(Msg::Installed(url, m))
+                });
+            }
+        });
+        ui.horizontal(|ui| {
+            let l = ui.label("Stremio data:");
+            ui.add(egui::TextEdit::singleline(&mut self.import_path).hint_text("Auto-detect local Stremio").desired_width(400.0))
+                .labelled_by(l.id);
+            if primary_button(ui, "Import from Stremio").on_hover_text("Import addons, watched titles and progress").clicked() {
+                let path = Some(PathBuf::from(self.import_path.trim())).filter(|p| !p.as_os_str().is_empty());
+                self.status = "Importing from Stremio...".into();
+                self.spawn(&ctx, async move {
+                    let (path, imp) = tokio::task::spawn_blocking(move || stremio_import::import(path.as_deref())).await??;
+                    Ok(Msg::Imported(path, imp))
                 });
             }
         });

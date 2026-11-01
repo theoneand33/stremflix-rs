@@ -5,14 +5,17 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.23"
 # glow (OpenGL) instead of the default wgpu: libmpv renders through OpenGL into our framebuffer.
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "system_fonts", "wayland", "x11"] }
 egui_extras = { version = "0.37", features = ["image"] }
+flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 librqbit = { version = "9.1.0", features = ["http-api", "tracing-subscriber-utils"] }
 librqbit-dualstack-sockets = "0.7.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+rusty-leveldb = "4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["full"] }
