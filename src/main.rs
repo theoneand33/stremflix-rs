@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
-use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, MetaPreview, Stream, parse_magnet_hash};
+use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, MetaPreview, Stream, Video, parse_magnet_hash};
 use stremio_lite::db::{Db, Progress, Watched};
 use stremio_lite::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
@@ -30,8 +30,10 @@ enum Msg {
     Catalog(String, Vec<MetaPreview>),
     /// Row source (addon URL, type, catalog id) and its items or error.
     Row((String, String, String), Result<Vec<MetaPreview>, String>),
-    /// meta, streams, subtitle URLs, play the first stream on arrival
-    Streams(MetaPreview, Vec<Stream>, Vec<String>, bool),
+    /// meta, episode (series only), streams, subtitle URLs, play the first stream on arrival
+    Streams(MetaPreview, Option<Video>, Vec<Stream>, Vec<String>, bool),
+    /// series and its episodes
+    Episodes(MetaPreview, Vec<Video>),
     /// poster URL, image bytes (empty on failure)
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs
@@ -125,11 +127,22 @@ fn card_text(ui: &egui::Ui, rect: egui::Rect, text: &str) {
     p.galley(rect.center() - g.size() / 2.0, g, Color32::WHITE);
 }
 
-/// Netflix episode-list row: index, bold name, gray details, play circle; highlights on hover.
 fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream) -> egui::Response {
     let mut parts = [&s.name, &s.title, &s.description].into_iter().flatten().map(|x| x.trim()).filter(|x| !x.is_empty());
     let head = parts.next().unwrap_or("Stream").replace('\n', " ");
-    let details = parts.collect::<Vec<_>>().join("\n");
+    list_row(ui, n, head, parts.collect::<Vec<_>>().join("\n"))
+}
+
+/// Episode row: number, title, release date.
+fn episode_row(ui: &mut egui::Ui, v: &Video) -> egui::Response {
+    let n = v.episode.unwrap_or(0) as usize;
+    let head = v.title.clone().unwrap_or_else(|| format!("Episode {n}"));
+    let date = v.released.as_deref().map(|d| d.chars().take(10).collect()).unwrap_or_default();
+    list_row(ui, n, head, date)
+}
+
+/// Netflix episode-list row: index, bold name, gray details, play circle; highlights on hover.
+fn list_row(ui: &mut egui::Ui, n: usize, head: String, details: String) -> egui::Response {
     let (w, text_x, pad) = (ui.available_width().min(960.0), 84.0, 18.0);
     let p = ui.painter();
     let hg = p.layout(head.clone(), egui::FontId::new(17.0, bold()), Color32::WHITE, w - text_x - 96.0);
@@ -162,6 +175,19 @@ fn kind_label(kind: &str) -> &str {
         "series" => "Shows",
         k => k,
     }
+}
+
+fn season_label(season: Option<u32>) -> String {
+    match season {
+        Some(0) => "Specials".into(),
+        Some(n) => format!("Season {n}"),
+        None => "Other".into(),
+    }
+}
+
+/// Episodes in watch order: by season then episode, with specials (season 0), then unnumbered videos, last.
+fn sort_episodes(videos: &mut [Video]) {
+    videos.sort_by_key(|v| (matches!(v.season, Some(0) | None), v.season.is_none(), v.season, v.episode));
 }
 
 /// The playable source when there is exactly one; `None` when there's a choice (or nothing).
@@ -201,6 +227,11 @@ struct App {
     rows: Vec<Row>,
     search_results: Option<(String, Vec<MetaPreview>)>,
     selected: Option<(MetaPreview, Vec<Stream>, Vec<String>)>,
+    /// Episodes of the selected series (in `sort_episodes` order), the season shown,
+    /// and the episode whose streams are in `selected`.
+    episodes: Vec<Video>,
+    season: Option<u32>,
+    episode: Option<Video>,
     scroll_top: bool,
     /// Scroll the stream picker into view on the next frame.
     show_streams: bool,
@@ -265,6 +296,9 @@ impl App {
             rows: Vec::new(),
             search_results: None,
             selected: None,
+            episodes: Vec::new(),
+            season: None,
+            episode: None,
             scroll_top: false,
             show_streams: false,
             magnet: String::new(),
@@ -333,16 +367,33 @@ impl App {
                     Vec::new()
                 }));
             }
-            Msg::Streams(meta, streams, subs, autoplay) => {
+            Msg::Streams(meta, episode, streams, subs, autoplay) => {
+                if episode.is_some() {
+                    // Stale reply for a series the user has since left.
+                    if self.selected.as_ref().is_none_or(|(m, ..)| *m != meta) {
+                        return;
+                    }
+                } else {
+                    self.episodes.clear();
+                    self.scroll_top = true;
+                }
                 self.status = format!("{}: {} streams", meta.name, streams.len());
+                let src = only_source(&streams);
+                (self.selected, self.episode) = (Some((meta, streams, subs.clone())), episode);
                 // Autoplay only when there's no choice to make; otherwise show the stream picker.
                 if autoplay {
-                    match only_source(&streams) {
-                        Some(src) => self.play(ctx, format!("{}:{}", meta.kind, meta.id), meta.name.clone(), src, subs.clone()),
-                        None => self.show_streams = true,
+                    match (src, self.play_key()) {
+                        (Some(src), Some((key, title))) => self.play(ctx, key, title, src, subs),
+                        _ => self.show_streams = true,
                     }
                 }
-                self.selected = Some((meta, streams, subs));
+            }
+            Msg::Episodes(meta, mut videos) => {
+                sort_episodes(&mut videos);
+                self.status = format!("{}: {} episodes", meta.name, videos.len());
+                self.season = videos.first().and_then(|v| v.season);
+                (self.episodes, self.episode) = (videos, None);
+                self.selected = Some((meta, Vec::new(), Vec::new()));
                 self.scroll_top = true;
             }
             Msg::RecentPoster(key, url) => {
@@ -381,9 +432,9 @@ impl App {
                     Some(p) if p.position > 3.0 && (p.duration <= 0.0 || p.position < p.duration - 5.0) => p.position,
                     _ => 0.0,
                 };
-                // Poster of the opened title, else the one saved earlier for this key.
+                // Poster of the opened title (the series, for an episode), else the one saved earlier for this key.
                 let poster = (self.selected.as_ref())
-                    .filter(|(m, ..)| format!("{}:{}", m.kind, m.id) == key)
+                    .filter(|_| self.play_key().is_some_and(|(k, _)| k == key))
                     .and_then(|(m, ..)| m.poster.clone())
                     .or(prev.and_then(|p| p.poster));
                 let wake = ctx.clone();
@@ -582,29 +633,66 @@ impl App {
         }
     }
 
+    /// Progress key and player title of the selected movie or episode.
+    /// Episodes are keyed `<type>:<video id>` (e.g. `series:tt1:1:2`), so each episode resumes on its own.
+    fn play_key(&self) -> Option<(String, String)> {
+        let (m, ..) = self.selected.as_ref()?;
+        Some(match &self.episode {
+            Some(v) => {
+                let se = format!("{} S{}E{}", m.name, v.season.unwrap_or(0), v.episode.unwrap_or(0));
+                (format!("{}:{}", m.kind, v.id), v.title.as_ref().map_or(se.clone(), |t| format!("{se} - {t}")))
+            }
+            None => (format!("{}:{}", m.kind, m.id), m.name.clone()),
+        })
+    }
+
+    /// Series load their episode list; anything else loads streams for its own id.
     fn open_meta(&mut self, ctx: &egui::Context, meta: MetaPreview, autoplay: bool) {
+        if meta.kind != "series" {
+            return self.open_streams(ctx, meta, None, autoplay);
+        }
         let client = self.client.clone();
-        let stream_addons = self.addons_for("stream", &meta.kind, &meta.id);
-        let sub_addons = self.addons_for("subtitles", &meta.kind, &meta.id);
+        let addons = self.addons_for("meta", &meta.kind, &meta.id);
+        self.status = format!("Loading episodes for {}...", meta.name);
+        self.spawn(ctx, async move {
+            let mut errors = Vec::new();
+            for u in &addons {
+                match client.meta(u, &meta.kind, &meta.id).await {
+                    Ok(m) if !m.videos.is_empty() => return Ok(Msg::Episodes(meta, m.videos)),
+                    Ok(_) => {}
+                    Err(e) => errors.push(format!("{e:#}")),
+                }
+            }
+            let why = if errors.is_empty() { "no addon lists them".to_string() } else { errors.join("; ") };
+            anyhow::bail!("no episodes for {}: {why}", meta.name)
+        });
+    }
+
+    /// Fetch streams and subtitles for a movie, or for `episode` of a series.
+    fn open_streams(&mut self, ctx: &egui::Context, meta: MetaPreview, episode: Option<Video>, autoplay: bool) {
+        let client = self.client.clone();
+        let id = episode.as_ref().map_or(meta.id.clone(), |v| v.id.clone());
+        let stream_addons = self.addons_for("stream", &meta.kind, &id);
+        let sub_addons = self.addons_for("subtitles", &meta.kind, &id);
         self.status = format!("Loading streams for {}...", meta.name);
         self.spawn(ctx, async move {
             let (mut streams, mut subs, mut errors) = (Vec::new(), Vec::new(), Vec::new());
             for u in &stream_addons {
-                match client.streams(u, &meta.kind, &meta.id).await {
+                match client.streams(u, &meta.kind, &id).await {
                     Ok(s) => streams.extend(s),
                     Err(e) => errors.push(format!("{e:#}")),
                 }
             }
             for u in &sub_addons {
                 // Subtitles are optional; a failing subtitle addon must not block playback.
-                if let Ok(s) = client.subtitles(u, &meta.kind, &meta.id).await {
+                if let Ok(s) = client.subtitles(u, &meta.kind, &id).await {
                     subs.extend(s.into_iter().map(|s| s.url));
                 }
             }
             if streams.is_empty() && !errors.is_empty() {
                 anyhow::bail!("no streams: {}", errors.join("; "));
             }
-            Ok(Msg::Streams(meta, streams, subs, autoplay))
+            Ok(Msg::Streams(meta, episode, streams, subs, autoplay))
         });
     }
 
@@ -639,20 +727,53 @@ impl App {
                 ui.spinner();
             }
         }
-        if let Some((meta, streams, subs)) = &self.selected {
+        let mut episode = None;
+        // Movies show their streams; a series shows them once an episode is picked.
+        if let Some((_, streams, subs)) = &self.selected
+            && let Some(key) = self.play_key()
+            && (self.episodes.is_empty() || self.episode.is_some())
+        {
             ui.add_space(16.0);
             ui.horizontal(|ui| {
                 let r = ui.label(RichText::new("Streams").size(24.0).strong().family(bold()).color(Color32::WHITE));
                 if std::mem::take(&mut self.show_streams) {
                     r.scroll_to_me(Some(Align::TOP));
                 }
-                ui.label(RichText::new(format!("{}  ·  {} subtitle track(s)", meta.name, subs.len())).size(15.0).color(Color32::from_gray(170)));
+                ui.label(RichText::new(format!("{}  ·  {} subtitle track(s)", key.1, subs.len())).size(15.0).color(Color32::from_gray(170)));
             });
             ui.add_space(8.0);
             let playable = streams.iter().filter_map(|s| Some((s, s.source()?)));
             for (i, (s, src)) in playable.enumerate() {
                 if stream_row(ui, i + 1, s).clicked() {
-                    play = Some((format!("{}:{}", meta.kind, meta.id), meta.name.clone(), src, subs.clone()));
+                    play = Some((key.0.clone(), key.1.clone(), src, subs.clone()));
+                }
+            }
+        }
+        if let Some((meta, ..)) = &self.selected
+            && !self.episodes.is_empty()
+        {
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                let r = ui.label(RichText::new("Episodes").size(24.0).strong().family(bold()).color(Color32::WHITE));
+                if self.episode.is_none() && std::mem::take(&mut self.show_streams) {
+                    r.scroll_to_me(Some(Align::TOP));
+                }
+                let mut seasons: Vec<Option<u32>> = self.episodes.iter().map(|v| v.season).collect();
+                seasons.dedup();
+                egui::ComboBox::from_id_salt("season").selected_text(season_label(self.season)).show_ui(ui, |ui| {
+                    for s in seasons {
+                        ui.selectable_value(&mut self.season, s, season_label(s));
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            for v in self.episodes.iter().filter(|v| v.season == self.season) {
+                let r = episode_row(ui, v);
+                if self.episode.as_ref() == Some(v) {
+                    ui.painter().rect_stroke(r.rect, 4, (2.0, RED), egui::StrokeKind::Inside);
+                }
+                if r.clicked() {
+                    episode = Some((meta.clone(), v.clone()));
                 }
             }
         }
@@ -728,6 +849,9 @@ impl App {
         }
         if let Some((m, autoplay)) = open {
             self.open_meta(&ctx, m, autoplay);
+        }
+        if let Some((m, v)) = episode {
+            self.open_streams(&ctx, m, Some(v), true);
         }
         if let Some((k, t, s, subs)) = play {
             self.play(&ctx, k, t, s, subs);
@@ -812,9 +936,9 @@ impl App {
                 let mut show_streams = false;
                 if hero_button(ui, "▶  Play", [Color32::WHITE, Color32::from_white_alpha(191)], Color32::BLACK).clicked() {
                     match &self.selected {
-                        Some((m, streams, subs)) if m == meta => match only_source(streams) {
-                            Some(src) => *play = Some((format!("{}:{}", m.kind, m.id), m.name.clone(), src, subs.clone())),
-                            None => show_streams = true,
+                        Some((m, streams, subs)) if m == meta => match (only_source(streams), self.play_key()) {
+                            (Some(src), Some((k, t))) => *play = Some((k, t, src, subs.clone())),
+                            _ => show_streams = true,
                         },
                         _ => *open = Some((meta.clone(), true)),
                     }
@@ -1238,6 +1362,7 @@ impl eframe::App for App {
             if self.selected.is_some() {
                 if pill_button(ui, "←  Back", 16.0, vec2(0.0, 40.0), white_fill(), Color32::BLACK).on_hover_text("Back to browse").clicked() {
                     self.selected = None;
+                    (self.episodes, self.episode) = (Vec::new(), None);
                     self.scroll_top = true;
                 }
                 ui.add_space(6.0);
@@ -1294,6 +1419,16 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn episodes_sort_with_specials_last() {
+        let v = |season, episode| Video { id: format!("tt1:{season:?}:{episode}"), title: None, season, episode: Some(episode), released: None, thumbnail: None };
+        let mut eps = vec![v(Some(0), 1), v(None, 1), v(Some(2), 1), v(Some(1), 2), v(Some(1), 1)];
+        sort_episodes(&mut eps);
+        let order: Vec<_> = eps.iter().map(|e| (e.season, e.episode)).collect();
+        assert_eq!(order, [(Some(1), Some(1)), (Some(1), Some(2)), (Some(2), Some(1)), (Some(0), Some(1)), (None, Some(1))]);
+        assert_eq!((season_label(Some(0)), season_label(Some(3))), ("Specials".to_string(), "Season 3".to_string()));
+    }
 
     #[test]
     fn only_source_autoplays_only_without_a_choice() {
