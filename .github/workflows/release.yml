@@ -6,12 +6,32 @@ on:
       version:
         description: "Release version, e.g. 1.2.3 (tagged as v1.2.3)"
         required: true
+  schedule:
+    - cron: "0 */3 * * *" # nightly build every 3 hours
 
 permissions:
   contents: write
 
+env:
+  TAG: ${{ inputs.version && format('v{0}', inputs.version) || 'nightly' }}
+
 jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh api "repos/$GITHUB_REPOSITORY/commits/nightly" --jq .sha 2>/dev/null || true)
+          echo "changed=$([ "$last" = "$GITHUB_SHA" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: changes
+    # skip scheduled nightlies when main has no new commits since the last one
+    if: github.event_name != 'schedule' || needs.changes.outputs.changed == 'true'
     strategy:
       matrix:
         include:
@@ -22,6 +42,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Validate version
+        if: inputs.version
         env:
           VERSION: ${{ inputs.version }}
         run: '[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "invalid version: $VERSION"; exit 1; }'
@@ -39,7 +60,7 @@ jobs:
       - run: cargo build --release --locked --bin stremio-lite
       - name: Package
         env:
-          NAME: stremio-lite-v${{ inputs.version }}-${{ matrix.target }}
+          NAME: stremio-lite-${{ env.TAG }}-${{ matrix.target }}
         run: |
           mkdir "$NAME"
           cp target/release/stremio-lite README.md "$NAME/"
@@ -59,8 +80,12 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v${{ inputs.version }}
-        run: >
-          gh release create "$TAG" *.tar.gz
-          --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA"
-          --title "$TAG" --generate-notes
+        run: |
+          if [ "$TAG" = nightly ]; then
+            gh release delete nightly --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+            gh release create nightly *.tar.gz --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Nightly ($(date -u +%F' '%H:%M) UTC, ${GITHUB_SHA::7})" --notes "Automated build of $GITHUB_SHA." --prerelease
+          else
+            gh release create "$TAG" *.tar.gz --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$TAG" --generate-notes
+          fi
