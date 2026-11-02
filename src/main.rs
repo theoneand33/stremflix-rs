@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, Stream, Video, parse_magnet_hash};
-use stremio_lite::db::{Db, Progress, Watched};
+use stremio_lite::db::{Db, Progress, SavedTitle, Watched};
 use stremio_lite::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
 use stremio_lite::player::{GlProc, Player, SUB_COLORS, SubStyle, valid_langs};
@@ -26,6 +26,57 @@ enum Tab {
 
 /// Addon subtitles as (url, lang).
 type Subs = Vec<(String, String)>;
+
+/// Order of the saved-titles list in the Library tab.
+#[derive(PartialEq, Clone, Copy)]
+enum LibSort {
+    Added,
+    Title,
+}
+
+/// Type filter of the saved-titles list in the Library tab.
+#[derive(PartialEq, Clone, Copy)]
+enum LibKind {
+    All,
+    Movie,
+    Series,
+}
+
+impl LibSort {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Added => "Recently added",
+            Self::Title => "Title A–Z",
+        }
+    }
+}
+
+impl LibKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All types",
+            Self::Movie => "Movies",
+            Self::Series => "Shows",
+        }
+    }
+
+    fn matches(self, kind: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Movie => kind == "movie",
+            Self::Series => kind == "series",
+        }
+    }
+}
+
+/// Saved titles of `kind`, newest first unless sorted by title (case-insensitive).
+fn saved_view(items: &[SavedTitle], kind: LibKind, sort: LibSort) -> Vec<&SavedTitle> {
+    let mut v: Vec<&SavedTitle> = items.iter().filter(|t| kind.matches(&t.kind)).collect();
+    if sort == LibSort::Title {
+        v.sort_by_key(|t| t.title.to_lowercase());
+    }
+    v
+}
 
 enum Msg {
     Status(String),
@@ -311,6 +362,10 @@ struct App {
     /// Preferred audio / subtitle languages (mpv `alang` / `slang`), as edited; saved to the settings table only when valid.
     langs: [String; 2],
     library: Vec<LibraryItem>,
+    /// Titles saved with "Add to library", newest first.
+    saved: Vec<SavedTitle>,
+    lib_sort: LibSort,
+    lib_kind: LibKind,
     recent: Vec<Progress>,
     watched: Vec<Watched>,
     /// Keys (`<type>:<id>`) of movies and episodes marked watched.
@@ -355,6 +410,9 @@ impl App {
             rt: tokio::runtime::Runtime::new()?,
             addons: db.addons()?,
             library: db.library_items()?,
+            saved: db.saved_titles()?,
+            lib_sort: LibSort::Added,
+            lib_kind: LibKind::All,
             recent: db.recent_progress(20)?,
             watched: db.watched(50)?,
             watched_keys: db.watched_keys()?,
@@ -805,6 +863,24 @@ impl App {
                     }
                 }
             });
+        }
+    }
+
+    /// Add the selected title to the library, or remove it; the DB write decides `status`.
+    fn toggle_saved(&mut self, meta: &MetaPreview) {
+        let key = format!("{}:{}", meta.kind, meta.id);
+        let res = if self.saved.iter().any(|t| t.key == key) {
+            self.saved.retain(|t| t.key != key);
+            self.status = format!("Removed {} from the library", meta.name);
+            self.db.remove_saved_title(&key)
+        } else {
+            let t = SavedTitle { key, title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone() };
+            self.saved.insert(0, t.clone());
+            self.status = format!("Added {} to the library", meta.name);
+            self.db.add_saved_title(&t)
+        };
+        if let Err(e) = res {
+            self.status = format!("Error saving library: {e:#}");
         }
     }
 
@@ -1287,6 +1363,11 @@ impl App {
                 if hero_button(ui, "More info", [gray(179), gray(102)], Color32::WHITE).clicked() {
                     *open = Some((meta.clone(), false));
                 }
+                let in_lib = self.saved.iter().any(|t| t.key == format!("{}:{}", meta.kind, meta.id));
+                let label = if in_lib { "✓  In library" } else { "+  Add to library" };
+                if hero_button(ui, label, [gray(179), gray(102)], Color32::WHITE).clicked() {
+                    self.toggle_saved(meta);
+                }
             });
             ui.add_space(12.0);
             if let Some(d) = &meta.description {
@@ -1690,6 +1771,37 @@ impl App {
 
     fn ui_library(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let (mut want, mut open) = (Vec::new(), None);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Saved titles").size(20.0).strong().family(bold()).color(Color32::WHITE));
+            egui::ComboBox::from_id_salt("lib_sort").selected_text(self.lib_sort.label()).show_ui(ui, |ui| {
+                for s in [LibSort::Added, LibSort::Title] {
+                    ui.selectable_value(&mut self.lib_sort, s, s.label());
+                }
+            });
+            egui::ComboBox::from_id_salt("lib_kind").selected_text(self.lib_kind.label()).show_ui(ui, |ui| {
+                for k in [LibKind::All, LibKind::Movie, LibKind::Series] {
+                    ui.selectable_value(&mut self.lib_kind, k, k.label());
+                }
+            });
+        });
+        ui.add_space(4.0);
+        let items: Vec<MetaPreview> = saved_view(&self.saved, self.lib_kind, self.lib_sort).into_iter().filter_map(SavedTitle::preview).collect();
+        if self.saved.is_empty() {
+            ui.label(RichText::new("Nothing saved yet. Open a title and choose \"Add to library\".").color(Color32::from_gray(170)));
+        } else if items.is_empty() {
+            ui.label(RichText::new("No saved titles of this type.").color(Color32::from_gray(170)));
+        }
+        self.ui_cards(ui, "saved", &items, &mut want, &mut open);
+        for u in want {
+            self.fetch_poster(&ctx, u);
+        }
+        if let Some((m, _)) = open {
+            // The detail page lives on the Home tab.
+            self.tab = Tab::Home;
+            self.open_meta(&ctx, m, false);
+        }
+        ui.separator();
         ui.horizontal(|ui| {
             let l = ui.label("Magnet link:");
             ui.add(egui::TextEdit::singleline(&mut self.magnet).hint_text("magnet:?xt=urn:btih:...").desired_width(500.0))
@@ -1873,6 +1985,26 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_view_filters_and_sorts() {
+        let t = |key: &str, title: &str| SavedTitle {
+            key: key.into(),
+            title: title.into(),
+            kind: key.split_once(':').unwrap().0.into(),
+            poster: None,
+        };
+        // Newest first, as stored.
+        let items = [t("series:tt2", "beta"), t("movie:tt3", "Alpha"), t("movie:tt1", "gamma")];
+        let keys = |v: Vec<&SavedTitle>| v.into_iter().map(|t| t.key.clone()).collect::<Vec<_>>();
+        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Added)), ["series:tt2", "movie:tt3", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::Movie, LibSort::Added)), ["movie:tt3", "movie:tt1"]);
+        // Case-insensitive title order, and the filter holds while sorting.
+        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Title)), ["movie:tt3", "series:tt2", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::Series, LibSort::Title)), ["series:tt2"]);
+        assert!(saved_view(&items, LibKind::Series, LibSort::Added).len() == 1);
+        assert_eq!(saved_view(&[], LibKind::All, LibSort::Title).len(), 0);
+    }
 
     #[test]
     fn episodes_sort_with_specials_last() {
