@@ -171,8 +171,7 @@ fn meta_videos_parsing() {
     let v = &m.videos[0];
     assert_eq!((v.id.as_str(), v.title.as_deref(), v.season, v.episode), ("tt9:1:2", Some("Pilot"), Some(1), Some(2)));
     assert_eq!(v.released.as_deref(), Some("2020-01-01T00:00:00.000Z"));
-    assert_eq!(v.thumbnail.as_deref(), Some("https://img.example/e.jpg"));
-    assert_eq!((m.videos[1].title.as_deref(), m.videos[1].thumbnail.as_deref()), (Some("Special"), None));
+    assert_eq!(m.videos[1].title.as_deref(), Some("Special"));
     for videos in ["null", "{}", "\"x\""] {
         let body = format!(r#"{{"meta": {{"id": "tt9", "type": "series", "name": "Show", "videos": {videos}}}}}"#);
         assert!(parse_meta(body.as_bytes()).unwrap().videos.is_empty(), "{videos}");
@@ -201,6 +200,12 @@ fn stream_parsing_and_targets() {
     assert!(m.contains("&tr=http%3A%2F%2Ftr.example%2Fannounce"));
     assert_eq!(magnet_peers(&m), vec!["127.0.0.1:6881".parse().unwrap()]);
     assert!(matches!(s[2].target(), Some(PlayTarget::Magnet(_, None))));
+    // Base32 (32 chars, uppercase as librqbit reads it) is a valid info hash too; other lengths are not.
+    let b32 = "MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43U";
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{b32}")).as_deref(), Some(b32));
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{}", b32.to_lowercase())), None);
+    assert_eq!(parse_magnet_hash("magnet:?xt=urn:btih:MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43"), None);
+    assert_eq!(parse_magnet_hash("magnet:?xt=urn:btih:MFRGGZDFMZTWQ2LKNNWG23TPOBYXE431"), None, "1 is not base32");
 }
 
 #[test]
@@ -208,7 +213,7 @@ fn stream_binge_group() {
     let long = "g".repeat(1000);
     let body = format!(
         r#"{{"streams": [
-        {{"url": "https://a.example/1", "behaviorHints": {{"bingeGroup": " addon-1080p\u0007 ", "notWebReady": true}}}},
+        {{"url": "https://a.example/1", "behaviorHints": {{"bingeGroup": " addon-1080p\u0007 "}}}},
         {{"url": "https://a.example/2", "behaviorHints": {{"bingeGroup": 7}}}},
         {{"url": "https://a.example/3", "behaviorHints": "junk"}},
         {{"url": "https://a.example/4", "behaviorHints": {{"bingeGroup": "{long}"}}}},
@@ -220,7 +225,6 @@ fn stream_binge_group() {
     let groups: Vec<_> = s.iter().map(|s| s.hints.binge_group.as_deref().map(str::len)).collect();
     assert_eq!(s[0].hints.binge_group.as_deref(), Some("addon-1080p"));
     assert_eq!(groups, [Some(11), None, None, Some(300), None, None]);
-    assert!(s[0].hints.not_web_ready && !s[1].hints.not_web_ready);
 }
 
 #[test]

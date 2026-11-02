@@ -98,20 +98,22 @@ enum Msg {
     /// Discover grid source and its items or error.
     Discover(DiscoverSrc, Result<Vec<MetaPreview>, String>),
     /// meta, episode (series only), streams, subtitle URLs, what to autoplay on arrival,
-    /// and the `bingeGroup` to prefer (next episode)
-    Streams(MetaPreview, Option<Video>, Vec<Stream>, Subs, Autoplay, Option<String>),
-    /// series and its full meta (with episodes)
-    Episodes(MetaPreview, Meta),
+    /// the `bingeGroup` to prefer (next episode), and the `nav` it was requested at
+    Streams(MetaPreview, Option<Video>, Vec<Stream>, Subs, Autoplay, Option<String>, u64),
+    /// series, its full meta (with episodes), and the `nav` it was requested at
+    Episodes(MetaPreview, Meta, u64),
     /// Full meta of a movie (genres, cast, ...) for the detail page.
     Details(Meta),
     /// poster URL, image bytes (empty on failure)
     Poster(String, Vec<u8>),
-    /// key, title, resumable source, playable URL/path, subtitle URLs
-    Play(String, String, String, String, Subs),
+    /// key, title, resumable source, playable URL/path, subtitle URLs, torrent id, the `nav` it was requested at
+    Play(String, String, String, String, Subs, Option<usize>, u64),
     /// progress key, poster URL found for a Continue Watching entry
     RecentPoster(String, String),
     /// Stremio storage that was read, and what it holds.
     Imported(PathBuf, Import),
+    /// Library folder and its scanned media files.
+    Scanned(PathBuf, Result<Vec<LibraryItem>, String>),
 }
 
 /// One horizontal catalog row on the home screen.
@@ -131,6 +133,8 @@ struct Row {
 
 /// Max items kept per catalog row.
 const ROW_CAP: usize = 1000;
+/// Posters kept in memory (bytes and decoded textures) before the cache is cleared.
+const POSTER_CACHE: usize = 1500;
 
 impl Row {
     /// Request the next page when the row is scrolled near its end.
@@ -393,11 +397,27 @@ fn only_source(streams: &[Stream]) -> Option<String> {
     if it.next().is_some() { None } else { first }
 }
 
+/// Run `f` for every item at once; results come back in item order (e.g. addon priority).
+async fn concurrently<I, T, F>(items: Vec<I>, f: impl Fn(I) -> F) -> Vec<anyhow::Result<T>>
+where
+    T: Send + 'static,
+    F: Future<Output = anyhow::Result<T>> + Send + 'static,
+{
+    let tasks: Vec<_> = items.into_iter().map(|i| tokio::spawn(f(i))).collect();
+    let mut out = Vec::with_capacity(tasks.len());
+    for t in tasks {
+        out.push(t.await.unwrap_or_else(|e| Err(e.into())));
+    }
+    out
+}
+
 struct Playing {
     player: Player,
     key: String,
     title: String,
     source: String,
+    /// Torrent being streamed, if any.
+    torrent: Option<usize>,
     pos: f64,
     dur: f64,
     poster: Option<String>,
@@ -435,6 +455,8 @@ struct App {
     /// Series id whose episodes are loading, and on arrival the video id whose streams to show
     /// (Continue Watching), or `None` to play the next episode (card play button).
     pending: Option<(String, Option<String>)>,
+    /// Bumped by every navigation (open a title or episode, play, Back); replies for an older one are dropped.
+    nav: u64,
     /// Full meta of the selected title, if an addon served one; checked against `selected` by id.
     details: Option<Meta>,
     /// Type and id of the movie whose details were last requested; older replies are dropped.
@@ -489,8 +511,7 @@ fn fmt_time(s: f64) -> String {
 }
 
 impl App {
-    fn new() -> anyhow::Result<Self> {
-        let data_dir = data_dir();
+    fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
         let db = Db::open(&data_dir.join("stremio-lite.db"))?;
         let (tx, rx) = channel();
         let mut app = Self {
@@ -524,6 +545,7 @@ impl App {
             season: None,
             episode: None,
             pending: None,
+            nav: 0,
             details: None,
             details_want: Default::default(),
             scroll_top: false,
@@ -556,17 +578,28 @@ impl App {
     /// Resolve `source` (http URL, magnet, or local path) and start playback.
     fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
         self.status = format!("Opening {title}...");
+        self.nav += 1;
+        let nav = self.nav;
         if !source.starts_with("magnet:") {
-            let _ = self.tx.send(Msg::Play(key, title, source.clone(), source, subs));
+            let _ = self.tx.send(Msg::Play(key, title, source.clone(), source, subs, None, nav));
             return;
         }
         let (cell, dir) = (self.torrent.clone(), self.data_dir.join("torrents"));
         let dht = std::env::var_os("STREMIO_LITE_NO_DHT").is_none();
         self.spawn(ctx, async move {
             let engine = cell.get_or_try_init(|| TorrentEngine::start(dir, dht)).await?;
-            let url = engine.stream_url(&source, None).await?;
-            Ok(Msg::Play(key, title, source, url, subs))
+            let (url, id) = engine.stream_url(&source, None).await?;
+            Ok(Msg::Play(key, title, source, url, subs, Some(id), nav))
         });
+    }
+
+    /// Delete every torrent but `keep`, so none keeps downloading and seeding. Runs on the UI thread,
+    /// so it always finishes before a later `play` adds the next torrent.
+    fn release_torrents(&self, keep: Option<usize>) {
+        if let Some(engine) = self.torrent.get() {
+            // shortcut: blocks the UI up to 2 s while librqbit deletes; fine for a few torrents at a time.
+            let _ = self.rt.block_on(tokio::time::timeout(Duration::from_secs(2), engine.release_except(keep)));
+        }
     }
 
     fn handle(&mut self, ctx: &egui::Context, msg: Msg) {
@@ -633,13 +666,12 @@ impl App {
                     }));
                 }
             }
-            Msg::Streams(meta, episode, streams, subs, autoplay, binge) => {
-                if episode.is_some() {
-                    // Stale reply for a series the user has since left.
-                    if self.selected.as_ref().is_none_or(|(m, ..)| *m != meta) {
-                        return;
-                    }
-                } else {
+            Msg::Streams(meta, episode, streams, subs, autoplay, binge, nav) => {
+                // Stale reply for a title the user has since left.
+                if nav != self.nav {
+                    return;
+                }
+                if episode.is_none() {
                     self.episodes.clear();
                     self.scroll_top = true;
                 }
@@ -655,7 +687,10 @@ impl App {
                     }
                 }
             }
-            Msg::Episodes(meta, mut m) => {
+            Msg::Episodes(meta, mut m, nav) => {
+                if nav != self.nav {
+                    return;
+                }
                 let mut videos = std::mem::take(&mut m.videos);
                 // A Continue Watching entry only knows the episode title.
                 let meta = MetaPreview { name: m.name.clone(), poster: meta.poster.or(m.poster.clone()), ..meta };
@@ -666,11 +701,7 @@ impl App {
                 (self.episodes, self.episode) = (videos, None);
                 self.selected = Some((meta.clone(), Vec::new(), Vec::new()));
                 self.scroll_top = true;
-                // A late reply for another series leaves the pending request alone.
-                if self.pending.as_ref().is_none_or(|(id, _)| *id != meta.id) {
-                    return;
-                }
-                let Some((_, show)) = self.pending.take() else { return };
+                let Some((_, show)) = self.pending.take().filter(|(id, _)| *id == meta.id) else { return };
                 let key = |v: &Video| format!("{}:{}", meta.kind, v.id);
                 let v = match &show {
                     Some(id) => self.episodes.iter().find(|v| v.id == *id),
@@ -724,11 +755,33 @@ impl App {
                 self.build_rows(ctx);
                 self.fetch_recent_posters(ctx);
             }
+            Msg::Scanned(dir, res) => {
+                let saved = res.map_err(anyhow::Error::msg).and_then(|items| {
+                    self.db.add_library_folder(&dir, &items)?;
+                    self.db.set_setting("last_folder", &dir.to_string_lossy())?;
+                    Ok(items.len())
+                });
+                match saved {
+                    Ok(n) => {
+                        self.status = format!("Added {n} files from {}", dir.display());
+                        self.library = self.db.library_items().unwrap_or_default();
+                    }
+                    Err(e) => self.status = format!("Error: {e:#}"),
+                }
+            }
             Msg::Poster(url, bytes) => {
                 self.posters.insert(url, Some(bytes.into()));
             }
-            Msg::Play(key, title, source, url, subs) => {
+            Msg::Play(key, title, source, url, subs, torrent, nav) => {
+                if nav != self.nav {
+                    // A torrent resolved after the user moved on: drop it, keeping only what is playing.
+                    if torrent.is_some() {
+                        self.release_torrents(self.player.as_ref().and_then(|p| p.torrent));
+                    }
+                    return;
+                }
                 self.stop_player();
+                self.release_torrents(torrent);
                 let prev = self.db.progress(&key).ok().flatten();
                 let start = match &prev {
                     Some(p) if p.position > 3.0 && (p.duration <= 0.0 || p.position < p.duration - 5.0) => p.position,
@@ -759,14 +812,17 @@ impl App {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
                         self.status = if start > 0.0 { format!("Resuming at {}", fmt_time(start)) } else { "Playing".into() };
-                        let p = Playing { player, key, title, source, pos: start, dur: 0.0, poster, osd_until: 0.0, menu: false, scrub: None };
+                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: 0.0, menu: false, scrub: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
                             v.3 = [0, 0];
                         }
                     }
-                    Err(e) => self.status = format!("Error: {e:#}"),
+                    Err(e) => {
+                        self.status = format!("Error: {e:#}");
+                        self.release_torrents(None);
+                    }
                 }
                 ctx.request_repaint();
             }
@@ -775,19 +831,23 @@ impl App {
 
     fn save_progress(&mut self) {
         if let Some(p) = &self.player {
-            if p.dur > 0.0 && p.pos >= p.dur * 0.9 {
-                // Past 90%: count it as watched instead of keeping a resume point.
-                let key = p.key.clone();
-                if !self.watched_keys.contains(&key) {
-                    self.set_watched(&key, true);
-                }
-            } else if p.pos > 0.0 {
-                let prog = Progress { key: p.key.clone(), title: p.title.clone(), source: p.source.clone(), position: p.pos, duration: p.dur, poster: p.poster.clone() };
-                if let Err(e) = self.db.save_progress(&prog) {
-                    self.status = format!("Error saving progress: {e:#}");
-                }
-                self.recent = self.db.recent_progress(20).unwrap_or_default();
+            let prog = Progress { key: p.key.clone(), title: p.title.clone(), source: p.source.clone(), position: p.pos, duration: p.dur, poster: p.poster.clone() };
+            self.record_progress(prog);
+        }
+    }
+
+    /// Past 90% the title counts as watched and loses its resume point; before that its position is saved.
+    fn record_progress(&mut self, p: Progress) {
+        if p.duration > 0.0 && p.position >= p.duration * 0.9 {
+            // Also for a rewatch of a watched title, so its resume point leaves Continue Watching.
+            if !self.watched_keys.contains(&p.key) || self.recent.iter().any(|r| r.key == p.key) {
+                self.set_watched(&p.key, true);
             }
+        } else if p.position > 0.0 {
+            if let Err(e) = self.db.save_progress(&p) {
+                self.status = format!("Error saving progress: {e:#}");
+            }
+            self.recent = self.db.recent_progress(20).unwrap_or_default();
         }
     }
 
@@ -812,6 +872,7 @@ impl App {
         if !p.player.poll() || p.player.state.error.is_some() {
             self.status = p.player.state.error.clone().unwrap_or_else(|| "Player closed".into());
             self.stop_player();
+            self.release_torrents(None);
             return;
         }
         let st = &p.player.state;
@@ -913,13 +974,18 @@ impl App {
         self.status = format!("Searching for \"{query}\"...");
         self.spawn(ctx, async move {
             let (mut items, mut errors) = (Vec::new(), Vec::new());
-            for (u, kind, id) in &targets {
-                match client.search(u, kind, id, &query).await {
+            let n = targets.len();
+            let ask = |(u, kind, id): (String, String, String)| {
+                let (client, query) = (client.clone(), query.clone());
+                async move { client.search(&u, &kind, &id, &query).await }
+            };
+            for res in concurrently(targets, ask).await {
+                match res {
                     Ok(ms) => items.extend(ms),
                     Err(e) => errors.push(format!("{e:#}")),
                 }
             }
-            if errors.len() == targets.len() {
+            if errors.len() == n {
                 anyhow::bail!("search failed: {}", errors.join("; "));
             }
             Ok(Msg::Catalog(format!("Results for \"{query}\""), items))
@@ -927,6 +993,11 @@ impl App {
     }
 
     fn fetch_poster(&mut self, ctx: &egui::Context, url: String) {
+        if self.posters.len() >= POSTER_CACHE {
+            // shortcut: drops every poster at once, not the least recently used; on-screen ones reload next frame.
+            self.posters.clear();
+            ctx.forget_all_images();
+        }
         self.posters.insert(url.clone(), None);
         let client = self.client.clone();
         self.spawn(ctx, async move {
@@ -1043,7 +1114,10 @@ impl App {
         self.stop_player();
         match next {
             Some((m, v)) => self.open_streams(ctx, m, Some(v), Autoplay::Only, binge),
-            None => self.status = "Finished".into(),
+            None => {
+                self.release_torrents(None);
+                self.status = "Finished".into();
+            }
         }
     }
 
@@ -1058,11 +1132,13 @@ impl App {
         let client = self.client.clone();
         let addons = self.addons_for("meta", &meta.kind, &meta.id);
         self.status = format!("Loading episodes for {}...", meta.name);
+        self.nav += 1;
+        let nav = self.nav;
         self.spawn(ctx, async move {
             let mut errors = Vec::new();
             for u in &addons {
                 match client.meta(u, &meta.kind, &meta.id).await {
-                    Ok(m) if !m.videos.is_empty() => return Ok(Msg::Episodes(meta, m)),
+                    Ok(m) if !m.videos.is_empty() => return Ok(Msg::Episodes(meta, m, nav)),
                     Ok(_) => {}
                     Err(e) => errors.push(format!("{e:#}")),
                 }
@@ -1114,24 +1190,34 @@ impl App {
         let stream_addons = self.addons_for("stream", &meta.kind, &id);
         let sub_addons = self.addons_for("subtitles", &meta.kind, &id);
         self.status = format!("Loading streams for {}...", meta.name);
+        self.nav += 1;
+        let nav = self.nav;
         self.spawn(ctx, async move {
             let (mut streams, mut subs, mut errors) = (Vec::new(), Vec::new(), Vec::new());
-            for u in &stream_addons {
-                match client.streams(u, &meta.kind, &id).await {
+            let (kind, vid) = (meta.kind.clone(), id.clone());
+            let ask_streams = |u: String| {
+                let (c, k, i) = (client.clone(), kind.clone(), vid.clone());
+                async move { c.streams(&u, &k, &i).await }
+            };
+            let ask_subs = |u: String| {
+                let (c, k, i) = (client.clone(), kind.clone(), vid.clone());
+                async move { c.subtitles(&u, &k, &i).await }
+            };
+            let (stream_res, sub_res) = tokio::join!(concurrently(stream_addons, ask_streams), concurrently(sub_addons, ask_subs));
+            for res in stream_res {
+                match res {
                     Ok(s) => streams.extend(s),
                     Err(e) => errors.push(format!("{e:#}")),
                 }
             }
-            for u in &sub_addons {
-                // Subtitles are optional; a failing subtitle addon must not block playback.
-                if let Ok(s) = client.subtitles(u, &meta.kind, &id).await {
-                    subs.extend(s.into_iter().map(|s| (s.url, s.lang)));
-                }
+            // Subtitles are optional; a failing subtitle addon must not block playback.
+            for s in sub_res.into_iter().flatten() {
+                subs.extend(s.into_iter().map(|s| (s.url, s.lang)));
             }
             if streams.is_empty() && !errors.is_empty() {
                 anyhow::bail!("no streams: {}", errors.join("; "));
             }
-            Ok(Msg::Streams(meta, episode, streams, subs, autoplay, binge))
+            Ok(Msg::Streams(meta, episode, streams, subs, autoplay, binge, nav))
         });
     }
 
@@ -1869,6 +1955,7 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             }
             self.stop_player();
+            self.release_torrents(None);
             self.status = "Stopped".into();
         } else if next {
             self.play_next(&ctx);
@@ -2011,17 +2098,16 @@ impl App {
             ui.add(egui::TextEdit::singleline(&mut self.folder).hint_text("/path/to/videos").desired_width(400.0)).labelled_by(l.id);
             if primary_button(ui, "Add folder").clicked() {
                 let dir = PathBuf::from(self.folder.trim());
-                match scan(&dir).map_err(anyhow::Error::from).and_then(|items| {
-                    self.db.add_library_folder(&dir, &items)?;
-                    self.db.set_setting("last_folder", &dir.to_string_lossy())?;
-                    Ok(items.len())
-                }) {
-                    Ok(n) => {
-                        self.status = format!("Added {n} files from {}", dir.display());
-                        self.library = self.db.library_items().unwrap_or_default();
-                    }
-                    Err(e) => self.status = format!("Error: {e:#}"),
-                }
+                self.status = format!("Scanning {}...", dir.display());
+                // Off the UI thread: a big folder or network share can take minutes.
+                self.spawn(&ctx, async move {
+                    let res = tokio::task::spawn_blocking({
+                        let dir = dir.clone();
+                        move || scan(&dir).map_err(|e| e.to_string())
+                    })
+                    .await?;
+                    Ok(Msg::Scanned(dir, res))
+                });
             }
         });
         ui.separator();
@@ -2106,6 +2192,7 @@ impl eframe::App for App {
                 ui.label(RichText::new(state).color(Color32::from_gray(160)));
                 if self.player.is_some() && small_button(ui, "Stop").clicked() {
                     self.stop_player();
+                    self.release_torrents(None);
                 }
                 ui.label(RichText::new(format!("Status: {}", self.status)).color(Color32::from_gray(160)));
             });
@@ -2116,6 +2203,7 @@ impl eframe::App for App {
                     (self.selected, self.details) = (None, None);
                     (self.episodes, self.episode) = (Vec::new(), None);
                     self.scroll_top = true;
+                    self.nav += 1;
                 }
                 ui.add_space(6.0);
             }
@@ -2134,7 +2222,7 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result {
-    let mut app = App::new().expect("failed to initialise app data");
+    let mut app = App::new(data_dir()).expect("failed to initialise app data");
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0])
             .with_title("Scarlet")
@@ -2195,7 +2283,7 @@ mod tests {
 
     #[test]
     fn episodes_sort_with_specials_last() {
-        let v = |season, episode| Video { id: format!("tt1:{season:?}:{episode}"), title: None, season, episode: Some(episode), released: None, thumbnail: None };
+        let v = |season, episode| Video { id: format!("tt1:{season:?}:{episode}"), title: None, season, episode: Some(episode), released: None };
         let mut eps = vec![v(Some(0), 1), v(None, 1), v(Some(2), 1), v(Some(1), 2), v(Some(1), 1)];
         sort_episodes(&mut eps);
         let order: Vec<_> = eps.iter().map(|e| (e.season, e.episode)).collect();
@@ -2205,7 +2293,7 @@ mod tests {
 
     #[test]
     fn next_episode_in_watch_order() {
-        let v = |season, episode| Video { id: format!("{season:?}:{episode}"), title: None, season, episode: Some(episode), released: None, thumbnail: None };
+        let v = |season, episode| Video { id: format!("{season:?}:{episode}"), title: None, season, episode: Some(episode), released: None };
         let mut eps = vec![v(Some(1), 1), v(Some(1), 2), v(Some(2), 1), v(Some(0), 1), v(Some(0), 2), v(None, 1)];
         sort_episodes(&mut eps);
         let next = |id: &str| next_episode(&eps, id).map(|n| n.id.as_str());
@@ -2266,6 +2354,50 @@ mod tests {
         assert!(request_headers(&streams, &magnet, "http://127.0.0.1:1234/stream").is_empty(), "torrent");
         assert!(request_headers(&streams, "/media/v.mkv", "/media/v.mkv").is_empty(), "local file");
         assert_eq!((fmt_size(734_003_200), fmt_size(2_345_000_000)), ("734 MB".to_string(), "2.35 GB".to_string()));
+    }
+
+    fn test_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(dir.path().into()).unwrap();
+        (dir, app)
+    }
+
+    #[test]
+    fn stale_replies_are_dropped() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let m = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
+        app.nav = 2;
+        app.handle(&ctx, Msg::Streams(m("a"), None, vec![], vec![], Autoplay::Off, None, 1));
+        assert!(app.selected.is_none(), "reply for an older navigation");
+        let series = stremio_lite::addon::parse_meta(br#"{"meta":{"id":"s","type":"series","name":"S","videos":[{"id":"s:1:1","season":1,"episode":1}]}}"#).unwrap();
+        app.handle(&ctx, Msg::Episodes(MetaPreview { kind: "series".into(), ..m("s") }, series, 1));
+        assert!(app.selected.is_none() && app.episodes.is_empty());
+        app.handle(&ctx, Msg::Play("movie:a".into(), "a".into(), "https://x.example/a".into(), "https://x.example/a".into(), vec![], None, 1));
+        assert!(app.player.is_none());
+        app.handle(&ctx, Msg::Streams(m("b"), None, vec![], vec![], Autoplay::Off, None, 2));
+        assert_eq!(app.selected.as_ref().map(|(m, ..)| m.id.as_str()), Some("b"), "current reply applies");
+    }
+
+    #[test]
+    fn rewatch_past_90_percent_leaves_continue_watching() {
+        let (_dir, mut app) = test_app();
+        app.set_watched("movie:tt1", true);
+        let p = |position| Progress { key: "movie:tt1".into(), title: "T".into(), source: "https://x.example/v".into(), position, duration: 100.0, poster: None };
+        app.record_progress(p(50.0));
+        assert_eq!(app.recent.len(), 1, "a rewatch keeps a resume point");
+        app.record_progress(p(95.0));
+        assert!(app.recent.is_empty() && app.db.progress("movie:tt1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrently_keeps_item_order() {
+        let out = concurrently(vec![30u64, 0, 10], |ms| async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            anyhow::Ok(ms)
+        })
+        .await;
+        assert_eq!(out.into_iter().map(Result::unwrap).collect::<Vec<_>>(), [30, 0, 10]);
     }
 
     #[test]

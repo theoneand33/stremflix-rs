@@ -213,8 +213,6 @@ pub struct Video {
     /// ISO 8601 release date.
     #[serde(default)]
     pub released: Option<String>,
-    #[serde(default)]
-    pub thumbnail: Option<String>,
 }
 
 fn lenient_vec<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
@@ -263,8 +261,6 @@ pub struct BehaviorHints {
     pub filename: Option<String>,
     /// `videoSize` in bytes.
     pub video_size: Option<u64>,
-    /// `notWebReady`: a browser would need it transcoded/proxied; mpv plays it as is, so it is informational only.
-    pub not_web_ready: bool,
 }
 
 const MAX_HEADERS: usize = 32;
@@ -295,7 +291,6 @@ fn behavior_hints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BehaviorHint
             .collect(),
         filename: text("filename"),
         video_size: v.get("videoSize").and_then(|x| x.as_u64()),
-        not_web_ready: v.get("notWebReady").and_then(|x| x.as_bool()).unwrap_or(false),
     })
 }
 
@@ -315,15 +310,6 @@ pub enum PlayTarget {
 }
 
 impl Stream {
-    pub fn label(&self) -> String {
-        let parts: Vec<&str> = [&self.name, &self.title, &self.description]
-            .into_iter()
-            .flatten()
-            .map(|s| s.as_str())
-            .collect();
-        if parts.is_empty() { "Stream".into() } else { parts.join(" - ").replace('\n', " ") }
-    }
-
     /// Playable source string (http URL or magnet with BEP 53 file index).
     pub fn source(&self) -> Option<String> {
         Some(match self.target()? {
@@ -377,15 +363,16 @@ pub fn is_info_hash(h: &str) -> bool {
     h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Info hash of a magnet: 40 hex digits (lowercased) or the 32-character base32 form (uppercase, as librqbit reads it).
 pub fn parse_magnet_hash(m: &str) -> Option<String> {
     let u = Url::parse(m).ok()?;
     if u.scheme() != "magnet" {
         return None;
     }
-    u.query_pairs()
-        .find(|(k, v)| k == "xt" && v.starts_with("urn:btih:"))
-        .map(|(_, v)| v["urn:btih:".len()..].to_ascii_lowercase())
-        .filter(|h| is_info_hash(h))
+    let (_, v) = u.query_pairs().find(|(k, v)| k == "xt" && v.starts_with("urn:btih:"))?;
+    let h = &v["urn:btih:".len()..];
+    let base32 = h.len() == 32 && h.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7'));
+    if is_info_hash(h) { Some(h.to_ascii_lowercase()) } else { base32.then(|| h.to_string()) }
 }
 
 /// Peer hints (`x.pe=host:port`) embedded in a magnet link.
@@ -498,7 +485,6 @@ pub fn parse_meta(body: &[u8]) -> Result<Meta> {
     for v in &mut m.videos {
         opt_text(&mut v.title, MAX_TEXT);
         opt_text(&mut v.released, 64);
-        opt_url(&mut v.thumbnail);
     }
     Ok(m)
 }

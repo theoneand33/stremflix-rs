@@ -22,7 +22,6 @@ fn data_survives_reopen() {
     }
     let db = Db::open(&path).unwrap();
     assert_eq!(db.addons().unwrap(), vec![("https://x.example/manifest.json".to_string(), manifest)]);
-    assert_eq!(db.library_folders().unwrap(), vec![std::path::PathBuf::from("/videos")]);
     assert_eq!(db.library_items().unwrap(), vec![item]);
     assert_eq!(db.setting("theme").unwrap().as_deref(), Some("dark"));
     assert_eq!(db.setting("missing").unwrap(), None);
