@@ -94,6 +94,39 @@ fn meta_parsing() {
 }
 
 #[test]
+fn meta_detail_fields() {
+    let m = parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": "One",
+        "genres": ["Drama", " ", "Sci\u0007-Fi", 7], "cast": ["A", "B"], "director": ["D"],
+        "runtime": "118 min", "imdbRating": 7.8, "background": "https://img.example/bg.jpg", "logo": "file:///etc/passwd",
+        "links": [
+            {"name": "7.8", "category": "imdb", "url": "https://imdb.com/title/tt1"},
+            {"name": "Drama", "category": "Genres", "url": "stremio:///discover/x"},
+            {"name": "", "category": "x", "url": "https://a.example/"},
+            {"category": "x", "url": "https://a.example/"},
+            "junk"
+        ]}}"#)
+    .unwrap();
+    assert_eq!(m.genres, ["Drama", "Sci-Fi"]);
+    assert_eq!((m.cast.len(), m.director.as_slice()), (2, ["D".to_string()].as_slice()));
+    assert_eq!((m.runtime.as_deref(), m.imdb_rating.as_deref()), (Some("118 min"), Some("7.8")));
+    assert_eq!((m.background.as_deref(), m.logo.as_deref()), (Some("https://img.example/bg.jpg"), None));
+    assert_eq!(m.links.len(), 1, "non-http, nameless and malformed links dropped");
+    assert_eq!((m.links[0].category.as_str(), m.links[0].url.as_str()), ("imdb", "https://imdb.com/title/tt1"));
+    // Legacy `genre`, wrong types and oversized lists never fail the meta.
+    let many: Vec<String> = (0..100).map(|i| format!("\"p{i}\"")).collect();
+    let body = format!(
+        r#"{{"meta": {{"id": "tt1", "type": "movie", "name": "One", "genre": ["Comedy"], "cast": [{}],
+        "director": "D", "links": {{}}, "runtime": [1], "imdbRating": null, "releaseInfo": 2020, "logo": 5}}}}"#,
+        many.join(",")
+    );
+    let m = parse_meta(body.as_bytes()).unwrap();
+    assert_eq!(m.genres, ["Comedy"]);
+    assert_eq!(m.cast.len(), 30, "cast capped");
+    assert!(m.director.is_empty() && m.links.is_empty() && m.runtime.is_none() && m.imdb_rating.is_none() && m.logo.is_none());
+    assert_eq!(m.release_info.as_deref(), Some("2020"));
+}
+
+#[test]
 fn meta_videos_parsing() {
     let m = parse_meta(br#"{"meta": {"id": "tt9", "type": "series", "name": "Show", "videos": [
         {"id": "tt9:1:2", "name": "Pilot\u0007 ", "season": 1, "episode": 2, "released": "2020-01-01T00:00:00.000Z", "thumbnail": "https://img.example/e.jpg"},
