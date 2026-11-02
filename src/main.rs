@@ -181,7 +181,9 @@ fn card_play(ui: &mut egui::Ui, card: &egui::Response, rect: egui::Rect, label: 
         let p = ui.painter();
         p.circle_filled(b.center(), 28.0, Color32::from_black_alpha(if r.hovered() { 210 } else { 140 }));
         p.circle_stroke(b.center(), 27.0, (2.0, Color32::WHITE));
-        p.text(b.center() + vec2(2.0, 0.0), egui::Align2::CENTER_CENTER, icons::PLAY, egui::FontId::new(26.0, fill()), Color32::WHITE);
+        // Triangle centroid on the circle center; a font glyph centers on its line box, not its ink.
+        let c = b.center();
+        p.add(egui::Shape::convex_polygon(vec![c + vec2(-7.0, -11.0), c + vec2(14.0, 0.0), c + vec2(-7.0, 11.0)], Color32::WHITE, egui::Stroke::NONE));
     }
     r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
