@@ -30,6 +30,8 @@ enum Msg {
     Catalog(String, Vec<MetaPreview>),
     /// Row source (addon URL, type, catalog id) and its items or error.
     Row((String, String, String), Result<Vec<MetaPreview>, String>),
+    /// Row source, the `skip` it was requested with, and the next page or error.
+    More((String, String, String), usize, Result<Vec<MetaPreview>, String>),
     /// meta, episode (series only), streams, subtitle URLs, play the first stream on arrival,
     /// and the `bingeGroup` to autoplay (next episode)
     Streams(MetaPreview, Option<Video>, Vec<Stream>, Vec<String>, bool, Option<String>),
@@ -53,6 +55,23 @@ struct Row {
     src: (String, String, String),
     /// `None` while loading; empty rows are hidden.
     items: Option<Vec<MetaPreview>>,
+    /// Catalog declares the `skip` extra.
+    skippable: bool,
+    /// Items received from the addon so far (the next `skip`), before de-duplication.
+    fetched: usize,
+    loading_more: bool,
+    /// Last page was empty, had nothing new, or failed.
+    exhausted: bool,
+}
+
+/// Max items kept per catalog row.
+const ROW_CAP: usize = 1000;
+
+impl Row {
+    /// Request the next page when the row is scrolled near its end.
+    fn wants_more(&self, near_end: bool) -> bool {
+        near_end && self.skippable && !self.loading_more && !self.exhausted && self.items.as_ref().is_some_and(|i| !i.is_empty() && i.len() < ROW_CAP)
+    }
 }
 
 const RED: Color32 = Color32::from_rgb(229, 9, 20);
@@ -395,6 +414,26 @@ impl App {
                     self.status = format!("Error loading {}: {e}", row.title);
                     Vec::new()
                 }));
+                row.fetched = row.items.as_ref().map_or(0, Vec::len);
+            }
+            Msg::More(src, skip, res) => {
+                // Ignore replies for a row that was rebuilt or advanced since the request.
+                let Some(row) = self.rows.iter_mut().find(|r| r.src == src && r.loading_more && r.fetched == skip) else { return };
+                row.loading_more = false;
+                match res {
+                    Ok(page) => {
+                        row.fetched += page.len();
+                        let items = row.items.get_or_insert_with(Vec::new);
+                        let mut seen: std::collections::HashSet<String> = items.iter().map(|m| m.id.clone()).collect();
+                        let before = items.len();
+                        items.extend(page.into_iter().filter(|m| seen.insert(m.id.clone())).take(ROW_CAP - before));
+                        row.exhausted = items.len() == before;
+                    }
+                    Err(e) => {
+                        row.exhausted = true;
+                        self.status = format!("Error loading more of {}: {e}", row.title);
+                    }
+                }
             }
             Msg::Streams(meta, episode, streams, subs, autoplay, binge) => {
                 if episode.is_some() {
@@ -588,13 +627,13 @@ impl App {
             .into_iter()
             .map(|(title, i)| {
                 let (u, _, c) = cats[i];
-                Row { title, src: (u.clone(), c.kind.clone(), c.id.clone()), items: None }
+                Row { title, src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: c.supports("skip"), fetched: 0, loading_more: false, exhausted: false }
             })
             .collect();
         for src in self.rows.iter().map(|r| r.src.clone()).collect::<Vec<_>>() {
             let client = self.client.clone();
             self.spawn(ctx, async move {
-                let res = client.catalog(&src.0, &src.1, &src.2).await.map_err(|e| format!("{e:#}"));
+                let res = client.catalog(&src.0, &src.1, &src.2, 0).await.map_err(|e| format!("{e:#}"));
                 Ok(Msg::Row(src, res))
             });
         }
@@ -923,18 +962,32 @@ impl App {
         if clear {
             self.search_results = None;
         }
+        let mut more = Vec::new();
         for row in &self.rows {
             match &row.items {
                 Some(items) if items.is_empty() => continue,
                 Some(items) => {
                     Self::row_title(ui, &row.title);
-                    self.ui_cards(ui, &row.title, items, &mut want, &mut open);
+                    let near_end = self.ui_cards(ui, &row.title, items, &mut want, &mut open);
+                    if row.wants_more(near_end) {
+                        more.push((row.src.clone(), row.fetched));
+                    }
                 }
                 None => {
                     Self::row_title(ui, &row.title);
                     ui.spinner();
                 }
             }
+        }
+        for (src, skip) in more {
+            if let Some(row) = self.rows.iter_mut().find(|r| r.src == src) {
+                row.loading_more = true;
+            }
+            let client = self.client.clone();
+            self.spawn(&ctx, async move {
+                let res = client.catalog(&src.0, &src.1, &src.2, skip).await.map_err(|e| format!("{e:#}"));
+                Ok(Msg::More(src, skip, res))
+            });
         }
         want.sort();
         want.dedup();
@@ -959,11 +1012,15 @@ impl App {
     }
 
     /// Horizontally scrolling poster cards; a click selects the title.
-    fn ui_cards(&self, ui: &mut egui::Ui, salt: &str, items: &[MetaPreview], want: &mut Vec<String>, open: &mut Option<(MetaPreview, bool)>) {
+    /// Returns true when one of the last 3 cards is on screen.
+    fn ui_cards(&self, ui: &mut egui::Ui, salt: &str, items: &[MetaPreview], want: &mut Vec<String>, open: &mut Option<(MetaPreview, bool)>) -> bool {
+        let mut near_end = false;
         egui::ScrollArea::horizontal().id_salt(salt).show(ui, |ui| {
             ui.horizontal(|ui| {
-                for m in items {
+                for (i, m) in items.iter().enumerate() {
                     let (r, rect) = card(ui, CARD, &m.name);
+                    // The scroll viewport clips, so a visible third-to-last card means near the end.
+                    near_end |= i + 3 >= items.len() && ui.is_rect_visible(r.rect);
                     self.paint_poster(ui, &r, rect, &m.poster, &m.name, want);
                     if r.on_hover_text(m.description.as_deref().unwrap_or(&m.name)).clicked() {
                         *open = Some((m.clone(), false));
@@ -971,6 +1028,7 @@ impl App {
                 }
             });
         });
+        near_end
     }
 
     /// Poster image in `rect`, or the title on a gray card until it loads.
@@ -1603,6 +1661,23 @@ mod tests {
         assert_eq!(next("Some(0):1"), Some("Some(0):2"));
         assert_eq!(next("None:1"), None, "last video");
         assert_eq!(next("missing"), None);
+    }
+
+    #[test]
+    fn row_wants_more_only_when_it_can() {
+        let m = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
+        let row = Row { title: String::new(), src: Default::default(), items: Some(vec![m("a")]), skippable: true, fetched: 1, loading_more: false, exhausted: false };
+        assert!(row.wants_more(true));
+        assert!(!row.wants_more(false), "not near the end");
+        assert!(!Row { skippable: false, ..clone_row(&row) }.wants_more(true), "no skip extra");
+        assert!(!Row { loading_more: true, ..clone_row(&row) }.wants_more(true), "in flight");
+        assert!(!Row { exhausted: true, ..clone_row(&row) }.wants_more(true), "exhausted");
+        assert!(!Row { items: None, ..clone_row(&row) }.wants_more(true), "still loading");
+        assert!(!Row { items: Some((0..ROW_CAP).map(|i| m(&i.to_string())).collect()), ..clone_row(&row) }.wants_more(true), "capped");
+    }
+
+    fn clone_row(r: &Row) -> Row {
+        Row { title: String::new(), src: Default::default(), items: r.items.clone(), skippable: r.skippable, fetched: r.fetched, loading_more: r.loading_more, exhausted: r.exhausted }
     }
 
     #[test]

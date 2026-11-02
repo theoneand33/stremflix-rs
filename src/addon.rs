@@ -486,6 +486,14 @@ fn enc(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>().replace('+', "%20")
 }
 
+/// Relative catalog URL; `skip > 0` adds the Stremio `skip` extra.
+pub fn catalog_path(kind: &str, id: &str, skip: usize) -> String {
+    match skip {
+        0 => format!("catalog/{}/{}.json", enc(kind), enc(id)),
+        n => format!("catalog/{}/{}/skip={n}.json", enc(kind), enc(id)),
+    }
+}
+
 #[derive(Clone)]
 pub struct AddonClient {
     http: reqwest::Client,
@@ -528,8 +536,9 @@ impl AddonClient {
         Ok(addon_base(transport_url)?.join(&format!("{resource}/{}/{}.json", enc(kind), enc(id)))?)
     }
 
-    pub async fn catalog(&self, transport_url: &str, kind: &str, id: &str) -> Result<Vec<MetaPreview>> {
-        parse_catalog(&self.get(Self::resource_url(transport_url, "catalog", kind, id)?).await?)
+    /// One catalog page; `skip` is the number of items already fetched (0 = first page).
+    pub async fn catalog(&self, transport_url: &str, kind: &str, id: &str, skip: usize) -> Result<Vec<MetaPreview>> {
+        parse_catalog(&self.get(addon_base(transport_url)?.join(&catalog_path(kind, id, skip))?).await?)
     }
 
     pub async fn search(&self, transport_url: &str, kind: &str, id: &str, query: &str) -> Result<Vec<MetaPreview>> {

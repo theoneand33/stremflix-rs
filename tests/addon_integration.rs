@@ -16,7 +16,7 @@ async fn client_against_test_addon() {
     assert!(["catalog", "meta", "stream", "subtitles"].iter().all(|r| m.has_resource(r)));
     let cat = &m.catalogs[0];
 
-    let metas = c.catalog(&url, &cat.kind, &cat.id).await.unwrap();
+    let metas = c.catalog(&url, &cat.kind, &cat.id, 0).await.unwrap();
     assert_eq!(metas.len(), 1);
     assert_eq!(metas[0].poster.as_deref(), Some(format!("{base}/media/poster.jpg").as_str()));
     assert!(cat.supports("search") && !cat.requires_extra());
@@ -38,6 +38,6 @@ async fn client_against_test_addon() {
 
     // Malformed and missing resources are errors, not panics.
     assert!(c.fetch_manifest(&format!("{base}/malformed/manifest.json")).await.is_err());
-    assert!(c.catalog(&url, "movie", "nope").await.is_err());
+    assert!(c.catalog(&url, "movie", "nope", 0).await.is_err());
     assert!(c.fetch_manifest(&format!("{base}/manifest.txt")).await.is_err());
 }
