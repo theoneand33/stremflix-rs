@@ -12,7 +12,7 @@ use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, MetaPreview, Stream
 use stremio_lite::db::{Db, Progress, Watched};
 use stremio_lite::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremio_lite::player::{GlProc, Player};
+use stremio_lite::player::{GlProc, Player, SUB_COLORS, SubStyle};
 use stremio_lite::stremio_import::{self, Import};
 use stremio_lite::torrent::TorrentEngine;
 
@@ -232,6 +232,7 @@ struct Playing {
 }
 
 struct App {
+    sub_style: SubStyle,
     rt: tokio::runtime::Runtime,
     db: Db,
     data_dir: PathBuf,
@@ -297,6 +298,7 @@ impl App {
         let db = Db::open(&data_dir.join("stremio-lite.db"))?;
         let (tx, rx) = channel();
         let mut app = Self {
+            sub_style: db.setting("sub_style")?.map(|s| SubStyle::decode(&s)).unwrap_or_default(),
             rt: tokio::runtime::Runtime::new()?,
             addons: db.addons()?,
             library: db.library_items()?,
@@ -463,6 +465,7 @@ impl App {
                 };
                 match Player::launch(&url, &title, start, &subs, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
+                        let _ = player.apply_sub_style(&self.sub_style);
                         self.status = if start > 0.0 { format!("Resuming at {}", fmt_time(start)) } else { "Playing".into() };
                         let p = Playing { player, key, title, source, pos: start, dur: 0.0, poster, osd_until: 0.0, menu: false, scrub: None };
                         self.player = Some(p);
@@ -1027,6 +1030,7 @@ impl App {
         let mut cmds: Vec<Vec<String>> = Vec::new();
         let mut cmd = |a: &[&str]| cmds.push(a.iter().map(|s| s.to_string()).collect());
         let (mut back, mut toggle_fs) = (false, false);
+        let mut style = self.sub_style;
         ui.painter().rect_filled(rect, 0, Color32::BLACK);
 
         // Video: mpv renders on the GPU into our framebuffer at on-screen pixel size.
@@ -1216,12 +1220,41 @@ impl App {
                                             cmd(&["set", prop, &v]);
                                         }
                                     }
+                                    if kind == "sub" {
+                                        ui.add_space(12.0);
+                                        ui.label(RichText::new("Style").size(16.0).family(bold()).color(Color32::WHITE));
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("Size {:.1}x", style.scale));
+                                            if ui.button("-").clicked() { style.scale -= 0.1 }
+                                            if ui.button("+").clicked() { style.scale += 0.1 }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            for (i, (name, _)) in SUB_COLORS.iter().enumerate() {
+                                                if ui.selectable_label(style.color == i, *name).clicked() { style.color = i }
+                                            }
+                                        });
+                                        ui.checkbox(&mut style.background, "Background box");
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("Delay {:+.1}s", style.delay));
+                                            if ui.button("-").clicked() { style.delay -= 0.1 }
+                                            if ui.button("+").clicked() { style.delay += 0.1 }
+                                            if ui.button("Reset").clicked() { style.delay = 0.0 }
+                                        });
+                                    }
                                 });
                             }
                         });
                     });
                 });
             }
+        }
+        let style = style.clamped();
+        if style != self.sub_style {
+            self.sub_style = style;
+            if let Err(e) = self.db.set_setting("sub_style", &style.encode()) {
+                self.status = format!("Error: {e:#}");
+            }
+            let _ = p.player.apply_sub_style(&style);
         }
         for c in &cmds {
             let args: Vec<&str> = c.iter().map(String::as_str).collect();

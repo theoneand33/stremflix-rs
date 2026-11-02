@@ -111,6 +111,57 @@ pub struct State {
     pub error: Option<String>,
 }
 
+/// Subtitle appearance chosen in the player menu; persisted as one setting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubStyle {
+    pub scale: f64,
+    /// Index into [`SUB_COLORS`].
+    pub color: usize,
+    pub background: bool,
+    /// Seconds; positive shows subtitles later.
+    pub delay: f64,
+}
+
+/// Preset text colors: label and mpv `sub-color` value.
+pub const SUB_COLORS: [(&str, &str); 4] = [("White", "#FFFFFF"), ("Yellow", "#FFFF00"), ("Green", "#00FF00"), ("Cyan", "#00FFFF")];
+
+impl Default for SubStyle {
+    fn default() -> Self {
+        Self { scale: 1.0, color: 0, background: false, delay: 0.0 }
+    }
+}
+
+impl SubStyle {
+    /// Forces every field into its valid range (also guards NaN and stale stored values).
+    pub fn clamped(self) -> Self {
+        let n = |v: f64, lo: f64, hi: f64, d: f64| if v.is_finite() { v.clamp(lo, hi) } else { d };
+        Self { scale: n(self.scale, 0.5, 3.0, 1.0), color: self.color.min(SUB_COLORS.len() - 1), background: self.background, delay: (n(self.delay, -60.0, 60.0, 0.0) * 10.0).round() / 10.0 }
+    }
+
+    /// mpv properties to `set`. `sub-border-style` makes `sub-back-color` show as a box.
+    pub fn props(&self) -> [(&'static str, String); 5] {
+        let s = self.clamped();
+        [
+            ("sub-scale", format!("{:.2}", s.scale)),
+            ("sub-color", SUB_COLORS[s.color].1.into()),
+            ("sub-border-style", if s.background { "background-box" } else { "outline-and-shadow" }.into()),
+            ("sub-back-color", "#99000000".into()),
+            ("sub-delay", format!("{:.1}", s.delay)),
+        ]
+    }
+
+    pub fn encode(&self) -> String {
+        format!("{},{},{},{}", self.scale, self.color, self.background as u8, self.delay)
+    }
+
+    /// Parses [`encode`](Self::encode) output; any malformed value falls back to the default.
+    pub fn decode(s: &str) -> Self {
+        let p: Vec<&str> = s.split(',').collect();
+        let (Some(Ok(scale)), Some(Ok(color)), Some(bg), Some(Ok(delay))) = (p.first().map(|v| v.parse()), p.get(1).map(|v| v.parse()), p.get(2), p.get(3).map(|v| v.parse())) else { return Self::default() };
+        Self { scale, color, background: *bg == "1", delay }.clamped()
+    }
+}
+
 pub struct Player {
     mpv: *mut c_void,
     render: *mut c_void,
@@ -258,6 +309,14 @@ impl Player {
         Ok(())
     }
 
+    /// Sets the subtitle style properties (async, like every other command).
+    pub fn apply_sub_style(&self, st: &SubStyle) -> Result<()> {
+        for (k, v) in st.props() {
+            self.command(&["set", k, &v])?;
+        }
+        Ok(())
+    }
+
     /// Drains mpv events into [`State`]. Returns false once mpv has shut down.
     pub fn poll(&mut self) -> bool {
         while self.alive {
@@ -378,6 +437,16 @@ mod tests {
     fn parses_cli_style_args() {
         let a = parse_args("--ao=null --no-audio-display --fs junk");
         assert_eq!(a, [("ao".into(), "null".into()), ("audio-display".into(), "no".into()), ("fs".into(), "yes".into())]);
+    }
+
+    #[test]
+    fn sub_style_clamps_and_roundtrips() {
+        let s = SubStyle { scale: 9.0, color: 99, background: true, delay: -500.0 }.clamped();
+        assert_eq!((s.scale, s.color, s.delay), (3.0, SUB_COLORS.len() - 1, -60.0));
+        assert_eq!(SubStyle::decode(&s.encode()), s);
+        assert_eq!(SubStyle::decode("junk"), SubStyle::default());
+        assert_eq!(SubStyle::decode("NaN,0,0,0").scale, 1.0);
+        assert_eq!(SubStyle { background: true, ..Default::default() }.props()[2].1, "background-box");
     }
 
     #[test]
