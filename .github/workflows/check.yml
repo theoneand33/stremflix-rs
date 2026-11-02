@@ -14,7 +14,7 @@ jobs:
     env:
       STREMIO_LITE_NO_DHT: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install libmpv (Linux)
