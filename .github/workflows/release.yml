@@ -55,11 +55,29 @@ jobs:
       - name: Install libmpv (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libmpv-dev
-      - name: Install libmpv (macOS)
+      - name: Resolve libmpv (macOS)
+        id: brew-mpv
         if: runner.os == 'macOS'
         run: |
-          brew install mpv
-          echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
+          # cache only what brew would install (mpv + deps missing from the image); pouring ~38 bottles costs ~1.5 min
+          prefix=$(brew --prefix)
+          installed=$(brew list --formula -1)
+          {
+            echo "key=brew-mpv-$ImageOS-$ImageVersion-$(brew info --json=v2 mpv | jq -r '.formulae[0] | "\(.versions.stable)_\(.revision)"')"
+            echo 'paths<<EOF'
+            for f in mpv $(brew deps mpv); do grep -qx "$f" <<<"$installed" || printf '%s\n' "$prefix/Cellar/$f" "$prefix/opt/$f"; done
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+          echo "LIBRARY_PATH=$prefix/opt/mpv/lib" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        id: brew-cache
+        if: runner.os == 'macOS'
+        with:
+          path: ${{ steps.brew-mpv.outputs.paths }}
+          key: ${{ steps.brew-mpv.outputs.key }}
+      - name: Install libmpv (macOS)
+        if: runner.os == 'macOS' && steps.brew-cache.outputs.cache-hit != 'true'
+        run: brew install mpv
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
       - name: Install libmpv (Windows)
@@ -82,6 +100,7 @@ jobs:
           lib /nologo /machine:x64 /def:"$dir\mpv.def" /out:"$dir\mpv.lib"
           if ($LASTEXITCODE -ne 0) { throw "lib.exe failed" }
           "RUSTFLAGS=-L native=$dir" >> $env:GITHUB_ENV
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=rust-lld" >> $env:GITHUB_ENV # lld-link links faster than link.exe; set after rust-cache so its key is unchanged
           "MPV_DIR=$($dir.Replace('\', '/'))" >> $env:GITHUB_ENV # forward slashes for the bash Package step
       - run: cargo build --release --locked --bin stremio-lite
       - name: Package
