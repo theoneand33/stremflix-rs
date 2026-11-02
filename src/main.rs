@@ -331,7 +331,8 @@ fn list_row(ui: &mut egui::Ui, n: usize, head: String, details: String) -> egui:
     r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Play {head}")));
     let t = ui.ctx().animate_bool(r.id, r.hovered() || r.has_focus());
     let p = ui.painter();
-    p.rect_filled(rect, 10, Color32::from_gray(51).gamma_multiply(t));
+    // Inset so neighbouring rows' highlights never touch.
+    p.rect_filled(rect.shrink2(vec2(4.0, 4.0)), 8, Color32::from_gray(51).gamma_multiply(t));
     let num = p.layout_no_wrap(n.to_string(), egui::FontId::proportional(24.0), Color32::from_gray(210));
     p.galley(pos2(rect.left() + text_x / 2.0 - num.size().x / 2.0, rect.center().y - num.size().y / 2.0), num, Color32::WHITE);
     let top = rect.center().y - block / 2.0;
