@@ -49,7 +49,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: '[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "invalid version: $VERSION"; exit 1; }'
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install libmpv (Linux)
@@ -133,7 +133,7 @@ jobs:
           cp assets/icon.png "$RUNNER_TEMP/stremio-lite.png"
           # bundles libmpv and its deps; glibc, GL and other host libs stay on the excludelist
           "$ld" --appdir AppDir -e target/release/stremio-lite -d "$RUNNER_TEMP/stremio-lite.desktop" -i "$RUNNER_TEMP/stremio-lite.png" --output appimage
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.target }}
           path: |
@@ -146,7 +146,7 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
       - name: Create release
