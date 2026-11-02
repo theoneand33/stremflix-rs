@@ -87,7 +87,7 @@ enum Autoplay {
 }
 
 enum Msg {
-    Status(String),
+    Error(String),
     Installed(String, Manifest, Option<String>),
     /// Search title and results.
     Catalog(String, Vec<MetaPreview>),
@@ -111,7 +111,7 @@ enum Msg {
     /// progress key, poster URL found for a Continue Watching entry
     RecentPoster(String, String),
     /// Stremio storage that was read, and what it holds.
-    Imported(PathBuf, Import),
+    Imported(Import),
     /// Library folder and its scanned media files.
     Scanned(PathBuf, Result<Vec<LibraryItem>, String>),
 }
@@ -501,10 +501,11 @@ struct App {
     watched_keys: std::collections::HashSet<String>,
     /// Stremio data path to import from; empty = auto-detect.
     import_path: String,
+    /// Last error, shown in a dismissible red line until cleared.
+    error: Option<String>,
     /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
     pill: Option<(Tab, egui::Rect, egui::Rect, f64)>,
     player: Option<Playing>,
-    status: String,
     last_poll: Instant,
     /// GL function loader of eframe's context, for libmpv's OpenGL renderer.
     gl_proc: Option<GlProc>,
@@ -522,6 +523,12 @@ fn data_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(std::env::temp_dir);
     base.join("stremflix-rs")
+}
+
+/// Show `e` in the UI and on stderr (headless runs, CI).
+fn report(slot: &mut Option<String>, e: impl std::fmt::Display) {
+    eprintln!("error: {e:#}");
+    *slot = Some(format!("{e:#}"));
 }
 
 fn fmt_time(s: f64) -> String {
@@ -545,6 +552,7 @@ impl App {
             watched: db.watched(50)?,
             watched_keys: db.watched_keys()?,
             import_path: String::new(),
+            error: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
             db,
@@ -574,7 +582,6 @@ impl App {
             posters: HashMap::new(),
             player: None,
             pill: None,
-            status: "Ready".into(),
             last_poll: Instant::now(),
             gl_proc: None,
             video: None,
@@ -588,15 +595,13 @@ impl App {
     fn spawn<F: Future<Output = anyhow::Result<Msg>> + Send + 'static>(&self, ctx: &egui::Context, f: F) {
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         self.rt.spawn(async move {
-            let msg = f.await.unwrap_or_else(|e| Msg::Status(format!("Error: {e:#}")));
-            let _ = tx.send(msg);
+            let _ = tx.send(f.await.unwrap_or_else(|e| Msg::Error(format!("{e:#}"))));
             ctx.request_repaint();
         });
     }
 
     /// Resolve `source` (http URL, magnet, or local path) and start playback.
     fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
-        self.status = format!("Opening {title}...");
         self.nav += 1;
         let nav = self.nav;
         if !source.starts_with("magnet:") {
@@ -623,12 +628,11 @@ impl App {
 
     fn handle(&mut self, ctx: &egui::Context, msg: Msg) {
         match msg {
-            Msg::Status(s) => self.status = s,
+            Msg::Error(e) => report(&mut self.error, e),
             Msg::Installed(url, m, replaces) => {
-                self.status = format!("Installed {} {}", m.name, m.version);
                 let saved = self.db.add_addon(&url, &m);
                 if let Err(e) = &saved {
-                    self.status = format!("Error saving addon: {e:#}");
+                    report(&mut self.error, format!("saving addon: {e:#}"));
                 }
                 self.addons.retain(|(u, _)| *u != url);
                 if let Some(old) = replaces {
@@ -646,13 +650,12 @@ impl App {
                 self.fetch_recent_posters(ctx);
             }
             Msg::Catalog(name, items) => {
-                self.status = format!("{name}: {} items", items.len());
                 self.search_results = Some((name, items));
             }
             Msg::Row(src, res) => {
                 let Some(row) = self.rows.iter_mut().find(|r| r.src == src) else { return };
                 row.items = Some(res.unwrap_or_else(|e| {
-                    self.status = format!("Error loading {}: {e}", row.title);
+                    report(&mut self.error, format!("loading {}: {e:#}", row.title));
                     Vec::new()
                 }));
                 row.fetched = row.items.as_ref().map_or(0, Vec::len);
@@ -672,7 +675,7 @@ impl App {
                     }
                     Err(e) => {
                         row.exhausted = true;
-                        self.status = format!("Error loading more of {}: {e}", row.title);
+                        report(&mut self.error, format!("loading more of {}: {e:#}", row.title));
                     }
                 }
             }
@@ -680,7 +683,7 @@ impl App {
                 // Ignore replies for a selection the user has since changed.
                 if self.discover.src.as_ref() == Some(&src) {
                     self.discover.items = Some(res.unwrap_or_else(|e| {
-                        self.status = format!("Error loading catalog: {e}");
+                        report(&mut self.error, format!("loading catalog: {e:#}"));
                         Vec::new()
                     }));
                 }
@@ -694,7 +697,6 @@ impl App {
                     self.episodes.clear();
                     self.scroll_top = true;
                 }
-                self.status = format!("{}: {} streams", meta.name, streams.len());
                 let fallback = || if autoplay == Autoplay::Top { streams.iter().find_map(Stream::source) } else { only_source(&streams) };
                 let src = binge.and_then(|g| binge_source(&streams, &g)).or_else(fallback);
                 (self.selected, self.episode) = (Some((meta, streams, subs.clone())), episode);
@@ -715,7 +717,6 @@ impl App {
                 let meta = MetaPreview { name: m.name.clone(), poster: meta.poster.or(m.poster.clone()), ..meta };
                 self.details = Some(m);
                 sort_episodes(&mut videos);
-                self.status = format!("{}: {} episodes", meta.name, videos.len());
                 // Episodes imported as watched from Stremio: saved once as local marks, so they can be unmarked.
                 let bk = format!("bitfield:{}:{}", meta.kind, meta.id);
                 if let Ok(Some(field)) = self.db.setting(&bk) {
@@ -724,7 +725,7 @@ impl App {
                     if !keys.is_empty() {
                         match self.db.apply_watched_bitfield(&bk, &keys) {
                             Ok(()) => self.watched_keys.extend(keys),
-                            Err(e) => self.status = format!("Error saving watched episodes: {e:#}"),
+                            Err(e) => report(&mut self.error, format!("saving watched episodes: {e:#}")),
                         }
                     }
                 }
@@ -761,24 +762,17 @@ impl App {
             }
             Msg::RecentPoster(key, url) => {
                 if let Err(e) = self.db.set_progress_poster(&key, &url) {
-                    self.status = format!("Error saving poster: {e:#}");
+                    report(&mut self.error, format!("saving poster: {e:#}"));
                 }
                 for p in self.recent.iter_mut().filter(|p| p.key == key) {
                     p.poster = Some(url.clone());
                 }
             }
-            Msg::Imported(path, imp) => {
+            Msg::Imported(imp) => {
                 if let Err(e) = imp.save(&self.db) {
-                    self.status = format!("Error saving import: {e:#}");
+                    report(&mut self.error, format!("saving import: {e:#}"));
                     return;
                 }
-                self.status = format!(
-                    "Imported {} addons, {} in progress, {} watched from {}",
-                    imp.addons.len(),
-                    imp.progress.len(),
-                    imp.watched.len(),
-                    path.display()
-                );
                 self.addons = self.db.addons().unwrap_or_default();
                 self.recent = self.db.recent_progress(20).unwrap_or_default();
                 self.watched = self.db.watched(50).unwrap_or_default();
@@ -793,11 +787,10 @@ impl App {
                     Ok(items.len())
                 });
                 match saved {
-                    Ok(n) => {
-                        self.status = format!("Added {n} files from {}", dir.display());
+                    Ok(_) => {
                         self.library = self.db.library_items().unwrap_or_default();
                     }
-                    Err(e) => self.status = format!("Error: {e:#}"),
+                    Err(e) => report(&mut self.error, e),
                 }
             }
             Msg::Poster(url, bytes) => {
@@ -825,7 +818,7 @@ impl App {
                     .or(prev.and_then(|p| p.poster));
                 let wake = ctx.clone();
                 let Some(gl_proc) = self.gl_proc.clone() else {
-                    self.status = "Error: no OpenGL context for the player".into();
+                    report(&mut self.error, "no OpenGL context for the player");
                     return;
                 };
                 let lang = |k| self.db.setting(k).ok().flatten().unwrap_or_default();
@@ -842,7 +835,6 @@ impl App {
                 match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], &headers, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
-                        self.status = if start > 0.0 { format!("Resuming at {}", fmt_time(start)) } else { "Playing".into() };
                         let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: 0.0, menu: false, scrub: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
@@ -851,7 +843,7 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.status = format!("Error: {e:#}");
+                        report(&mut self.error, e);
                         self.release_torrents(None);
                     }
                 }
@@ -876,7 +868,7 @@ impl App {
             }
         } else if p.position > 0.0 {
             if let Err(e) = self.db.save_progress(&p) {
-                self.status = format!("Error saving progress: {e:#}");
+                report(&mut self.error, format!("saving progress: {e:#}"));
             }
             self.recent = self.db.recent_progress(20).unwrap_or_default();
         }
@@ -889,7 +881,7 @@ impl App {
                 self.watched = self.db.watched(50).unwrap_or_default();
                 self.recent = self.db.recent_progress(20).unwrap_or_default();
             }
-            Err(e) => self.status = format!("Error saving watched state: {e:#}"),
+            Err(e) => report(&mut self.error, format!("saving watched state: {e:#}")),
         }
     }
 
@@ -901,7 +893,9 @@ impl App {
     fn poll_player(&mut self, ctx: &egui::Context) {
         let Some(p) = &mut self.player else { return };
         if !p.player.poll() || p.player.state.error.is_some() {
-            self.status = p.player.state.error.clone().unwrap_or_else(|| "Player closed".into());
+            if let Some(e) = p.player.state.error.clone() {
+                report(&mut self.error, e);
+            }
             self.stop_player();
             self.release_torrents(None);
             return;
@@ -998,11 +992,10 @@ impl App {
             .flat_map(|(u, m)| m.catalogs.iter().filter(|c| c.searchable()).map(move |c| (u.clone(), c.kind.clone(), c.id.clone())))
             .collect();
         if targets.is_empty() {
-            self.status = "Error: no installed addon supports search".into();
+            report(&mut self.error, "no installed addon supports search");
             return;
         }
         let client = self.client.clone();
-        self.status = format!("Searching for \"{query}\"...");
         self.spawn(ctx, async move {
             let (mut items, mut errors) = (Vec::new(), Vec::new());
             let n = targets.len();
@@ -1080,7 +1073,7 @@ impl App {
             }
             let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), ctx.clone());
             let (key, kind, id) = (p.key.clone(), kind.to_owned(), id.to_owned());
-            // Not `spawn`: a missing poster is not worth an error in the status bar.
+            // Not `spawn`: a missing poster is not worth an error.
             self.rt.spawn(async move {
                 for u in &addons {
                     if let Ok(m) = client.meta(u, &kind, &id).await
@@ -1095,21 +1088,19 @@ impl App {
         }
     }
 
-    /// Add the selected title to the library, or remove it; the DB write decides `status`.
+    /// Add the selected title to the library, or remove it.
     fn toggle_saved(&mut self, meta: &MetaPreview) {
         let key = format!("{}:{}", meta.kind, meta.id);
         let res = if self.saved.iter().any(|t| t.key == key) {
             self.saved.retain(|t| t.key != key);
-            self.status = format!("Removed {} from the library", meta.name);
             self.db.remove_saved_title(&key)
         } else {
             let t = SavedTitle { key, title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone() };
             self.saved.insert(0, t.clone());
-            self.status = format!("Added {} to the library", meta.name);
             self.db.add_saved_title(&t)
         };
         if let Err(e) = res {
-            self.status = format!("Error saving library: {e:#}");
+            report(&mut self.error, format!("saving library: {e:#}"));
         }
     }
 
@@ -1147,7 +1138,6 @@ impl App {
             Some((m, v)) => self.open_streams(ctx, m, Some(v), Autoplay::Only, binge),
             None => {
                 self.release_torrents(None);
-                self.status = "Finished".into();
             }
         }
     }
@@ -1162,7 +1152,6 @@ impl App {
         }
         let client = self.client.clone();
         let addons = self.addons_for("meta", &meta.kind, &meta.id);
-        self.status = format!("Loading episodes for {}...", meta.name);
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -1220,7 +1209,6 @@ impl App {
         let id = episode.as_ref().map_or(meta.id.clone(), |v| v.id.clone());
         let stream_addons = self.addons_for("stream", &meta.kind, &id);
         let sub_addons = self.addons_for("subtitles", &meta.kind, &id);
-        self.status = format!("Loading streams for {}...", meta.name);
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -1745,7 +1733,7 @@ impl App {
                     match (gl.create_framebuffer(), gl.create_texture()) {
                         (Ok(fbo), Ok(tex)) => Some((fbo, tex, frame.register_native_glow_texture(tex), [0, 0])),
                         (a, b) => {
-                            self.status = format!("Error: GL setup failed: {:?}", a.err().or(b.err()));
+                            report(&mut self.error, format!("GL setup failed: {:?}", a.err().or(b.err())));
                             None
                         }
                     }
@@ -1952,7 +1940,7 @@ impl App {
                                         && r.changed()
                                         && let Err(e) = self.db.set_setting(key, v)
                                     {
-                                        self.status = format!("Error saving {key}: {e:#}");
+                                        report(&mut self.error, format!("saving {key}: {e:#}"));
                                     }
                                     if valid.is_none() {
                                         ui.label(RichText::new("Use codes like en,eng,pt-BR (max 8)").size(13.0).color(Color32::from_rgb(230, 90, 90)));
@@ -1968,14 +1956,14 @@ impl App {
         if style != self.sub_style {
             self.sub_style = style;
             if let Err(e) = self.db.set_setting("sub_style", &style.encode()) {
-                self.status = format!("Error: {e:#}");
+                report(&mut self.error, e);
             }
             let _ = p.player.apply_sub_style(&style);
         }
         for c in &cmds {
             let args: Vec<&str> = c.iter().map(String::as_str).collect();
             if let Err(e) = p.player.command(&args) {
-                self.status = format!("Error: {e:#}");
+                report(&mut self.error, e);
             }
         }
         if toggle_fs {
@@ -1987,7 +1975,6 @@ impl App {
             }
             self.stop_player();
             self.release_torrents(None);
-            self.status = "Stopped".into();
         } else if next {
             self.play_next(&ctx);
         }
@@ -2001,7 +1988,6 @@ impl App {
                 .labelled_by(l.id);
             if primary_button(ui, "Install").clicked() {
                 let (client, url) = (self.client.clone(), self.addon_url.trim().to_string());
-                self.status = format!("Installing {url}...");
                 self.spawn(&ctx, async move {
                     let m = client.fetch_manifest(&url).await?;
                     Ok(Msg::Installed(url, m, None))
@@ -2014,10 +2000,9 @@ impl App {
                 .labelled_by(l.id);
             if primary_button(ui, "Import from Stremio").on_hover_text("Import addons, watched titles and progress").clicked() {
                 let path = Some(PathBuf::from(self.import_path.trim())).filter(|p| !p.as_os_str().is_empty());
-                self.status = "Importing from Stremio...".into();
                 self.spawn(&ctx, async move {
-                    let (path, imp) = tokio::task::spawn_blocking(move || stremio_import::import(path.as_deref())).await??;
-                    Ok(Msg::Imported(path, imp))
+                    let (_, imp) = tokio::task::spawn_blocking(move || stremio_import::import(path.as_deref())).await??;
+                    Ok(Msg::Imported(imp))
                 });
             }
         });
@@ -2051,7 +2036,6 @@ impl App {
         }
         if let Some((old, new)) = replace {
             let client = self.client.clone();
-            self.status = format!("Installing {new}...");
             self.spawn(&ctx, async move {
                 let m = client.fetch_manifest(&new).await?;
                 Ok(Msg::Installed(new, m, Some(old)))
@@ -2061,10 +2045,9 @@ impl App {
             match stremflix_rs::addon::configure_url(&u) {
                 Ok(page) => {
                     ctx.open_url(egui::OpenUrl::new_tab(page.as_str()));
-                    self.status = "Configure in your browser, then paste the resulting manifest URL".into();
                     self.configuring = Some((u, String::new()));
                 }
-                Err(e) => self.status = format!("Error: {e:#}"),
+                Err(e) => report(&mut self.error, e),
             }
         }
         if let Some(u) = remove {
@@ -2120,7 +2103,7 @@ impl App {
                         let m = self.magnet.trim().to_string();
                         self.play(&ctx, format!("btih:{h}"), format!("Torrent {}", &h[..8]), m, vec![]);
                     }
-                    None => self.status = "Error: invalid magnet link".into(),
+                    None => report(&mut self.error, "invalid magnet link"),
                 }
             }
         });
@@ -2129,7 +2112,6 @@ impl App {
             ui.add(egui::TextEdit::singleline(&mut self.folder).hint_text("/path/to/videos").desired_width(400.0)).labelled_by(l.id);
             if primary_button(ui, "Add folder").clicked() {
                 let dir = PathBuf::from(self.folder.trim());
-                self.status = format!("Scanning {}...", dir.display());
                 // Off the UI thread: a big folder or network share can take minutes.
                 self.spawn(&ctx, async move {
                     let res = tokio::task::spawn_blocking({
@@ -2214,9 +2196,14 @@ impl eframe::App for App {
                     }
                 });
             });
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Status: {}", self.status)).color(Color32::from_gray(160)));
-            });
+            if let Some(e) = self.error.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Error: {e}")).color(Color32::from_rgb(230, 90, 90)));
+                    if ui.small_button("Dismiss").clicked() {
+                        self.error = None;
+                    }
+                });
+            }
             ui.add_space(8.0);
             // Back lives outside the scroll area, so it stays put while the detail page scrolls.
             if self.selected.is_some() {
