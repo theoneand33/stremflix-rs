@@ -14,6 +14,8 @@ permissions:
 
 env:
   TAG: ${{ inputs.version && format('v{0}', inputs.version) || 'nightly' }}
+  # lld-link is much faster than MSVC link.exe; only read when targeting Windows MSVC
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld.exe
 
 jobs:
   changes:
@@ -50,6 +52,15 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: '[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "invalid version: $VERSION"; exit 1; }'
       - uses: actions/checkout@v5
+      - uses: samypr100/setup-dev-drive@v4
+        if: runner.os == 'Windows'
+        with:
+          # ReFS dev drive mounted as ./target; NTFS + Defender made cache restore and cargo's fingerprint scan ~2x slower
+          drive-size: 10GB
+          mount-path: target
+          trusted-dev-drive: true
+          env-mapping: |
+            CARGO_HOME,{{ DEV_DRIVE }}/.cargo
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install libmpv (Linux)
