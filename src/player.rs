@@ -284,6 +284,7 @@ impl Player {
     /// `headers` (validated addon request headers) go to this instance only; each launch is a fresh mpv,
     /// so they never leak to the next stream or host.
     /// Must be called, rendered and dropped with the GUI's GL context current.
+    #[allow(clippy::too_many_arguments)] // player setup options; bundling them adds no clarity
     pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], headers: &[(String, String)], gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
         let mpv = unsafe { mpv_create() };
         if mpv.is_null() {

@@ -113,11 +113,11 @@ pub struct Manifest {
     #[serde(default, rename = "idPrefixes")]
     pub id_prefixes: Option<Vec<String>>,
     #[serde(default, rename = "behaviorHints", deserialize_with = "lenient_hints")]
-    pub behavior_hints: BehaviorHints,
+    pub behavior_hints: ManifestHints,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct BehaviorHints {
+pub struct ManifestHints {
     #[serde(default)]
     pub configurable: bool,
     #[serde(default, rename = "configurationRequired")]
@@ -125,10 +125,10 @@ pub struct BehaviorHints {
 }
 
 /// Malformed hints (wrong type, non-bool flags) degrade to false instead of failing the manifest.
-fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<BehaviorHints, D::Error> {
+fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<ManifestHints, D::Error> {
     let v = serde_json::Value::deserialize(d)?;
     let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
-    Ok(BehaviorHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired") })
+    Ok(ManifestHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired") })
 }
 
 impl Manifest {
@@ -574,11 +574,11 @@ mod configure_tests {
             let body = format!(r#"{{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"]{h}}}"#);
             parse_manifest(body.as_bytes()).unwrap().behavior_hints
         };
-        assert_eq!(m(""), BehaviorHints::default());
+        assert_eq!(m(""), ManifestHints::default());
         let h = m(r#","behaviorHints":{"configurable":true,"configurationRequired":true}"#);
         assert!(h.configurable && h.configuration_required);
-        assert_eq!(m(r#","behaviorHints":"junk""#), BehaviorHints::default());
-        assert_eq!(m(r#","behaviorHints":{"configurable":"yes"}"#), BehaviorHints::default());
+        assert_eq!(m(r#","behaviorHints":"junk""#), ManifestHints::default());
+        assert_eq!(m(r#","behaviorHints":{"configurable":"yes"}"#), ManifestHints::default());
     }
 }
 
