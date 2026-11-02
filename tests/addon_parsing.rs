@@ -142,6 +142,25 @@ fn stream_parsing_and_targets() {
 }
 
 #[test]
+fn stream_binge_group() {
+    let long = "g".repeat(1000);
+    let body = format!(
+        r#"{{"streams": [
+        {{"url": "https://a.example/1", "behaviorHints": {{"bingeGroup": " addon-1080p\u0007 ", "notWebReady": true}}}},
+        {{"url": "https://a.example/2", "behaviorHints": {{"bingeGroup": 7}}}},
+        {{"url": "https://a.example/3", "behaviorHints": "junk"}},
+        {{"url": "https://a.example/4", "behaviorHints": {{"bingeGroup": "{long}"}}}},
+        {{"url": "https://a.example/5", "behaviorHints": {{"bingeGroup": "  "}}}},
+        {{"url": "https://a.example/6"}}
+    ]}}"#
+    );
+    let s = parse_streams(body.as_bytes()).unwrap();
+    let groups: Vec<_> = s.iter().map(|s| s.binge_group.as_deref().map(str::len)).collect();
+    assert_eq!(s[0].binge_group.as_deref(), Some("addon-1080p"));
+    assert_eq!(groups, [Some(11), None, None, Some(300), None, None]);
+}
+
+#[test]
 fn subtitle_parsing() {
     let s = parse_subtitles(br#"{"subtitles": [
         {"id": "1", "url": "https://subs.example/en.vtt", "lang": "eng"},

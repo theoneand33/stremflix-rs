@@ -169,6 +169,14 @@ pub struct Stream {
     /// e.g. "tracker:<url>", "dht:<hash>"; "peer:<host:port>" is a local extension.
     #[serde(default)]
     pub sources: Vec<String>,
+    /// `behaviorHints.bingeGroup`: streams sharing one come from the same source/quality, so the next episode can autoplay it.
+    #[serde(default, rename = "behaviorHints", deserialize_with = "binge_group", skip_serializing)]
+    pub binge_group: Option<String>,
+}
+
+/// Only the string `bingeGroup` of `behaviorHints`; anything malformed is ignored, never fatal.
+fn binge_group<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?.get("bingeGroup").and_then(|g| g.as_str()).map(String::from))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -365,6 +373,7 @@ pub fn parse_streams(body: &[u8]) -> Result<Vec<Stream>> {
             opt_text(&mut s.name, MAX_TEXT);
             opt_text(&mut s.title, MAX_LONG_TEXT);
             opt_text(&mut s.description, MAX_LONG_TEXT);
+            opt_text(&mut s.binge_group, MAX_TEXT);
             s.target().is_some().then_some(s)
         })
         .collect())
