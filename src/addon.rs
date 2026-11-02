@@ -15,6 +15,8 @@ const MAX_ITEMS: usize = 500;
 const MAX_VIDEOS: usize = 5000;
 /// Cap on genres, cast, directors and links of a meta.
 const MAX_TAGS: usize = 30;
+/// Max options kept per catalog extra (e.g. genres).
+const MAX_OPTIONS: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -58,6 +60,9 @@ pub struct ExtraDef {
     pub name: String,
     #[serde(default, rename = "isRequired")]
     pub is_required: bool,
+    /// Allowed values (e.g. genres); non-string entries are dropped.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub options: Vec<String>,
 }
 
 impl CatalogDef {
@@ -75,6 +80,22 @@ impl CatalogDef {
     /// True for catalogs that can't be browsed without an extra arg (e.g. search-only catalogs).
     pub fn requires_extra(&self) -> bool {
         self.extra.iter().any(|e| e.is_required) || !self.extra_required.is_empty()
+    }
+
+    /// Options of the `genre` extra (empty for legacy `extraSupported` catalogs, which list none).
+    pub fn genres(&self) -> &[String] {
+        self.extra.iter().find(|e| e.name == "genre").map_or(&[], |e| &e.options)
+    }
+
+    pub fn requires_genre(&self) -> bool {
+        self.extra.iter().any(|e| e.is_required && e.name == "genre") || self.extra_required.iter().any(|e| e == "genre")
+    }
+
+    /// Browsable on Discover: no required extra other than a genre we have options for.
+    pub fn discoverable(&self) -> bool {
+        self.extra.iter().all(|e| !e.is_required || e.name == "genre")
+            && self.extra_required.iter().all(|e| e == "genre")
+            && (!self.requires_genre() || !self.genres().is_empty())
     }
 }
 
@@ -367,6 +388,9 @@ pub fn parse_manifest(body: &[u8]) -> Result<Manifest> {
     m.catalogs.truncate(100);
     for c in &mut m.catalogs {
         opt_text(&mut c.name, MAX_TEXT);
+        for e in &mut c.extra {
+            e.options = e.options.iter().map(|o| sanitize_text(o, 64)).filter(|o| !o.is_empty()).take(MAX_OPTIONS).collect();
+        }
     }
     Ok(m)
 }
@@ -542,6 +566,14 @@ pub fn catalog_path(kind: &str, id: &str, skip: usize) -> String {
     }
 }
 
+/// Relative catalog URL, with an optional `genre` extra (`catalog/<type>/<id>/genre=<value>.json`).
+pub fn discover_path(kind: &str, id: &str, genre: Option<&str>) -> String {
+    match genre {
+        None => format!("catalog/{}/{}.json", enc(kind), enc(id)),
+        Some(g) => format!("catalog/{}/{}/genre={}.json", enc(kind), enc(id), enc(g)),
+    }
+}
+
 #[derive(Clone)]
 pub struct AddonClient {
     http: reqwest::Client,
@@ -587,6 +619,11 @@ impl AddonClient {
     /// One catalog page; `skip` is the number of items already fetched (0 = first page).
     pub async fn catalog(&self, transport_url: &str, kind: &str, id: &str, skip: usize) -> Result<Vec<MetaPreview>> {
         parse_catalog(&self.get(addon_base(transport_url)?.join(&catalog_path(kind, id, skip))?).await?)
+    }
+
+    /// First page of a catalog, filtered by `genre` if given.
+    pub async fn discover(&self, transport_url: &str, kind: &str, id: &str, genre: Option<&str>) -> Result<Vec<MetaPreview>> {
+        parse_catalog(&self.get(addon_base(transport_url)?.join(&discover_path(kind, id, genre))?).await?)
     }
 
     pub async fn search(&self, transport_url: &str, kind: &str, id: &str, query: &str) -> Result<Vec<MetaPreview>> {
