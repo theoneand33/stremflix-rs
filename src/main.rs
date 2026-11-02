@@ -12,7 +12,7 @@ use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, 
 use stremio_lite::db::{Db, Progress, Watched};
 use stremio_lite::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremio_lite::player::{GlProc, Player, SUB_COLORS, SubStyle};
+use stremio_lite::player::{GlProc, Player, SUB_COLORS, SubStyle, valid_langs};
 use stremio_lite::stremio_import::{self, Import};
 use stremio_lite::torrent::TorrentEngine;
 
@@ -22,6 +22,9 @@ enum Tab {
     Addons,
     Library,
 }
+
+/// Addon subtitles as (url, lang).
+type Subs = Vec<(String, String)>;
 
 enum Msg {
     Status(String),
@@ -34,7 +37,7 @@ enum Msg {
     More((String, String, String), usize, Result<Vec<MetaPreview>, String>),
     /// meta, episode (series only), streams, subtitle URLs, play the first stream on arrival,
     /// and the `bingeGroup` to autoplay (next episode)
-    Streams(MetaPreview, Option<Video>, Vec<Stream>, Vec<String>, bool, Option<String>),
+    Streams(MetaPreview, Option<Video>, Vec<Stream>, Subs, bool, Option<String>),
     /// series and its full meta (with episodes)
     Episodes(MetaPreview, Meta),
     /// Full meta of a movie (genres, cast, ...) for the detail page.
@@ -42,7 +45,7 @@ enum Msg {
     /// poster URL, image bytes (empty on failure)
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs
-    Play(String, String, String, String, Vec<String>),
+    Play(String, String, String, String, Subs),
     /// progress key, poster URL found for a Continue Watching entry
     RecentPoster(String, String),
     /// Stremio storage that was read, and what it holds.
@@ -268,7 +271,7 @@ struct App {
     configuring: Option<(String, String)>,
     rows: Vec<Row>,
     search_results: Option<(String, Vec<MetaPreview>)>,
-    selected: Option<(MetaPreview, Vec<Stream>, Vec<String>)>,
+    selected: Option<(MetaPreview, Vec<Stream>, Subs)>,
     /// Episodes of the selected series (in `sort_episodes` order), the season shown,
     /// and the episode whose streams are in `selected`.
     episodes: Vec<Video>,
@@ -286,6 +289,8 @@ struct App {
     /// Poster bytes by URL; `None` while loading, empty if the fetch failed.
     posters: HashMap<String, Option<Arc<[u8]>>>,
     folder: String,
+    /// Preferred audio / subtitle languages (mpv `alang` / `slang`), as edited; saved to the settings table only when valid.
+    langs: [String; 2],
     library: Vec<LibraryItem>,
     recent: Vec<Progress>,
     watched: Vec<Watched>,
@@ -333,6 +338,7 @@ impl App {
             watched: db.watched(50)?,
             import_path: String::new(),
             folder: db.setting("last_folder")?.unwrap_or_default(),
+            langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
             db,
             data_dir,
             client: AddonClient::new(),
@@ -378,7 +384,7 @@ impl App {
     }
 
     /// Resolve `source` (http URL, magnet, or local path) and start playback.
-    fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Vec<String>) {
+    fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
         self.status = format!("Opening {title}...");
         if !source.starts_with("magnet:") {
             let _ = self.tx.send(Msg::Play(key, title, source.clone(), source, subs));
@@ -530,7 +536,8 @@ impl App {
                     self.status = "Error: no OpenGL context for the player".into();
                     return;
                 };
-                match Player::launch(&url, &title, start, &subs, gl_proc, Box::new(move || wake.request_repaint())) {
+                let lang = |k| self.db.setting(k).ok().flatten().unwrap_or_default();
+                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
                         self.status = if start > 0.0 { format!("Resuming at {}", fmt_time(start)) } else { "Playing".into() };
@@ -829,7 +836,7 @@ impl App {
             for u in &sub_addons {
                 // Subtitles are optional; a failing subtitle addon must not block playback.
                 if let Ok(s) = client.subtitles(u, &meta.kind, &id).await {
-                    subs.extend(s.into_iter().map(|s| s.url));
+                    subs.extend(s.into_iter().map(|s| (s.url, s.lang)));
                 }
             }
             if streams.is_empty() && !errors.is_empty() {
@@ -1063,7 +1070,7 @@ impl App {
         meta: &MetaPreview,
         want: &mut Vec<String>,
         open: &mut Option<(MetaPreview, bool)>,
-        play: &mut Option<(String, String, String, Vec<String>)>,
+        play: &mut Option<(String, String, String, Subs)>,
     ) {
         let w = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(vec2(w, (w * 0.42).clamp(320.0, 560.0)), Sense::hover());
@@ -1386,6 +1393,19 @@ impl App {
                                             if ui.button("+").clicked() { style.delay += 0.1 }
                                             if ui.button("Reset").clicked() { style.delay = 0.0 }
                                         });
+                                    }
+                                    ui.add_space(8.0);
+                                    let (i, key) = if kind == "audio" { (0, "alang") } else { (1, "slang") };
+                                    let valid = valid_langs(&self.langs[i]);
+                                    let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("Preferred: en,eng").desired_width(200.0));
+                                    if let Some(v) = &valid
+                                        && r.changed()
+                                        && let Err(e) = self.db.set_setting(key, v)
+                                    {
+                                        self.status = format!("Error saving {key}: {e:#}");
+                                    }
+                                    if valid.is_none() {
+                                        ui.label(RichText::new("Use codes like en,eng,pt-BR (max 8)").size(13.0).color(Color32::from_rgb(230, 90, 90)));
                                     }
                                 });
                             }
