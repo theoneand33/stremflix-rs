@@ -14,8 +14,21 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       STREMFLIX_RS_NO_DHT: "1"
+      # smaller debug info: faster linking (worst on Windows) and smaller caches; backtraces keep file:line
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # lld-link is much faster than MSVC link.exe; only read when targeting Windows MSVC
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld.exe
     steps:
       - uses: actions/checkout@v5
+      - uses: samypr100/setup-dev-drive@v4
+        if: runner.os == 'Windows'
+        with:
+          # ReFS dev drive mounted as ./target; NTFS + Defender made cache restore and cargo's fingerprint scan ~2x slower
+          drive-size: 10GB
+          mount-path: target
+          trusted-dev-drive: true
+          env-mapping: |
+            CARGO_HOME,{{ DEV_DRIVE }}/.cargo
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
