@@ -11,6 +11,8 @@ pub const MAX_BODY: usize = 4 * 1024 * 1024;
 const MAX_TEXT: usize = 300;
 const MAX_LONG_TEXT: usize = 4000;
 const MAX_ITEMS: usize = 500;
+/// Long-running series have well over `MAX_ITEMS` episodes.
+const MAX_VIDEOS: usize = 5000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -122,6 +124,32 @@ pub struct Meta {
     pub description: Option<String>,
     #[serde(default, rename = "releaseInfo")]
     pub release_info: Option<String>,
+    /// Episodes of a series; malformed entries are dropped.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub videos: Vec<Video>,
+}
+
+/// One video of a meta, e.g. a series episode. Its `id` (often `tt…:S:E`) is what streams are requested for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Video {
+    pub id: String,
+    #[serde(default, alias = "name")]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub season: Option<u32>,
+    #[serde(default)]
+    pub episode: Option<u32>,
+    /// ISO 8601 release date.
+    #[serde(default)]
+    pub released: Option<String>,
+    #[serde(default)]
+    pub thumbnail: Option<String>,
+}
+
+fn lenient_vec<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let items = v.as_array().map(|a| a.as_slice()).unwrap_or_default();
+    Ok(items.iter().take(MAX_VIDEOS).filter_map(|v| T::deserialize(v).ok()).collect())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -314,6 +342,12 @@ pub fn parse_meta(body: &[u8]) -> Result<Meta> {
     opt_url(&mut m.poster);
     opt_text(&mut m.description, MAX_LONG_TEXT);
     opt_text(&mut m.release_info, 64);
+    m.videos.retain(|v| valid_id(&v.id));
+    for v in &mut m.videos {
+        opt_text(&mut v.title, MAX_TEXT);
+        opt_text(&mut v.released, 64);
+        opt_url(&mut v.thumbnail);
+    }
     Ok(m)
 }
 

@@ -90,6 +90,31 @@ fn meta_parsing() {
     assert_eq!(m.description.as_deref(), Some("ab"), "bidi override stripped");
     assert!(parse_meta(br#"{"meta": null}"#).is_err());
     assert!(parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": ""}}"#).is_err());
+    assert!(m.videos.is_empty());
+}
+
+#[test]
+fn meta_videos_parsing() {
+    let m = parse_meta(br#"{"meta": {"id": "tt9", "type": "series", "name": "Show", "videos": [
+        {"id": "tt9:1:2", "name": "Pilot\u0007 ", "season": 1, "episode": 2, "released": "2020-01-01T00:00:00.000Z", "thumbnail": "https://img.example/e.jpg"},
+        {"id": "tt9:0:1", "title": "Special", "season": 0, "episode": 1, "thumbnail": "javascript:alert(1)"},
+        {"id": "tt9/../x", "season": 1, "episode": 3},
+        {"id": "", "season": 1, "episode": 4},
+        {"id": "tt9:1:5", "season": "one"},
+        {"season": 1},
+        42
+    ]}}"#)
+    .unwrap();
+    assert_eq!(m.videos.len(), 2, "invalid ids and malformed entries dropped, meta kept");
+    let v = &m.videos[0];
+    assert_eq!((v.id.as_str(), v.title.as_deref(), v.season, v.episode), ("tt9:1:2", Some("Pilot"), Some(1), Some(2)));
+    assert_eq!(v.released.as_deref(), Some("2020-01-01T00:00:00.000Z"));
+    assert_eq!(v.thumbnail.as_deref(), Some("https://img.example/e.jpg"));
+    assert_eq!((m.videos[1].title.as_deref(), m.videos[1].thumbnail.as_deref()), (Some("Special"), None));
+    for videos in ["null", "{}", "\"x\""] {
+        let body = format!(r#"{{"meta": {{"id": "tt9", "type": "series", "name": "Show", "videos": {videos}}}}}"#);
+        assert!(parse_meta(body.as_bytes()).unwrap().videos.is_empty(), "{videos}");
+    }
 }
 
 #[test]
