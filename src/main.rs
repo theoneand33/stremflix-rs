@@ -78,6 +78,14 @@ fn saved_view(items: &[SavedTitle], kind: LibKind, sort: LibSort) -> Vec<&SavedT
     v
 }
 
+/// What to play when streams arrive: nothing, the only stream, or the top one.
+#[derive(Clone, Copy, PartialEq)]
+enum Autoplay {
+    Off,
+    Only,
+    Top,
+}
+
 enum Msg {
     Status(String),
     Installed(String, Manifest, Option<String>),
@@ -89,9 +97,9 @@ enum Msg {
     More((String, String, String), usize, Result<Vec<MetaPreview>, String>),
     /// Discover grid source and its items or error.
     Discover(DiscoverSrc, Result<Vec<MetaPreview>, String>),
-    /// meta, episode (series only), streams, subtitle URLs, play the first stream on arrival,
-    /// and the `bingeGroup` to autoplay (next episode)
-    Streams(MetaPreview, Option<Video>, Vec<Stream>, Subs, bool, Option<String>),
+    /// meta, episode (series only), streams, subtitle URLs, what to autoplay on arrival,
+    /// and the `bingeGroup` to prefer (next episode)
+    Streams(MetaPreview, Option<Video>, Vec<Stream>, Subs, Autoplay, Option<String>),
     /// series and its full meta (with episodes)
     Episodes(MetaPreview, Meta),
     /// Full meta of a movie (genres, cast, ...) for the detail page.
@@ -158,9 +166,24 @@ fn card(ui: &mut egui::Ui, size: egui::Vec2, label: &str) -> (egui::Response, eg
     // Reserve room for the grown card so the scroll area doesn't clip it.
     let (slot, r) = ui.allocate_exact_size(size * GROW, Sense::click());
     r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
-    let target = if r.is_pointer_button_down_on() { 0.96 } else if r.hovered() || r.has_focus() { GROW } else { 1.0 };
+    let target = if r.is_pointer_button_down_on() { 0.96 } else if r.contains_pointer() || r.has_focus() { GROW } else { 1.0 };
     let s = ui.ctx().animate_value_with_time(r.id, target, 0.15);
     (r, egui::Rect::from_center_size(slot.center(), size * s))
+}
+
+/// Round play button in the middle of a card, shown while the card is hovered or the button focused.
+/// Registered after the card, so it takes the click.
+fn card_play(ui: &mut egui::Ui, card: &egui::Response, rect: egui::Rect, label: &str) -> bool {
+    let b = egui::Rect::from_center_size(rect.center(), vec2(56.0, 56.0));
+    let r = ui.interact(b, card.id.with("play"), Sense::click());
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Play {label}")));
+    if card.contains_pointer() || r.has_focus() {
+        let p = ui.painter();
+        p.circle_filled(b.center(), 28.0, Color32::from_black_alpha(if r.hovered() { 210 } else { 140 }));
+        p.circle_stroke(b.center(), 27.0, (2.0, Color32::WHITE));
+        p.text(b.center() + vec2(2.0, 0.0), egui::Align2::CENTER_CENTER, icons::PLAY, egui::FontId::new(26.0, fill()), Color32::WHITE);
+    }
+    r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 /// Bold weight of the UI font (egui's `strong()` only brightens the color).
@@ -339,6 +362,23 @@ fn request_headers(streams: &[Stream], source: &str, url: &str) -> Vec<(String, 
     (source == url).then(|| streams.iter().find(own)).flatten().map(|s| s.hints.request_headers.clone()).unwrap_or_default()
 }
 
+/// Series id of a local episode progress key's video id, for history saved before the series id was stored:
+/// `tt1:<season>:<episode>` → `tt1`, `kitsu:1:<episode>` → `kitsu:1` (no season). Other ids are returned unchanged.
+fn series_id(video: &str) -> &str {
+    let num = |x: &str| x.parse::<u32>().is_ok();
+    match video.rsplitn(3, ':').collect::<Vec<_>>()[..] {
+        [e, s, id] if num(e) && num(s) && id.contains(|c: char| c.is_ascii_digit()) => id,
+        [e, ..] if num(e) => &video[..video.len() - e.len() - 1],
+        _ => video,
+    }
+}
+
+/// Episode to start a series at: the one after the last watched (in list order), else the first regular one.
+fn start_episode(episodes: &[Video], watched: impl Fn(&Video) -> bool) -> Option<&Video> {
+    let first = || episodes.iter().find(|v| v.season.is_some_and(|s| s > 0)).or(episodes.first());
+    episodes.iter().rposition(watched).and_then(|i| next_episode(episodes, &episodes[i].id)).or_else(first)
+}
+
 /// mpv's `keep-open` pauses on the last frame at end of file.
 fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
     paused && dur > 0.0 && pos >= dur - 1.0
@@ -390,6 +430,9 @@ struct App {
     episodes: Vec<Video>,
     season: Option<u32>,
     episode: Option<Video>,
+    /// Series id whose episodes are loading, and on arrival the video id whose streams to show
+    /// (Continue Watching), or `None` to play the next episode (card play button).
+    pending: Option<(String, Option<String>)>,
     /// Full meta of the selected title, if an addon served one; checked against `selected` by id.
     details: Option<Meta>,
     /// Type and id of the movie whose details were last requested; older replies are dropped.
@@ -478,6 +521,7 @@ impl App {
             episodes: Vec::new(),
             season: None,
             episode: None,
+            pending: None,
             details: None,
             details_want: Default::default(),
             scroll_top: false,
@@ -598,10 +642,11 @@ impl App {
                     self.scroll_top = true;
                 }
                 self.status = format!("{}: {} streams", meta.name, streams.len());
-                let src = binge.and_then(|g| binge_source(&streams, &g)).or_else(|| only_source(&streams));
+                let fallback = || if autoplay == Autoplay::Top { streams.iter().find_map(Stream::source) } else { only_source(&streams) };
+                let src = binge.and_then(|g| binge_source(&streams, &g)).or_else(fallback);
                 (self.selected, self.episode) = (Some((meta, streams, subs.clone())), episode);
-                // Autoplay only when there's no choice to make; otherwise show the stream picker.
-                if autoplay {
+                // `Only` autoplays when there's no choice to make; otherwise show the stream picker.
+                if autoplay != Autoplay::Off {
                     match (src, self.play_key()) {
                         (Some(src), Some((key, title))) => self.play(ctx, key, title, src, subs),
                         _ => self.show_streams = true,
@@ -610,13 +655,40 @@ impl App {
             }
             Msg::Episodes(meta, mut m) => {
                 let mut videos = std::mem::take(&mut m.videos);
+                // A Continue Watching entry only knows the episode title.
+                let meta = MetaPreview { name: m.name.clone(), poster: meta.poster.or(m.poster.clone()), ..meta };
                 self.details = Some(m);
                 sort_episodes(&mut videos);
                 self.status = format!("{}: {} episodes", meta.name, videos.len());
                 self.season = videos.first().and_then(|v| v.season);
                 (self.episodes, self.episode) = (videos, None);
-                self.selected = Some((meta, Vec::new(), Vec::new()));
+                self.selected = Some((meta.clone(), Vec::new(), Vec::new()));
                 self.scroll_top = true;
+                // A late reply for another series leaves the pending request alone.
+                if self.pending.as_ref().is_none_or(|(id, _)| *id != meta.id) {
+                    return;
+                }
+                let Some((_, show)) = self.pending.take() else { return };
+                let key = |v: &Video| format!("{}:{}", meta.kind, v.id);
+                let v = match &show {
+                    Some(id) => self.episodes.iter().find(|v| v.id == *id),
+                    None => {
+                        // Resume the episode in progress with its stream, else start the next one.
+                        let resume = self.recent.iter().find(|p| self.episodes.iter().any(|v| key(v) == p.key)).cloned();
+                        if let Some(p) = resume {
+                            // Select the episode so the player offers the next one.
+                            self.episode = self.episodes.iter().find(|v| key(v) == p.key).cloned();
+                            self.season = self.episode.as_ref().and_then(|v| v.season);
+                            return self.play(ctx, p.key, p.title, p.source, vec![]);
+                        }
+                        start_episode(&self.episodes, |v| self.watched_keys.contains(&key(v)))
+                    }
+                };
+                let Some(v) = v.cloned() else { return };
+                self.season = v.season;
+                let binge = self.db.setting(&format!("binge:{}:{}", meta.kind, meta.id)).ok().flatten().filter(|g| !g.is_empty());
+                let autoplay = if show.is_some() { Autoplay::Off } else { Autoplay::Top };
+                self.open_streams(ctx, meta, Some(v), autoplay, binge);
             }
             Msg::Details(m) => {
                 if self.details_want == (m.kind.clone(), m.id.clone()) {
@@ -672,6 +744,15 @@ impl App {
                 };
                 let lang = |k| self.db.setting(k).ok().flatten().unwrap_or_default();
                 let headers = self.selected.as_ref().map(|(_, streams, _)| request_headers(streams, &source, &url)).unwrap_or_default();
+                // Remember the episode's series (its key holds only the video id) and the stream's binge group
+                // (empty if none), so the series' play button and Continue Watching can find them later.
+                if let (Some((m, streams, _)), Some(_)) = (&self.selected, &self.episode)
+                    && self.play_key().is_some_and(|(k, _)| k == key)
+                {
+                    let group = streams.iter().find(|s| s.source().as_ref() == Some(&source)).and_then(|s| s.hints.binge_group.clone());
+                    let _ = self.db.set_setting(&format!("series:{key}"), &m.id);
+                    let _ = self.db.set_setting(&format!("binge:{}:{}", m.kind, m.id), &group.unwrap_or_default());
+                }
                 match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], &headers, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
@@ -959,16 +1040,18 @@ impl App {
             .and_then(|((m, ..), cur)| Some((m.clone(), next_episode(&self.episodes, &cur.id)?.clone())));
         self.stop_player();
         match next {
-            Some((m, v)) => self.open_streams(ctx, m, Some(v), true, binge),
+            Some((m, v)) => self.open_streams(ctx, m, Some(v), Autoplay::Only, binge),
             None => self.status = "Finished".into(),
         }
     }
 
     /// Series load their episode list; anything else loads streams for its own id.
     fn open_meta(&mut self, ctx: &egui::Context, meta: MetaPreview, autoplay: bool) {
+        // Opening any title cancels a play/show request still waiting for episodes.
+        self.pending = None;
         if meta.kind != "series" {
             self.fetch_details(ctx, &meta);
-            return self.open_streams(ctx, meta, None, autoplay, None);
+            return self.open_streams(ctx, meta, None, if autoplay { Autoplay::Only } else { Autoplay::Off }, None);
         }
         let client = self.client.clone();
         let addons = self.addons_for("meta", &meta.kind, &meta.id);
@@ -987,9 +1070,43 @@ impl App {
         });
     }
 
+    /// Card play button: resume the title (or a series' episode in progress) with its last stream,
+    /// else play the top stream of the movie or of the series' next episode (its last binge group first).
+    fn quick_play(&mut self, ctx: &egui::Context, meta: MetaPreview) {
+        let key = format!("{}:{}", meta.kind, meta.id);
+        if let Some(p) = self.recent.iter().find(|p| p.key == key).cloned() {
+            return self.play(ctx, p.key, p.title, p.source, vec![]);
+        }
+        self.tab = Tab::Home;
+        if meta.kind == "series" {
+            let id = meta.id.clone();
+            self.open_meta(ctx, meta, false);
+            self.pending = Some((id, None));
+            return;
+        }
+        self.fetch_details(ctx, &meta);
+        self.open_streams(ctx, meta, None, Autoplay::Top, None);
+    }
+
+    /// Continue Watching card: the title's page with its stream picker (for a series, the episode's).
+    /// Torrents and local files have no page, so they resume.
+    fn open_progress(&mut self, ctx: &egui::Context, p: Progress) {
+        let Some((kind, id)) = p.key.split_once(':').filter(|(k, _)| !matches!(*k, "btih" | "file")) else {
+            return self.play(ctx, p.key, p.title, p.source, vec![]);
+        };
+        let mut meta = MetaPreview { id: id.into(), kind: kind.into(), name: p.title.clone(), poster: p.poster.clone(), background: None, description: None };
+        if kind == "series" {
+            let saved = self.db.setting(&format!("series:{}", p.key)).ok().flatten();
+            meta.id = saved.unwrap_or_else(|| series_id(id).into());
+        }
+        let pending = (kind == "series").then(|| (meta.id.clone(), Some(id.to_owned())));
+        self.open_meta(ctx, meta, false);
+        self.pending = pending;
+    }
+
     /// Fetch streams and subtitles for a movie, or for `episode` of a series.
     /// `binge`: on arrival, autoplay the stream in this binge group if there is one.
-    fn open_streams(&mut self, ctx: &egui::Context, meta: MetaPreview, episode: Option<Video>, autoplay: bool, binge: Option<String>) {
+    fn open_streams(&mut self, ctx: &egui::Context, meta: MetaPreview, episode: Option<Video>, autoplay: Autoplay, binge: Option<String>) {
         let client = self.client.clone();
         let id = episode.as_ref().map_or(meta.id.clone(), |v| v.id.clone());
         let stream_addons = self.addons_for("stream", &meta.kind, &id);
@@ -1031,7 +1148,7 @@ impl App {
 
     fn ui_home(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let (mut want, mut open, mut play) = (Vec::new(), None, None);
+        let (mut want, mut open, mut play, mut quick, mut resume) = (Vec::new(), None, None, None, None);
         let featured = match &self.selected {
             Some((m, ..)) => Some(m.clone()),
             None => self.rows.iter().find_map(|r| r.items.as_ref()?.first().cloned()),
@@ -1119,13 +1236,15 @@ impl App {
                     for p in &self.recent {
                         let (r, rect) = card(ui, CARD, &p.title);
                         self.paint_poster(ui, &r, rect, &p.poster, &p.title, &mut want);
-                        let r = r.on_hover_text(format!("Resume {} ({} / {})", p.title, fmt_time(p.position), fmt_time(p.duration)));
+                        let r = r.on_hover_text(format!("{} ({} / {})", p.title, fmt_time(p.position), fmt_time(p.duration)));
                         let frac = if p.duration > 0.0 { (p.position / p.duration).clamp(0.0, 1.0) as f32 } else { 0.0 };
                         let bar = egui::Rect::from_min_max(pos2(rect.left() + 10.0, rect.bottom() - 10.0), pos2(rect.right() - 10.0, rect.bottom() - 6.0));
                         ui.painter().rect_filled(bar, 2, Color32::from_gray(90));
                         ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, bar.height())), 2, RED);
-                        if r.clicked() {
+                        if card_play(ui, &r, rect, &p.title) {
                             play = Some((p.key.clone(), p.title.clone(), p.source.clone(), vec![]));
+                        } else if r.clicked() {
+                            resume = Some(p.clone());
                         }
                     }
                 });
@@ -1138,11 +1257,14 @@ impl App {
                     for w in &self.watched {
                         let (r, rect) = card(ui, CARD, &w.title);
                         self.paint_poster(ui, &r, rect, &w.poster, &w.title, &mut want);
+                        let meta = w.key.split_once(':').map(|(kind, id)| MetaPreview { id: id.into(), kind: kind.into(), name: w.title.clone(), poster: w.poster.clone(), background: None, description: None });
+                        if card_play(ui, &r, rect, &w.title) {
+                            quick = meta.clone();
+                        }
                         let hint = if w.episodes > 0 { format!("{} · {} episodes watched", w.title, w.episodes) } else { format!("{} · Watched", w.title) };
                         if r.on_hover_text(hint).clicked()
-                            && let Some((kind, id)) = w.key.split_once(':')
+                            && let Some(meta) = meta
                         {
-                            let meta = MetaPreview { id: id.into(), kind: kind.into(), name: w.title.clone(), poster: w.poster.clone(), background: None, description: None };
                             open = Some((meta, false));
                         }
                     }
@@ -1159,7 +1281,7 @@ impl App {
             if items.is_empty() {
                 ui.label("No results.");
             }
-            self.ui_cards(ui, "search", items, &mut want, &mut open);
+            self.ui_cards(ui, "search", items, &mut want, &mut open, &mut quick);
         }
         if clear {
             self.search_results = None;
@@ -1170,7 +1292,7 @@ impl App {
                 Some(items) if items.is_empty() => continue,
                 Some(items) => {
                     Self::row_title(ui, &row.title);
-                    let near_end = self.ui_cards(ui, &row.title, items, &mut want, &mut open);
+                    let near_end = self.ui_cards(ui, &row.title, items, &mut want, &mut open, &mut quick);
                     if row.wants_more(near_end) {
                         more.push((row.src.clone(), row.fetched));
                     }
@@ -1203,10 +1325,16 @@ impl App {
             self.open_meta(&ctx, m, autoplay);
         }
         if let Some((m, v)) = episode {
-            self.open_streams(&ctx, m, Some(v), true, None);
+            self.open_streams(&ctx, m, Some(v), Autoplay::Only, None);
         }
         if let Some((k, t, s, subs)) = play {
             self.play(&ctx, k, t, s, subs);
+        }
+        if let Some(m) = quick {
+            self.quick_play(&ctx, m);
+        }
+        if let Some(p) = resume {
+            self.open_progress(&ctx, p);
         }
     }
 
@@ -1278,7 +1406,7 @@ impl App {
             }
         });
         ui.add_space(12.0);
-        let (mut want, mut open) = (Vec::new(), None);
+        let (mut want, mut open, mut quick) = (Vec::new(), None, None);
         match &self.discover.items {
             None => {
                 ui.spinner();
@@ -1291,6 +1419,9 @@ impl App {
                     for m in items {
                         let (r, rect) = card(ui, CARD, &m.name);
                         self.paint_poster(ui, &r, rect, &m.poster, &m.name, &mut want);
+                        if card_play(ui, &r, rect, &m.name) {
+                            quick = Some(m.clone());
+                        }
                         if r.on_hover_text(m.description.as_deref().unwrap_or(&m.name)).clicked() {
                             open = Some(m.clone());
                         }
@@ -1308,6 +1439,9 @@ impl App {
             self.tab = Tab::Home;
             self.open_meta(&ctx, m, false);
         }
+        if let Some(m) = quick {
+            self.quick_play(&ctx, m);
+        }
     }
 
     fn row_title(ui: &mut egui::Ui, title: &str) {
@@ -1318,7 +1452,7 @@ impl App {
 
     /// Horizontally scrolling poster cards; a click selects the title.
     /// Returns true when one of the last 3 cards is on screen.
-    fn ui_cards(&self, ui: &mut egui::Ui, salt: &str, items: &[MetaPreview], want: &mut Vec<String>, open: &mut Option<(MetaPreview, bool)>) -> bool {
+    fn ui_cards(&self, ui: &mut egui::Ui, salt: &str, items: &[MetaPreview], want: &mut Vec<String>, open: &mut Option<(MetaPreview, bool)>, quick: &mut Option<MetaPreview>) -> bool {
         let mut near_end = false;
         egui::ScrollArea::horizontal().id_salt(salt).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1327,6 +1461,9 @@ impl App {
                     // The scroll viewport clips, so a visible third-to-last card means near the end.
                     near_end |= i + 3 >= items.len() && ui.is_rect_visible(r.rect);
                     self.paint_poster(ui, &r, rect, &m.poster, &m.name, want);
+                    if card_play(ui, &r, rect, &m.name) {
+                        *quick = Some(m.clone());
+                    }
                     if r.on_hover_text(m.description.as_deref().unwrap_or(&m.name)).clicked() {
                         *open = Some((m.clone(), false));
                     }
@@ -1819,7 +1956,7 @@ impl App {
 
     fn ui_library(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let (mut want, mut open) = (Vec::new(), None);
+        let (mut want, mut open, mut quick) = (Vec::new(), None, None);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Saved titles").size(20.0).strong().family(bold()).color(Color32::WHITE));
             egui::ComboBox::from_id_salt("lib_sort").selected_text(self.lib_sort.label()).show_ui(ui, |ui| {
@@ -1840,7 +1977,7 @@ impl App {
         } else if items.is_empty() {
             ui.label(RichText::new("No saved titles of this type.").color(Color32::from_gray(170)));
         }
-        self.ui_cards(ui, "saved", &items, &mut want, &mut open);
+        self.ui_cards(ui, "saved", &items, &mut want, &mut open, &mut quick);
         for u in want {
             self.fetch_poster(&ctx, u);
         }
@@ -1848,6 +1985,9 @@ impl App {
             // The detail page lives on the Home tab.
             self.tab = Tab::Home;
             self.open_meta(&ctx, m, false);
+        }
+        if let Some(m) = quick {
+            self.quick_play(&ctx, m);
         }
         ui.separator();
         ui.horizontal(|ui| {
@@ -2073,6 +2213,18 @@ mod tests {
         assert_eq!(next("Some(0):1"), Some("Some(0):2"));
         assert_eq!(next("None:1"), None, "last video");
         assert_eq!(next("missing"), None);
+        let start = |seen: &[&str]| start_episode(&eps, |v| seen.contains(&v.id.as_str())).map(|n| n.id.as_str());
+        assert_eq!(start(&[]), Some("Some(1):1"), "first regular episode");
+        assert_eq!(start(&["Some(1):1", "Some(1):2"]), Some("Some(2):1"), "after the last watched");
+        assert_eq!(start(&["Some(2):1"]), Some("Some(1):1"), "finale watched: start over");
+    }
+
+    #[test]
+    fn series_id_strips_season_and_episode() {
+        assert_eq!(series_id("tt1:1:2"), "tt1");
+        assert_eq!(series_id("tt1"), "tt1");
+        assert_eq!(series_id("kitsu:1234:5"), "kitsu:1234");
+        assert_eq!(series_id("x:a:b"), "x:a:b");
     }
 
     #[test]

@@ -29,6 +29,10 @@ Open a series to pick a season and an episode. The ⏭ control in the player ope
 
 If the stream you were watching has a `bingeGroup` (set by the addon in `behaviorHints`), the next episode autoplays a stream from the same group. Without a match, the app plays the only stream or shows the stream picker.
 
+## Play button on posters
+
+Hover a poster and press the play button in its middle to start playback. If the title is in Continue Watching, it resumes with the same stream. For a series, it resumes the episode in progress, or it starts the episode after the last one you watched. That episode uses a stream from the series' last `bingeGroup`, or the top stream if none matches. A movie with no progress plays its top stream. A click elsewhere on a Continue Watching poster opens the title's stream picker. For a series, that is the episode's stream picker.
+
 ## Search
 
 The search pill in the header queries every installed addon catalog that supports the `search` extra. Results appear as a row on Home.
