@@ -1,6 +1,6 @@
-use stremio_lite::addon::parse_manifest;
-use stremio_lite::db::{Db, Progress, SavedTitle, Watched};
-use stremio_lite::library::LibraryItem;
+use stremflix_rs::addon::parse_manifest;
+use stremflix_rs::db::{Db, Progress, SavedTitle, Watched};
+use stremflix_rs::library::LibraryItem;
 
 #[test]
 fn data_survives_reopen() {

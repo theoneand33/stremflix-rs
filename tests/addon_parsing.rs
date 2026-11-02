@@ -1,4 +1,4 @@
-use stremio_lite::addon::*;
+use stremflix_rs::addon::*;
 
 const MANIFEST: &str = r#"{
   "id": "org.example.x", "version": "1.2.3", "name": "  Example\u0007 ",
