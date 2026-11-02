@@ -13,6 +13,8 @@ const MAX_LONG_TEXT: usize = 4000;
 const MAX_ITEMS: usize = 500;
 /// Long-running series have well over `MAX_ITEMS` episodes.
 const MAX_VIDEOS: usize = 5000;
+/// Cap on genres, cast, directors and links of a meta.
+const MAX_TAGS: usize = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -118,15 +120,46 @@ pub struct Meta {
     #[serde(rename = "type")]
     pub kind: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_text")]
     pub poster: Option<String>,
-    #[serde(default)]
+    /// Wide backdrop image shown behind the detail header.
+    #[serde(default, deserialize_with = "lenient_text")]
+    pub background: Option<String>,
+    /// Title artwork shown in place of the name.
+    #[serde(default, deserialize_with = "lenient_text")]
+    pub logo: Option<String>,
+    #[serde(default, deserialize_with = "lenient_text")]
     pub description: Option<String>,
-    #[serde(default, rename = "releaseInfo")]
+    #[serde(default, rename = "releaseInfo", deserialize_with = "lenient_text")]
     pub release_info: Option<String>,
+    /// e.g. "118 min".
+    #[serde(default, deserialize_with = "lenient_text")]
+    pub runtime: Option<String>,
+    #[serde(default, rename = "imdbRating", deserialize_with = "lenient_text")]
+    pub imdb_rating: Option<String>,
+    /// Also filled from the legacy `genre` field.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub genres: Vec<String>,
+    #[serde(default, deserialize_with = "lenient_vec", skip_serializing)]
+    genre: Vec<String>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub cast: Vec<String>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub director: Vec<String>,
+    /// Only links with an http(s) URL are kept (Stremio's own `stremio://` links are dropped).
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub links: Vec<Link>,
     /// Episodes of a series; malformed entries are dropped.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub videos: Vec<Video>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Link {
+    pub name: String,
+    #[serde(default)]
+    pub category: String,
+    pub url: String,
 }
 
 /// One video of a meta, e.g. a series episode. Its `id` (often `tt…:S:E`) is what streams are requested for.
@@ -150,6 +183,15 @@ fn lenient_vec<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(d: D) -> R
     let v = serde_json::Value::deserialize(d)?;
     let items = v.as_array().map(|a| a.as_slice()).unwrap_or_default();
     Ok(items.iter().take(MAX_VIDEOS).filter_map(|v| T::deserialize(v).ok()).collect())
+}
+
+/// A string (or number, e.g. `"imdbRating": 7.8`); anything else becomes `None` instead of failing the meta.
+fn lenient_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -348,8 +390,29 @@ pub fn parse_meta(body: &[u8]) -> Result<Meta> {
     m.name = sanitize_text(&m.name, MAX_TEXT);
     ensure!(!m.name.is_empty(), "meta: empty name");
     opt_url(&mut m.poster);
+    opt_url(&mut m.background);
+    opt_url(&mut m.logo);
     opt_text(&mut m.description, MAX_LONG_TEXT);
     opt_text(&mut m.release_info, 64);
+    opt_text(&mut m.runtime, 64);
+    opt_text(&mut m.imdb_rating, 16);
+    if m.genres.is_empty() {
+        m.genres = std::mem::take(&mut m.genre);
+    }
+    m.genre.clear();
+    for list in [&mut m.genres, &mut m.cast, &mut m.director] {
+        *list = list.iter().map(|s| sanitize_text(s, MAX_TEXT)).filter(|s| !s.is_empty()).take(MAX_TAGS).collect();
+    }
+    m.links = std::mem::take(&mut m.links)
+        .into_iter()
+        .filter_map(|mut l| {
+            l.url = safe_http_url(&l.url)?.into();
+            l.name = sanitize_text(&l.name, MAX_TEXT);
+            l.category = sanitize_text(&l.category, 64);
+            (!l.name.is_empty()).then_some(l)
+        })
+        .take(MAX_TAGS)
+        .collect();
     m.videos.retain(|v| valid_id(&v.id));
     for v in &mut m.videos {
         opt_text(&mut v.title, MAX_TEXT);

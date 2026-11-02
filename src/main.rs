@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
-use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, MetaPreview, Stream, Video, parse_magnet_hash};
+use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, Stream, Video, parse_magnet_hash};
 use stremio_lite::db::{Db, Progress, Watched};
 use stremio_lite::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
@@ -33,8 +33,10 @@ enum Msg {
     /// meta, episode (series only), streams, subtitle URLs, play the first stream on arrival,
     /// and the `bingeGroup` to autoplay (next episode)
     Streams(MetaPreview, Option<Video>, Vec<Stream>, Vec<String>, bool, Option<String>),
-    /// series and its episodes
-    Episodes(MetaPreview, Vec<Video>),
+    /// series and its full meta (with episodes)
+    Episodes(MetaPreview, Meta),
+    /// Full meta of a movie (genres, cast, ...) for the detail page.
+    Details(Meta),
     /// poster URL, image bytes (empty on failure)
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs
@@ -250,6 +252,10 @@ struct App {
     episodes: Vec<Video>,
     season: Option<u32>,
     episode: Option<Video>,
+    /// Full meta of the selected title, if an addon served one; checked against `selected` by id.
+    details: Option<Meta>,
+    /// Type and id of the movie whose details were last requested; older replies are dropped.
+    details_want: (String, String),
     scroll_top: bool,
     /// Scroll the stream picker into view on the next frame.
     show_streams: bool,
@@ -318,6 +324,8 @@ impl App {
             episodes: Vec::new(),
             season: None,
             episode: None,
+            details: None,
+            details_want: Default::default(),
             scroll_top: false,
             show_streams: false,
             magnet: String::new(),
@@ -407,13 +415,20 @@ impl App {
                     }
                 }
             }
-            Msg::Episodes(meta, mut videos) => {
+            Msg::Episodes(meta, mut m) => {
+                let mut videos = std::mem::take(&mut m.videos);
+                self.details = Some(m);
                 sort_episodes(&mut videos);
                 self.status = format!("{}: {} episodes", meta.name, videos.len());
                 self.season = videos.first().and_then(|v| v.season);
                 (self.episodes, self.episode) = (videos, None);
                 self.selected = Some((meta, Vec::new(), Vec::new()));
                 self.scroll_top = true;
+            }
+            Msg::Details(m) => {
+                if self.details_want == (m.kind.clone(), m.id.clone()) {
+                    self.details = Some(m);
+                }
             }
             Msg::RecentPoster(key, url) => {
                 if let Err(e) = self.db.set_progress_poster(&key, &url) {
@@ -631,6 +646,30 @@ impl App {
         self.addons.iter().filter(|(_, m)| matches(m)).map(|(u, _)| u.clone()).collect()
     }
 
+    /// Fetch a movie's full meta for the detail page from the first addon that serves it.
+    fn fetch_details(&mut self, ctx: &egui::Context, meta: &MetaPreview) {
+        let addons = self.addons_for("meta", &meta.kind, &meta.id);
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), ctx.clone());
+        let (kind, id) = (meta.kind.clone(), meta.id.clone());
+        self.details_want = (kind.clone(), id.clone());
+        // Not `spawn`: the page works without details, so a failure is not worth an error.
+        self.rt.spawn(async move {
+            for u in &addons {
+                if let Ok(m) = client.meta(u, &kind, &id).await {
+                    let _ = tx.send(Msg::Details(m));
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Full meta of the selected title, once loaded.
+    fn selected_details(&self) -> Option<&Meta> {
+        let (m, ..) = self.selected.as_ref()?;
+        self.details.as_ref().filter(|d| d.id == m.id && d.kind == m.kind)
+    }
+
     /// Look up posters for Continue Watching entries saved without one (older history).
     /// Torrent/file keys never match an addon type, so they are skipped.
     fn fetch_recent_posters(&self, ctx: &egui::Context) {
@@ -696,6 +735,7 @@ impl App {
     /// Series load their episode list; anything else loads streams for its own id.
     fn open_meta(&mut self, ctx: &egui::Context, meta: MetaPreview, autoplay: bool) {
         if meta.kind != "series" {
+            self.fetch_details(ctx, &meta);
             return self.open_streams(ctx, meta, None, autoplay, None);
         }
         let client = self.client.clone();
@@ -705,7 +745,7 @@ impl App {
             let mut errors = Vec::new();
             for u in &addons {
                 match client.meta(u, &meta.kind, &meta.id).await {
-                    Ok(m) if !m.videos.is_empty() => return Ok(Msg::Episodes(meta, m.videos)),
+                    Ok(m) if !m.videos.is_empty() => return Ok(Msg::Episodes(meta, m)),
                     Ok(_) => {}
                     Err(e) => errors.push(format!("{e:#}")),
                 }
@@ -774,6 +814,9 @@ impl App {
                 ui.add_space(40.0);
                 ui.spinner();
             }
+        }
+        if let Some(d) = self.selected_details() {
+            Self::ui_details(ui, d);
         }
         let mut episode = None;
         // Movies show their streams; a series shows them once an episode is picked.
@@ -954,8 +997,10 @@ impl App {
             ui.scroll_to_rect(rect, Some(Align::TOP));
         }
         ui.painter().rect_filled(rect, 12, Color32::from_gray(28));
+        let details = self.selected_details();
+        let (background, logo) = (meta.background.clone().or_else(|| details?.background.clone()), details.and_then(|d| d.logo.clone()));
         // Background first; fall back to the poster when it is missing or rejected.
-        let bg = self.image(&meta.background, want);
+        let bg = self.image(&background, want);
         let poster = if bg.is_none() { self.image(&meta.poster, want) } else { None };
         if let Some((u, b)) = bg {
             let img = egui::Image::from_bytes(format!("bytes://{u}"), b).corner_radius(12);
@@ -1010,8 +1055,38 @@ impl App {
                 k => k,
             };
             ui.label(RichText::new(kind).size(15.0).strong().family(bold()).color(Color32::from_gray(220)));
-            ui.add(egui::Label::new(RichText::new(&meta.name).size(46.0).strong().family(bold()).color(Color32::WHITE)).wrap());
+            match self.image(&logo, want) {
+                Some((u, b)) => ui.add(egui::Image::from_bytes(format!("bytes://{u}"), b).alt_text(&meta.name).max_height(120.0).max_width(col.width())),
+                None => ui.add(egui::Label::new(RichText::new(&meta.name).size(46.0).strong().family(bold()).color(Color32::WHITE)).wrap()),
+            };
         });
+    }
+
+    /// Detail facts under the banner: year, runtime, rating, genres, cast, director, links.
+    fn ui_details(ui: &mut egui::Ui, d: &Meta) {
+        ui.add_space(14.0);
+        let gray = Color32::from_gray(170);
+        let facts: Vec<String> = [d.release_info.clone(), d.runtime.clone(), d.imdb_rating.as_ref().map(|r| format!("IMDb {r}"))]
+            .into_iter()
+            .flatten()
+            .chain((!d.genres.is_empty()).then(|| d.genres.join(", ")))
+            .collect();
+        if !facts.is_empty() {
+            ui.label(RichText::new(facts.join("  ·  ")).size(16.0).color(Color32::WHITE));
+        }
+        for (name, list) in [("Cast", &d.cast), ("Director", &d.director)] {
+            if !list.is_empty() {
+                ui.add(egui::Label::new(RichText::new(format!("{name}: {}", list.join(", "))).size(15.0).color(gray)).wrap());
+            }
+        }
+        if !d.links.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for l in &d.links {
+                    // `links` holds only http(s) URLs (checked in `parse_meta`).
+                    ui.hyperlink_to(&l.name, &l.url).on_hover_text(format!("{}: {}", l.category, l.url));
+                }
+            });
+        }
     }
 
     /// Full-window Netflix-style player: letterboxed video, controls that fade out after
@@ -1414,7 +1489,7 @@ impl eframe::App for App {
             // Back lives outside the scroll area, so it stays put while the detail page scrolls.
             if self.selected.is_some() {
                 if pill_button(ui, "←  Back", 16.0, vec2(0.0, 40.0), white_fill(), Color32::BLACK).on_hover_text("Back to browse").clicked() {
-                    self.selected = None;
+                    (self.selected, self.details) = (None, None);
                     (self.episodes, self.episode) = (Vec::new(), None);
                     self.scroll_top = true;
                 }
