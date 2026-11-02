@@ -2,7 +2,7 @@
 
 # Scarlet
 
-Scarlet is a desktop client for [Stremio addons](https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/protocol.md), written in Rust. You install addons by manifest URL, browse their catalogs, and play their HTTP and torrent streams. It also plays video files from local folders. Playback progress is saved in SQLite and survives restarts.
+Scarlet is a desktop client for [Stremio addons](https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/protocol.md), written in Rust. You install addons by manifest URL, browse and search their catalogs, and play their HTTP and torrent streams. It also plays video files from local folders. Playback progress is saved in SQLite and survives restarts.
 
 The client ships with no content sources. You install every addon yourself. All media in this repo is generated locally.
 
@@ -13,7 +13,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design: egui UI, libmpv playback,
 - Rust 1.85 or newer (edition 2024)
 - libmpv (`libmpv.so.2` and headers, for example `pacman -S mpv` or `apt install libmpv-dev`), linked for the built-in player
 - `ffmpeg`, only needed to generate demo media
-- Linux, macOS, or Windows (x86_64)
+- Linux, macOS, or Windows. Release archives cover `linux-x86_64`, `macos-arm64`, and `windows-x86_64`.
 
 The Windows release zip includes `libmpv-2.dll`. To build from source on Windows, you need an MSVC build of libmpv. The Windows step in `.github/workflows/release.yml` shows the pinned build that releases use.
 
@@ -28,6 +28,10 @@ Click the video or press Space or K to pause. Press ←/→ to skip 10 s, ↑/�
 Open a series to pick a season and an episode. The ⏭ control in the player opens the next episode in the list.
 
 If the stream you were watching has a `bingeGroup` (set by the addon in `behaviorHints`), the next episode autoplays a stream from the same group. Without a match, the app plays the only stream or shows the stream picker.
+
+## Search
+
+The search pill in the header queries every installed addon catalog that supports the `search` extra. Results appear as a row on Home.
 
 ## Build
 
@@ -72,7 +76,7 @@ cargo test
 
 The tests cover:
 
-- manifest, catalog, meta, stream, and subtitle parsing
+- manifest, catalog, meta, stream, and subtitle parsing, including series `videos` and `bingeGroup`
 - rejection of malformed and oversized responses. Every truncation of every sample goes to every parser, and none may panic.
 - URL safety: only `http`/`https` URLs and valid magnets are accepted
 - SQLite persistence across reopen
