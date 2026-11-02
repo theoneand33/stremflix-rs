@@ -30,8 +30,9 @@ enum Msg {
     Catalog(String, Vec<MetaPreview>),
     /// Row source (addon URL, type, catalog id) and its items or error.
     Row((String, String, String), Result<Vec<MetaPreview>, String>),
-    /// meta, episode (series only), streams, subtitle URLs, play the first stream on arrival
-    Streams(MetaPreview, Option<Video>, Vec<Stream>, Vec<String>, bool),
+    /// meta, episode (series only), streams, subtitle URLs, play the first stream on arrival,
+    /// and the `bingeGroup` to autoplay (next episode)
+    Streams(MetaPreview, Option<Video>, Vec<Stream>, Vec<String>, bool, Option<String>),
     /// series and its episodes
     Episodes(MetaPreview, Vec<Video>),
     /// poster URL, image bytes (empty on failure)
@@ -188,6 +189,23 @@ fn season_label(season: Option<u32>) -> String {
 /// Episodes in watch order: by season then episode, with specials (season 0), then unnumbered videos, last.
 fn sort_episodes(videos: &mut [Video]) {
     videos.sort_by_key(|v| (matches!(v.season, Some(0) | None), v.season.is_none(), v.season, v.episode));
+}
+
+/// The episode after `current` in `sort_episodes` order; a regular episode never rolls over into specials or unnumbered videos.
+fn next_episode<'a>(episodes: &'a [Video], current: &str) -> Option<&'a Video> {
+    let i = episodes.iter().position(|v| v.id == current)?;
+    let regular = |v: &Video| v.season.is_some_and(|s| s > 0);
+    episodes.get(i + 1).filter(|n| regular(n) || !regular(&episodes[i]))
+}
+
+/// Playable source of the first stream in binge group `group` (same addon/quality as the previous episode).
+fn binge_source(streams: &[Stream], group: &str) -> Option<String> {
+    streams.iter().filter(|s| s.binge_group.as_deref() == Some(group)).find_map(Stream::source)
+}
+
+/// mpv's `keep-open` pauses on the last frame at end of file.
+fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
+    paused && dur > 0.0 && pos >= dur - 1.0
 }
 
 /// The playable source when there is exactly one; `None` when there's a choice (or nothing).
@@ -367,7 +385,7 @@ impl App {
                     Vec::new()
                 }));
             }
-            Msg::Streams(meta, episode, streams, subs, autoplay) => {
+            Msg::Streams(meta, episode, streams, subs, autoplay, binge) => {
                 if episode.is_some() {
                     // Stale reply for a series the user has since left.
                     if self.selected.as_ref().is_none_or(|(m, ..)| *m != meta) {
@@ -378,7 +396,7 @@ impl App {
                     self.scroll_top = true;
                 }
                 self.status = format!("{}: {} streams", meta.name, streams.len());
-                let src = only_source(&streams);
+                let src = binge.and_then(|g| binge_source(&streams, &g)).or_else(|| only_source(&streams));
                 (self.selected, self.episode) = (Some((meta, streams, subs.clone())), episode);
                 // Autoplay only when there's no choice to make; otherwise show the stream picker.
                 if autoplay {
@@ -476,13 +494,18 @@ impl App {
         self.player = None;
     }
 
-    fn poll_player(&mut self) {
+    fn poll_player(&mut self, ctx: &egui::Context) {
         let Some(p) = &mut self.player else { return };
         if !p.player.poll() || p.player.state.error.is_some() {
             self.status = p.player.state.error.clone().unwrap_or_else(|| "Player closed".into());
             self.stop_player();
             return;
         }
+        let st = &p.player.state;
+        if at_end(st.pos, st.dur, st.paused) && self.playing_episode() {
+            return self.play_next(ctx);
+        }
+        let Some(p) = &mut self.player else { return };
         if self.last_poll.elapsed() < Duration::from_secs(1) {
             return;
         }
@@ -646,10 +669,33 @@ impl App {
         })
     }
 
+    /// Whether the player shows the selected series episode (not e.g. a Continue Watching entry).
+    fn playing_episode(&self) -> bool {
+        self.episode.is_some() && self.player.as_ref().zip(self.play_key()).is_some_and(|(p, (k, _))| p.key == k)
+    }
+
+    /// Stop the playing episode and open the next one, autoplaying a stream from the same `bingeGroup`
+    /// (else the only stream, else the picker). Without a next episode, just stop.
+    fn play_next(&mut self, ctx: &egui::Context) {
+        let Some(p) = &mut self.player else { return };
+        if let Some((pos, dur)) = p.player.position() {
+            (p.pos, p.dur) = (pos, dur);
+        }
+        let src = Some(p.source.clone());
+        let binge = (self.selected.as_ref()).and_then(|(_, streams, _)| streams.iter().find(|s| s.source() == src)?.binge_group.clone());
+        let next = (self.selected.as_ref().zip(self.episode.as_ref()))
+            .and_then(|((m, ..), cur)| Some((m.clone(), next_episode(&self.episodes, &cur.id)?.clone())));
+        self.stop_player();
+        match next {
+            Some((m, v)) => self.open_streams(ctx, m, Some(v), true, binge),
+            None => self.status = "Finished".into(),
+        }
+    }
+
     /// Series load their episode list; anything else loads streams for its own id.
     fn open_meta(&mut self, ctx: &egui::Context, meta: MetaPreview, autoplay: bool) {
         if meta.kind != "series" {
-            return self.open_streams(ctx, meta, None, autoplay);
+            return self.open_streams(ctx, meta, None, autoplay, None);
         }
         let client = self.client.clone();
         let addons = self.addons_for("meta", &meta.kind, &meta.id);
@@ -669,7 +715,8 @@ impl App {
     }
 
     /// Fetch streams and subtitles for a movie, or for `episode` of a series.
-    fn open_streams(&mut self, ctx: &egui::Context, meta: MetaPreview, episode: Option<Video>, autoplay: bool) {
+    /// `binge`: on arrival, autoplay the stream in this binge group if there is one.
+    fn open_streams(&mut self, ctx: &egui::Context, meta: MetaPreview, episode: Option<Video>, autoplay: bool, binge: Option<String>) {
         let client = self.client.clone();
         let id = episode.as_ref().map_or(meta.id.clone(), |v| v.id.clone());
         let stream_addons = self.addons_for("stream", &meta.kind, &id);
@@ -692,7 +739,7 @@ impl App {
             if streams.is_empty() && !errors.is_empty() {
                 anyhow::bail!("no streams: {}", errors.join("; "));
             }
-            Ok(Msg::Streams(meta, episode, streams, subs, autoplay))
+            Ok(Msg::Streams(meta, episode, streams, subs, autoplay, binge))
         });
     }
 
@@ -851,7 +898,7 @@ impl App {
             self.open_meta(&ctx, m, autoplay);
         }
         if let Some((m, v)) = episode {
-            self.open_streams(&ctx, m, Some(v), true);
+            self.open_streams(&ctx, m, Some(v), true, None);
         }
         if let Some((k, t, s, subs)) = play {
             self.play(&ctx, k, t, s, subs);
@@ -971,6 +1018,8 @@ impl App {
     fn ui_player(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let rect = ui.max_rect();
+        let has_next = self.playing_episode() && self.episode.as_ref().is_some_and(|c| next_episode(&self.episodes, &c.id).is_some());
+        let mut next = false;
         let Some(p) = &mut self.player else { return };
         let now = ctx.input(|i| i.time);
         let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -1138,6 +1187,7 @@ impl App {
             paint.rect_filled(egui::Rect::from_min_size(vt.min, vec2(vt.width() * vf, 4.0)), 2, white);
             paint.circle_filled(pos2(vt.left() + vt.width() * vf, vt.center().y), 6.0, white);
             paint.text(pos2(rect.center().x, y), egui::Align2::CENTER_CENTER, &p.title, egui::FontId::new(18.0, bold()), white);
+            next = has_next && icon(ui, pos2(rect.right() - 188.0, y), "⏭", "Next episode").clicked();
             let cc = icon(ui, pos2(rect.right() - 120.0, y), "💬", "Audio & Subtitles");
             if cc.clicked() {
                 p.menu = !p.menu;
@@ -1187,6 +1237,8 @@ impl App {
             }
             self.stop_player();
             self.status = "Stopped".into();
+        } else if next {
+            self.play_next(&ctx);
         }
     }
 
@@ -1292,7 +1344,7 @@ impl eframe::App for App {
         while let Ok(msg) = self.rx.try_recv() {
             self.handle(&ctx, msg);
         }
-        self.poll_player();
+        self.poll_player(&ctx);
         ctx.request_repaint_after(Duration::from_millis(500));
         if self.player.is_some() {
             self.ui_player(ui, frame);
@@ -1428,6 +1480,29 @@ mod tests {
         let order: Vec<_> = eps.iter().map(|e| (e.season, e.episode)).collect();
         assert_eq!(order, [(Some(1), Some(1)), (Some(1), Some(2)), (Some(2), Some(1)), (Some(0), Some(1)), (None, Some(1))]);
         assert_eq!((season_label(Some(0)), season_label(Some(3))), ("Specials".to_string(), "Season 3".to_string()));
+    }
+
+    #[test]
+    fn next_episode_in_watch_order() {
+        let v = |season, episode| Video { id: format!("{season:?}:{episode}"), title: None, season, episode: Some(episode), released: None, thumbnail: None };
+        let mut eps = vec![v(Some(1), 1), v(Some(1), 2), v(Some(2), 1), v(Some(0), 1), v(Some(0), 2), v(None, 1)];
+        sort_episodes(&mut eps);
+        let next = |id: &str| next_episode(&eps, id).map(|n| n.id.as_str());
+        assert_eq!(next("Some(1):2"), Some("Some(2):1"), "crosses seasons");
+        assert_eq!(next("Some(1):1"), Some("Some(1):2"));
+        assert_eq!(next("Some(2):1"), None, "finale doesn't roll into specials");
+        assert_eq!(next("Some(0):1"), Some("Some(0):2"));
+        assert_eq!(next("None:1"), None, "last video");
+        assert_eq!(next("missing"), None);
+    }
+
+    #[test]
+    fn binge_source_matches_group() {
+        let s = |u: &str, g: Option<&str>| Stream { url: Some(u.into()), binge_group: g.map(String::from), ..Default::default() };
+        let streams = [s("https://a/1", None), s("javascript:x", Some("hd")), s("https://a/2", Some("sd")), s("https://a/3", Some("hd"))];
+        assert_eq!(binge_source(&streams, "hd").as_deref(), Some("https://a/3"), "skips unplayable");
+        assert_eq!(binge_source(&streams, "4k"), None);
+        assert!(at_end(99.5, 100.0, true) && !at_end(99.5, 100.0, false) && !at_end(50.0, 100.0, true) && !at_end(0.0, 0.0, true));
     }
 
     #[test]
