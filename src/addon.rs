@@ -91,6 +91,23 @@ pub struct Manifest {
     pub catalogs: Vec<CatalogDef>,
     #[serde(default, rename = "idPrefixes")]
     pub id_prefixes: Option<Vec<String>>,
+    #[serde(default, rename = "behaviorHints", deserialize_with = "lenient_hints")]
+    pub behavior_hints: BehaviorHints,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BehaviorHints {
+    #[serde(default)]
+    pub configurable: bool,
+    #[serde(default, rename = "configurationRequired")]
+    pub configuration_required: bool,
+}
+
+/// Malformed hints (wrong type, non-bool flags) degrade to false instead of failing the manifest.
+fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<BehaviorHints, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+    Ok(BehaviorHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired") })
 }
 
 impl Manifest {
@@ -472,6 +489,32 @@ pub fn check_poster(body: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod configure_tests {
+    use super::*;
+
+    #[test]
+    fn configure_url_derivation() {
+        assert_eq!(configure_url("https://a.example/x/manifest.json").unwrap().as_str(), "https://a.example/x/configure");
+        assert_eq!(configure_url("http://127.0.0.1:7070/manifest.json").unwrap().as_str(), "http://127.0.0.1:7070/configure");
+        assert!(configure_url("stremio://a.example/manifest.json").is_err());
+        assert!(configure_url("https://a.example/other.json").is_err());
+    }
+
+    #[test]
+    fn behavior_hints_tolerant() {
+        let m = |h: &str| {
+            let body = format!(r#"{{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"]{h}}}"#);
+            parse_manifest(body.as_bytes()).unwrap().behavior_hints
+        };
+        assert_eq!(m(""), BehaviorHints::default());
+        let h = m(r#","behaviorHints":{"configurable":true,"configurationRequired":true}"#);
+        assert!(h.configurable && h.configuration_required);
+        assert_eq!(m(r#","behaviorHints":"junk""#), BehaviorHints::default());
+        assert_eq!(m(r#","behaviorHints":{"configurable":"yes"}"#), BehaviorHints::default());
+    }
+}
+
 // ---------- client ----------
 
 /// Base URL of an addon given its transport (manifest) URL.
@@ -480,6 +523,11 @@ pub fn addon_base(transport_url: &str) -> Result<Url> {
     let s = u.as_str();
     let Some(base) = s.strip_suffix("/manifest.json") else { bail!("addon URL must end with /manifest.json") };
     Ok(Url::parse(&format!("{base}/"))?)
+}
+
+/// `<base>/configure` page of a configurable addon (http(s) only).
+pub fn configure_url(transport_url: &str) -> Result<Url> {
+    Ok(addon_base(transport_url)?.join("configure")?)
 }
 
 fn enc(s: &str) -> String {
