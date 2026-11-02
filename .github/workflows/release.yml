@@ -124,6 +124,8 @@ jobs:
           LINUXDEPLOY_SHA256: c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
           APPIMAGE_EXTRACT_AND_RUN: "1" # runners have no FUSE
           LDAI_OUTPUT: stremio-lite-${{ env.TAG }}-${{ matrix.target }}.AppImage
+          # embedded so AppImageUpdate can find new builds; nightly is a prerelease, so "latest" would skip it
+          LDAI_UPDATE_INFORMATION: gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|${{ inputs.version && 'latest' || 'nightly' }}|stremio-lite-*-${{ matrix.target }}.AppImage.zsync
         run: |
           ld="$RUNNER_TEMP/linuxdeploy"
           curl -fsSL --retry 3 -o "$ld" "$LINUXDEPLOY_URL"
@@ -140,6 +142,7 @@ jobs:
             *.tar.gz
             *.zip
             *.AppImage
+            *.AppImage.zsync
           if-no-files-found: error
 
   release:
@@ -155,9 +158,9 @@ jobs:
         run: |
           if [ "$TAG" = nightly ]; then
             gh release delete nightly --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
-            gh release create nightly *.tar.gz *.zip *.AppImage --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            gh release create nightly *.tar.gz *.zip *.AppImage *.AppImage.zsync --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --title "Nightly ($(date -u +%F' '%H:%M) UTC, ${GITHUB_SHA::7})" --notes "Automated build of $GITHUB_SHA." --prerelease
           else
-            gh release create "$TAG" *.tar.gz *.zip *.AppImage --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            gh release create "$TAG" *.tar.gz *.zip *.AppImage *.AppImage.zsync --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --title "$TAG" --generate-notes
           fi
