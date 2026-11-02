@@ -1,5 +1,5 @@
 use stremio_lite::addon::parse_manifest;
-use stremio_lite::db::{Db, Progress};
+use stremio_lite::db::{Db, Progress, SavedTitle};
 use stremio_lite::library::LibraryItem;
 
 #[test]
@@ -32,6 +32,31 @@ fn data_survives_reopen() {
     db.remove_addon("https://x.example/manifest.json").unwrap();
     drop(db);
     assert!(Db::open(&path).unwrap().addons().unwrap().is_empty());
+}
+
+#[test]
+fn saved_titles_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let movie = SavedTitle { key: "movie:tt1".into(), title: "One".into(), kind: "movie".into(), poster: Some("https://x.example/p.jpg".into()) };
+    let show = SavedTitle { key: "series:tt2".into(), title: "Two".into(), kind: "series".into(), poster: None };
+    {
+        let db = Db::open(&path).unwrap();
+        db.add_saved_title(&movie).unwrap();
+        db.add_saved_title(&show).unwrap();
+        // Re-adding keeps one row and does not push it below newer entries.
+        db.add_saved_title(&SavedTitle { title: "One (2020)".into(), ..movie.clone() }).unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    let saved = db.saved_titles().unwrap();
+    assert_eq!(saved, vec![show.clone(), SavedTitle { title: "One (2020)".into(), ..movie.clone() }]);
+    // A malformed key or type is skipped instead of breaking the list.
+    db.add_saved_title(&SavedTitle { key: "bad/key".into(), title: "Bad".into(), kind: "movie".into(), poster: None }).unwrap();
+    assert_eq!(db.saved_titles().unwrap().len(), 2);
+    assert_eq!(show.preview().map(|m| (m.kind, m.id, m.name)), Some(("series".to_string(), "tt2".to_string(), "Two".to_string())));
+    assert_eq!(SavedTitle { key: "nocolon".into(), ..show.clone() }.preview(), None);
+    db.remove_saved_title("movie:tt1").unwrap();
+    assert_eq!(db.saved_titles().unwrap(), vec![show]);
 }
 
 #[test]

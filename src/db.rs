@@ -1,10 +1,10 @@
-//! SQLite persistence: addons, library folders/items, settings, watch progress.
+//! SQLite persistence: addons, library folders/items, saved titles, settings, watch progress.
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
-use crate::addon::{Manifest, parse_manifest};
+use crate::addon::{Manifest, MetaPreview, parse_manifest, valid_id};
 use crate::library::LibraryItem;
 
 pub struct Db {
@@ -34,6 +34,24 @@ pub struct Watched {
     pub episodes: u32,
 }
 
+/// A title saved with "Add to library".
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedTitle {
+    /// `<type>:<id>`, like addon progress keys.
+    pub key: String,
+    pub title: String,
+    pub kind: String,
+    pub poster: Option<String>,
+}
+
+impl SavedTitle {
+    /// Detail-page view of the saved title; `None` if the key has no `<type>:<id>` shape.
+    pub fn preview(&self) -> Option<MetaPreview> {
+        let (kind, id) = self.key.split_once(':')?;
+        Some(MetaPreview { id: id.into(), kind: kind.into(), name: self.title.clone(), poster: self.poster.clone(), background: None, description: None })
+    }
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -49,7 +67,9 @@ impl Db {
              CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, title TEXT NOT NULL, source TEXT NOT NULL,
                  position REAL NOT NULL, duration REAL NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS watched (key TEXT PRIMARY KEY, title TEXT NOT NULL, poster TEXT,
-                 episodes INTEGER NOT NULL, watched_at INTEGER NOT NULL);",
+                 episodes INTEGER NOT NULL, watched_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS saved_titles (key TEXT PRIMARY KEY, title TEXT NOT NULL, kind TEXT NOT NULL,
+                 poster TEXT, saved_at INTEGER NOT NULL DEFAULT (unixepoch()));",
         )?;
         // Migrate databases created before posters were stored; fails harmlessly if the column exists.
         let _ = conn.execute("ALTER TABLE progress ADD COLUMN poster TEXT", []);
@@ -110,6 +130,34 @@ impl Db {
             Ok(LibraryItem { path: PathBuf::from(r.get::<_, String>(0)?), title: r.get(1)? })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Re-adding a saved title keeps its original `saved_at`, so the library order is stable.
+    pub fn add_saved_title(&self, t: &SavedTitle) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO saved_titles (key, title, kind, poster) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster)",
+            params![t.key, t.title, t.kind, t.poster],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_saved_title(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM saved_titles WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    /// Saved titles, newest first; rows with a malformed key or type are skipped.
+    pub fn saved_titles(&self) -> Result<Vec<SavedTitle>> {
+        // rowid, not key, breaks same-second ties so the order matches insertion order.
+        let mut st = self.conn.prepare("SELECT key, title, kind, poster FROM saved_titles ORDER BY saved_at DESC, rowid DESC")?;
+        let rows = st.query_map([], |r| {
+            Ok(SavedTitle { key: r.get(0)?, title: r.get(1)?, kind: r.get(2)?, poster: r.get(3)? })
+        })?;
+        Ok(rows
+            .filter_map(|r| r.ok())
+            .filter(|t| valid_id(&t.key) && valid_id(&t.kind) && !t.title.trim().is_empty())
+            .collect())
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
