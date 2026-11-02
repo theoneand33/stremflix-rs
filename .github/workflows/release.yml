@@ -100,7 +100,6 @@ jobs:
           lib /nologo /machine:x64 /def:"$dir\mpv.def" /out:"$dir\mpv.lib"
           if ($LASTEXITCODE -ne 0) { throw "lib.exe failed" }
           "RUSTFLAGS=-L native=$dir" >> $env:GITHUB_ENV
-          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=rust-lld" >> $env:GITHUB_ENV # lld-link links faster than link.exe; set after rust-cache so its key is unchanged
           "MPV_DIR=$($dir.Replace('\', '/'))" >> $env:GITHUB_ENV # forward slashes for the bash Package step
       - run: cargo build --release --locked --bin stremio-lite
       - name: Package
