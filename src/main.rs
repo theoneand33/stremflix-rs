@@ -1937,10 +1937,9 @@ impl App {
                                     let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("Preferred: en,eng").desired_width(200.0));
                                     if let Some(v) = &valid
                                         && r.changed()
+                                        && let Err(e) = self.db.set_setting(key, v)
                                     {
-                                        if let Err(e) = self.db.set_setting(key, v) {
-                                            report(&mut self.error, format!("saving {key}: {e:#}"));
-                                        }
+                                        report(&mut self.error, format!("saving {key}: {e:#}"));
                                     }
                                     if valid.is_none() {
                                         ui.label(RichText::new("Use codes like en,eng,pt-BR (max 8)").size(13.0).color(Color32::from_rgb(230, 90, 90)));
