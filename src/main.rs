@@ -192,12 +192,17 @@ fn card_play(ui: &mut egui::Ui, card: &egui::Response, rect: egui::Rect, label: 
     r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
-/// Bold weight of the UI font (egui's `strong()` only brightens the color).
 /// Phosphor Fill weight (same codepoints as Regular); used for play and pause.
 fn fill() -> egui::FontFamily {
     egui::FontFamily::Name("Phosphor-Fill".into())
 }
 
+/// Phosphor Regular alone. Inter has its own glyphs at some Phosphor codepoints (e.g. ARROW_LEFT), so icons must not go through Inter.
+fn phosphor() -> egui::FontFamily {
+    egui::FontFamily::Name("Phosphor".into())
+}
+
+/// Bold weight of the UI font (egui's `strong()` only brightens the color).
 fn bold() -> egui::FontFamily {
     egui::FontFamily::Name("bold".into())
 }
@@ -226,8 +231,9 @@ fn install_fonts(ctx: &egui::Context) {
     for (name, bytes) in [("Inter", &include_bytes!("../assets/fonts/Inter-Regular.ttf")[..]), ("Inter-Bold", &include_bytes!("../assets/fonts/Inter-Bold.ttf")[..])] {
         f.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(bytes)));
     }
-    // Phosphor icons (MIT): private-use codepoints, so they only ever match the `icons` constants.
+    // Phosphor icons (MIT). Kept as the last fallback: it also maps a-z for ligatures.
     f.font_data.insert("Phosphor".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Phosphor.ttf"))));
+    f.families.insert(phosphor(), vec!["Phosphor".into()]);
     f.families.get_mut(&egui::FontFamily::Proportional).unwrap().push("Phosphor".into());
     f.font_data.insert("Phosphor-Fill".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Phosphor-Fill.ttf"))));
     f.families.insert(fill(), vec!["Phosphor-Fill".into()]);
@@ -244,7 +250,13 @@ fn pill_button(ui: &mut egui::Ui, text: &str, size: f32, min: egui::Vec2, fill: 
         for (st, f) in [(&mut w.inactive, fill[0]), (&mut w.hovered, fill[1]), (&mut w.active, fill[1])] {
             (st.weak_bg_fill, st.bg_stroke, st.fg_stroke.color) = (f, egui::Stroke::NONE, fg);
         }
-        ui.add(egui::Button::new(RichText::new(text).size(size).strong().family(bold())).min_size(min).corner_radius((min.y / 2.0) as u8))
+        let rt = |s: &str, family| RichText::new(s).size(size).strong().family(family);
+        // A leading icon ("<icon>  Label") is drawn in Phosphor, not Inter; see `phosphor`.
+        let button = match text.split_once("  ") {
+            Some((i, t)) if !i.is_empty() && i.chars().all(|c| ('\u{E000}'..='\u{F8FF}').contains(&c)) => egui::Button::new((rt(i, phosphor()), rt(t, bold()))),
+            _ => egui::Button::new(rt(text, bold())),
+        };
+        ui.add(button.min_size(min).corner_radius((min.y / 2.0) as u8))
     })
     .inner
 }
@@ -1797,7 +1809,7 @@ impl App {
                 if r.hovered() {
                     paint.rect_filled(r.rect, 8, Color32::from_white_alpha((20.0 * a) as u8));
                 }
-                paint.text(c, egui::Align2::CENTER_CENTER, glyph, egui::FontId::new(26.0, if glyph == icons::PLAY || glyph == icons::PAUSE { fill() } else { egui::FontFamily::Proportional }), white);
+                paint.text(c, egui::Align2::CENTER_CENTER, glyph, egui::FontId::new(26.0, if glyph == icons::PLAY || glyph == icons::PAUSE { fill() } else { phosphor() }), white);
                 r.on_hover_cursor(egui::CursorIcon::PointingHand)
             };
             // Scrims behind the top and bottom controls.
