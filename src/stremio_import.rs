@@ -291,10 +291,12 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
         }
         let video = s.video_id.clone().unwrap_or(it.id.clone());
         if s.time_offset > 0
-            && let Some(source) = streams.get(&(it.id.clone(), video))
+            && let Some(source) = streams.get(&(it.id.clone(), video.clone()))
+            && valid_id(&video)
         {
             let p = Progress {
-                key: key.clone(),
+                // `<type>:<video id>` like local progress, so a series' episode resumes on its own.
+                key: format!("{}:{video}", it.kind),
                 title: title.clone(),
                 source: source.clone(),
                 position: s.time_offset as f64 / 1000.0,

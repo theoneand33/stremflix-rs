@@ -60,6 +60,7 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL; -- safe with WAL; a crash loses at most the last commit, and progress saves every second
              CREATE TABLE IF NOT EXISTS addons (transport_url TEXT PRIMARY KEY, manifest TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS library_folders (path TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS library_items (path TEXT PRIMARY KEY, folder TEXT NOT NULL, title TEXT NOT NULL);
@@ -117,11 +118,6 @@ impl Db {
         }
         tx.commit()?;
         Ok(())
-    }
-
-    pub fn library_folders(&self) -> Result<Vec<PathBuf>> {
-        let mut st = self.conn.prepare("SELECT path FROM library_folders ORDER BY path")?;
-        Ok(st.query_map([], |r| r.get::<_, String>(0))?.filter_map(|r| r.ok()).map(PathBuf::from).collect())
     }
 
     pub fn library_items(&self) -> Result<Vec<LibraryItem>> {

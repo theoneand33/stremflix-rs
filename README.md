@@ -53,7 +53,7 @@ Environment variables:
 
 | Variable | Purpose |
 |---|---|
-| `STREMIO_LITE_DATA` | Data directory for the DB and torrent downloads. Default: `$XDG_DATA_HOME/stremio-lite`, or `%APPDATA%\stremio-lite` on Windows. Without `XDG_DATA_HOME`, Unix uses `~/.local/share/stremio-lite`. |
+| `STREMIO_LITE_DATA` | Data directory for the DB and torrent downloads. A torrent and its files are deleted when playback stops, and leftovers are cleared at the next start. Default: `$XDG_DATA_HOME/stremio-lite`, or `%APPDATA%\stremio-lite` on Windows. Without `XDG_DATA_HOME`, Unix uses `~/.local/share/stremio-lite`. |
 | `STREMIO_LITE_MPV_ARGS` | Extra mpv options, e.g. `--ao=null` for headless runs |
 | `STREMIO_LITE_IPC` | mpv IPC endpoint. Default: `$TMPDIR/stremio-lite-mpv.sock` on Unix, `\\.\pipe\stremio-lite-mpv` on Windows |
 | `STREMIO_LITE_NO_DHT` | Set to disable the BitTorrent DHT (offline/CI use) |
