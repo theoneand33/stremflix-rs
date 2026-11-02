@@ -169,14 +169,54 @@ pub struct Stream {
     /// e.g. "tracker:<url>", "dht:<hash>"; "peer:<host:port>" is a local extension.
     #[serde(default)]
     pub sources: Vec<String>,
-    /// `behaviorHints.bingeGroup`: streams sharing one come from the same source/quality, so the next episode can autoplay it.
-    #[serde(default, rename = "behaviorHints", deserialize_with = "binge_group", skip_serializing)]
-    pub binge_group: Option<String>,
+    #[serde(default, rename = "behaviorHints", deserialize_with = "behavior_hints", skip_serializing)]
+    pub hints: BehaviorHints,
 }
 
-/// Only the string `bingeGroup` of `behaviorHints`; anything malformed is ignored, never fatal.
-fn binge_group<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    Ok(serde_json::Value::deserialize(d)?.get("bingeGroup").and_then(|g| g.as_str()).map(String::from))
+/// The parts of a stream's `behaviorHints` this client uses.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BehaviorHints {
+    /// `bingeGroup`: streams sharing one come from the same source/quality, so the next episode can autoplay it.
+    pub binge_group: Option<String>,
+    /// `proxyHeaders.request`: headers the stream URL needs (e.g. a debrid User-Agent), each passing [`valid_header`].
+    pub request_headers: Vec<(String, String)>,
+    pub filename: Option<String>,
+    /// `videoSize` in bytes.
+    pub video_size: Option<u64>,
+    /// `notWebReady`: a browser would need it transcoded/proxied; mpv plays it as is, so it is informational only.
+    pub not_web_ready: bool,
+}
+
+const MAX_HEADERS: usize = 32;
+
+/// Addon request header check: the name is an RFC 7230 token, the value printable ASCII (so no CR/LF/NUL
+/// header injection), both length-capped, and never a header that frames or routes the request.
+pub fn valid_header(name: &str, value: &str) -> bool {
+    const RESERVED: [&str; 10] = ["host", "content-length", "transfer-encoding", "connection", "te", "upgrade", "trailer", "keep-alive", "proxy-connection", "range"];
+    let tchar = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+    (1..=128).contains(&name.len())
+        && name.bytes().all(tchar)
+        && !RESERVED.iter().any(|r| name.eq_ignore_ascii_case(r))
+        && value.len() <= MAX_LONG_TEXT
+        && value.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
+}
+
+/// Typed fields of `behaviorHints`; anything malformed is ignored, never fatal.
+fn behavior_hints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BehaviorHints, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let text = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
+    let headers = v.pointer("/proxyHeaders/request").and_then(|h| h.as_object()).into_iter().flatten();
+    Ok(BehaviorHints {
+        binge_group: text("bingeGroup"),
+        request_headers: headers
+            .filter_map(|(k, x)| Some((k.clone(), x.as_str()?.trim().to_string())))
+            .filter(|(k, x)| valid_header(k, x))
+            .take(MAX_HEADERS)
+            .collect(),
+        filename: text("filename"),
+        video_size: v.get("videoSize").and_then(|x| x.as_u64()),
+        not_web_ready: v.get("notWebReady").and_then(|x| x.as_bool()).unwrap_or(false),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -373,7 +413,10 @@ pub fn parse_streams(body: &[u8]) -> Result<Vec<Stream>> {
             opt_text(&mut s.name, MAX_TEXT);
             opt_text(&mut s.title, MAX_LONG_TEXT);
             opt_text(&mut s.description, MAX_LONG_TEXT);
-            opt_text(&mut s.binge_group, MAX_TEXT);
+            opt_text(&mut s.hints.binge_group, MAX_TEXT);
+            // Shown on one line of the stream row.
+            s.hints.filename = s.hints.filename.map(|f| f.replace(['\n', '\t'], " "));
+            opt_text(&mut s.hints.filename, MAX_TEXT);
             s.target().is_some().then_some(s)
         })
         .collect())

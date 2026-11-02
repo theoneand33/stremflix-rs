@@ -155,9 +155,37 @@ fn stream_binge_group() {
     ]}}"#
     );
     let s = parse_streams(body.as_bytes()).unwrap();
-    let groups: Vec<_> = s.iter().map(|s| s.binge_group.as_deref().map(str::len)).collect();
-    assert_eq!(s[0].binge_group.as_deref(), Some("addon-1080p"));
+    let groups: Vec<_> = s.iter().map(|s| s.hints.binge_group.as_deref().map(str::len)).collect();
+    assert_eq!(s[0].hints.binge_group.as_deref(), Some("addon-1080p"));
     assert_eq!(groups, [Some(11), None, None, Some(300), None, None]);
+    assert!(s[0].hints.not_web_ready && !s[1].hints.not_web_ready);
+}
+
+#[test]
+fn stream_behavior_hints() {
+    let many: Vec<String> = (0..40).map(|i| format!(r#""X-H{i:02}": "v""#)).collect();
+    let body = format!(
+        r#"{{"streams": [
+        {{"url": "https://a.example/1", "behaviorHints": {{"filename": " Movie.2024\n.1080p.mkv\u0007", "videoSize": 2345000000,
+            "proxyHeaders": {{"request": {{"User-Agent": " Moz (KHTML, like Gecko) ", "Referer": "https://a.example/",
+                "X-Inject": "a\r\nX-Evil: 1", "X-Nul": "a\u0000b", "Bad Name": "v", "Bad:Name": "v", "": "v", "Host": "evil.example",
+                "Content-Length": "0", "X-Num": 7, "X-Uni": "café", "X-Long": "{long}"}}}}}}}},
+        {{"url": "https://a.example/2", "behaviorHints": {{"videoSize": -1, "filename": 3, "proxyHeaders": {{"request": "junk"}}}}}},
+        {{"url": "https://a.example/3", "behaviorHints": {{"proxyHeaders": {{"request": {{{many}}}}}}}}}
+    ]}}"#,
+        long = "x".repeat(5000),
+        many = many.join(",")
+    );
+    let s = parse_streams(body.as_bytes()).unwrap();
+    let h = &s[0].hints;
+    assert_eq!(h.filename.as_deref(), Some("Movie.2024 .1080p.mkv"));
+    assert_eq!(h.video_size, Some(2_345_000_000));
+    let names: Vec<_> = h.request_headers.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(names, ["Referer", "User-Agent"]);
+    assert_eq!(h.request_headers[1].1, "Moz (KHTML, like Gecko)");
+    assert_eq!((s[1].hints.video_size, &s[1].hints.filename, s[1].hints.request_headers.len()), (None, &None, 0));
+    assert_eq!(s[2].hints.request_headers.len(), 32);
+    assert!(valid_header("X-Debrid-Token", "abc, def;q=1") && !valid_header("X-A", "a\nb") && !valid_header("TE", "trailers"));
 }
 
 #[test]
