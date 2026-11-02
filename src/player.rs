@@ -222,6 +222,25 @@ pub fn parse_args(s: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// HTTP request headers as mpv options: User-Agent as the plain-string `user-agent`, the rest as the
+/// comma-separated `http-header-fields` list. mpv reads `\,` as a literal comma, but a value's own
+/// backslash would make that ambiguous, so such headers are dropped.
+pub fn header_options(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let mut opts = Vec::new();
+    let mut fields = Vec::new();
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("user-agent") {
+            opts.push(("user-agent".to_string(), v.clone()));
+        } else if !v.contains('\\') {
+            fields.push(format!("{k}: {}", v.replace(',', "\\,")));
+        }
+    }
+    if !fields.is_empty() {
+        opts.push(("http-header-fields".to_string(), fields.join(",")));
+    }
+    opts
+}
+
 /// mpv's `track-list` JSON to tracks; unknown shapes yield an empty list.
 pub fn parse_tracks(json: &str) -> Vec<Track> {
     let Ok(serde_json::Value::Array(list)) = serde_json::from_str(json) else { return Vec::new() };
@@ -262,8 +281,10 @@ fn pick_sub(subs: &[(String, String)], slang: &str) -> Option<usize> {
 impl Player {
     /// `source` is a URL or local path, passed to `loadfile` as a plain argument (never parsed as options).
     /// `wake` is called from mpv's thread whenever a new frame is ready.
+    /// `headers` (validated addon request headers) go to this instance only; each launch is a fresh mpv,
+    /// so they never leak to the next stream or host.
     /// Must be called, rendered and dropped with the GUI's GL context current.
-    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
+    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], headers: &[(String, String)], gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
         let mpv = unsafe { mpv_create() };
         if mpv.is_null() {
             bail!("failed to create mpv instance");
@@ -292,6 +313,7 @@ impl Player {
                 opts.push((k.into(), v.into()));
             }
         }
+        opts.extend(header_options(headers));
         opts.extend(parse_args(&std::env::var("STREMIO_LITE_MPV_ARGS").unwrap_or_default()));
         for (k, v) in &opts {
             let rc = unsafe { mpv_set_option_string(mpv, cstr(k).as_ptr(), cstr(v).as_ptr()) };
@@ -495,6 +517,14 @@ mod tests {
         assert_eq!(SubStyle::decode("junk"), SubStyle::default());
         assert_eq!(SubStyle::decode("NaN,0,0,0").scale, 1.0);
         assert_eq!(SubStyle { background: true, ..Default::default() }.props()[2].1, "background-box");
+    }
+
+    #[test]
+    fn headers_to_mpv_options() {
+        let h = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let o = header_options(&[h("User-Agent", "Moz (KHTML, like Gecko)"), h("Referer", "https://a.example/"), h("Accept", "a, b"), h("X-Bad", r"c\")]);
+        assert_eq!(o, [h("user-agent", "Moz (KHTML, like Gecko)"), h("http-header-fields", r"Referer: https://a.example/,Accept: a\, b")]);
+        assert!(header_options(&[]).is_empty());
     }
 
     #[test]

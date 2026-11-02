@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
-use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, Stream, Video, parse_magnet_hash};
+use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash};
 use stremio_lite::db::{Db, Progress, SavedTitle, Watched};
 use stremio_lite::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
@@ -224,7 +224,14 @@ fn card_text(ui: &egui::Ui, rect: egui::Rect, text: &str) {
 fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream) -> egui::Response {
     let mut parts = [&s.name, &s.title, &s.description].into_iter().flatten().map(|x| x.trim()).filter(|x| !x.is_empty());
     let head = parts.next().unwrap_or("Stream").replace('\n', " ");
-    list_row(ui, n, head, parts.collect::<Vec<_>>().join("\n"))
+    let file = [s.hints.filename.clone(), s.hints.video_size.map(fmt_size)].into_iter().flatten().collect::<Vec<_>>().join("  ·  ");
+    let details: Vec<&str> = parts.chain(Some(file.as_str()).filter(|f| !f.is_empty())).collect();
+    list_row(ui, n, head, details.join("\n"))
+}
+
+/// Byte count as decimal MB/GB, like addons label sizes.
+fn fmt_size(b: u64) -> String {
+    if b >= 1_000_000_000 { format!("{:.2} GB", b as f64 / 1e9) } else { format!("{:.0} MB", b as f64 / 1e6) }
 }
 
 /// Episode row: number, title, release date.
@@ -293,7 +300,14 @@ fn next_episode<'a>(episodes: &'a [Video], current: &str) -> Option<&'a Video> {
 
 /// Playable source of the first stream in binge group `group` (same addon/quality as the previous episode).
 fn binge_source(streams: &[Stream], group: &str) -> Option<String> {
-    streams.iter().filter(|s| s.binge_group.as_deref() == Some(group)).find_map(Stream::source)
+    streams.iter().filter(|s| s.hints.binge_group.as_deref() == Some(group)).find_map(Stream::source)
+}
+
+/// The addon's `proxyHeaders` for playing `url`, only when it is that addon's own http(s) stream:
+/// never for torrents (`url` is then the local torrent server, not `source`) or local files.
+fn request_headers(streams: &[Stream], source: &str, url: &str) -> Vec<(String, String)> {
+    let own = |s: &&Stream| matches!(s.target(), Some(PlayTarget::Http(u)) if u.as_str() == url);
+    (source == url).then(|| streams.iter().find(own)).flatten().map(|s| s.hints.request_headers.clone()).unwrap_or_default()
 }
 
 /// mpv's `keep-open` pauses on the last frame at end of file.
@@ -628,7 +642,8 @@ impl App {
                     return;
                 };
                 let lang = |k| self.db.setting(k).ok().flatten().unwrap_or_default();
-                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], gl_proc, Box::new(move || wake.request_repaint())) {
+                let headers = self.selected.as_ref().map(|(_, streams, _)| request_headers(streams, &source, &url)).unwrap_or_default();
+                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], &headers, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
                         self.status = if start > 0.0 { format!("Resuming at {}", fmt_time(start)) } else { "Playing".into() };
@@ -910,7 +925,7 @@ impl App {
             (p.pos, p.dur) = (pos, dur);
         }
         let src = Some(p.source.clone());
-        let binge = (self.selected.as_ref()).and_then(|(_, streams, _)| streams.iter().find(|s| s.source() == src)?.binge_group.clone());
+        let binge = (self.selected.as_ref()).and_then(|(_, streams, _)| streams.iter().find(|s| s.source() == src)?.hints.binge_group.clone());
         let next = (self.selected.as_ref().zip(self.episode.as_ref()))
             .and_then(|((m, ..), cur)| Some((m.clone(), next_episode(&self.episodes, &cur.id)?.clone())));
         self.stop_player();
@@ -2049,11 +2064,24 @@ mod tests {
 
     #[test]
     fn binge_source_matches_group() {
-        let s = |u: &str, g: Option<&str>| Stream { url: Some(u.into()), binge_group: g.map(String::from), ..Default::default() };
+        let s = |u: &str, g: Option<&str>| Stream { url: Some(u.into()), hints: stremio_lite::addon::BehaviorHints { binge_group: g.map(String::from), ..Default::default() }, ..Default::default() };
         let streams = [s("https://a/1", None), s("javascript:x", Some("hd")), s("https://a/2", Some("sd")), s("https://a/3", Some("hd"))];
         assert_eq!(binge_source(&streams, "hd").as_deref(), Some("https://a/3"), "skips unplayable");
         assert_eq!(binge_source(&streams, "4k"), None);
         assert!(at_end(99.5, 100.0, true) && !at_end(99.5, 100.0, false) && !at_end(50.0, 100.0, true) && !at_end(0.0, 0.0, true));
+    }
+
+    #[test]
+    fn request_headers_only_for_own_http_stream() {
+        let h = vec![("Referer".to_string(), "https://a.example/".to_string())];
+        let s = |u: &str| Stream { url: Some(u.into()), hints: stremio_lite::addon::BehaviorHints { request_headers: h.clone(), ..Default::default() }, ..Default::default() };
+        let magnet = format!("magnet:?xt=urn:btih:{}", "a".repeat(40));
+        let streams = [s("https://a.example/v.mp4"), s(&magnet)];
+        assert_eq!(request_headers(&streams, "https://a.example/v.mp4", "https://a.example/v.mp4"), h);
+        assert!(request_headers(&streams, "https://b.example/v.mp4", "https://b.example/v.mp4").is_empty());
+        assert!(request_headers(&streams, &magnet, "http://127.0.0.1:1234/stream").is_empty(), "torrent");
+        assert!(request_headers(&streams, "/media/v.mkv", "/media/v.mkv").is_empty(), "local file");
+        assert_eq!((fmt_size(734_003_200), fmt_size(2_345_000_000)), ("734 MB".to_string(), "2.35 GB".to_string()));
     }
 
     #[test]
