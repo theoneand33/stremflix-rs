@@ -127,7 +127,13 @@ pub struct Player {
 pub fn ipc_socket_path() -> PathBuf {
     std::env::var_os("STREMIO_LITE_IPC")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("stremio-lite-mpv.sock"))
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                PathBuf::from(r"\\.\pipe\stremio-lite-mpv")
+            } else {
+                std::env::temp_dir().join("stremio-lite-mpv.sock")
+            }
+        })
 }
 
 fn cstr(s: &str) -> CString {
@@ -354,6 +360,19 @@ impl Drop for Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_ipc_path_per_platform() {
+        if std::env::var_os("STREMIO_LITE_IPC").is_some() {
+            return;
+        }
+        let p = ipc_socket_path();
+        if cfg!(windows) {
+            assert_eq!(p, PathBuf::from(r"\\.\pipe\stremio-lite-mpv"));
+        } else {
+            assert_eq!(p, std::env::temp_dir().join("stremio-lite-mpv.sock"));
+        }
+    }
 
     #[test]
     fn parses_cli_style_args() {
