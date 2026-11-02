@@ -164,8 +164,30 @@ fn card(ui: &mut egui::Ui, size: egui::Vec2, label: &str) -> (egui::Response, eg
 }
 
 /// Bold weight of the UI font (egui's `strong()` only brightens the color).
+/// Phosphor Fill weight (same codepoints as Regular); used for play and pause.
+fn fill() -> egui::FontFamily {
+    egui::FontFamily::Name("Phosphor-Fill".into())
+}
+
 fn bold() -> egui::FontFamily {
     egui::FontFamily::Name("bold".into())
+}
+
+/// Phosphor Regular codepoints used by the UI.
+mod icons {
+    pub const ARROW_LEFT: &str = "\u{E058}";
+    pub const ARROWS_IN: &str = "\u{E09A}";
+    pub const ARROWS_OUT: &str = "\u{E0A2}";
+    pub const CARET_LEFT: &str = "\u{E138}";
+    pub const CHECK: &str = "\u{E182}";
+    pub const MAGNIFYING_GLASS: &str = "\u{E30C}";
+    pub const PAUSE: &str = "\u{E39E}";
+    pub const PLAY: &str = "\u{E3D0}";
+    pub const PLUS: &str = "\u{E3D4}";
+    pub const SKIP_FORWARD: &str = "\u{E5A6}";
+    pub const SPEAKER_HIGH: &str = "\u{E44A}";
+    pub const SPEAKER_X: &str = "\u{E45C}";
+    pub const SUBTITLES: &str = "\u{E1A8}";
 }
 
 /// Inter (OFL) as the UI font: the closest free match to Netflix Sans, which is proprietary.
@@ -175,6 +197,11 @@ fn install_fonts(ctx: &egui::Context) {
     for (name, bytes) in [("Inter", &include_bytes!("../assets/fonts/Inter-Regular.ttf")[..]), ("Inter-Bold", &include_bytes!("../assets/fonts/Inter-Bold.ttf")[..])] {
         f.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(bytes)));
     }
+    // Phosphor icons (MIT): private-use codepoints, so they only ever match the `icons` constants.
+    f.font_data.insert("Phosphor".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Phosphor.ttf"))));
+    f.families.get_mut(&egui::FontFamily::Proportional).unwrap().push("Phosphor".into());
+    f.font_data.insert("Phosphor-Fill".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Phosphor-Fill.ttf"))));
+    f.families.insert(fill(), vec!["Phosphor-Fill".into()]);
     let fallback = f.families[&egui::FontFamily::Proportional].clone();
     f.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0, "Inter".into());
     f.families.insert(bold(), std::iter::once("Inter-Bold".into()).chain(fallback).collect());
@@ -241,7 +268,7 @@ fn episode_row(ui: &mut egui::Ui, v: &Video, watched: bool) -> egui::Response {
     let n = v.episode.unwrap_or(0) as usize;
     let head = v.title.clone().unwrap_or_else(|| format!("Episode {n}"));
     let date: String = v.released.as_deref().map(|d| d.chars().take(10).collect()).unwrap_or_default();
-    list_row(ui, n, if watched { format!("{head}  ✔") } else { head }, date)
+    list_row(ui, n, if watched { format!("{head}  {}", icons::CHECK) } else { head }, date)
 }
 
 /// Netflix episode-list row: index, bold name, gray details, play circle; highlights on hover.
@@ -1366,7 +1393,7 @@ impl App {
         ui.scope_builder(UiBuilder::new().max_rect(col).layout(Layout::bottom_up(Align::LEFT)), |ui| {
             ui.horizontal(|ui| {
                 let mut show_streams = false;
-                if hero_button(ui, "▶  Play", [Color32::WHITE, Color32::from_white_alpha(191)], Color32::BLACK).clicked() {
+                if hero_button(ui, &format!("{}  Play", icons::PLAY), [Color32::WHITE, Color32::from_white_alpha(191)], Color32::BLACK).clicked() {
                     match &self.selected {
                         Some((m, streams, subs)) if m == meta => match (only_source(streams), self.play_key()) {
                             (Some(src), Some((k, t))) => *play = Some((k, t, src, subs.clone())),
@@ -1381,8 +1408,8 @@ impl App {
                     *open = Some((meta.clone(), false));
                 }
                 let in_lib = self.saved.iter().any(|t| t.key == format!("{}:{}", meta.kind, meta.id));
-                let label = if in_lib { "✓  In library" } else { "+  Add to library" };
-                if hero_button(ui, label, [gray(179), gray(102)], Color32::WHITE).clicked() {
+                let label = if in_lib { format!("{}  In library", icons::CHECK) } else { format!("{}  Add to library", icons::PLUS) };
+                if hero_button(ui, &label, [gray(179), gray(102)], Color32::WHITE).clicked() {
                     self.toggle_saved(meta);
                 }
             });
@@ -1545,7 +1572,7 @@ impl App {
                 if r.hovered() {
                     paint.rect_filled(r.rect, 8, Color32::from_white_alpha((20.0 * a) as u8));
                 }
-                paint.text(c, egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(26.0), white);
+                paint.text(c, egui::Align2::CENTER_CENTER, glyph, egui::FontId::new(26.0, if glyph == icons::PLAY || glyph == icons::PAUSE { fill() } else { egui::FontFamily::Proportional }), white);
                 r.on_hover_cursor(egui::CursorIcon::PointingHand)
             };
             // Scrims behind the top and bottom controls.
@@ -1553,9 +1580,9 @@ impl App {
             paint.rect_filled(egui::Rect::from_min_max(pos2(rect.left(), rect.bottom() - 110.0), rect.max), 0, Color32::from_black_alpha((150.0 * a) as u8));
 
             // Top bar: back chevron + title on the left, full screen on the right.
-            back |= icon(ui, rect.min + vec2(44.0, 46.0), "❮", "Back to browse").clicked();
+            back |= icon(ui, rect.min + vec2(44.0, 46.0), icons::CARET_LEFT, "Back to browse").clicked();
             paint.text(rect.min + vec2(82.0, 46.0), egui::Align2::LEFT_CENTER, &p.title, egui::FontId::proportional(17.0), white);
-            toggle_fs |= icon(ui, pos2(rect.right() - 52.0, rect.top() + 46.0), "⛶", if fs { "Exit full screen" } else { "Full screen" }).clicked();
+            toggle_fs |= icon(ui, pos2(rect.right() - 52.0, rect.top() + 46.0), if fs { icons::ARROWS_IN } else { icons::ARROWS_OUT }, if fs { "Exit full screen" } else { "Full screen" }).clicked();
 
             // Seek bar between elapsed and total time: thin track, purple progress and knob; drag or click to seek.
             let font = egui::FontId::proportional(15.0);
@@ -1592,12 +1619,12 @@ impl App {
             // Control row: play, next episode, volume on the left; audio & subtitles on the right.
             let y = rect.bottom() - 38.0;
             let x = |i: f32| rect.left() + 48.0 + i * 64.0;
-            if icon(ui, pos2(x(0.0), y), if st.paused { "▶" } else { "⏸" }, if st.paused { "Play" } else { "Pause" }).clicked() {
+            if icon(ui, pos2(x(0.0), y), if st.paused { icons::PLAY } else { icons::PAUSE }, if st.paused { "Play" } else { "Pause" }).clicked() {
                 cmd(&["cycle", "pause"]);
             }
-            next = has_next && icon(ui, pos2(x(1.0), y), "⏭", "Next episode").clicked();
+            next = has_next && icon(ui, pos2(x(1.0), y), icons::SKIP_FORWARD, "Next episode").clicked();
             let vx = x(if has_next { 2.0 } else { 1.0 });
-            let vol = icon(ui, pos2(vx, y), if st.muted || st.volume <= 0.0 { "🔇" } else { "🔊" }, "Mute");
+            let vol = icon(ui, pos2(vx, y), if st.muted || st.volume <= 0.0 { icons::SPEAKER_X } else { icons::SPEAKER_HIGH }, "Mute");
             if vol.clicked() {
                 cmd(&["cycle", "mute"]);
             }
@@ -1614,7 +1641,7 @@ impl App {
             paint.rect_filled(vt, 2, Color32::from_gray(128).gamma_multiply(a * 0.5));
             paint.rect_filled(egui::Rect::from_min_size(vt.min, vec2(vt.width() * vf, 4.0)), 2, white);
             paint.circle_filled(pos2(vt.left() + vt.width() * vf, vt.center().y), 7.0, white);
-            let cc = icon(ui, pos2(rect.right() - 52.0, y), "💬", "Audio & Subtitles");
+            let cc = icon(ui, pos2(rect.right() - 52.0, y), icons::SUBTITLES, "Audio & Subtitles");
             if cc.clicked() {
                 p.menu = !p.menu;
             }
@@ -1633,7 +1660,7 @@ impl App {
                                     let off = !tracks.iter().any(|t| t.selected);
                                     let entries = (kind == "sub").then_some((None, "Off", off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.selected)));
                                     for (id, label, sel) in entries {
-                                        let text = RichText::new(format!("{}  {label}", if sel { "✓" } else { "   " })).size(16.0);
+                                        let text = RichText::new(format!("{}  {label}", if sel { icons::CHECK } else { "   " })).size(16.0);
                                         let text = if sel { text.color(Color32::WHITE).family(bold()) } else { text.color(Color32::from_gray(180)) };
                                         if ui.add(egui::Button::new(text).frame(false)).clicked() {
                                             let v = id.map_or("no".to_string(), |i| i.to_string());
@@ -1915,12 +1942,9 @@ impl eframe::App for App {
                     let bg = ui.painter().add(egui::Shape::Noop);
                     ui.add_space(12.0);
                     let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Titles, people, genres").frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 2, ..Default::default() })).desired_width(220.0)); // top margin: optically center the text
-                    // Painted magnifier: the emoji glyph sits off-center in its line box.
                     let (icon, b) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
                     b.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Search"));
-                    let (c, stroke) = (icon.center() - vec2(1.5, 1.5), egui::Stroke::new(1.8, Color32::from_gray(180)));
-                    ui.painter().circle_stroke(c, 5.5, stroke);
-                    ui.painter().line_segment([c + vec2(4.0, 4.0), icon.center() + vec2(7.0, 7.0)], stroke);
+                    ui.painter().text(icon.center(), egui::Align2::CENTER_CENTER, icons::MAGNIFYING_GLASS, egui::FontId::proportional(18.0), Color32::from_gray(180));
                     let b = b.on_hover_text("Search").on_hover_cursor(egui::CursorIcon::PointingHand);
                     let pill = r.rect.union(b.rect);
                     ui.painter().set(bg, egui::epaint::RectShape::filled(egui::Rect::from_center_size(pos2(pill.center().x, icon.center().y), vec2(pill.width() + 24.0, 34.0)), 17, Color32::from_gray(51)));
@@ -1946,7 +1970,7 @@ impl eframe::App for App {
             ui.add_space(8.0);
             // Back lives outside the scroll area, so it stays put while the detail page scrolls.
             if self.selected.is_some() {
-                if pill_button(ui, "←  Back", 16.0, vec2(0.0, 40.0), white_fill(), Color32::BLACK).on_hover_text("Back to browse").clicked() {
+                if pill_button(ui, &format!("{}  Back", icons::ARROW_LEFT), 16.0, vec2(0.0, 40.0), white_fill(), Color32::BLACK).on_hover_text("Back to browse").clicked() {
                     (self.selected, self.details) = (None, None);
                     (self.episodes, self.episode) = (Vec::new(), None);
                     self.scroll_top = true;
