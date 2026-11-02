@@ -34,6 +34,6 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           # check.yml already builds/tests on 3 OSes; cold cargo runs here cost 1.5-3.5 min per review
-          OPENCODE_CONFIG_CONTENT: '{"instructions":[".github/opencode-review.md"],"permission":{"bash":{"*":"allow","cargo *":"deny","*=* cargo *":"deny"}}}'
+          OPENCODE_CONFIG_CONTENT: '{"instructions":[".github/opencode-review.md"],"permission":{"*":"allow","bash":{"*":"allow","cargo *":"deny","*=* cargo *":"deny"}}}'
         with:
           model: openrouter/deepseek/deepseek-v4.1-flash-1017
