@@ -1819,10 +1819,6 @@ impl App {
                 paint.text(c, egui::Align2::CENTER_CENTER, glyph, egui::FontId::new(26.0, if glyph == icons::PLAY || glyph == icons::PAUSE { fill() } else { phosphor() }), white);
                 r.on_hover_cursor(egui::CursorIcon::PointingHand)
             };
-            // Scrims behind the top and bottom controls.
-            paint.rect_filled(egui::Rect::from_min_size(rect.min, vec2(rect.width(), 90.0)), 0, Color32::from_black_alpha((150.0 * a) as u8));
-            paint.rect_filled(egui::Rect::from_min_max(pos2(rect.left(), rect.bottom() - 110.0), rect.max), 0, Color32::from_black_alpha((150.0 * a) as u8));
-
             // Top bar: back chevron + title on the left, full screen on the right.
             back |= icon(ui, rect.min + vec2(44.0, 46.0), icons::CARET_LEFT, "Back to browse").clicked();
             paint.text(rect.min + vec2(82.0, 46.0), egui::Align2::LEFT_CENTER, &p.title, egui::FontId::proportional(17.0), white);
