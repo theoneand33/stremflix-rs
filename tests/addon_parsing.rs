@@ -32,6 +32,35 @@ fn catalog_extras() {
 }
 
 #[test]
+fn genre_extra() {
+    let m = parse_manifest(br#"{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"],"catalogs":[
+      {"type":"movie","id":"g","extra":[{"name":"genre","isRequired":true,"options":["Action"," Sci\u0007-Fi ","",7,"Action"]},{"name":"skip"}]},
+      {"type":"movie","id":"opt","extra":[{"name":"genre","options":"bad"}]},
+      {"type":"movie","id":"none","extra":[{"name":"genre","isRequired":true}]},
+      {"type":"movie","id":"s","extra":[{"name":"search","isRequired":true}]},
+      {"type":"movie","id":"legacy","extraRequired":["genre"]}]}"#).unwrap();
+    let c = &m.catalogs;
+    assert_eq!(c[0].genres(), ["Action", "Sci-Fi", "Action"], "sanitized, empty and non-string options dropped");
+    assert!(c[0].requires_genre() && c[0].discoverable());
+    assert!(c[1].genres().is_empty() && !c[1].requires_genre() && c[1].discoverable());
+    assert!(!c[2].discoverable(), "required genre without options");
+    assert!(!c[3].discoverable(), "required non-genre extra");
+    assert!(c[4].requires_genre() && !c[4].discoverable());
+    let many: Vec<String> = (0..500).map(|i| format!("\"g{i}\"")).collect();
+    let body = format!(r#"{{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"],"catalogs":[{{"type":"movie","id":"g","extra":[{{"name":"genre","options":[{}]}}]}}]}}"#, many.join(","));
+    assert_eq!(parse_manifest(body.as_bytes()).unwrap().catalogs[0].genres().len(), 200);
+}
+
+#[test]
+fn discover_url() {
+    assert_eq!(discover_path("movie", "top", None), "catalog/movie/top.json");
+    assert_eq!(discover_path("movie", "top", Some("Sci-Fi & Fantasy")), "catalog/movie/top/genre=Sci-Fi%20%26%20Fantasy.json");
+    assert_eq!(discover_path("movie", "top", Some("a/b=c?")), "catalog/movie/top/genre=a%2Fb%3Dc%3F.json");
+    let base = addon_base("https://x.example/a/manifest.json").unwrap();
+    assert_eq!(base.join(&discover_path("series", "top", Some("a/../b"))).unwrap().as_str(), "https://x.example/a/catalog/series/top/genre=a%2F..%2Fb.json");
+}
+
+#[test]
 fn poster_dimension_limits() {
     let png = |w, h| {
         let mut b = Vec::new();

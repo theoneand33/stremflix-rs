@@ -19,6 +19,7 @@ use stremio_lite::torrent::TorrentEngine;
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Home,
+    Discover,
     Addons,
     Library,
 }
@@ -30,6 +31,8 @@ enum Msg {
     Catalog(String, Vec<MetaPreview>),
     /// Row source (addon URL, type, catalog id) and its items or error.
     Row((String, String, String), Result<Vec<MetaPreview>, String>),
+    /// Discover grid source and its items or error.
+    Discover(DiscoverSrc, Result<Vec<MetaPreview>, String>),
     /// meta, episode (series only), streams, subtitle URLs, play the first stream on arrival,
     /// and the `bingeGroup` to autoplay (next episode)
     Streams(MetaPreview, Option<Video>, Vec<Stream>, Vec<String>, bool, Option<String>),
@@ -50,6 +53,21 @@ struct Row {
     title: String,
     src: (String, String, String),
     /// `None` while loading; empty rows are hidden.
+    items: Option<Vec<MetaPreview>>,
+}
+
+/// Addon URL, type, catalog id, genre.
+type DiscoverSrc = (String, String, String, Option<String>);
+
+/// Discover tab pickers and the grid they loaded.
+#[derive(Default)]
+struct Discover {
+    kind: String,
+    /// Addon URL and catalog id.
+    cat: (String, String),
+    genre: Option<String>,
+    src: Option<DiscoverSrc>,
+    /// `None` while loading.
     items: Option<Vec<MetaPreview>>,
 }
 
@@ -244,6 +262,7 @@ struct App {
     addon_url: String,
     rows: Vec<Row>,
     search_results: Option<(String, Vec<MetaPreview>)>,
+    discover: Discover,
     selected: Option<(MetaPreview, Vec<Stream>, Vec<String>)>,
     /// Episodes of the selected series (in `sort_episodes` order), the season shown,
     /// and the episode whose streams are in `selected`.
@@ -314,6 +333,7 @@ impl App {
             addon_url: String::new(),
             rows: Vec::new(),
             search_results: None,
+            discover: Discover::default(),
             selected: None,
             episodes: Vec::new(),
             season: None,
@@ -385,6 +405,15 @@ impl App {
                     self.status = format!("Error loading {}: {e}", row.title);
                     Vec::new()
                 }));
+            }
+            Msg::Discover(src, res) => {
+                // Ignore replies for a selection the user has since changed.
+                if self.discover.src.as_ref() == Some(&src) {
+                    self.discover.items = Some(res.unwrap_or_else(|e| {
+                        self.status = format!("Error loading catalog: {e}");
+                        Vec::new()
+                    }));
+                }
             }
             Msg::Streams(meta, episode, streams, subs, autoplay, binge) => {
                 if episode.is_some() {
@@ -906,6 +935,106 @@ impl App {
         }
     }
 
+    /// Pick a type, catalog and genre; the catalog's first page shows as a poster grid.
+    fn ui_discover(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let cats: Vec<(&String, &String, &CatalogDef)> = self
+            .addons
+            .iter()
+            .filter(|(_, m)| m.has_resource("catalog"))
+            .flat_map(|(u, m)| m.catalogs.iter().filter(|c| c.discoverable()).map(move |c| (u, &m.name, c)))
+            .collect();
+        if cats.is_empty() {
+            ui.add_space(40.0);
+            ui.label(RichText::new("Install an addon with a catalog in Addons to start browsing.").size(18.0));
+            return;
+        }
+        let d = &mut self.discover;
+        let mut kinds: Vec<&str> = Vec::new();
+        for (_, _, c) in &cats {
+            if !kinds.contains(&c.kind.as_str()) {
+                kinds.push(&c.kind);
+            }
+        }
+        // Keep the pickers valid as addons change: fall back to the first type, catalog and (if required) genre.
+        if !kinds.contains(&d.kind.as_str()) {
+            d.kind = kinds[0].into();
+        }
+        let in_kind: Vec<_> = cats.iter().filter(|(_, _, c)| c.kind == d.kind).collect();
+        let cur = *in_kind.iter().find(|(u, _, c)| **u == d.cat.0 && c.id == d.cat.1).unwrap_or(&in_kind[0]);
+        d.cat = (cur.0.clone(), cur.2.id.clone());
+        let genres = cur.2.genres();
+        if !d.genre.as_ref().is_some_and(|g| genres.contains(g)) {
+            d.genre = genres.first().filter(|_| cur.2.requires_genre()).cloned();
+        }
+        let src = (d.cat.0.clone(), d.kind.clone(), d.cat.1.clone(), d.genre.clone());
+        if d.src.as_ref() != Some(&src) {
+            (d.src, d.items) = (Some(src.clone()), None);
+            let client = self.client.clone();
+            self.spawn(&ctx, async move {
+                let res = client.discover(&src.0, &src.1, &src.2, src.3.as_deref()).await.map_err(|e| format!("{e:#}"));
+                Ok(Msg::Discover(src, res))
+            });
+        }
+        // Picker changes apply on the next frame, after the checks above.
+        let d = &mut self.discover;
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("discover_kind").selected_text(kind_label(&d.kind)).show_ui(ui, |ui| {
+                for k in &kinds {
+                    ui.selectable_value(&mut d.kind, k.to_string(), kind_label(k));
+                }
+            });
+            let cat_label = |addon: &str, c: &CatalogDef| format!("{addon} - {}", c.name.as_deref().unwrap_or(&c.id));
+            egui::ComboBox::from_id_salt("discover_cat").selected_text(cat_label(cur.1, cur.2)).show_ui(ui, |ui| {
+                for (u, addon, c) in &in_kind {
+                    ui.selectable_value(&mut d.cat, ((*u).clone(), c.id.clone()), cat_label(addon, c));
+                }
+            });
+            if !genres.is_empty() {
+                egui::ComboBox::from_id_salt("discover_genre").selected_text(d.genre.as_deref().unwrap_or("All genres")).show_ui(ui, |ui| {
+                    if !cur.2.requires_genre() {
+                        ui.selectable_value(&mut d.genre, None, "All genres");
+                    }
+                    for g in genres {
+                        ui.selectable_value(&mut d.genre, Some(g.clone()), g);
+                    }
+                });
+            }
+        });
+        ui.add_space(12.0);
+        let (mut want, mut open) = (Vec::new(), None);
+        match &self.discover.items {
+            None => {
+                ui.spinner();
+            }
+            Some(items) if items.is_empty() => {
+                ui.label("Nothing in this catalog.");
+            }
+            Some(items) => {
+                ui.horizontal_wrapped(|ui| {
+                    for m in items {
+                        let (r, rect) = card(ui, CARD, &m.name);
+                        self.paint_poster(ui, &r, rect, &m.poster, &m.name, &mut want);
+                        if r.on_hover_text(m.description.as_deref().unwrap_or(&m.name)).clicked() {
+                            open = Some(m.clone());
+                        }
+                    }
+                });
+            }
+        }
+        want.sort();
+        want.dedup();
+        for u in want {
+            self.fetch_poster(&ctx, u);
+        }
+        // The detail view lives on Home.
+        if let Some(m) = open {
+            self.tab = Tab::Home;
+            self.open_meta(&ctx, m, false);
+        }
+    }
+
     fn row_title(ui: &mut egui::Ui, title: &str) {
         ui.add_space(22.0);
         ui.label(RichText::new(title).size(20.0).strong().family(bold()).color(Color32::WHITE));
@@ -1361,7 +1490,7 @@ impl eframe::App for App {
                 // Netflix nav: current tab is bold white on a dark gray pill that slides between tabs.
                 let pill_slot = ui.painter().add(egui::Shape::Noop);
                 let mut sel_rect = None;
-                for (tab, name) in [(Tab::Home, "Home"), (Tab::Addons, "Addons"), (Tab::Library, "Library")] {
+                for (tab, name) in [(Tab::Home, "Home"), (Tab::Discover, "Discover"), (Tab::Addons, "Addons"), (Tab::Library, "Library")] {
                     let text = RichText::new(name).size(15.0);
                     let text = if self.tab == tab { text.strong().family(bold()).color(Color32::WHITE) } else { text.color(Color32::from_gray(180)) };
                     let r = ui.add(egui::Button::new(text).fill(Color32::TRANSPARENT).min_size(vec2(0.0, 34.0))).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1422,6 +1551,7 @@ impl eframe::App for App {
             }
             egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
                 Tab::Home => self.ui_home(ui),
+                Tab::Discover => self.ui_discover(ui),
                 Tab::Addons => self.ui_addons(ui),
                 Tab::Library => self.ui_library(ui),
             });
