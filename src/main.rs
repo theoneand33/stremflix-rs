@@ -25,7 +25,7 @@ enum Tab {
 
 enum Msg {
     Status(String),
-    Installed(String, Manifest),
+    Installed(String, Manifest, Option<String>),
     /// Search title and results.
     Catalog(String, Vec<MetaPreview>),
     /// Row source (addon URL, type, catalog id) and its items or error.
@@ -242,6 +242,8 @@ struct App {
     tab: Tab,
     addons: Vec<(String, Manifest)>,
     addon_url: String,
+    /// Addon being reconfigured (old transport URL) and the pasted result URL.
+    configuring: Option<(String, String)>,
     rows: Vec<Row>,
     search_results: Option<(String, Vec<MetaPreview>)>,
     selected: Option<(MetaPreview, Vec<Stream>, Vec<String>)>,
@@ -312,6 +314,7 @@ impl App {
             rx,
             tab: Tab::Home,
             addon_url: String::new(),
+            configuring: None,
             rows: Vec::new(),
             search_results: None,
             selected: None,
@@ -364,12 +367,22 @@ impl App {
     fn handle(&mut self, ctx: &egui::Context, msg: Msg) {
         match msg {
             Msg::Status(s) => self.status = s,
-            Msg::Installed(url, m) => {
+            Msg::Installed(url, m, replaces) => {
                 self.status = format!("Installed {} {}", m.name, m.version);
-                if let Err(e) = self.db.add_addon(&url, &m) {
+                let saved = self.db.add_addon(&url, &m);
+                if let Err(e) = &saved {
                     self.status = format!("Error saving addon: {e:#}");
                 }
                 self.addons.retain(|(u, _)| *u != url);
+                if let Some(old) = replaces {
+                    if old != url {
+                        if saved.is_ok() {
+                            let _ = self.db.remove_addon(&old);
+                        }
+                        self.addons.retain(|(u, _)| *u != old);
+                    }
+                    self.configuring = None;
+                }
                 self.addons.push((url, m));
                 self.addon_url.clear();
                 self.build_rows(ctx);
@@ -1254,7 +1267,7 @@ impl App {
                 self.status = format!("Installing {url}...");
                 self.spawn(&ctx, async move {
                     let m = client.fetch_manifest(&url).await?;
-                    Ok(Msg::Installed(url, m))
+                    Ok(Msg::Installed(url, m, None))
                 });
             }
         });
@@ -1273,13 +1286,49 @@ impl App {
         });
         ui.separator();
         let mut remove = None;
+        let mut configure = None;
+        let mut replace = None;
         for (url, m) in &self.addons {
             ui.horizontal(|ui| {
                 ui.label(format!("{} {} ({})", m.name, m.version, url));
+                if m.behavior_hints.configurable && small_button(ui, "Configure").clicked() {
+                    configure = Some(url.clone());
+                }
                 if small_button(ui, "Uninstall").clicked() {
                     remove = Some(url.clone());
                 }
             });
+            if m.behavior_hints.configuration_required {
+                ui.label(RichText::new("Needs configuration before use. Press Configure.").weak());
+            }
+            if let Some((old, pasted)) = self.configuring.as_mut().filter(|(o, _)| o == url) {
+                ui.horizontal(|ui| {
+                    let l = ui.label("Configured manifest URL:");
+                    ui.add(egui::TextEdit::singleline(pasted).hint_text("https://.../manifest.json").desired_width(400.0))
+                        .labelled_by(l.id);
+                    if primary_button(ui, "Replace").clicked() {
+                        replace = Some((old.clone(), pasted.trim().to_string()));
+                    }
+                });
+            }
+        }
+        if let Some((old, new)) = replace {
+            let client = self.client.clone();
+            self.status = format!("Installing {new}...");
+            self.spawn(&ctx, async move {
+                let m = client.fetch_manifest(&new).await?;
+                Ok(Msg::Installed(new, m, Some(old)))
+            });
+        }
+        if let Some(u) = configure {
+            match stremio_lite::addon::configure_url(&u) {
+                Ok(page) => {
+                    ctx.open_url(egui::OpenUrl::new_tab(page.as_str()));
+                    self.status = "Configure in your browser, then paste the resulting manifest URL".into();
+                    self.configuring = Some((u, String::new()));
+                }
+                Err(e) => self.status = format!("Error: {e:#}"),
+            }
         }
         if let Some(u) = remove {
             let _ = self.db.remove_addon(&u);
