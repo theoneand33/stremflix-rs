@@ -282,8 +282,12 @@ fn card_text(ui: &egui::Ui, rect: egui::Rect, text: &str) {
 fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream) -> egui::Response {
     let mut parts = [&s.name, &s.title, &s.description].into_iter().flatten().map(|x| x.trim()).filter(|x| !x.is_empty());
     let head = parts.next().unwrap_or("Stream").replace('\n', " ");
-    let file = [s.hints.filename.clone(), s.hints.video_size.map(fmt_size)].into_iter().flatten().collect::<Vec<_>>().join("  ·  ");
-    let details: Vec<&str> = parts.chain(Some(file.as_str()).filter(|f| !f.is_empty())).collect();
+    let parts: Vec<&str> = parts.collect();
+    // Torrent addons already describe the file (name, size) in their text; don't repeat it.
+    let stem = s.hints.filename.as_deref().map(|f| f.rsplit_once('.').map_or(f, |x| x.0)).filter(|f| !f.is_empty());
+    let described = stem.is_some_and(|f| parts.iter().any(|p| p.contains(f)));
+    let file = if described { String::new() } else { [s.hints.filename.clone(), s.hints.video_size.map(fmt_size)].into_iter().flatten().collect::<Vec<_>>().join("  ·  ") };
+    let details: Vec<&str> = parts.into_iter().chain(Some(file.as_str()).filter(|f| !f.is_empty())).collect();
     list_row(ui, n, head, details.join("\n"))
 }
 
@@ -305,20 +309,22 @@ fn list_row(ui: &mut egui::Ui, n: usize, head: String, details: String) -> egui:
     let (w, text_x, pad) = (ui.available_width().min(960.0), 84.0, 18.0);
     let p = ui.painter();
     let hg = p.layout(head.clone(), egui::FontId::new(17.0, bold()), Color32::WHITE, w - text_x - 96.0);
-    let dg = p.layout(details, egui::FontId::proportional(14.0), Color32::from_gray(170), w - text_x - 96.0);
-    let block = hg.size().y + if dg.size().y > 0.0 { 6.0 + dg.size().y } else { 0.0 };
+    let has_details = !details.is_empty();
+    let mut job = egui::text::LayoutJob::simple(details, egui::FontId::proportional(14.0), Color32::from_gray(170), w - text_x - 96.0);
+    job.sections[0].format.line_height = Some(20.0);
+    let dg = p.layout_job(job);
+    let block = hg.size().y + if has_details { 8.0 + dg.size().y } else { 0.0 };
     let h = (pad * 2.0 + block).max(88.0);
     let (rect, r) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Play {head}")));
     let t = ui.ctx().animate_bool(r.id, r.hovered() || r.has_focus());
     let p = ui.painter();
-    p.rect_filled(rect, 4, Color32::from_gray(51).gamma_multiply(t));
-    p.hline(rect.x_range(), rect.bottom(), (1.0, Color32::from_gray(64)));
+    p.rect_filled(rect, 10, Color32::from_gray(51).gamma_multiply(t));
     let num = p.layout_no_wrap(n.to_string(), egui::FontId::proportional(24.0), Color32::from_gray(210));
     p.galley(pos2(rect.left() + text_x / 2.0 - num.size().x / 2.0, rect.center().y - num.size().y / 2.0), num, Color32::WHITE);
     let top = rect.center().y - block / 2.0;
     p.galley(pos2(rect.left() + text_x, top), hg.clone(), Color32::WHITE);
-    p.galley(pos2(rect.left() + text_x, top + hg.size().y + 6.0), dg, Color32::WHITE);
+    p.galley(pos2(rect.left() + text_x, top + hg.size().y + 8.0), dg, Color32::WHITE);
     // Play button: outlined circle that fills white on hover.
     let c = pos2(rect.right() - 48.0, rect.center().y);
     let fg = Color32::from_gray(160).lerp_to_gamma(Color32::WHITE, t);
@@ -1305,7 +1311,7 @@ impl App {
                 let seen = self.watched_keys.contains(&k);
                 let r = episode_row(ui, v, seen);
                 if self.episode.as_ref() == Some(v) {
-                    ui.painter().rect_stroke(r.rect, 4, (2.0, RED), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(r.rect, 10, (2.0, RED), egui::StrokeKind::Inside);
                 }
                 // Overlaid left of the play circle; the topmost widget wins the click.
                 let b = egui::Rect::from_center_size(pos2(r.rect.right() - 160.0, r.rect.center().y), vec2(120.0, 32.0));
