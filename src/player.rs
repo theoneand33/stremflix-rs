@@ -111,6 +111,57 @@ pub struct State {
     pub error: Option<String>,
 }
 
+/// Subtitle appearance chosen in the player menu; persisted as one setting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubStyle {
+    pub scale: f64,
+    /// Index into [`SUB_COLORS`].
+    pub color: usize,
+    pub background: bool,
+    /// Seconds; positive shows subtitles later.
+    pub delay: f64,
+}
+
+/// Preset text colors: label and mpv `sub-color` value.
+pub const SUB_COLORS: [(&str, &str); 4] = [("White", "#FFFFFF"), ("Yellow", "#FFFF00"), ("Green", "#00FF00"), ("Cyan", "#00FFFF")];
+
+impl Default for SubStyle {
+    fn default() -> Self {
+        Self { scale: 1.0, color: 0, background: false, delay: 0.0 }
+    }
+}
+
+impl SubStyle {
+    /// Forces every field into its valid range (also guards NaN and stale stored values).
+    pub fn clamped(self) -> Self {
+        let n = |v: f64, lo: f64, hi: f64, d: f64| if v.is_finite() { v.clamp(lo, hi) } else { d };
+        Self { scale: n(self.scale, 0.5, 3.0, 1.0), color: self.color.min(SUB_COLORS.len() - 1), background: self.background, delay: (n(self.delay, -60.0, 60.0, 0.0) * 10.0).round() / 10.0 }
+    }
+
+    /// mpv properties to `set`. `sub-border-style` makes `sub-back-color` show as a box.
+    pub fn props(&self) -> [(&'static str, String); 5] {
+        let s = self.clamped();
+        [
+            ("sub-scale", format!("{:.2}", s.scale)),
+            ("sub-color", SUB_COLORS[s.color].1.into()),
+            ("sub-border-style", if s.background { "background-box" } else { "outline-and-shadow" }.into()),
+            ("sub-back-color", "#99000000".into()),
+            ("sub-delay", format!("{:.1}", s.delay)),
+        ]
+    }
+
+    pub fn encode(&self) -> String {
+        format!("{},{},{},{}", self.scale, self.color, self.background as u8, self.delay)
+    }
+
+    /// Parses [`encode`](Self::encode) output; any malformed value falls back to the default.
+    pub fn decode(s: &str) -> Self {
+        let p: Vec<&str> = s.split(',').collect();
+        let (Some(Ok(scale)), Some(Ok(color)), Some(bg), Some(Ok(delay))) = (p.first().map(|v| v.parse()), p.get(1).map(|v| v.parse()), p.get(2), p.get(3).map(|v| v.parse())) else { return Self::default() };
+        Self { scale, color, background: *bg == "1", delay }.clamped()
+    }
+}
+
 pub struct Player {
     mpv: *mut c_void,
     render: *mut c_void,
@@ -118,7 +169,9 @@ pub struct Player {
     wake: *mut Box<dyn Fn() + Send + Sync>,
     /// Handed to mpv as the `get_proc_address` context; boxed so its address is stable.
     gl_proc: Box<GlProc>,
-    subs: Vec<String>,
+    /// Addon subtitles as (url, lang).
+    subs: Vec<(String, String)>,
+    slang: String,
     alive: bool,
     pub state: State,
 }
@@ -169,6 +222,25 @@ pub fn parse_args(s: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// HTTP request headers as mpv options: User-Agent as the plain-string `user-agent`, the rest as the
+/// comma-separated `http-header-fields` list. mpv reads `\,` as a literal comma, but a value's own
+/// backslash would make that ambiguous, so such headers are dropped.
+pub fn header_options(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let mut opts = Vec::new();
+    let mut fields = Vec::new();
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("user-agent") {
+            opts.push(("user-agent".to_string(), v.clone()));
+        } else if !v.contains('\\') {
+            fields.push(format!("{k}: {}", v.replace(',', "\\,")));
+        }
+    }
+    if !fields.is_empty() {
+        opts.push(("http-header-fields".to_string(), fields.join(",")));
+    }
+    opts
+}
+
 /// mpv's `track-list` JSON to tracks; unknown shapes yield an empty list.
 pub fn parse_tracks(json: &str) -> Vec<Track> {
     let Ok(serde_json::Value::Array(list)) = serde_json::from_str(json) else { return Vec::new() };
@@ -187,16 +259,38 @@ pub fn parse_tracks(json: &str) -> Vec<Track> {
         .collect()
 }
 
+/// Validates a language preference for mpv's `alang`/`slang`: up to 8 comma-separated
+/// tokens like `en`, `eng`, `pt-BR`. Returns the normalized list (empty clears the preference).
+pub fn valid_langs(s: &str) -> Option<String> {
+    let tokens: Vec<&str> = s.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
+    let ok = |t: &str| {
+        let mut parts = t.split('-');
+        let head = parts.next().unwrap_or("");
+        (2..=3).contains(&head.len()) && head.bytes().all(|b| b.is_ascii_alphabetic()) && parts.all(|p| (2..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
+    };
+    (tokens.len() <= 8 && tokens.iter().all(|t| ok(t))).then(|| tokens.join(","))
+}
+
+/// Index of the first addon subtitle whose language matches a `slang` token, in preference order.
+/// Compares primary subtags case-insensitively; `en` and `eng` are different tokens, list both.
+fn pick_sub(subs: &[(String, String)], slang: &str) -> Option<usize> {
+    let primary = |l: &str| l.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
+    slang.split(',').map(primary).find_map(|want| subs.iter().position(|(_, l)| primary(l) == want))
+}
+
 impl Player {
     /// `source` is a URL or local path, passed to `loadfile` as a plain argument (never parsed as options).
     /// `wake` is called from mpv's thread whenever a new frame is ready.
+    /// `headers` (validated addon request headers) go to this instance only; each launch is a fresh mpv,
+    /// so they never leak to the next stream or host.
     /// Must be called, rendered and dropped with the GUI's GL context current.
-    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[String], gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
+    #[allow(clippy::too_many_arguments)] // player setup options; bundling them adds no clarity
+    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], headers: &[(String, String)], gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
         let mpv = unsafe { mpv_create() };
         if mpv.is_null() {
             bail!("failed to create mpv instance");
         }
-        let mut p = Self { mpv, render: std::ptr::null_mut(), wake: Box::into_raw(Box::new(wake)), gl_proc: Box::new(gl_proc), subs: subtitles.to_vec(), alive: true, state: State::default() };
+        let mut p = Self { mpv, render: std::ptr::null_mut(), wake: Box::into_raw(Box::new(wake)), gl_proc: Box::new(gl_proc), subs: subtitles.to_vec(), slang: slang.to_string(), alive: true, state: State::default() };
         let socket = ipc_socket_path();
         let _ = std::fs::remove_file(&socket);
         let mut opts: Vec<(String, String)> = [
@@ -215,6 +309,12 @@ impl Player {
         .into_iter()
         .map(|(k, v)| (k.into(), v.into()))
         .collect();
+        for (k, v) in [("alang", alang), ("slang", slang)] {
+            if !v.is_empty() {
+                opts.push((k.into(), v.into()));
+            }
+        }
+        opts.extend(header_options(headers));
         opts.extend(parse_args(&std::env::var("STREMIO_LITE_MPV_ARGS").unwrap_or_default()));
         for (k, v) in &opts {
             let rc = unsafe { mpv_set_option_string(mpv, cstr(k).as_ptr(), cstr(v).as_ptr()) };
@@ -258,6 +358,14 @@ impl Player {
         Ok(())
     }
 
+    /// Sets the subtitle style properties (async, like every other command).
+    pub fn apply_sub_style(&self, st: &SubStyle) -> Result<()> {
+        for (k, v) in st.props() {
+            self.command(&["set", k, &v])?;
+        }
+        Ok(())
+    }
+
     /// Drains mpv events into [`State`]. Returns false once mpv has shut down.
     pub fn poll(&mut self) -> bool {
         while self.alive {
@@ -266,9 +374,11 @@ impl Player {
                 0 => break,
                 EVENT_SHUTDOWN => self.alive = false,
                 EVENT_FILE_LOADED => {
-                    // Addon subtitles: the first one is selected, like `--sub-file`.
-                    for (i, s) in std::mem::take(&mut self.subs).iter().enumerate() {
-                        let _ = self.command(&["sub-add", s, if i == 0 { "select" } else { "auto" }]);
+                    // Addon subtitles: select the one matching `slang`; without a preference, the first (like `--sub-file`).
+                    let subs = std::mem::take(&mut self.subs);
+                    let pick = if self.slang.is_empty() { Some(0) } else { pick_sub(&subs, &self.slang) };
+                    for (i, (url, lang)) in subs.iter().enumerate() {
+                        let _ = self.command(&["sub-add", url, if Some(i) == pick { "select" } else { "auto" }, "", lang]);
                     }
                 }
                 EVENT_END_FILE => {
@@ -362,6 +472,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn language_validation() {
+        assert_eq!(valid_langs(" en, eng ,pt-BR"), Some("en,eng,pt-BR".into()));
+        assert_eq!(valid_langs(""), Some(String::new()));
+        for bad in ["e", "english", "en;fr", "en-", "en-x", "1a", "en,,e1", "a,b,c,d,e,f,g,h,i"] {
+            assert_eq!(valid_langs(bad), None, "{bad}");
+        }
+        assert!(valid_langs("en,fr,de,es,it,pt,ja,ko").is_some());
+        assert!(valid_langs("en,fr,de,es,it,pt,ja,ko,ru").is_none());
+    }
+
+    #[test]
+    fn slang_picks_by_preference_order() {
+        let s = |l: &str| (String::new(), l.to_string());
+        let subs = [s("fre"), s("ENG"), s("pt-BR")];
+        assert_eq!(pick_sub(&subs, "pt,eng"), Some(2));
+        assert_eq!(pick_sub(&subs, "en,eng"), Some(1));
+        assert_eq!(pick_sub(&subs, "de"), None);
+    }
+
+    #[test]
     fn default_ipc_path_per_platform() {
         if std::env::var_os("STREMIO_LITE_IPC").is_some() {
             return;
@@ -378,6 +508,24 @@ mod tests {
     fn parses_cli_style_args() {
         let a = parse_args("--ao=null --no-audio-display --fs junk");
         assert_eq!(a, [("ao".into(), "null".into()), ("audio-display".into(), "no".into()), ("fs".into(), "yes".into())]);
+    }
+
+    #[test]
+    fn sub_style_clamps_and_roundtrips() {
+        let s = SubStyle { scale: 9.0, color: 99, background: true, delay: -500.0 }.clamped();
+        assert_eq!((s.scale, s.color, s.delay), (3.0, SUB_COLORS.len() - 1, -60.0));
+        assert_eq!(SubStyle::decode(&s.encode()), s);
+        assert_eq!(SubStyle::decode("junk"), SubStyle::default());
+        assert_eq!(SubStyle::decode("NaN,0,0,0").scale, 1.0);
+        assert_eq!(SubStyle { background: true, ..Default::default() }.props()[2].1, "background-box");
+    }
+
+    #[test]
+    fn headers_to_mpv_options() {
+        let h = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let o = header_options(&[h("User-Agent", "Moz (KHTML, like Gecko)"), h("Referer", "https://a.example/"), h("Accept", "a, b"), h("X-Bad", r"c\")]);
+        assert_eq!(o, [h("user-agent", "Moz (KHTML, like Gecko)"), h("http-header-fields", r"Referer: https://a.example/,Accept: a\, b")]);
+        assert!(header_options(&[]).is_empty());
     }
 
     #[test]

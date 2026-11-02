@@ -13,6 +13,10 @@ const MAX_LONG_TEXT: usize = 4000;
 const MAX_ITEMS: usize = 500;
 /// Long-running series have well over `MAX_ITEMS` episodes.
 const MAX_VIDEOS: usize = 5000;
+/// Cap on genres, cast, directors and links of a meta.
+const MAX_TAGS: usize = 30;
+/// Max options kept per catalog extra (e.g. genres).
+const MAX_OPTIONS: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -56,6 +60,9 @@ pub struct ExtraDef {
     pub name: String,
     #[serde(default, rename = "isRequired")]
     pub is_required: bool,
+    /// Allowed values (e.g. genres); non-string entries are dropped.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub options: Vec<String>,
 }
 
 impl CatalogDef {
@@ -74,6 +81,22 @@ impl CatalogDef {
     pub fn requires_extra(&self) -> bool {
         self.extra.iter().any(|e| e.is_required) || !self.extra_required.is_empty()
     }
+
+    /// Options of the `genre` extra (empty for legacy `extraSupported` catalogs, which list none).
+    pub fn genres(&self) -> &[String] {
+        self.extra.iter().find(|e| e.name == "genre").map_or(&[], |e| &e.options)
+    }
+
+    pub fn requires_genre(&self) -> bool {
+        self.extra.iter().any(|e| e.is_required && e.name == "genre") || self.extra_required.iter().any(|e| e == "genre")
+    }
+
+    /// Browsable on Discover: no required extra other than a genre we have options for.
+    pub fn discoverable(&self) -> bool {
+        self.extra.iter().all(|e| !e.is_required || e.name == "genre")
+            && self.extra_required.iter().all(|e| e == "genre")
+            && (!self.requires_genre() || !self.genres().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -89,6 +112,23 @@ pub struct Manifest {
     pub catalogs: Vec<CatalogDef>,
     #[serde(default, rename = "idPrefixes")]
     pub id_prefixes: Option<Vec<String>>,
+    #[serde(default, rename = "behaviorHints", deserialize_with = "lenient_hints")]
+    pub behavior_hints: ManifestHints,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ManifestHints {
+    #[serde(default)]
+    pub configurable: bool,
+    #[serde(default, rename = "configurationRequired")]
+    pub configuration_required: bool,
+}
+
+/// Malformed hints (wrong type, non-bool flags) degrade to false instead of failing the manifest.
+fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<ManifestHints, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+    Ok(ManifestHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired") })
 }
 
 impl Manifest {
@@ -118,15 +158,46 @@ pub struct Meta {
     #[serde(rename = "type")]
     pub kind: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_text")]
     pub poster: Option<String>,
-    #[serde(default)]
+    /// Wide backdrop image shown behind the detail header.
+    #[serde(default, deserialize_with = "lenient_text")]
+    pub background: Option<String>,
+    /// Title artwork shown in place of the name.
+    #[serde(default, deserialize_with = "lenient_text")]
+    pub logo: Option<String>,
+    #[serde(default, deserialize_with = "lenient_text")]
     pub description: Option<String>,
-    #[serde(default, rename = "releaseInfo")]
+    #[serde(default, rename = "releaseInfo", deserialize_with = "lenient_text")]
     pub release_info: Option<String>,
+    /// e.g. "118 min".
+    #[serde(default, deserialize_with = "lenient_text")]
+    pub runtime: Option<String>,
+    #[serde(default, rename = "imdbRating", deserialize_with = "lenient_text")]
+    pub imdb_rating: Option<String>,
+    /// Also filled from the legacy `genre` field.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub genres: Vec<String>,
+    #[serde(default, deserialize_with = "lenient_vec", skip_serializing)]
+    genre: Vec<String>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub cast: Vec<String>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub director: Vec<String>,
+    /// Only links with an http(s) URL are kept (Stremio's own `stremio://` links are dropped).
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub links: Vec<Link>,
     /// Episodes of a series; malformed entries are dropped.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub videos: Vec<Video>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Link {
+    pub name: String,
+    #[serde(default)]
+    pub category: String,
+    pub url: String,
 }
 
 /// One video of a meta, e.g. a series episode. Its `id` (often `tt…:S:E`) is what streams are requested for.
@@ -142,14 +213,21 @@ pub struct Video {
     /// ISO 8601 release date.
     #[serde(default)]
     pub released: Option<String>,
-    #[serde(default)]
-    pub thumbnail: Option<String>,
 }
 
 fn lenient_vec<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
     let v = serde_json::Value::deserialize(d)?;
     let items = v.as_array().map(|a| a.as_slice()).unwrap_or_default();
     Ok(items.iter().take(MAX_VIDEOS).filter_map(|v| T::deserialize(v).ok()).collect())
+}
+
+/// A string (or number, e.g. `"imdbRating": 7.8`); anything else becomes `None` instead of failing the meta.
+fn lenient_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -169,14 +247,51 @@ pub struct Stream {
     /// e.g. "tracker:<url>", "dht:<hash>"; "peer:<host:port>" is a local extension.
     #[serde(default)]
     pub sources: Vec<String>,
-    /// `behaviorHints.bingeGroup`: streams sharing one come from the same source/quality, so the next episode can autoplay it.
-    #[serde(default, rename = "behaviorHints", deserialize_with = "binge_group", skip_serializing)]
-    pub binge_group: Option<String>,
+    #[serde(default, rename = "behaviorHints", deserialize_with = "behavior_hints", skip_serializing)]
+    pub hints: BehaviorHints,
 }
 
-/// Only the string `bingeGroup` of `behaviorHints`; anything malformed is ignored, never fatal.
-fn binge_group<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    Ok(serde_json::Value::deserialize(d)?.get("bingeGroup").and_then(|g| g.as_str()).map(String::from))
+/// The parts of a stream's `behaviorHints` this client uses.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BehaviorHints {
+    /// `bingeGroup`: streams sharing one come from the same source/quality, so the next episode can autoplay it.
+    pub binge_group: Option<String>,
+    /// `proxyHeaders.request`: headers the stream URL needs (e.g. a debrid User-Agent), each passing [`valid_header`].
+    pub request_headers: Vec<(String, String)>,
+    pub filename: Option<String>,
+    /// `videoSize` in bytes.
+    pub video_size: Option<u64>,
+}
+
+const MAX_HEADERS: usize = 32;
+
+/// Addon request header check: the name is an RFC 7230 token, the value printable ASCII (so no CR/LF/NUL
+/// header injection), both length-capped, and never a header that frames or routes the request.
+pub fn valid_header(name: &str, value: &str) -> bool {
+    const RESERVED: [&str; 10] = ["host", "content-length", "transfer-encoding", "connection", "te", "upgrade", "trailer", "keep-alive", "proxy-connection", "range"];
+    let tchar = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+    (1..=128).contains(&name.len())
+        && name.bytes().all(tchar)
+        && !RESERVED.iter().any(|r| name.eq_ignore_ascii_case(r))
+        && value.len() <= MAX_LONG_TEXT
+        && value.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
+}
+
+/// Typed fields of `behaviorHints`; anything malformed is ignored, never fatal.
+fn behavior_hints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BehaviorHints, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let text = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
+    let headers = v.pointer("/proxyHeaders/request").and_then(|h| h.as_object()).into_iter().flatten();
+    Ok(BehaviorHints {
+        binge_group: text("bingeGroup"),
+        request_headers: headers
+            .filter_map(|(k, x)| Some((k.clone(), x.as_str()?.trim().to_string())))
+            .filter(|(k, x)| valid_header(k, x))
+            .take(MAX_HEADERS)
+            .collect(),
+        filename: text("filename"),
+        video_size: v.get("videoSize").and_then(|x| x.as_u64()),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -195,15 +310,6 @@ pub enum PlayTarget {
 }
 
 impl Stream {
-    pub fn label(&self) -> String {
-        let parts: Vec<&str> = [&self.name, &self.title, &self.description]
-            .into_iter()
-            .flatten()
-            .map(|s| s.as_str())
-            .collect();
-        if parts.is_empty() { "Stream".into() } else { parts.join(" - ").replace('\n', " ") }
-    }
-
     /// Playable source string (http URL or magnet with BEP 53 file index).
     pub fn source(&self) -> Option<String> {
         Some(match self.target()? {
@@ -257,15 +363,16 @@ pub fn is_info_hash(h: &str) -> bool {
     h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Info hash of a magnet: 40 hex digits (lowercased) or the 32-character base32 form (uppercase, as librqbit reads it).
 pub fn parse_magnet_hash(m: &str) -> Option<String> {
     let u = Url::parse(m).ok()?;
     if u.scheme() != "magnet" {
         return None;
     }
-    u.query_pairs()
-        .find(|(k, v)| k == "xt" && v.starts_with("urn:btih:"))
-        .map(|(_, v)| v["urn:btih:".len()..].to_ascii_lowercase())
-        .filter(|h| is_info_hash(h))
+    let (_, v) = u.query_pairs().find(|(k, v)| k == "xt" && v.starts_with("urn:btih:"))?;
+    let h = &v["urn:btih:".len()..];
+    let base32 = h.len() == 32 && h.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7'));
+    if is_info_hash(h) { Some(h.to_ascii_lowercase()) } else { base32.then(|| h.to_string()) }
 }
 
 /// Peer hints (`x.pe=host:port`) embedded in a magnet link.
@@ -308,6 +415,9 @@ pub fn parse_manifest(body: &[u8]) -> Result<Manifest> {
     m.catalogs.truncate(100);
     for c in &mut m.catalogs {
         opt_text(&mut c.name, MAX_TEXT);
+        for e in &mut c.extra {
+            e.options = e.options.iter().map(|o| sanitize_text(o, 64)).filter(|o| !o.is_empty()).take(MAX_OPTIONS).collect();
+        }
     }
     Ok(m)
 }
@@ -348,13 +458,33 @@ pub fn parse_meta(body: &[u8]) -> Result<Meta> {
     m.name = sanitize_text(&m.name, MAX_TEXT);
     ensure!(!m.name.is_empty(), "meta: empty name");
     opt_url(&mut m.poster);
+    opt_url(&mut m.background);
+    opt_url(&mut m.logo);
     opt_text(&mut m.description, MAX_LONG_TEXT);
     opt_text(&mut m.release_info, 64);
+    opt_text(&mut m.runtime, 64);
+    opt_text(&mut m.imdb_rating, 16);
+    if m.genres.is_empty() {
+        m.genres = std::mem::take(&mut m.genre);
+    }
+    m.genre.clear();
+    for list in [&mut m.genres, &mut m.cast, &mut m.director] {
+        *list = list.iter().map(|s| sanitize_text(s, MAX_TEXT)).filter(|s| !s.is_empty()).take(MAX_TAGS).collect();
+    }
+    m.links = std::mem::take(&mut m.links)
+        .into_iter()
+        .filter_map(|mut l| {
+            l.url = safe_http_url(&l.url)?.into();
+            l.name = sanitize_text(&l.name, MAX_TEXT);
+            l.category = sanitize_text(&l.category, 64);
+            (!l.name.is_empty()).then_some(l)
+        })
+        .take(MAX_TAGS)
+        .collect();
     m.videos.retain(|v| valid_id(&v.id));
     for v in &mut m.videos {
         opt_text(&mut v.title, MAX_TEXT);
         opt_text(&mut v.released, 64);
-        opt_url(&mut v.thumbnail);
     }
     Ok(m)
 }
@@ -373,7 +503,10 @@ pub fn parse_streams(body: &[u8]) -> Result<Vec<Stream>> {
             opt_text(&mut s.name, MAX_TEXT);
             opt_text(&mut s.title, MAX_LONG_TEXT);
             opt_text(&mut s.description, MAX_LONG_TEXT);
-            opt_text(&mut s.binge_group, MAX_TEXT);
+            opt_text(&mut s.hints.binge_group, MAX_TEXT);
+            // Shown on one line of the stream row.
+            s.hints.filename = s.hints.filename.map(|f| f.replace(['\n', '\t'], " "));
+            opt_text(&mut s.hints.filename, MAX_TEXT);
             s.target().is_some().then_some(s)
         })
         .collect())
@@ -409,6 +542,32 @@ pub fn check_poster(body: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod configure_tests {
+    use super::*;
+
+    #[test]
+    fn configure_url_derivation() {
+        assert_eq!(configure_url("https://a.example/x/manifest.json").unwrap().as_str(), "https://a.example/x/configure");
+        assert_eq!(configure_url("http://127.0.0.1:7070/manifest.json").unwrap().as_str(), "http://127.0.0.1:7070/configure");
+        assert!(configure_url("stremio://a.example/manifest.json").is_err());
+        assert!(configure_url("https://a.example/other.json").is_err());
+    }
+
+    #[test]
+    fn behavior_hints_tolerant() {
+        let m = |h: &str| {
+            let body = format!(r#"{{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"]{h}}}"#);
+            parse_manifest(body.as_bytes()).unwrap().behavior_hints
+        };
+        assert_eq!(m(""), ManifestHints::default());
+        let h = m(r#","behaviorHints":{"configurable":true,"configurationRequired":true}"#);
+        assert!(h.configurable && h.configuration_required);
+        assert_eq!(m(r#","behaviorHints":"junk""#), ManifestHints::default());
+        assert_eq!(m(r#","behaviorHints":{"configurable":"yes"}"#), ManifestHints::default());
+    }
+}
+
 // ---------- client ----------
 
 /// Base URL of an addon given its transport (manifest) URL.
@@ -419,8 +578,29 @@ pub fn addon_base(transport_url: &str) -> Result<Url> {
     Ok(Url::parse(&format!("{base}/"))?)
 }
 
+/// `<base>/configure` page of a configurable addon (http(s) only).
+pub fn configure_url(transport_url: &str) -> Result<Url> {
+    Ok(addon_base(transport_url)?.join("configure")?)
+}
+
 fn enc(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>().replace('+', "%20")
+}
+
+/// Relative catalog URL; `skip > 0` adds the Stremio `skip` extra.
+pub fn catalog_path(kind: &str, id: &str, skip: usize) -> String {
+    match skip {
+        0 => format!("catalog/{}/{}.json", enc(kind), enc(id)),
+        n => format!("catalog/{}/{}/skip={n}.json", enc(kind), enc(id)),
+    }
+}
+
+/// Relative catalog URL, with an optional `genre` extra (`catalog/<type>/<id>/genre=<value>.json`).
+pub fn discover_path(kind: &str, id: &str, genre: Option<&str>) -> String {
+    match genre {
+        None => format!("catalog/{}/{}.json", enc(kind), enc(id)),
+        Some(g) => format!("catalog/{}/{}/genre={}.json", enc(kind), enc(id), enc(g)),
+    }
 }
 
 #[derive(Clone)]
@@ -465,8 +645,14 @@ impl AddonClient {
         Ok(addon_base(transport_url)?.join(&format!("{resource}/{}/{}.json", enc(kind), enc(id)))?)
     }
 
-    pub async fn catalog(&self, transport_url: &str, kind: &str, id: &str) -> Result<Vec<MetaPreview>> {
-        parse_catalog(&self.get(Self::resource_url(transport_url, "catalog", kind, id)?).await?)
+    /// One catalog page; `skip` is the number of items already fetched (0 = first page).
+    pub async fn catalog(&self, transport_url: &str, kind: &str, id: &str, skip: usize) -> Result<Vec<MetaPreview>> {
+        parse_catalog(&self.get(addon_base(transport_url)?.join(&catalog_path(kind, id, skip))?).await?)
+    }
+
+    /// First page of a catalog, filtered by `genre` if given.
+    pub async fn discover(&self, transport_url: &str, kind: &str, id: &str, genre: Option<&str>) -> Result<Vec<MetaPreview>> {
+        parse_catalog(&self.get(addon_base(transport_url)?.join(&discover_path(kind, id, genre))?).await?)
     }
 
     pub async fn search(&self, transport_url: &str, kind: &str, id: &str, query: &str) -> Result<Vec<MetaPreview>> {

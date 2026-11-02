@@ -32,6 +32,35 @@ fn catalog_extras() {
 }
 
 #[test]
+fn genre_extra() {
+    let m = parse_manifest(br#"{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"],"catalogs":[
+      {"type":"movie","id":"g","extra":[{"name":"genre","isRequired":true,"options":["Action"," Sci\u0007-Fi ","",7,"Action"]},{"name":"skip"}]},
+      {"type":"movie","id":"opt","extra":[{"name":"genre","options":"bad"}]},
+      {"type":"movie","id":"none","extra":[{"name":"genre","isRequired":true}]},
+      {"type":"movie","id":"s","extra":[{"name":"search","isRequired":true}]},
+      {"type":"movie","id":"legacy","extraRequired":["genre"]}]}"#).unwrap();
+    let c = &m.catalogs;
+    assert_eq!(c[0].genres(), ["Action", "Sci-Fi", "Action"], "sanitized, empty and non-string options dropped");
+    assert!(c[0].requires_genre() && c[0].discoverable());
+    assert!(c[1].genres().is_empty() && !c[1].requires_genre() && c[1].discoverable());
+    assert!(!c[2].discoverable(), "required genre without options");
+    assert!(!c[3].discoverable(), "required non-genre extra");
+    assert!(c[4].requires_genre() && !c[4].discoverable());
+    let many: Vec<String> = (0..500).map(|i| format!("\"g{i}\"")).collect();
+    let body = format!(r#"{{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"],"catalogs":[{{"type":"movie","id":"g","extra":[{{"name":"genre","options":[{}]}}]}}]}}"#, many.join(","));
+    assert_eq!(parse_manifest(body.as_bytes()).unwrap().catalogs[0].genres().len(), 200);
+}
+
+#[test]
+fn discover_url() {
+    assert_eq!(discover_path("movie", "top", None), "catalog/movie/top.json");
+    assert_eq!(discover_path("movie", "top", Some("Sci-Fi & Fantasy")), "catalog/movie/top/genre=Sci-Fi%20%26%20Fantasy.json");
+    assert_eq!(discover_path("movie", "top", Some("a/b=c?")), "catalog/movie/top/genre=a%2Fb%3Dc%3F.json");
+    let base = addon_base("https://x.example/a/manifest.json").unwrap();
+    assert_eq!(base.join(&discover_path("series", "top", Some("a/../b"))).unwrap().as_str(), "https://x.example/a/catalog/series/top/genre=a%2F..%2Fb.json");
+}
+
+#[test]
 fn poster_dimension_limits() {
     let png = |w, h| {
         let mut b = Vec::new();
@@ -94,6 +123,39 @@ fn meta_parsing() {
 }
 
 #[test]
+fn meta_detail_fields() {
+    let m = parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": "One",
+        "genres": ["Drama", " ", "Sci\u0007-Fi", 7], "cast": ["A", "B"], "director": ["D"],
+        "runtime": "118 min", "imdbRating": 7.8, "background": "https://img.example/bg.jpg", "logo": "file:///etc/passwd",
+        "links": [
+            {"name": "7.8", "category": "imdb", "url": "https://imdb.com/title/tt1"},
+            {"name": "Drama", "category": "Genres", "url": "stremio:///discover/x"},
+            {"name": "", "category": "x", "url": "https://a.example/"},
+            {"category": "x", "url": "https://a.example/"},
+            "junk"
+        ]}}"#)
+    .unwrap();
+    assert_eq!(m.genres, ["Drama", "Sci-Fi"]);
+    assert_eq!((m.cast.len(), m.director.as_slice()), (2, ["D".to_string()].as_slice()));
+    assert_eq!((m.runtime.as_deref(), m.imdb_rating.as_deref()), (Some("118 min"), Some("7.8")));
+    assert_eq!((m.background.as_deref(), m.logo.as_deref()), (Some("https://img.example/bg.jpg"), None));
+    assert_eq!(m.links.len(), 1, "non-http, nameless and malformed links dropped");
+    assert_eq!((m.links[0].category.as_str(), m.links[0].url.as_str()), ("imdb", "https://imdb.com/title/tt1"));
+    // Legacy `genre`, wrong types and oversized lists never fail the meta.
+    let many: Vec<String> = (0..100).map(|i| format!("\"p{i}\"")).collect();
+    let body = format!(
+        r#"{{"meta": {{"id": "tt1", "type": "movie", "name": "One", "genre": ["Comedy"], "cast": [{}],
+        "director": "D", "links": {{}}, "runtime": [1], "imdbRating": null, "releaseInfo": 2020, "logo": 5}}}}"#,
+        many.join(",")
+    );
+    let m = parse_meta(body.as_bytes()).unwrap();
+    assert_eq!(m.genres, ["Comedy"]);
+    assert_eq!(m.cast.len(), 30, "cast capped");
+    assert!(m.director.is_empty() && m.links.is_empty() && m.runtime.is_none() && m.imdb_rating.is_none() && m.logo.is_none());
+    assert_eq!(m.release_info.as_deref(), Some("2020"));
+}
+
+#[test]
 fn meta_videos_parsing() {
     let m = parse_meta(br#"{"meta": {"id": "tt9", "type": "series", "name": "Show", "videos": [
         {"id": "tt9:1:2", "name": "Pilot\u0007 ", "season": 1, "episode": 2, "released": "2020-01-01T00:00:00.000Z", "thumbnail": "https://img.example/e.jpg"},
@@ -109,8 +171,7 @@ fn meta_videos_parsing() {
     let v = &m.videos[0];
     assert_eq!((v.id.as_str(), v.title.as_deref(), v.season, v.episode), ("tt9:1:2", Some("Pilot"), Some(1), Some(2)));
     assert_eq!(v.released.as_deref(), Some("2020-01-01T00:00:00.000Z"));
-    assert_eq!(v.thumbnail.as_deref(), Some("https://img.example/e.jpg"));
-    assert_eq!((m.videos[1].title.as_deref(), m.videos[1].thumbnail.as_deref()), (Some("Special"), None));
+    assert_eq!(m.videos[1].title.as_deref(), Some("Special"));
     for videos in ["null", "{}", "\"x\""] {
         let body = format!(r#"{{"meta": {{"id": "tt9", "type": "series", "name": "Show", "videos": {videos}}}}}"#);
         assert!(parse_meta(body.as_bytes()).unwrap().videos.is_empty(), "{videos}");
@@ -139,6 +200,12 @@ fn stream_parsing_and_targets() {
     assert!(m.contains("&tr=http%3A%2F%2Ftr.example%2Fannounce"));
     assert_eq!(magnet_peers(&m), vec!["127.0.0.1:6881".parse().unwrap()]);
     assert!(matches!(s[2].target(), Some(PlayTarget::Magnet(_, None))));
+    // Base32 (32 chars, uppercase as librqbit reads it) is a valid info hash too; other lengths are not.
+    let b32 = "MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43U";
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{b32}")).as_deref(), Some(b32));
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{}", b32.to_lowercase())), None);
+    assert_eq!(parse_magnet_hash("magnet:?xt=urn:btih:MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43"), None);
+    assert_eq!(parse_magnet_hash("magnet:?xt=urn:btih:MFRGGZDFMZTWQ2LKNNWG23TPOBYXE431"), None, "1 is not base32");
 }
 
 #[test]
@@ -146,7 +213,7 @@ fn stream_binge_group() {
     let long = "g".repeat(1000);
     let body = format!(
         r#"{{"streams": [
-        {{"url": "https://a.example/1", "behaviorHints": {{"bingeGroup": " addon-1080p\u0007 ", "notWebReady": true}}}},
+        {{"url": "https://a.example/1", "behaviorHints": {{"bingeGroup": " addon-1080p\u0007 "}}}},
         {{"url": "https://a.example/2", "behaviorHints": {{"bingeGroup": 7}}}},
         {{"url": "https://a.example/3", "behaviorHints": "junk"}},
         {{"url": "https://a.example/4", "behaviorHints": {{"bingeGroup": "{long}"}}}},
@@ -155,9 +222,36 @@ fn stream_binge_group() {
     ]}}"#
     );
     let s = parse_streams(body.as_bytes()).unwrap();
-    let groups: Vec<_> = s.iter().map(|s| s.binge_group.as_deref().map(str::len)).collect();
-    assert_eq!(s[0].binge_group.as_deref(), Some("addon-1080p"));
+    let groups: Vec<_> = s.iter().map(|s| s.hints.binge_group.as_deref().map(str::len)).collect();
+    assert_eq!(s[0].hints.binge_group.as_deref(), Some("addon-1080p"));
     assert_eq!(groups, [Some(11), None, None, Some(300), None, None]);
+}
+
+#[test]
+fn stream_behavior_hints() {
+    let many: Vec<String> = (0..40).map(|i| format!(r#""X-H{i:02}": "v""#)).collect();
+    let body = format!(
+        r#"{{"streams": [
+        {{"url": "https://a.example/1", "behaviorHints": {{"filename": " Movie.2024\n.1080p.mkv\u0007", "videoSize": 2345000000,
+            "proxyHeaders": {{"request": {{"User-Agent": " Moz (KHTML, like Gecko) ", "Referer": "https://a.example/",
+                "X-Inject": "a\r\nX-Evil: 1", "X-Nul": "a\u0000b", "Bad Name": "v", "Bad:Name": "v", "": "v", "Host": "evil.example",
+                "Content-Length": "0", "X-Num": 7, "X-Uni": "café", "X-Long": "{long}"}}}}}}}},
+        {{"url": "https://a.example/2", "behaviorHints": {{"videoSize": -1, "filename": 3, "proxyHeaders": {{"request": "junk"}}}}}},
+        {{"url": "https://a.example/3", "behaviorHints": {{"proxyHeaders": {{"request": {{{many}}}}}}}}}
+    ]}}"#,
+        long = "x".repeat(5000),
+        many = many.join(",")
+    );
+    let s = parse_streams(body.as_bytes()).unwrap();
+    let h = &s[0].hints;
+    assert_eq!(h.filename.as_deref(), Some("Movie.2024 .1080p.mkv"));
+    assert_eq!(h.video_size, Some(2_345_000_000));
+    let names: Vec<_> = h.request_headers.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(names, ["Referer", "User-Agent"]);
+    assert_eq!(h.request_headers[1].1, "Moz (KHTML, like Gecko)");
+    assert_eq!((s[1].hints.video_size, &s[1].hints.filename, s[1].hints.request_headers.len()), (None, &None, 0));
+    assert_eq!(s[2].hints.request_headers.len(), 32);
+    assert!(valid_header("X-Debrid-Token", "abc, def;q=1") && !valid_header("X-A", "a\nb") && !valid_header("TE", "trailers"));
 }
 
 #[test]

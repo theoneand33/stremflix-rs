@@ -1,10 +1,10 @@
-//! SQLite persistence: addons, library folders/items, settings, watch progress.
+//! SQLite persistence: addons, library folders/items, saved titles, settings, watch progress.
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
-use crate::addon::{Manifest, parse_manifest};
+use crate::addon::{Manifest, MetaPreview, parse_manifest, valid_id};
 use crate::library::LibraryItem;
 
 pub struct Db {
@@ -34,6 +34,24 @@ pub struct Watched {
     pub episodes: u32,
 }
 
+/// A title saved with "Add to library".
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedTitle {
+    /// `<type>:<id>`, like addon progress keys.
+    pub key: String,
+    pub title: String,
+    pub kind: String,
+    pub poster: Option<String>,
+}
+
+impl SavedTitle {
+    /// Detail-page view of the saved title; `None` if the key has no `<type>:<id>` shape.
+    pub fn preview(&self) -> Option<MetaPreview> {
+        let (kind, id) = self.key.split_once(':')?;
+        Some(MetaPreview { id: id.into(), kind: kind.into(), name: self.title.clone(), poster: self.poster.clone(), background: None, description: None })
+    }
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -42,6 +60,7 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL; -- safe with WAL; a crash loses at most the last commit, and progress saves every second
              CREATE TABLE IF NOT EXISTS addons (transport_url TEXT PRIMARY KEY, manifest TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS library_folders (path TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS library_items (path TEXT PRIMARY KEY, folder TEXT NOT NULL, title TEXT NOT NULL);
@@ -49,7 +68,9 @@ impl Db {
              CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, title TEXT NOT NULL, source TEXT NOT NULL,
                  position REAL NOT NULL, duration REAL NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS watched (key TEXT PRIMARY KEY, title TEXT NOT NULL, poster TEXT,
-                 episodes INTEGER NOT NULL, watched_at INTEGER NOT NULL);",
+                 episodes INTEGER NOT NULL, watched_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS saved_titles (key TEXT PRIMARY KEY, title TEXT NOT NULL, kind TEXT NOT NULL,
+                 poster TEXT, saved_at INTEGER NOT NULL DEFAULT (unixepoch()));",
         )?;
         // Migrate databases created before posters were stored; fails harmlessly if the column exists.
         let _ = conn.execute("ALTER TABLE progress ADD COLUMN poster TEXT", []);
@@ -99,17 +120,40 @@ impl Db {
         Ok(())
     }
 
-    pub fn library_folders(&self) -> Result<Vec<PathBuf>> {
-        let mut st = self.conn.prepare("SELECT path FROM library_folders ORDER BY path")?;
-        Ok(st.query_map([], |r| r.get::<_, String>(0))?.filter_map(|r| r.ok()).map(PathBuf::from).collect())
-    }
-
     pub fn library_items(&self) -> Result<Vec<LibraryItem>> {
         let mut st = self.conn.prepare("SELECT path, title FROM library_items ORDER BY path")?;
         let rows = st.query_map([], |r| {
             Ok(LibraryItem { path: PathBuf::from(r.get::<_, String>(0)?), title: r.get(1)? })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Re-adding a saved title keeps its original `saved_at`, so the library order is stable.
+    pub fn add_saved_title(&self, t: &SavedTitle) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO saved_titles (key, title, kind, poster) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster)",
+            params![t.key, t.title, t.kind, t.poster],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_saved_title(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM saved_titles WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    /// Saved titles, newest first; rows with a malformed key or type are skipped.
+    pub fn saved_titles(&self) -> Result<Vec<SavedTitle>> {
+        // rowid, not key, breaks same-second ties so the order matches insertion order.
+        let mut st = self.conn.prepare("SELECT key, title, kind, poster FROM saved_titles ORDER BY saved_at DESC, rowid DESC")?;
+        let rows = st.query_map([], |r| {
+            Ok(SavedTitle { key: r.get(0)?, title: r.get(1)?, kind: r.get(2)?, poster: r.get(3)? })
+        })?;
+        Ok(rows
+            .filter_map(|r| r.ok())
+            .filter(|t| valid_id(&t.key) && valid_id(&t.kind) && !t.title.trim().is_empty())
+            .collect())
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
@@ -169,6 +213,31 @@ impl Db {
         let mut st = self.conn.prepare("SELECT key, title, poster, episodes FROM watched ORDER BY watched_at DESC, key LIMIT ?1")?;
         let rows = st.query_map([limit as i64], |r| Ok(Watched { key: r.get(0)?, title: r.get(1)?, poster: r.get(2)?, episodes: r.get(3)? }))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Mark a movie or episode (`<type>:<id>`) watched or not. Watching also drops its resume point,
+    /// so it leaves Continue Watching. Kept in `settings` so the Watch It Again row stays Stremio-only.
+    pub fn set_watched(&self, key: &str, on: bool) -> Result<()> {
+        let k = format!("watched:{key}");
+        self.transaction(|| {
+            if on {
+                self.set_setting(&k, "1")?;
+                self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
+            } else {
+                self.conn.execute("DELETE FROM settings WHERE key = ?1", [&k])?;
+                // Also clears a title imported from Stremio.
+                self.conn.execute("DELETE FROM watched WHERE key = ?1", [key])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Keys marked watched here or imported from Stremio (a movie imported as watched counts).
+    pub fn watched_keys(&self) -> Result<std::collections::HashSet<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT substr(key, 9) FROM settings WHERE key LIKE 'watched:%' UNION SELECT key FROM watched",
+        )?;
+        Ok(st.query_map([], |r| r.get::<_, String>(0))?.filter_map(|r| r.ok()).collect())
     }
 
     pub fn recent_progress(&self, limit: usize) -> Result<Vec<Progress>> {

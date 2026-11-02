@@ -58,7 +58,7 @@ fn parses_and_saves_without_clobbering_newer_progress() {
     assert_eq!(imp.progress.len(), 2);
     imp.progress.sort_by(|a, b| a.0.key.cmp(&b.0.key));
     let ep = &imp.progress[1].0;
-    assert_eq!((ep.key.as_str(), ep.source.as_str()), ("series:tt2", "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&so=2"));
+    assert_eq!((ep.key.as_str(), ep.source.as_str()), ("series:tt2:1:3", "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&so=2"));
     let p = &imp.progress[0].0;
     assert_eq!((p.key.as_str(), p.source.as_str(), p.position, p.duration), ("movie:tt1", "https://s.example/1.mp4", 61.5, 120.0));
     let mut w: Vec<_> = imp.watched.iter().map(|(w, _)| (w.key.as_str(), w.episodes, w.poster.is_some())).collect();
