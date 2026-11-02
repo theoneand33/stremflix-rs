@@ -1,5 +1,5 @@
 use std::path::Path;
-use stremio_lite::library::scan;
+use stremflix_rs::library::scan;
 
 #[test]
 fn scans_fixture_folder() {

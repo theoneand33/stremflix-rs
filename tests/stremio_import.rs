@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use stremio_lite::db::Db;
-use stremio_lite::addon::Video;
-use stremio_lite::stremio_import::{import, parse, read_storage, watched_episodes, watched_videos};
+use stremflix_rs::db::Db;
+use stremflix_rs::addon::Video;
+use stremflix_rs::stremio_import::{import, parse, read_storage, watched_episodes, watched_videos};
 
 /// A Stremio 5 localStorage snapshot: 2 addons (1 invalid), a movie in progress, a watched series,
 /// a watched movie, and an item with a `javascript:` poster.
@@ -95,7 +95,7 @@ fn parses_and_saves_without_clobbering_newer_progress() {
     // Newest watched first.
     assert_eq!(db.watched(10).unwrap().iter().map(|w| w.key.as_str()).collect::<Vec<_>>(), ["series:tt2", "movie:tt3"]);
     // Local progress saved now is newer than the 2026-01-02 import and survives a re-import.
-    db.save_progress(&stremio_lite::db::Progress { position: 99.0, ..p.clone() }).unwrap();
+    db.save_progress(&stremflix_rs::db::Progress { position: 99.0, ..p.clone() }).unwrap();
     imp.save(&db).unwrap();
     assert_eq!(db.progress("movie:tt1").unwrap().unwrap().position, 99.0);
 }

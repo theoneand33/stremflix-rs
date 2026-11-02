@@ -1,6 +1,6 @@
 # Implementer protocol (one TODO item, one worktree, one PR)
 
-Repo: github.com/theoneand33/stremioclient (Rust 2024, egui/eframe app "Scarlet", crate `stremio-lite`; libmpv FFI in src/player.rs; UI in src/main.rs; addon protocol in src/addon.rs; SQLite in src/db.rs). Read ARCHITECTURE.md and the files your item touches before writing.
+Repo: github.com/theoneand33/stremioclient (Rust 2024, egui/eframe app "Stremflix-rs", crate `stremflix-rs`; libmpv FFI in src/player.rs; UI in src/main.rs; addon protocol in src/addon.rs; SQLite in src/db.rs). Read ARCHITECTURE.md and the files your item touches before writing.
 
 You are ALREADY running inside your own dedicated git worktree (created for you). Never `cd` into /home/noah/stremioclient itself or any other worktree, and never run `git checkout`/`switch` outside your own worktree.
 
@@ -8,8 +8,8 @@ You are ALREADY running inside your own dedicated git worktree (created for you)
 1. `git rev-parse --show-toplevel` and `git branch --show-current` to confirm your worktree. If the branch is `worktree-<anything>`, rename it: `git branch -m fix/<ID>`. PRs get merged while you work, so if NOT stacked, first run `git fetch origin && git reset --hard origin/main` (safe: your worktree is fresh). If your prompt says STACKED ON <branch>, first run `git fetch origin <branch> && git reset --hard origin/<branch>` (safe: your worktree is fresh) — then rename.
 2. Implement the smallest complete change for the item. Edit files; do not rewrite them. Touch only files the item needs. Keep the existing style (see surrounding code). Validate addon/network input at trust boundaries like existing code does (sanitize_text, safe_http_url, valid_id). Non-trivial new logic (parsers, branches) gets at least one test in tests/ or a #[cfg(test)] module. If you see out-of-scope work, list it in your summary; do not do it.
 3. Build and test. ALWAYS use these env vars (shared cache; builds serialize on its lock — waiting on "Blocking waiting for file lock" is normal):
-   `CARGO_TARGET_DIR=/home/noah/stremioclient/target STREMIO_LITE_NO_DHT=1 cargo build --workspace --all-targets --locked`
-   `CARGO_TARGET_DIR=/home/noah/stremioclient/target STREMIO_LITE_NO_DHT=1 cargo test --workspace --locked`
+   `CARGO_TARGET_DIR=/home/noah/stremioclient/target STREMFLIX_RS_NO_DHT=1 cargo build --workspace --all-targets --locked`
+   `CARGO_TARGET_DIR=/home/noah/stremioclient/target STREMFLIX_RS_NO_DHT=1 cargo test --workspace --locked`
    main is NOT rustfmt-clean, so never run `cargo fmt` (it rewrites the whole repo); just hand-format your own lines in the surrounding style. Also run `cargo clippy --workspace --all-targets --locked` with the same env (fix new warnings you introduced). For workflow-only changes, validate YAML with `python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" <file>` and reason carefully about the GitHub Actions semantics; there is no Windows machine here.
    Fix all failures. Do not report "mostly passes".
 4. Review: spawn a FRESH subagent with the Agent tool: `subagent_type: "Explore"`, `model: "sonnet"`, `run_in_background: false` (Explore is read-only: no Edit/Write). Do NOT fork. Its prompt must contain: the reviewer instructions below verbatim, the TODO item ID + exact text, your worktree absolute path, the full `git diff` (against the base: `git diff origin/main` or `git diff origin/<stack-base>`; include untracked new files via `git add -N .` first), and your test/clippy/fmt results. It returns PASS or FIXES REQUIRED.

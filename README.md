@@ -1,8 +1,8 @@
 <img src="assets/icon.png" width="64" height="64" alt="">
 
-# Scarlet
+# Stremflix-rs
 
-Scarlet is a desktop client for [Stremio addons](https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/protocol.md), written in Rust. You install addons by manifest URL, browse and search their catalogs, and play their HTTP and torrent streams. It also plays video files from local folders. Playback progress is saved in SQLite and survives restarts.
+Stremflix-rs is a desktop client for [Stremio addons](https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/protocol.md), written in Rust. You install addons by manifest URL, browse and search their catalogs, and play their HTTP and torrent streams. It also plays video files from local folders. Playback progress is saved in SQLite and survives restarts.
 
 The client ships with no content sources. You install every addon yourself. All media in this repo is generated locally.
 
@@ -40,23 +40,23 @@ The search pill in the header queries every installed addon catalog that support
 ## Build
 
 ```sh
-cargo build            # builds the app (stremio-lite) and test-addon
+cargo build            # builds the app (stremflix-rs) and test-addon
 ```
 
 ## Run
 
 ```sh
-cargo run --bin stremio-lite
+cargo run --bin stremflix-rs
 ```
 
 Environment variables:
 
 | Variable | Purpose |
 |---|---|
-| `STREMIO_LITE_DATA` | Data directory for the DB and torrent downloads. A torrent and its files are deleted when playback stops, and leftovers are cleared at the next start. Default: `$XDG_DATA_HOME/stremio-lite`, or `%APPDATA%\stremio-lite` on Windows. Without `XDG_DATA_HOME`, Unix uses `~/.local/share/stremio-lite`. |
-| `STREMIO_LITE_MPV_ARGS` | Extra mpv options, e.g. `--ao=null` for headless runs |
-| `STREMIO_LITE_IPC` | mpv IPC endpoint. Default: `$TMPDIR/stremio-lite-mpv.sock` on Unix, `\\.\pipe\stremio-lite-mpv` on Windows |
-| `STREMIO_LITE_NO_DHT` | Set to disable the BitTorrent DHT (offline/CI use) |
+| `STREMFLIX_RS_DATA` | Data directory for the DB and torrent downloads. A torrent and its files are deleted when playback stops, and leftovers are cleared at the next start. Default: `$XDG_DATA_HOME/stremflix-rs`, or `%APPDATA%\stremflix-rs` on Windows. Without `XDG_DATA_HOME`, Unix uses `~/.local/share/stremflix-rs`. |
+| `STREMFLIX_RS_MPV_ARGS` | Extra mpv options, e.g. `--ao=null` for headless runs |
+| `STREMFLIX_RS_IPC` | mpv IPC endpoint. Default: `$TMPDIR/stremflix-rs-mpv.sock` on Unix, `\\.\pipe\stremflix-rs-mpv` on Windows |
+| `STREMFLIX_RS_NO_DHT` | Set to disable the BitTorrent DHT (offline/CI use) |
 
 ### Import from Stremio
 
@@ -102,7 +102,7 @@ The tests cover:
    ```
 3. Start the app with a fresh data directory:
    ```sh
-   STREMIO_LITE_DATA=/tmp/stremio-lite-demo STREMIO_LITE_NO_DHT=1 cargo run --bin stremio-lite
+   STREMFLIX_RS_DATA=/tmp/stremflix-rs-demo STREMFLIX_RS_NO_DHT=1 cargo run --bin stremflix-rs
    ```
 4. **Install an addon and play from it.** Open **Addons**, enter `http://127.0.0.1:7070/manifest.json`, and click **Install**. Open **Home**, click the **Test Pattern** card in the **Test Addon - Test Movies** row, then click **Play: Test Addon - Test pattern (HTTP)**. The built-in player opens with the test subtitle loaded.
 5. **Play a torrent.** On **Home**, click **Play: Test Addon - Test pattern (torrent)**. You can also open **Library**, paste the printed magnet into **Magnet link**, and click **Play magnet**. librqbit downloads the file from the local seeder and streams it to the player over `http://127.0.0.1:<port>/torrents/<id>/stream/<file>`.
@@ -112,15 +112,15 @@ The tests cover:
 You can query player state from outside the app while it runs. On Linux or macOS:
 
 ```sh
-printf '{"command":["get_property","time-pos"]}\n' | socat - /tmp/stremio-lite-mpv.sock
-# or: python3 -c 'import socket,json;s=socket.socket(socket.AF_UNIX);s.connect("/tmp/stremio-lite-mpv.sock");s.send(b"{\"command\":[\"get_property\",\"time-pos\"]}\n");print(s.recv(4096))'
+printf '{"command":["get_property","time-pos"]}\n' | socat - /tmp/stremflix-rs-mpv.sock
+# or: python3 -c 'import socket,json;s=socket.socket(socket.AF_UNIX);s.connect("/tmp/stremflix-rs-mpv.sock");s.send(b"{\"command\":[\"get_property\",\"time-pos\"]}\n");print(s.recv(4096))'
 ```
 
-On Windows, open the pipe `\\.\pipe\stremio-lite-mpv` instead.
+On Windows, open the pipe `\\.\pipe\stremflix-rs-mpv` instead.
 
 ## Releases
 
-Release archives are named `stremio-lite-<tag>-<target>` and published on GitHub Releases:
+Release archives are named `stremflix-rs-<tag>-<target>` and published on GitHub Releases:
 
 | Target | Archive |
 |---|---|

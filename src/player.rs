@@ -1,7 +1,7 @@
 //! Playback backend: libmpv embedded in-process. mpv renders through its OpenGL render
 //! API into a framebuffer the GUI owns (GPU scaling, hardware decoding via `hwdec`),
 //! so the video is a texture under the GUI's own controls.
-//! `STREMIO_LITE_MPV_ARGS` adds mpv options (e.g. `--ao=null` for headless CI).
+//! `STREMFLIX_RS_MPV_ARGS` adds mpv options (e.g. `--ao=null` for headless CI).
 //! mpv's JSON IPC server stays on at [`ipc_socket_path`] so tools can query player state.
 
 use anyhow::{Result, bail};
@@ -178,13 +178,13 @@ pub struct Player {
 
 /// Fixed, documented socket path so external tools can query player state.
 pub fn ipc_socket_path() -> PathBuf {
-    std::env::var_os("STREMIO_LITE_IPC")
+    std::env::var_os("STREMFLIX_RS_IPC")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             if cfg!(windows) {
-                PathBuf::from(r"\\.\pipe\stremio-lite-mpv")
+                PathBuf::from(r"\\.\pipe\stremflix-rs-mpv")
             } else {
-                std::env::temp_dir().join("stremio-lite-mpv.sock")
+                std::env::temp_dir().join("stremflix-rs-mpv.sock")
             }
         })
 }
@@ -315,7 +315,7 @@ impl Player {
             }
         }
         opts.extend(header_options(headers));
-        opts.extend(parse_args(&std::env::var("STREMIO_LITE_MPV_ARGS").unwrap_or_default()));
+        opts.extend(parse_args(&std::env::var("STREMFLIX_RS_MPV_ARGS").unwrap_or_default()));
         for (k, v) in &opts {
             let rc = unsafe { mpv_set_option_string(mpv, cstr(k).as_ptr(), cstr(v).as_ptr()) };
             if rc < 0 {
@@ -493,14 +493,14 @@ mod tests {
 
     #[test]
     fn default_ipc_path_per_platform() {
-        if std::env::var_os("STREMIO_LITE_IPC").is_some() {
+        if std::env::var_os("STREMFLIX_RS_IPC").is_some() {
             return;
         }
         let p = ipc_socket_path();
         if cfg!(windows) {
-            assert_eq!(p, PathBuf::from(r"\\.\pipe\stremio-lite-mpv"));
+            assert_eq!(p, PathBuf::from(r"\\.\pipe\stremflix-rs-mpv"));
         } else {
-            assert_eq!(p, std::env::temp_dir().join("stremio-lite-mpv.sock"));
+            assert_eq!(p, std::env::temp_dir().join("stremflix-rs-mpv.sock"));
         }
     }
 

@@ -102,7 +102,7 @@ fn candidates(roots: &[PathBuf], stremio_only: bool) -> Vec<PathBuf> {
         let walk = WalkDir::new(root).max_depth(8).into_iter().filter_entry(|e| {
             let name = e.file_name().to_string_lossy().to_lowercase();
             if e.depth() == 1 && stremio_only {
-                return name.contains("stremio") && !name.contains("stremio-lite") || name.contains("smart code");
+                return name.contains("stremio") && !name.contains("stremflix-rs") || name.contains("smart code");
             }
             // Skip video caches and downloads: large and never hold localStorage. Never skip the root itself.
             e.depth() == 0 || !(e.file_type().is_dir() && (name.contains("cache") || name.contains("server") || name == "downloads"))
@@ -150,7 +150,7 @@ fn copy_to(src: &Path, dir: &Path) -> Result<PathBuf> {
 /// localStorage key/values of the origin that holds a Stremio `profile`.
 pub fn read_storage(src: &Path) -> Result<HashMap<String, String>> {
     let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
-    let dir = std::env::temp_dir().join(format!("stremio-lite-import-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("stremflix-rs-import-{}-{nanos}", std::process::id()));
     // Owner-only and must not exist yet: the copy holds Stremio's auth key.
     let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]

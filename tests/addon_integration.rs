@@ -1,5 +1,5 @@
 //! Starts the bundled test addon and exercises the real addon client against it.
-use stremio_lite::addon::{AddonClient, PlayTarget};
+use stremflix_rs::addon::{AddonClient, PlayTarget};
 
 #[tokio::test]
 async fn client_against_test_addon() {

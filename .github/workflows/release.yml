@@ -101,19 +101,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "lib.exe failed" }
           "RUSTFLAGS=-L native=$dir" >> $env:GITHUB_ENV
           "MPV_DIR=$($dir.Replace('\', '/'))" >> $env:GITHUB_ENV # forward slashes for the bash Package step
-      - run: cargo build --release --locked --bin stremio-lite
+      - run: cargo build --release --locked --bin stremflix-rs
       - name: Package
         shell: bash
         env:
-          NAME: stremio-lite-${{ env.TAG }}-${{ matrix.target }}
+          NAME: stremflix-rs-${{ env.TAG }}-${{ matrix.target }}
         run: |
           mkdir "$NAME"
           if [ "$RUNNER_OS" = Windows ]; then
             # the exe imports libmpv-2.dll by that exact name, so ship it unrenamed next to the exe
-            cp target/release/stremio-lite.exe "$MPV_DIR/libmpv-2.dll" README.md "$NAME/"
+            cp target/release/stremflix-rs.exe "$MPV_DIR/libmpv-2.dll" README.md "$NAME/"
             7z a -tzip "$NAME.zip" "$NAME" > /dev/null
           else
-            cp target/release/stremio-lite README.md "$NAME/"
+            cp target/release/stremflix-rs README.md "$NAME/"
             tar czf "$NAME.tar.gz" "$NAME"
           fi
       - name: Package AppImage (Linux)
@@ -123,18 +123,18 @@ jobs:
           LINUXDEPLOY_URL: https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
           LINUXDEPLOY_SHA256: c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
           APPIMAGE_EXTRACT_AND_RUN: "1" # runners have no FUSE
-          LDAI_OUTPUT: stremio-lite-${{ env.TAG }}-${{ matrix.target }}.AppImage
+          LDAI_OUTPUT: stremflix-rs-${{ env.TAG }}-${{ matrix.target }}.AppImage
           # embedded so AppImageUpdate can find new builds; nightly is a prerelease, so "latest" would skip it
-          LDAI_UPDATE_INFORMATION: gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|${{ inputs.version && 'latest' || 'nightly' }}|stremio-lite-*-${{ matrix.target }}.AppImage.zsync
+          LDAI_UPDATE_INFORMATION: gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|${{ inputs.version && 'latest' || 'nightly' }}|stremflix-rs-*-${{ matrix.target }}.AppImage.zsync
         run: |
           ld="$RUNNER_TEMP/linuxdeploy"
           curl -fsSL --retry 3 -o "$ld" "$LINUXDEPLOY_URL"
           echo "$LINUXDEPLOY_SHA256  $ld" | sha256sum -c -
           chmod +x "$ld"
-          printf '%s\n' '[Desktop Entry]' Type=Application Name=Stremio\ Lite Exec=stremio-lite Icon=stremio-lite Categories=AudioVideo\;Video\;Player\; > "$RUNNER_TEMP/stremio-lite.desktop"
-          cp assets/icon.png "$RUNNER_TEMP/stremio-lite.png"
+          printf '%s\n' '[Desktop Entry]' Type=Application Name=Stremflix-rs Exec=stremflix-rs Icon=stremflix-rs Categories=AudioVideo\;Video\;Player\; > "$RUNNER_TEMP/stremflix-rs.desktop"
+          cp assets/icon.png "$RUNNER_TEMP/stremflix-rs.png"
           # bundles libmpv and its deps; glibc, GL and other host libs stay on the excludelist
-          "$ld" --appdir AppDir -e target/release/stremio-lite -d "$RUNNER_TEMP/stremio-lite.desktop" -i "$RUNNER_TEMP/stremio-lite.png" --output appimage
+          "$ld" --appdir AppDir -e target/release/stremflix-rs -d "$RUNNER_TEMP/stremflix-rs.desktop" -i "$RUNNER_TEMP/stremflix-rs.png" --output appimage
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.target }}

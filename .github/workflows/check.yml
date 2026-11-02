@@ -13,7 +13,7 @@ jobs:
         os: [ubuntu-24.04, macos-15, windows-2025]
     runs-on: ${{ matrix.os }}
     env:
-      STREMIO_LITE_NO_DHT: "1"
+      STREMFLIX_RS_NO_DHT: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

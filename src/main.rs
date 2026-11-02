@@ -1,4 +1,4 @@
-//! Stremio Lite desktop GUI (egui/eframe). Network and torrent work runs on a tokio
+//! Stremflix-rs desktop GUI (egui/eframe). Network and torrent work runs on a tokio
 //! runtime; results come back to the UI thread over a channel.
 
 use eframe::egui;
@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
-use stremio_lite::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash};
-use stremio_lite::db::{Db, Progress, SavedTitle, Watched};
-use stremio_lite::library::{LibraryItem, scan};
+use stremflix_rs::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash};
+use stremflix_rs::db::{Db, Progress, SavedTitle, Watched};
+use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremio_lite::player::{GlProc, Player, SUB_COLORS, SubStyle, valid_langs};
-use stremio_lite::stremio_import::{self, Import};
-use stremio_lite::torrent::TorrentEngine;
+use stremflix_rs::player::{GlProc, Player, SUB_COLORS, SubStyle, valid_langs};
+use stremflix_rs::stremio_import::{self, Import};
+use stremflix_rs::torrent::TorrentEngine;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -512,7 +512,7 @@ struct App {
 }
 
 fn data_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("STREMIO_LITE_DATA") {
+    if let Some(d) = std::env::var_os("STREMFLIX_RS_DATA") {
         return d.into();
     }
     let base = std::env::var_os("XDG_DATA_HOME")
@@ -520,7 +520,7 @@ fn data_dir() -> PathBuf {
         .or_else(|| cfg!(windows).then(|| std::env::var_os("APPDATA").map(PathBuf::from)).flatten())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(std::env::temp_dir);
-    base.join("stremio-lite")
+    base.join("stremflix-rs")
 }
 
 fn fmt_time(s: f64) -> String {
@@ -530,7 +530,7 @@ fn fmt_time(s: f64) -> String {
 
 impl App {
     fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
-        let db = Db::open(&data_dir.join("stremio-lite.db"))?;
+        let db = Db::open(&data_dir.join("stremflix-rs.db"))?;
         let (tx, rx) = channel();
         let mut app = Self {
             sub_style: db.setting("sub_style")?.map(|s| SubStyle::decode(&s)).unwrap_or_default(),
@@ -603,7 +603,7 @@ impl App {
             return;
         }
         let (cell, dir) = (self.torrent.clone(), self.data_dir.join("torrents"));
-        let dht = std::env::var_os("STREMIO_LITE_NO_DHT").is_none();
+        let dht = std::env::var_os("STREMFLIX_RS_NO_DHT").is_none();
         self.spawn(ctx, async move {
             let engine = cell.get_or_try_init(|| TorrentEngine::start(dir, dht)).await?;
             let (url, id) = engine.stream_url(&source, None).await?;
@@ -2057,7 +2057,7 @@ impl App {
             });
         }
         if let Some(u) = configure {
-            match stremio_lite::addon::configure_url(&u) {
+            match stremflix_rs::addon::configure_url(&u) {
                 Ok(page) => {
                     ctx.open_url(egui::OpenUrl::new_tab(page.as_str()));
                     self.status = "Configure in your browser, then paste the resulting manifest URL".into();
@@ -2174,7 +2174,7 @@ impl eframe::App for App {
             ui.set_min_size(ui.available_size());
             // Fixed-height row so the nav and search pills share one center line.
             ui.allocate_ui_with_layout(vec2(ui.available_width(), 44.0), Layout::left_to_right(Align::Center), |ui| {
-                ui.label(RichText::new("STREMIO LITE").size(26.0).strong().family(bold()).color(RED));
+                ui.label(RichText::new("STREMFLIX-RS").size(26.0).strong().family(bold()).color(RED));
                 ui.add_space(20.0);
                 // Netflix nav: current tab is bold white on a dark gray pill that slides between tabs.
                 let pill_slot = ui.painter().add(egui::Shape::Noop);
@@ -2245,12 +2245,12 @@ fn main() -> eframe::Result {
     let mut app = App::new(data_dir()).expect("failed to initialise app data");
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0])
-            .with_title("Scarlet")
+            .with_title("Stremflix-rs")
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("bundled icon is a valid PNG")),
         ..Default::default()
     };
     eframe::run_native(
-        "Scarlet",
+        "Stremflix-rs",
         opts,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -2356,7 +2356,7 @@ mod tests {
 
     #[test]
     fn binge_source_matches_group() {
-        let s = |u: &str, g: Option<&str>| Stream { url: Some(u.into()), hints: stremio_lite::addon::BehaviorHints { binge_group: g.map(String::from), ..Default::default() }, ..Default::default() };
+        let s = |u: &str, g: Option<&str>| Stream { url: Some(u.into()), hints: stremflix_rs::addon::BehaviorHints { binge_group: g.map(String::from), ..Default::default() }, ..Default::default() };
         let streams = [s("https://a/1", None), s("javascript:x", Some("hd")), s("https://a/2", Some("sd")), s("https://a/3", Some("hd"))];
         assert_eq!(binge_source(&streams, "hd").as_deref(), Some("https://a/3"), "skips unplayable");
         assert_eq!(binge_source(&streams, "4k"), None);
@@ -2366,7 +2366,7 @@ mod tests {
     #[test]
     fn request_headers_only_for_own_http_stream() {
         let h = vec![("Referer".to_string(), "https://a.example/".to_string())];
-        let s = |u: &str| Stream { url: Some(u.into()), hints: stremio_lite::addon::BehaviorHints { request_headers: h.clone(), ..Default::default() }, ..Default::default() };
+        let s = |u: &str| Stream { url: Some(u.into()), hints: stremflix_rs::addon::BehaviorHints { request_headers: h.clone(), ..Default::default() }, ..Default::default() };
         let magnet = format!("magnet:?xt=urn:btih:{}", "a".repeat(40));
         let streams = [s("https://a.example/v.mp4"), s(&magnet)];
         assert_eq!(request_headers(&streams, "https://a.example/v.mp4", "https://a.example/v.mp4"), h);
@@ -2390,7 +2390,7 @@ mod tests {
         app.nav = 2;
         app.handle(&ctx, Msg::Streams(m("a"), None, vec![], vec![], Autoplay::Off, None, 1));
         assert!(app.selected.is_none(), "reply for an older navigation");
-        let series = stremio_lite::addon::parse_meta(br#"{"meta":{"id":"s","type":"series","name":"S","videos":[{"id":"s:1:1","season":1,"episode":1}]}}"#).unwrap();
+        let series = stremflix_rs::addon::parse_meta(br#"{"meta":{"id":"s","type":"series","name":"S","videos":[{"id":"s:1:1","season":1,"episode":1}]}}"#).unwrap();
         app.handle(&ctx, Msg::Episodes(MetaPreview { kind: "series".into(), ..m("s") }, series, 1));
         assert!(app.selected.is_none() && app.episodes.is_empty());
         app.handle(&ctx, Msg::Play("movie:a".into(), "a".into(), "https://x.example/a".into(), "https://x.example/a".into(), vec![], None, 1));
