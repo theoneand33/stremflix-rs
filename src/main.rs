@@ -709,6 +709,18 @@ impl App {
                 self.details = Some(m);
                 sort_episodes(&mut videos);
                 self.status = format!("{}: {} episodes", meta.name, videos.len());
+                // Episodes imported as watched from Stremio: saved once as local marks, so they can be unmarked.
+                let bk = format!("bitfield:{}:{}", meta.kind, meta.id);
+                if let Ok(Some(field)) = self.db.setting(&bk) {
+                    let keys: Vec<String> = stremio_import::watched_videos(&field, &videos).into_iter().map(|id| format!("{}:{id}", meta.kind)).collect();
+                    // An anchor missing from this addon's list marks nothing; keep the field for another source.
+                    if !keys.is_empty() {
+                        match self.db.apply_watched_bitfield(&bk, &keys) {
+                            Ok(()) => self.watched_keys.extend(keys),
+                            Err(e) => self.status = format!("Error saving watched episodes: {e:#}"),
+                        }
+                    }
+                }
                 self.season = videos.first().and_then(|v| v.season);
                 (self.episodes, self.episode) = (videos, None);
                 self.selected = Some((meta.clone(), Vec::new(), Vec::new()));

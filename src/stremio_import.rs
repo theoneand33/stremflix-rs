@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
-use crate::addon::{Manifest, Stream, addon_base, parse_manifest, safe_http_url, sanitize_text, valid_id};
+use crate::addon::{Manifest, Stream, Video, addon_base, parse_manifest, safe_http_url, sanitize_text, valid_id};
 use crate::db::{Db, Progress, Watched};
 
 #[derive(Debug, Default)]
@@ -25,6 +25,8 @@ pub struct Import {
     /// Progress and when it was last watched (ISO 8601).
     pub progress: Vec<(Progress, String)>,
     pub watched: Vec<(Watched, String)>,
+    /// Series key (`<type>:<id>`) and its raw watched-episodes bitfield, mapped to episodes once their list loads.
+    pub bitfields: Vec<(String, String)>,
 }
 
 impl Import {
@@ -43,6 +45,9 @@ impl Import {
         }
         for (w, at) in &self.watched {
             db.save_watched(w, at)?;
+        }
+        for (key, field) in &self.bitfields {
+            db.set_setting(&format!("bitfield:{key}"), field)?;
         }
         Ok(())
     }
@@ -234,17 +239,41 @@ struct ItemState {
     watched: Option<String>,
 }
 
-/// Number of watched episodes in a stremio-core bitfield string.
-pub fn watched_episodes(field: &str) -> u32 {
+/// Anchor video id, anchor length and bits (LSB first) of a stremio-core bitfield string.
+fn decode_bitfield(field: &str) -> Option<(&str, usize, Vec<u8>)> {
     let mut parts = field.rsplitn(3, ':');
-    let (Some(b64), Some(len)) = (parts.next(), parts.next().and_then(|l| l.parse::<usize>().ok())) else { return 0 };
-    let Ok(z) = base64::engine::general_purpose::STANDARD.decode(b64) else { return 0 };
+    let (b64, len, anchor) = (parts.next()?, parts.next()?.parse::<usize>().ok()?, parts.next()?);
+    let z = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     let mut bits = Vec::new();
     // Cap: the bitfield is one bit per episode, so even huge shows stay tiny.
-    if flate2::read::ZlibDecoder::new(&z[..]).take(1 << 20).read_to_end(&mut bits).is_err() {
-        return 0;
-    }
-    (0..len.min(bits.len() * 8)).filter(|i| bits[i / 8] >> (i % 8) & 1 == 1).count() as u32
+    flate2::read::ZlibDecoder::new(&z[..]).take(1 << 20).read_to_end(&mut bits).ok()?;
+    Some((anchor, len, bits))
+}
+
+fn bit(bits: &[u8], i: usize) -> bool {
+    bits.get(i / 8).is_some_and(|b| b >> (i % 8) & 1 == 1)
+}
+
+/// Number of watched episodes in a stremio-core bitfield string.
+pub fn watched_episodes(field: &str) -> u32 {
+    decode_bitfield(field).map_or(0, |(_, len, bits)| (0..len).filter(|&i| bit(&bits, i)).count() as u32)
+}
+
+/// Ids of `videos` marked watched in a stremio-core bitfield. Like stremio-core, bits follow the videos
+/// sorted by (season, episode, released), re-aligned on the anchor; an unknown anchor marks nothing.
+pub fn watched_videos(field: &str, videos: &[Video]) -> Vec<String> {
+    let Some((anchor, len, bits)) = decode_bitfield(field) else { return Vec::new() };
+    let mut ids: Vec<&Video> = videos.iter().collect();
+    ids.sort_by_key(|v| (v.season.zip(v.episode), v.released.as_deref()));
+    ids.dedup_by(|a, b| a.id == b.id);
+    let Some(at) = ids.iter().position(|v| v.id == anchor) else { return Vec::new() };
+    // Bit `i + offset` of the stored field is video `i` now (episodes may have been added since).
+    let offset = len as isize - at as isize - 1;
+    ids.iter()
+        .enumerate()
+        .filter(|&(i, _)| usize::try_from(i as isize + offset).is_ok_and(|j| j < len && bit(&bits, j)))
+        .map(|(_, v)| v.id.clone())
+        .collect()
 }
 
 /// Build an import from Stremio's localStorage values. Addon and stream data came from addons,
@@ -308,6 +337,9 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
         let episodes = s.watched.as_deref().map(watched_episodes).unwrap_or(0);
         if episodes > 0 || s.flagged_watched > 0 || s.times_watched > 0 {
             let episodes = if it.kind == "movie" { 0 } else { episodes };
+            if episodes > 0 {
+                imp.bitfields.push((key.clone(), s.watched.clone().unwrap_or_default()));
+            }
             imp.watched.push((Watched { key, title, poster, episodes }, at));
         }
     }
