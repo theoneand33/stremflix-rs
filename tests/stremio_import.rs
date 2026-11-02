@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use stremio_lite::db::Db;
-use stremio_lite::stremio_import::{import, parse, read_storage, watched_episodes};
+use stremio_lite::addon::Video;
+use stremio_lite::stremio_import::{import, parse, read_storage, watched_episodes, watched_videos};
 
 /// A Stremio 5 localStorage snapshot: 2 addons (1 invalid), a movie in progress, a watched series,
 /// a watched movie, and an item with a `javascript:` poster.
@@ -52,6 +53,25 @@ fn bitfield_counts_watched_episodes() {
 }
 
 #[test]
+fn bitfield_maps_to_episode_ids() {
+    let s = storage();
+    let field = s["library_recent"].split(r#""watched":""#).nth(1).unwrap().split('"').next().unwrap().to_string();
+    let ep = |id: &str, season, episode| Video { id: id.into(), title: None, season: Some(season), episode: Some(episode), released: None };
+    let videos = [ep("tt2:1:3", 1, 3), ep("tt2:1:1", 1, 1), ep("tt2:1:2", 1, 2), ep("tt2:1:4", 1, 4), ep("tt2:1:5", 1, 5)];
+    // Anchor `tt2:1:1` with length 5 puts it at bit 4, so the field is shifted by 4: only bit 4 (= 1x1) maps.
+    assert_eq!(watched_videos(&field, &videos), ["tt2:1:1"]);
+    // Anchored on the 5th video, the bits map one to one: 1x1, 1x3, 1x5.
+    let field5 = field.replacen("tt2:1:1:", "tt2:1:5:", 1);
+    assert_eq!(watched_videos(&field5, &videos), ["tt2:1:1", "tt2:1:3", "tt2:1:5"]);
+    // A special (season 0) sorts first in Stremio, shifting every episode by one; the anchor re-aligns it.
+    let mut with_special = videos.to_vec();
+    with_special.push(ep("tt2:0:1", 0, 1));
+    assert_eq!(watched_videos(&field5, &with_special), ["tt2:1:1", "tt2:1:3", "tt2:1:5"]);
+    assert!(watched_videos(&field.replacen("tt2:1:1:", "tt9:1:1:", 1), &videos).is_empty(), "unknown anchor");
+    assert!(watched_videos("garbage", &videos).is_empty());
+}
+
+#[test]
 fn parses_and_saves_without_clobbering_newer_progress() {
     let mut imp = parse(&storage()).unwrap();
     assert_eq!(imp.addons.len(), 1, "file: transport URL is rejected");
@@ -70,6 +90,7 @@ fn parses_and_saves_without_clobbering_newer_progress() {
     imp.save(&db).unwrap();
     imp.save(&db).unwrap(); // re-import is idempotent
     assert_eq!(db.addons().unwrap().len(), 1);
+    assert!(db.setting("bitfield:series:tt2").unwrap().is_some_and(|f| f.starts_with("tt2:1:1:5:")));
     assert_eq!(db.recent_progress(10).unwrap().len(), 2);
     // Newest watched first.
     assert_eq!(db.watched(10).unwrap().iter().map(|w| w.key.as_str()).collect::<Vec<_>>(), ["series:tt2", "movie:tt3"]);

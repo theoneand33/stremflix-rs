@@ -232,6 +232,17 @@ impl Db {
         })
     }
 
+    /// Mark episodes `keys` watched and drop the imported bitfield setting they came from, in one transaction.
+    pub fn apply_watched_bitfield(&self, bitfield_key: &str, keys: &[String]) -> Result<()> {
+        self.transaction(|| {
+            for k in keys {
+                self.set_setting(&format!("watched:{k}"), "1")?;
+            }
+            self.conn.execute("DELETE FROM settings WHERE key = ?1", [bitfield_key])?;
+            Ok(())
+        })
+    }
+
     /// Keys marked watched here or imported from Stremio (a movie imported as watched counts).
     pub fn watched_keys(&self) -> Result<std::collections::HashSet<String>> {
         let mut st = self.conn.prepare(
