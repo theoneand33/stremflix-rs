@@ -2213,17 +2213,7 @@ impl eframe::App for App {
                     }
                 });
             });
-            // Player / status line: OCR- and screen-reader-friendly state.
-            let state = match &self.player {
-                Some(p) => format!("Player: playing \"{}\" at {} / {}", p.title, fmt_time(p.pos), fmt_time(p.dur)),
-                None => "Player: stopped".into(),
-            };
             ui.horizontal(|ui| {
-                ui.label(RichText::new(state).color(Color32::from_gray(160)));
-                if self.player.is_some() && small_button(ui, "Stop").clicked() {
-                    self.stop_player();
-                    self.release_torrents(None);
-                }
                 ui.label(RichText::new(format!("Status: {}", self.status)).color(Color32::from_gray(160)));
             });
             ui.add_space(8.0);
