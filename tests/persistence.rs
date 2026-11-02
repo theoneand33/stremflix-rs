@@ -1,5 +1,5 @@
 use stremio_lite::addon::parse_manifest;
-use stremio_lite::db::{Db, Progress};
+use stremio_lite::db::{Db, Progress, Watched};
 use stremio_lite::library::LibraryItem;
 
 #[test]
@@ -51,4 +51,29 @@ fn migrates_progress_without_poster() {
     db.set_progress_poster("k", "https://x.example/p.jpg").unwrap();
     assert_eq!(db.progress("k").unwrap().unwrap().poster.as_deref(), Some("https://x.example/p.jpg"));
     Db::open(&path).unwrap(); // reopening with the column present still works
+}
+
+#[test]
+fn watched_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("w.db")).unwrap();
+    let key = "series:tt1:1:2";
+    let prog = Progress { key: key.into(), title: "T".into(), source: "s".into(), position: 10.0, duration: 100.0, poster: None };
+    db.save_progress(&prog).unwrap();
+    assert!(db.watched_keys().unwrap().is_empty());
+
+    db.set_watched(key, true).unwrap();
+    assert!(db.watched_keys().unwrap().contains(key));
+    assert!(db.progress(key).unwrap().is_none()); // left Continue Watching
+    assert!(db.watched(10).unwrap().is_empty()); // not a Watch It Again title
+
+    db.set_watched(key, false).unwrap();
+    assert!(db.watched_keys().unwrap().is_empty());
+
+    // An imported movie counts as watched, and can be unmarked.
+    let w = Watched { key: "movie:tt9".into(), title: "M".into(), poster: None, episodes: 0 };
+    db.save_watched(&w, "2024-01-01T00:00:00Z").unwrap();
+    assert!(db.watched_keys().unwrap().contains("movie:tt9"));
+    db.set_watched("movie:tt9", false).unwrap();
+    assert!(db.watched_keys().unwrap().is_empty());
 }

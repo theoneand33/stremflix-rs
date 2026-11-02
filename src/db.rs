@@ -171,6 +171,31 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Mark a movie or episode (`<type>:<id>`) watched or not. Watching also drops its resume point,
+    /// so it leaves Continue Watching. Kept in `settings` so the Watch It Again row stays Stremio-only.
+    pub fn set_watched(&self, key: &str, on: bool) -> Result<()> {
+        let k = format!("watched:{key}");
+        self.transaction(|| {
+            if on {
+                self.set_setting(&k, "1")?;
+                self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
+            } else {
+                self.conn.execute("DELETE FROM settings WHERE key = ?1", [&k])?;
+                // Also clears a title imported from Stremio.
+                self.conn.execute("DELETE FROM watched WHERE key = ?1", [key])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Keys marked watched here or imported from Stremio (a movie imported as watched counts).
+    pub fn watched_keys(&self) -> Result<std::collections::HashSet<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT substr(key, 9) FROM settings WHERE key LIKE 'watched:%' UNION SELECT key FROM watched",
+        )?;
+        Ok(st.query_map([], |r| r.get::<_, String>(0))?.filter_map(|r| r.ok()).collect())
+    }
+
     pub fn recent_progress(&self, limit: usize) -> Result<Vec<Progress>> {
         let mut st = self.conn.prepare(
             "SELECT key, title, source, position, duration, poster FROM progress ORDER BY updated_at DESC, key LIMIT ?1",

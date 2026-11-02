@@ -135,11 +135,11 @@ fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream) -> egui::Response {
 }
 
 /// Episode row: number, title, release date.
-fn episode_row(ui: &mut egui::Ui, v: &Video) -> egui::Response {
+fn episode_row(ui: &mut egui::Ui, v: &Video, watched: bool) -> egui::Response {
     let n = v.episode.unwrap_or(0) as usize;
     let head = v.title.clone().unwrap_or_else(|| format!("Episode {n}"));
-    let date = v.released.as_deref().map(|d| d.chars().take(10).collect()).unwrap_or_default();
-    list_row(ui, n, head, date)
+    let date: String = v.released.as_deref().map(|d| d.chars().take(10).collect()).unwrap_or_default();
+    list_row(ui, n, if watched { format!("{head}  ✔") } else { head }, date)
 }
 
 /// Netflix episode-list row: index, bold name, gray details, play circle; highlights on hover.
@@ -261,6 +261,8 @@ struct App {
     library: Vec<LibraryItem>,
     recent: Vec<Progress>,
     watched: Vec<Watched>,
+    /// Keys (`<type>:<id>`) of movies and episodes marked watched.
+    watched_keys: std::collections::HashSet<String>,
     /// Stremio data path to import from; empty = auto-detect.
     import_path: String,
     /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
@@ -302,6 +304,7 @@ impl App {
             library: db.library_items()?,
             recent: db.recent_progress(20)?,
             watched: db.watched(50)?,
+            watched_keys: db.watched_keys()?,
             import_path: String::new(),
             folder: db.setting("last_folder")?.unwrap_or_default(),
             db,
@@ -438,6 +441,7 @@ impl App {
                 self.addons = self.db.addons().unwrap_or_default();
                 self.recent = self.db.recent_progress(20).unwrap_or_default();
                 self.watched = self.db.watched(50).unwrap_or_default();
+                self.watched_keys = self.db.watched_keys().unwrap_or_default();
                 self.build_rows(ctx);
                 self.fetch_recent_posters(ctx);
             }
@@ -480,13 +484,30 @@ impl App {
 
     fn save_progress(&mut self) {
         if let Some(p) = &self.player {
-            if p.pos > 0.0 {
+            if p.dur > 0.0 && p.pos >= p.dur * 0.9 {
+                // Past 90%: count it as watched instead of keeping a resume point.
+                let key = p.key.clone();
+                if !self.watched_keys.contains(&key) {
+                    self.set_watched(&key, true);
+                }
+            } else if p.pos > 0.0 {
                 let prog = Progress { key: p.key.clone(), title: p.title.clone(), source: p.source.clone(), position: p.pos, duration: p.dur, poster: p.poster.clone() };
                 if let Err(e) = self.db.save_progress(&prog) {
                     self.status = format!("Error saving progress: {e:#}");
                 }
                 self.recent = self.db.recent_progress(20).unwrap_or_default();
             }
+        }
+    }
+
+    fn set_watched(&mut self, key: &str, on: bool) {
+        match self.db.set_watched(key, on) {
+            Ok(()) => {
+                self.watched_keys = self.db.watched_keys().unwrap_or_default();
+                self.watched = self.db.watched(50).unwrap_or_default();
+                self.recent = self.db.recent_progress(20).unwrap_or_default();
+            }
+            Err(e) => self.status = format!("Error saving watched state: {e:#}"),
         }
     }
 
@@ -776,6 +797,7 @@ impl App {
             }
         }
         let mut episode = None;
+        let mut toggle: Option<(String, bool)> = None;
         // Movies show their streams; a series shows them once an episode is picked.
         if let Some((_, streams, subs)) = &self.selected
             && let Some(key) = self.play_key()
@@ -788,6 +810,10 @@ impl App {
                     r.scroll_to_me(Some(Align::TOP));
                 }
                 ui.label(RichText::new(format!("{}  ·  {} subtitle track(s)", key.1, subs.len())).size(15.0).color(Color32::from_gray(170)));
+                let seen = self.watched_keys.contains(&key.0);
+                if small_button(ui, if seen { "Mark unwatched" } else { "Mark watched" }).clicked() {
+                    toggle = Some((key.0.clone(), !seen));
+                }
             });
             ui.add_space(8.0);
             let playable = streams.iter().filter_map(|s| Some((s, s.source()?)));
@@ -816,11 +842,18 @@ impl App {
             });
             ui.add_space(8.0);
             for v in self.episodes.iter().filter(|v| v.season == self.season) {
-                let r = episode_row(ui, v);
+                let k = format!("{}:{}", meta.kind, v.id);
+                let seen = self.watched_keys.contains(&k);
+                let r = episode_row(ui, v, seen);
                 if self.episode.as_ref() == Some(v) {
                     ui.painter().rect_stroke(r.rect, 4, (2.0, RED), egui::StrokeKind::Inside);
                 }
-                if r.clicked() {
+                // Overlaid left of the play circle; the topmost widget wins the click.
+                let b = egui::Rect::from_center_size(pos2(r.rect.right() - 160.0, r.rect.center().y), vec2(120.0, 32.0));
+                let label = if seen { "Unwatched" } else { "Watched" };
+                if ui.put(b, egui::Button::new(label)).on_hover_text(if seen { "Mark unwatched" } else { "Mark watched" }).clicked() {
+                    toggle = Some((k, !seen));
+                } else if r.clicked() {
                     episode = Some((meta.clone(), v.clone()));
                 }
             }
@@ -894,6 +927,9 @@ impl App {
         want.dedup();
         for u in want {
             self.fetch_poster(&ctx, u);
+        }
+        if let Some((k, on)) = toggle {
+            self.set_watched(&k, on);
         }
         if let Some((m, autoplay)) = open {
             self.open_meta(&ctx, m, autoplay);
