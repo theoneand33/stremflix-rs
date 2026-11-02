@@ -147,6 +147,8 @@ struct Discover {
 }
 
 const RED: Color32 = Color32::from_rgb(229, 9, 20);
+/// Stremio's purple, used for the player's seek bar.
+const ACCENT: Color32 = Color32::from_rgb(123, 91, 245);
 const CARD: egui::Vec2 = egui::Vec2::new(150.0, 225.0);
 
 /// Netflix-style card: no border, grows on hover/focus, shrinks while pressed.
@@ -1536,21 +1538,29 @@ impl App {
         if a > 0.01 {
             let paint = ui.painter().clone().with_layer_id(ui.layer_id());
             let white = Color32::WHITE.gamma_multiply(a);
-            // Icon button: glyph that grows on hover, like Netflix's control bar.
+            // Icon button: Stremio-style glyph on a rounded highlight that appears on hover.
             let icon = |ui: &mut egui::Ui, c: egui::Pos2, glyph: &str, label: &str| {
-                let r = ui.interact(egui::Rect::from_center_size(c, vec2(48.0, 48.0)), ui.scope_id().with(label), Sense::CLICK);
+                let r = ui.interact(egui::Rect::from_center_size(c, vec2(56.0, 56.0)), ui.scope_id().with(label), Sense::CLICK);
                 r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
-                let s = ui.ctx().animate_value_with_time(r.id, if r.hovered() { 1.2 } else { 1.0 }, 0.12);
-                paint.text(c, egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(30.0 * s), white);
+                if r.hovered() {
+                    paint.rect_filled(r.rect, 8, Color32::from_white_alpha((20.0 * a) as u8));
+                }
+                paint.text(c, egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(26.0), white);
                 r.on_hover_cursor(egui::CursorIcon::PointingHand)
             };
             // Scrims behind the top and bottom controls.
-            paint.rect_filled(egui::Rect::from_min_size(rect.min, vec2(rect.width(), 80.0)), 0, Color32::from_black_alpha((110.0 * a) as u8));
-            paint.rect_filled(egui::Rect::from_min_max(pos2(rect.left(), rect.bottom() - 130.0), rect.max), 0, Color32::from_black_alpha((150.0 * a) as u8));
-            back |= icon(ui, rect.min + vec2(44.0, 40.0), "←", "Back to browse").clicked();
+            paint.rect_filled(egui::Rect::from_min_size(rect.min, vec2(rect.width(), 90.0)), 0, Color32::from_black_alpha((150.0 * a) as u8));
+            paint.rect_filled(egui::Rect::from_min_max(pos2(rect.left(), rect.bottom() - 110.0), rect.max), 0, Color32::from_black_alpha((150.0 * a) as u8));
 
-            // Seek bar: gray track, red progress and knob; drag or click to seek.
-            let bar = egui::Rect::from_min_max(pos2(rect.left() + 28.0, rect.bottom() - 104.0), pos2(rect.right() - 130.0, rect.bottom() - 80.0));
+            // Top bar: back chevron + title on the left, full screen on the right.
+            back |= icon(ui, rect.min + vec2(44.0, 46.0), "❮", "Back to browse").clicked();
+            paint.text(rect.min + vec2(82.0, 46.0), egui::Align2::LEFT_CENTER, &p.title, egui::FontId::proportional(17.0), white);
+            toggle_fs |= icon(ui, pos2(rect.right() - 52.0, rect.top() + 46.0), "⛶", if fs { "Exit full screen" } else { "Full screen" }).clicked();
+
+            // Seek bar between elapsed and total time: thin track, purple progress and knob; drag or click to seek.
+            let font = egui::FontId::proportional(15.0);
+            let by = rect.bottom() - 84.0;
+            let bar = egui::Rect::from_min_max(pos2(rect.left() + 100.0, by - 12.0), pos2(rect.right() - 100.0, by + 12.0));
             let r = ui.interact(bar, ui.scope_id().with("seek"), Sense::CLICK | Sense::DRAG);
             r.widget_info(|| egui::WidgetInfo::slider(true, st.pos, "Seek"));
             let at = |x: f32| (((x - bar.left()) / bar.width()).clamp(0.0, 1.0) as f64) * st.dur;
@@ -1566,34 +1576,33 @@ impl App {
             let pos = p.scrub.unwrap_or(st.pos);
             let frac = if st.dur > 0.0 { (pos / st.dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
             let hot = r.hovered() || r.dragged();
-            let th = ctx.animate_value_with_time(r.id.with("h"), if hot { 7.0 } else { 4.0 }, 0.1);
+            let th = ctx.animate_value_with_time(r.id.with("h"), if hot { 6.0 } else { 4.0 }, 0.1);
             let track = egui::Rect::from_center_size(bar.center(), vec2(bar.width(), th));
-            paint.rect_filled(track, 2, Color32::from_gray(128).gamma_multiply(a * 0.7));
-            paint.rect_filled(egui::Rect::from_min_size(track.min, vec2(track.width() * frac, th)), 2, RED.gamma_multiply(a));
-            paint.circle_filled(pos2(track.left() + track.width() * frac, track.center().y), if hot { 10.0 } else { 7.0 }, RED.gamma_multiply(a));
+            paint.rect_filled(track, 2, Color32::from_gray(128).gamma_multiply(a * 0.5));
+            paint.rect_filled(egui::Rect::from_min_size(track.min, vec2(track.width() * frac, th)), 2, ACCENT.gamma_multiply(a));
+            let knob = pos2(track.left() + track.width() * frac, track.center().y);
+            paint.circle_filled(knob, if hot { 9.0 } else { 7.0 }, ACCENT.gamma_multiply(a));
+            paint.circle_filled(knob, 3.0, white);
             if let Some(h) = r.hover_pos().filter(|_| st.dur > 0.0) {
-                paint.text(pos2(h.x, bar.top() - 8.0), egui::Align2::CENTER_BOTTOM, fmt_time(at(h.x)), egui::FontId::proportional(14.0), white);
+                paint.text(pos2(h.x, bar.top() - 6.0), egui::Align2::CENTER_BOTTOM, fmt_time(at(h.x)), font.clone(), white);
             }
-            paint.text(pos2(rect.right() - 28.0, bar.center().y), egui::Align2::RIGHT_CENTER, fmt_time(st.dur - pos), egui::FontId::proportional(16.0), white);
+            paint.text(pos2(rect.left() + 24.0, by), egui::Align2::LEFT_CENTER, fmt_time(pos), font.clone(), white);
+            paint.text(pos2(rect.right() - 24.0, by), egui::Align2::RIGHT_CENTER, fmt_time(st.dur), font, white);
 
-            // Control row.
-            let y = rect.bottom() - 44.0;
-            let x = |i: f32| rect.left() + 52.0 + i * 68.0;
+            // Control row: play, next episode, volume on the left; audio & subtitles on the right.
+            let y = rect.bottom() - 38.0;
+            let x = |i: f32| rect.left() + 48.0 + i * 64.0;
             if icon(ui, pos2(x(0.0), y), if st.paused { "▶" } else { "⏸" }, if st.paused { "Play" } else { "Pause" }).clicked() {
                 cmd(&["cycle", "pause"]);
             }
-            if icon(ui, pos2(x(1.0), y), "↺", "Back 10 seconds").clicked() {
-                cmd(&["seek", "-10"]);
-            }
-            if icon(ui, pos2(x(2.0), y), "↻", "Forward 10 seconds").clicked() {
-                cmd(&["seek", "10"]);
-            }
-            let vol = icon(ui, pos2(x(3.0), y), if st.muted || st.volume <= 0.0 { "🔇" } else { "🔊" }, "Mute");
+            next = has_next && icon(ui, pos2(x(1.0), y), "⏭", "Next episode").clicked();
+            let vx = x(if has_next { 2.0 } else { 1.0 });
+            let vol = icon(ui, pos2(vx, y), if st.muted || st.volume <= 0.0 { "🔇" } else { "🔊" }, "Mute");
             if vol.clicked() {
                 cmd(&["cycle", "mute"]);
             }
             // Volume slider next to the speaker.
-            let vbar = egui::Rect::from_min_size(pos2(x(3.0) + 30.0, y - 12.0), vec2(110.0, 24.0));
+            let vbar = egui::Rect::from_min_size(pos2(vx + 36.0, y - 12.0), vec2(150.0, 24.0));
             let vr = ui.interact(vbar, ui.scope_id().with("volume"), Sense::CLICK | Sense::DRAG);
             vr.widget_info(|| egui::WidgetInfo::slider(true, st.volume, "Volume"));
             if let Some(q) = vr.interact_pointer_pos().filter(|_| vr.dragged() || vr.clicked()) {
@@ -1602,16 +1611,13 @@ impl App {
             }
             let vt = egui::Rect::from_center_size(vbar.center(), vec2(vbar.width(), 4.0));
             let vf = if st.muted { 0.0 } else { (st.volume / 100.0).clamp(0.0, 1.0) as f32 };
-            paint.rect_filled(vt, 2, Color32::from_gray(128).gamma_multiply(a * 0.7));
+            paint.rect_filled(vt, 2, Color32::from_gray(128).gamma_multiply(a * 0.5));
             paint.rect_filled(egui::Rect::from_min_size(vt.min, vec2(vt.width() * vf, 4.0)), 2, white);
-            paint.circle_filled(pos2(vt.left() + vt.width() * vf, vt.center().y), 6.0, white);
-            paint.text(pos2(rect.center().x, y), egui::Align2::CENTER_CENTER, &p.title, egui::FontId::new(18.0, bold()), white);
-            next = has_next && icon(ui, pos2(rect.right() - 188.0, y), "⏭", "Next episode").clicked();
-            let cc = icon(ui, pos2(rect.right() - 120.0, y), "💬", "Audio & Subtitles");
+            paint.circle_filled(pos2(vt.left() + vt.width() * vf, vt.center().y), 7.0, white);
+            let cc = icon(ui, pos2(rect.right() - 52.0, y), "💬", "Audio & Subtitles");
             if cc.clicked() {
                 p.menu = !p.menu;
             }
-            toggle_fs |= icon(ui, pos2(rect.right() - 52.0, y), "⛶", if fs { "Exit full screen" } else { "Full screen" }).clicked();
 
             // Audio & Subtitles panel: two columns, selected track marked with a check.
             if p.menu {
