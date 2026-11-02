@@ -120,7 +120,7 @@ Release archives are named `stremio-lite-<tag>-<target>` and published on GitHub
 
 | Target | Archive |
 |---|---|
-| `linux-x86_64` | `.tar.gz` |
+| `linux-x86_64` | `.tar.gz` (needs system libmpv), `.AppImage` (bundles libmpv) |
 | `macos-arm64` | `.tar.gz` |
 | `windows-x86_64` | `.zip` (includes `libmpv-2.dll`) |
 
