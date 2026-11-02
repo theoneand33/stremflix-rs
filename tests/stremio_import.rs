@@ -63,10 +63,13 @@ fn bitfield_maps_to_episode_ids() {
     // Anchored on the 5th video, the bits map one to one: 1x1, 1x3, 1x5.
     let field5 = field.replacen("tt2:1:1:", "tt2:1:5:", 1);
     assert_eq!(watched_videos(&field5, &videos), ["tt2:1:1", "tt2:1:3", "tt2:1:5"]);
-    // A special (season 0) sorts first in Stremio, shifting every episode by one; the anchor re-aligns it.
+    // Like stremio-core, a special (season 0) sorts after regular episodes, so it shifts nothing.
     let mut with_special = videos.to_vec();
     with_special.push(ep("tt2:0:1", 0, 1));
     assert_eq!(watched_videos(&field5, &with_special), ["tt2:1:1", "tt2:1:3", "tt2:1:5"]);
+    // Anchored on the special as 6th video: no shift, so regular episodes keep their bits.
+    let field_sp = field.replacen("tt2:1:1:5:", "tt2:0:1:6:", 1);
+    assert_eq!(watched_videos(&field_sp, &with_special), ["tt2:1:1", "tt2:1:3", "tt2:1:5"]);
     assert!(watched_videos(&field.replacen("tt2:1:1:", "tt9:1:1:", 1), &videos).is_empty(), "unknown anchor");
     assert!(watched_videos("garbage", &videos).is_empty());
 }
