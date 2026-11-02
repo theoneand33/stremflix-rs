@@ -118,7 +118,9 @@ pub struct Player {
     wake: *mut Box<dyn Fn() + Send + Sync>,
     /// Handed to mpv as the `get_proc_address` context; boxed so its address is stable.
     gl_proc: Box<GlProc>,
-    subs: Vec<String>,
+    /// Addon subtitles as (url, lang).
+    subs: Vec<(String, String)>,
+    slang: String,
     alive: bool,
     pub state: State,
 }
@@ -187,16 +189,35 @@ pub fn parse_tracks(json: &str) -> Vec<Track> {
         .collect()
 }
 
+/// Validates a language preference for mpv's `alang`/`slang`: up to 8 comma-separated
+/// tokens like `en`, `eng`, `pt-BR`. Returns the normalized list (empty clears the preference).
+pub fn valid_langs(s: &str) -> Option<String> {
+    let tokens: Vec<&str> = s.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
+    let ok = |t: &str| {
+        let mut parts = t.split('-');
+        let head = parts.next().unwrap_or("");
+        (2..=3).contains(&head.len()) && head.bytes().all(|b| b.is_ascii_alphabetic()) && parts.all(|p| (2..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
+    };
+    (tokens.len() <= 8 && tokens.iter().all(|t| ok(t))).then(|| tokens.join(","))
+}
+
+/// Index of the first addon subtitle whose language matches a `slang` token, in preference order.
+/// Compares primary subtags case-insensitively; `en` and `eng` are different tokens, list both.
+fn pick_sub(subs: &[(String, String)], slang: &str) -> Option<usize> {
+    let primary = |l: &str| l.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
+    slang.split(',').map(primary).find_map(|want| subs.iter().position(|(_, l)| primary(l) == want))
+}
+
 impl Player {
     /// `source` is a URL or local path, passed to `loadfile` as a plain argument (never parsed as options).
     /// `wake` is called from mpv's thread whenever a new frame is ready.
     /// Must be called, rendered and dropped with the GUI's GL context current.
-    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[String], gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
+    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
         let mpv = unsafe { mpv_create() };
         if mpv.is_null() {
             bail!("failed to create mpv instance");
         }
-        let mut p = Self { mpv, render: std::ptr::null_mut(), wake: Box::into_raw(Box::new(wake)), gl_proc: Box::new(gl_proc), subs: subtitles.to_vec(), alive: true, state: State::default() };
+        let mut p = Self { mpv, render: std::ptr::null_mut(), wake: Box::into_raw(Box::new(wake)), gl_proc: Box::new(gl_proc), subs: subtitles.to_vec(), slang: slang.to_string(), alive: true, state: State::default() };
         let socket = ipc_socket_path();
         let _ = std::fs::remove_file(&socket);
         let mut opts: Vec<(String, String)> = [
@@ -215,6 +236,11 @@ impl Player {
         .into_iter()
         .map(|(k, v)| (k.into(), v.into()))
         .collect();
+        for (k, v) in [("alang", alang), ("slang", slang)] {
+            if !v.is_empty() {
+                opts.push((k.into(), v.into()));
+            }
+        }
         opts.extend(parse_args(&std::env::var("STREMIO_LITE_MPV_ARGS").unwrap_or_default()));
         for (k, v) in &opts {
             let rc = unsafe { mpv_set_option_string(mpv, cstr(k).as_ptr(), cstr(v).as_ptr()) };
@@ -266,9 +292,11 @@ impl Player {
                 0 => break,
                 EVENT_SHUTDOWN => self.alive = false,
                 EVENT_FILE_LOADED => {
-                    // Addon subtitles: the first one is selected, like `--sub-file`.
-                    for (i, s) in std::mem::take(&mut self.subs).iter().enumerate() {
-                        let _ = self.command(&["sub-add", s, if i == 0 { "select" } else { "auto" }]);
+                    // Addon subtitles: select the one matching `slang`; without a preference, the first (like `--sub-file`).
+                    let subs = std::mem::take(&mut self.subs);
+                    let pick = if self.slang.is_empty() { Some(0) } else { pick_sub(&subs, &self.slang) };
+                    for (i, (url, lang)) in subs.iter().enumerate() {
+                        let _ = self.command(&["sub-add", url, if Some(i) == pick { "select" } else { "auto" }, "", lang]);
                     }
                 }
                 EVENT_END_FILE => {
@@ -360,6 +388,26 @@ impl Drop for Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_validation() {
+        assert_eq!(valid_langs(" en, eng ,pt-BR"), Some("en,eng,pt-BR".into()));
+        assert_eq!(valid_langs(""), Some(String::new()));
+        for bad in ["e", "english", "en;fr", "en-", "en-x", "1a", "en,,e1", "a,b,c,d,e,f,g,h,i"] {
+            assert_eq!(valid_langs(bad), None, "{bad}");
+        }
+        assert!(valid_langs("en,fr,de,es,it,pt,ja,ko").is_some());
+        assert!(valid_langs("en,fr,de,es,it,pt,ja,ko,ru").is_none());
+    }
+
+    #[test]
+    fn slang_picks_by_preference_order() {
+        let s = |l: &str| (String::new(), l.to_string());
+        let subs = [s("fre"), s("ENG"), s("pt-BR")];
+        assert_eq!(pick_sub(&subs, "pt,eng"), Some(2));
+        assert_eq!(pick_sub(&subs, "en,eng"), Some(1));
+        assert_eq!(pick_sub(&subs, "de"), None);
+    }
 
     #[test]
     fn default_ipc_path_per_platform() {
