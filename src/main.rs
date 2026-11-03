@@ -479,17 +479,18 @@ struct Playing {
 
 impl Drop for Playing {
     fn drop(&mut self) {
-        release(self.awake.take());
+        release_awake(self.awake.take());
     }
 }
 
 /// Inhibits screen dimming, blanking and idle sleep until dropped; `None` when no inhibit service is reachable.
 fn keep_awake() -> Option<keepawake::KeepAwake> {
-    keepawake::Builder::default().display(true).idle(true).reason("Video playback").app_name("Stremflix").app_reverse_domain("io.github.stremflix").create().ok()
+    // Linux: without a ScreenSaver service the combined request fails outright, so fall back to logind's idle inhibitor.
+    [true, false].into_iter().find_map(|display| keepawake::Builder::default().display(display).idle(true).reason("Video playback").app_name("Stremflix").app_reverse_domain("io.github.stremflix").create().ok())
 }
 
 /// keepawake's Linux drop unwraps the D-Bus UnInhibit call, which fails if the screensaver service went away mid-playback.
-fn release(awake: Option<Option<keepawake::KeepAwake>>) {
+fn release_awake(awake: Option<Option<keepawake::KeepAwake>>) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(awake)));
 }
 
@@ -956,7 +957,7 @@ impl App {
         self.last_poll = Instant::now();
         let paused = p.player.state.paused;
         if paused {
-            release(p.awake.take());
+            release_awake(p.awake.take());
         } else if p.awake.is_none() {
             // Not retried until the next pause/play, so a missing service never blocks the UI thread repeatedly.
             p.awake = Some(keep_awake());
