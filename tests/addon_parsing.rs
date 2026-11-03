@@ -172,6 +172,8 @@ fn meta_videos_parsing() {
     assert_eq!((v.id.as_str(), v.title.as_deref(), v.season, v.episode), ("tt9:1:2", Some("Pilot"), Some(1), Some(2)));
     assert_eq!(v.released.as_deref(), Some("2020-01-01T00:00:00.000Z"));
     assert_eq!(m.videos[1].title.as_deref(), Some("Special"));
+    assert_eq!(v.thumbnail.as_deref(), Some("https://img.example/e.jpg"));
+    assert_eq!(m.videos[1].thumbnail, None, "non-http thumbnail dropped");
     for videos in ["null", "{}", "\"x\""] {
         let body = format!(r#"{{"meta": {{"id": "tt9", "type": "series", "name": "Show", "videos": {videos}}}}}"#);
         assert!(parse_meta(body.as_bytes()).unwrap().videos.is_empty(), "{videos}");
