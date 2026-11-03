@@ -1818,16 +1818,18 @@ impl App {
         let bg = ui.interact(rect, ui.scope_id().with("video"), Sense::CLICK);
         // Press and hold the video for 2x speed; the release restores 1x and is not a click.
         let was_fast = p.fast;
-        let down = bg.is_pointer_button_down_on();
-        p.fast = down && ctx.input(|i| i.pointer.press_start_time().is_some_and(|t| now - t >= 0.4));
+        // Primary button only; losing focus ends the hold in case the release went to another window.
+        let down = bg.is_pointer_button_down_on() && ctx.input(|i| i.pointer.primary_down() && i.focused);
+        p.fast = down && ctx.input(|i| i.pointer.press_start_time().is_some_and(|t| now - t >= 0.5));
         if p.fast != was_fast {
-            cmd(&["set", "speed", if p.fast { "2" } else { "1" }]);
+            // Multiply, not set, so the speed in effect before the hold comes back.
+            cmd(&["multiply", "speed", if p.fast { "2" } else { "0.5" }]);
         }
-        if down && !p.fast {
-            ctx.request_repaint_after(Duration::from_millis(100)); // reach the hold threshold even when paused
+        if down {
+            ctx.request_repaint_after(Duration::from_millis(100)); // reach the threshold and see the release even when paused
         }
         if p.fast {
-            let r = egui::Rect::from_center_size(pos2(rect.center().x, rect.top() + 46.0), vec2(64.0, 32.0));
+            let r = egui::Rect::from_center_size(pos2(rect.center().x, rect.top() + 110.0), vec2(64.0, 32.0));
             ui.painter().rect_filled(r, 16, Color32::from_black_alpha(160));
             ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "2x", egui::FontId::new(17.0, bold()), Color32::WHITE);
         }
