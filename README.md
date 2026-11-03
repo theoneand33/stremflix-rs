@@ -22,7 +22,7 @@ The Windows release zip includes `libmpv-2.dll`. To build from source on Windows
 
 Playback runs inside the app window. The controls fade after 3 s without input.
 
-Click the video or press Space or K to pause. Press ←/→ to skip 10 s, ↑/↓ for volume, and M to mute. Press F or double-click for full screen. Press Esc to leave full screen or go back. 💬 opens the Audio & Subtitles panel. Its Playback column sets the speed, toggles hardware decoding, and opens the stream in an external player (set the command in **Settings**; the app pauses its own player). Wrap a program path that has spaces in double quotes. Torrents and addon request headers stay with the app: leave the app on the player screen while an external player streams a torrent, since going back stops the torrent.
+Click the video or press Space or K to pause. Press ←/→ to skip 10 s, ↑/↓ for volume, and M to mute. Press F or double-click for full screen. Press Esc to leave full screen or go back. The buttons at the bottom right open the Audio, Subtitles, and Playback panels. Playback sets the speed, toggles hardware decoding, and opens the stream in an external player (set the command in **Settings**; the app pauses its own player). Wrap a program path that has spaces in double quotes. Torrents and addon request headers stay with the app: leave the app on the player screen while an external player streams a torrent, since going back stops the torrent.
 
 ## Addons and streams
 

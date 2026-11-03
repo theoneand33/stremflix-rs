@@ -266,7 +266,116 @@ mod icons {
     pub const SPEAKER_HIGH: &str = "\u{E44A}";
     pub const SPEAKER_X: &str = "\u{E45C}";
     pub const SUBTITLES: &str = "\u{E1A8}";
+    pub const WAVEFORM: &str = "\u{E802}";
+    pub const GEAR: &str = "\u{E270}";
     pub const X: &str = "\u{E4F6}";
+}
+
+/// Player popover opened from its control-row button.
+#[derive(Clone, Copy, PartialEq)]
+enum Menu {
+    Audio,
+    Subtitles,
+    Playback,
+}
+
+/// Keyboard-focus outline for the popover's custom controls.
+fn focus_ring(ui: &egui::Ui, r: &egui::Response, radius: u8) {
+    if r.has_focus() {
+        ui.painter().rect_stroke(r.rect, radius, egui::Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+    }
+}
+
+/// Small caps section heading inside a player popover.
+fn menu_heading(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(12.0);
+    ui.label(RichText::new(text.to_uppercase()).size(11.5).family(bold()).color(Color32::from_gray(140)));
+    ui.add_space(4.0);
+}
+
+/// Full-width popover row: accent check when selected, highlight on hover, long labels truncated.
+fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+    r.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, label));
+    focus_ring(ui, &r, 6);
+    let p = ui.painter();
+    if r.hovered() {
+        p.rect_filled(rect, 6, Color32::from_white_alpha(14));
+    }
+    if selected {
+        p.text(pos2(rect.left() + 14.0, rect.center().y), egui::Align2::LEFT_CENTER, icons::CHECK, egui::FontId::new(16.0, phosphor()), ACCENT);
+    }
+    let font = egui::FontId::new(15.0, if selected { bold() } else { egui::FontFamily::Proportional });
+    let color = if selected { Color32::WHITE } else { Color32::from_gray(200) };
+    let mut job = egui::text::LayoutJob::simple_singleline(label.to_string(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - 50.0);
+    let g = p.layout_job(job);
+    p.galley(pos2(rect.left() + 40.0, rect.center().y - g.size().y / 2.0), g, color);
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Rounded chip, accent-filled when selected.
+fn pill(ui: &mut egui::Ui, label: &str, selected: bool, role: egui::Role) -> egui::Response {
+    let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::new(14.0, if selected { bold() } else { egui::FontFamily::Proportional }), Color32::WHITE);
+    let (rect, r) = ui.allocate_exact_size(vec2(g.size().x + 24.0, 30.0), Sense::click());
+    r.widget_info(|| egui::WidgetInfo::selected(role, true, selected, label));
+    let fill = if selected { ACCENT } else { Color32::from_white_alpha(if r.hovered() { 30 } else { 16 }) };
+    ui.painter().rect_filled(rect, 15, fill);
+    focus_ring(ui, &r, 15);
+    ui.painter().galley(rect.center() - g.size() / 2.0, g, Color32::WHITE);
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Color dot with an accent ring when selected.
+fn swatch(ui: &mut egui::Ui, name: &str, color: Color32, selected: bool) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
+    r.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, name));
+    focus_ring(ui, &r, 15);
+    if selected || r.hovered() {
+        ui.painter().circle_stroke(rect.center(), 13.0, egui::Stroke::new(2.0, if selected { ACCENT } else { Color32::from_gray(120) }));
+    }
+    ui.painter().circle_filled(rect.center(), 9.0, color);
+    r.on_hover_text(name).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Label on the left, `− value +` on the right; returns -1, 0 or 1.
+fn stepper(ui: &mut egui::Ui, label: &str, value: &str) -> i32 {
+    let mut step = 0;
+    ui.horizontal(|ui| {
+        ui.set_min_height(36.0);
+        ui.label(RichText::new(label).size(15.0).color(Color32::from_gray(210)));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if pill(ui, "+", false, egui::Role::Button).on_hover_text(format!("Increase {label}")).clicked() {
+                step = 1;
+            }
+            ui.add_sized([56.0, 30.0], egui::Label::new(RichText::new(value).size(14.0).color(Color32::WHITE)));
+            if pill(ui, "−", false, egui::Role::Button).on_hover_text(format!("Decrease {label}")).clicked() {
+                step = -1;
+            }
+        });
+    });
+    step
+}
+
+/// Full-width row with a label and an on/off switch.
+fn switch_row(ui: &mut egui::Ui, label: &str, on: &mut bool) -> egui::Response {
+    let (rect, mut r) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+    if r.clicked() {
+        *on = !*on;
+        r.mark_changed();
+    }
+    r.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, *on, label));
+    focus_ring(ui, &r, 6);
+    let p = ui.painter();
+    if r.hovered() {
+        p.rect_filled(rect, 6, Color32::from_white_alpha(14));
+    }
+    p.text(pos2(rect.left() + 8.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(15.0), Color32::from_gray(210));
+    let t = ui.ctx().animate_bool_with_time(r.id, *on, 0.12);
+    let track = egui::Rect::from_center_size(pos2(rect.right() - 26.0, rect.center().y), vec2(36.0, 20.0));
+    p.rect_filled(track, 10, Color32::from_gray(80).lerp_to_gamma(ACCENT, t));
+    p.circle_filled(pos2(egui::lerp(track.left() + 10.0..=track.right() - 10.0, t), track.center().y), 7.0, Color32::WHITE);
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Inter (OFL) as the UI font: the closest free match to Netflix Sans, which is proprietary.
@@ -529,8 +638,8 @@ struct Playing {
     poster: Option<String>,
     /// Controls stay visible until this time (seconds, egui clock).
     osd_until: f64,
-    /// Audio & Subtitles panel open.
-    menu: bool,
+    /// Open player popover, if any.
+    menu: Option<Menu>,
     /// Seek-bar position while dragging, in seconds.
     scrub: Option<f64>,
     /// Video held down: playing at 2x until release.
@@ -992,7 +1101,7 @@ impl App {
                 match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], lang("sub_off") == "1", &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, awake: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1882,7 +1991,7 @@ impl App {
     }
 
     /// Full-window Netflix-style player: letterboxed video, controls that fade out after
-    /// 3 s without input, red seek bar, ±10 s skips, volume, Audio & Subtitles panel.
+    /// 3 s without input, red seek bar, ±10 s skips, volume, Audio / Subtitles / Playback panels.
     fn ui_player(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let rect = ui.max_rect();
@@ -1996,16 +2105,18 @@ impl App {
             ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "2x", egui::FontId::new(17.0, bold()), Color32::WHITE);
         }
         if bg.clicked() && !long {
-            if p.menu { p.menu = false } else { cmd(&["cycle", "pause"]) }
+            if p.menu.is_some() { p.menu = None } else { cmd(&["cycle", "pause"]) }
         }
         toggle_fs |= bg.double_clicked() && !p.after_hold;
         if bg.clicked() {
             p.after_hold = long;
         }
+        let focused = ctx.memory(|m| m.focused());
         ctx.input(|i| {
             use egui::Key::*;
             let k = |key| i.key_pressed(key);
-            if k(Space) || k(K) { cmd(&["cycle", "pause"]) }
+            // Space activates a focused popover control, so it must not also toggle pause.
+            if (k(Space) && focused.is_none()) || k(K) { cmd(&["cycle", "pause"]) }
             if k(ArrowLeft) { seek = Some((-10.0, true)) }
             if k(ArrowRight) { seek = Some((10.0, true)) }
             if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
@@ -2023,7 +2134,7 @@ impl App {
         if st.buffering || vw == 0 {
             p.osd_until = now + 3.0;
         }
-        let show = st.paused || p.menu || p.scrub.is_some() || now < p.osd_until;
+        let show = st.paused || p.menu.is_some() || p.scrub.is_some() || now < p.osd_until;
         if now < p.osd_until {
             ctx.request_repaint_after(Duration::from_secs_f64(p.osd_until - now));
         }
@@ -2099,7 +2210,7 @@ impl App {
             paint.text(pos2(rect.left() + 24.0, by), egui::Align2::LEFT_CENTER, fmt_time(pos), font.clone(), white);
             paint.text(pos2(rect.right() - 24.0, by), egui::Align2::RIGHT_CENTER, fmt_time(st.dur), font, white);
 
-            // Control row: play, next episode, volume on the left; audio & subtitles on the right.
+            // Control row: play, next episode, volume on the left; audio, subtitles, playback on the right.
             let y = rect.bottom() - 38.0;
             let x = |i: f32| rect.left() + 48.0 + i * 64.0;
             if icon(ui, pos2(x(0.0), y), if st.paused { icons::PLAY } else { icons::PAUSE }, if st.paused { "Play" } else { "Pause" }).clicked() {
@@ -2128,114 +2239,120 @@ impl App {
             paint.rect_filled(vt, 2, Color32::from_gray(128).gamma_multiply(a * 0.5));
             paint.rect_filled(egui::Rect::from_min_size(vt.min, vec2(vt.width() * vf, 4.0)), 2, white);
             paint.circle_filled(pos2(vt.left() + vt.width() * vf, vt.center().y), 7.0, white);
-            let cc = icon(ui, pos2(rect.right() - 52.0, y), icons::SUBTITLES, "Audio & Subtitles");
-            if cc.clicked() {
-                p.menu = !p.menu;
+            // Audio, subtitles and playback each open their own popover above the button.
+            for (i, (m, glyph, label)) in [(Menu::Audio, icons::WAVEFORM, "Audio"), (Menu::Subtitles, icons::SUBTITLES, "Subtitles"), (Menu::Playback, icons::GEAR, "Playback")].into_iter().enumerate() {
+                let bx = rect.right() - 52.0 - (2 - i) as f32 * 64.0;
+                let b = icon(ui, pos2(bx, y), glyph, label);
+                if p.menu == Some(m) {
+                    paint.rect_filled(egui::Rect::from_center_size(pos2(bx, y + 22.0), vec2(18.0, 3.0)), 2, ACCENT.gamma_multiply(a));
+                }
+                if b.clicked() {
+                    p.menu = if p.menu == Some(m) { None } else { Some(m) };
+                }
             }
 
-            // Audio & Subtitles panel: two columns, selected track marked with a check.
-            if p.menu {
-                egui::Area::new(ui.scope_id().with("tracks")).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_BOTTOM).fixed_pos(pos2(rect.right() - 24.0, y - 76.0)).show(&ctx, |ui| {
-                    egui::Frame::new().fill(Color32::from_rgba_unmultiplied(38, 38, 38, 240)).corner_radius(6).inner_margin(20).show(ui, |ui| {
-                        ui.horizontal_top(|ui| {
-                            for (kind, head, prop) in [("audio", "Audio", "aid"), ("sub", "Subtitles", "sid")] {
-                                ui.vertical(|ui| {
-                                    ui.set_min_width(200.0);
-                                    ui.label(RichText::new(head).size(20.0).family(bold()).color(Color32::WHITE));
-                                    ui.add_space(8.0);
-                                    let tracks: Vec<_> = st.tracks.iter().filter(|t| t.kind == kind).collect();
-                                    let off = !tracks.iter().any(|t| t.selected);
-                                    let entries = (kind == "sub").then_some((None, "Off", None, off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.lang.as_deref(), t.selected)));
-                                    for (id, label, lang, sel) in entries {
-                                        let text = RichText::new(format!("{}  {label}", if sel { icons::CHECK } else { "   " })).size(16.0);
-                                        let text = if sel { text.color(Color32::WHITE).family(bold()) } else { text.color(Color32::from_gray(180)) };
-                                        if ui.add(egui::Button::new(text).frame(false)).clicked() {
-                                            let v = id.map_or("no".to_string(), |i| i.to_string());
-                                            cmd(&["set", prop, &v]);
-                                            // Remember the subtitle choice for the next video: Off, or the picked language first in `slang`.
-                                            if kind == "sub" {
-                                                let mut save = vec![("sub_off", if id.is_none() { "1" } else { "" }.to_string())];
-                                                // shortcut: name-only addon languages ("English") fail `valid_langs` and aren't remembered; map names to codes if users hit it.
-                                                if let Some(v) = lang.and_then(|l| prefer_lang(&self.langs[1], l)) {
-                                                    self.langs[1] = v.clone();
-                                                    save.push(("slang", v));
-                                                }
-                                                for (k, v) in save {
-                                                    if let Err(e) = self.db.set_setting(k, &v) {
-                                                        report(&mut self.error, format!("saving {k}: {e:#}"));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if kind == "sub" {
-                                        ui.add_space(12.0);
-                                        ui.label(RichText::new("Style").size(16.0).family(bold()).color(Color32::WHITE));
-                                        ui.horizontal(|ui| {
-                                            ui.add_sized([90.0, 20.0], egui::Label::new(format!("Size {:.1}x", style.scale)));
-                                            if ui.button("−").clicked() { style.scale -= 0.1 }
-                                            if ui.button("+").clicked() { style.scale += 0.1 }
-                                        });
-                                        ui.horizontal(|ui| {
-                                            for (i, (name, _)) in SUB_COLORS.iter().enumerate() {
-                                                if ui.selectable_label(style.color == i, *name).clicked() { style.color = i }
-                                            }
-                                        });
-                                        ui.checkbox(&mut style.background, "Background box");
-                                        ui.horizontal(|ui| {
-                                            ui.add_sized([90.0, 20.0], egui::Label::new(format!("Delay {:+.1}s", style.delay)));
-                                            if ui.button("−").clicked() { style.delay -= 0.1 }
-                                            if ui.button("+").clicked() { style.delay += 0.1 }
-                                            if ui.button("Reset").clicked() { style.delay = 0.0 }
-                                        });
-                                    }
-                                    ui.add_space(8.0);
-                                    let (i, key) = if kind == "audio" { (0, "alang") } else { (1, "slang") };
-                                    let valid = valid_langs(&self.langs[i]);
-                                    let l = ui.label(RichText::new(format!("Preferred {} languages", if kind == "audio" { "audio" } else { "subtitle" })).size(13.0).color(Color32::from_gray(180)));
-                                    let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("Preferred: en,eng").desired_width(200.0)).labelled_by(l.id);
-                                    if let Some(v) = &valid
-                                        && r.changed()
-                                        && let Err(e) = self.db.set_setting(key, v)
-                                    {
-                                        report(&mut self.error, format!("saving {key}: {e:#}"));
-                                    }
-                                    // Typing a subtitle language preference turns subtitles back on after a remembered "Off".
-                                    if kind == "sub"
-                                        && r.changed()
-                                        && valid_langs(&self.langs[1]).is_some_and(|v| !v.is_empty())
-                                        && let Err(e) = self.db.set_setting("sub_off", "")
-                                    {
-                                        report(&mut self.error, format!("saving sub_off: {e:#}"));
-                                    }
-                                    if valid.is_none() {
-                                        ui.label(RichText::new("Use codes like en,eng,pt-BR (max 8)").size(13.0).color(Color32::from_rgb(230, 90, 90)));
-                                    }
-                                });
+            if let Some(m) = p.menu {
+                let i = [Menu::Audio, Menu::Subtitles, Menu::Playback].iter().position(|&x| x == m).unwrap_or(0);
+                // Right edge sits 150 px past its button's center, clamped inside the window.
+                let right = (rect.right() - 52.0 - (2 - i) as f32 * 64.0 + 150.0).min(rect.right() - 16.0);
+                egui::Area::new(ui.scope_id().with(("menu", i))).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_BOTTOM).fixed_pos(pos2(right, y - 70.0)).show(&ctx, |ui| {
+                    egui::Frame::new().fill(Color32::from_rgba_unmultiplied(24, 24, 28, 245)).stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(18))).corner_radius(12).inner_margin(egui::Margin::symmetric(12, 14)).show(ui, |ui| {
+                        ui.set_width(300.0);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        let title = match m { Menu::Audio => "Audio", Menu::Subtitles => "Subtitles", Menu::Playback => "Playback" };
+                        ui.label(RichText::new(title).size(18.0).family(bold()).color(Color32::WHITE));
+                        if m != Menu::Playback {
+                            let (kind, prop) = if m == Menu::Audio { ("audio", "aid") } else { ("sub", "sid") };
+                            menu_heading(ui, "Track");
+                            let tracks: Vec<_> = st.tracks.iter().filter(|t| t.kind == kind).collect();
+                            let off = !tracks.iter().any(|t| t.selected);
+                            let entries: Vec<_> = (kind == "sub").then_some((None, "Off", None, off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.lang.as_deref(), t.selected))).collect();
+                            if entries.is_empty() {
+                                ui.label(RichText::new("No tracks").size(14.0).color(Color32::from_gray(150)));
                             }
-                            ui.vertical(|ui| {
-                                ui.set_min_width(200.0);
-                                ui.label(RichText::new("Playback").size(20.0).family(bold()).color(Color32::WHITE));
-                                ui.add_space(8.0);
-                                ui.label(RichText::new("Speed").size(16.0).family(bold()).color(Color32::WHITE));
-                                ui.horizontal_wrapped(|ui| {
-                                    for sp in SPEEDS {
-                                        if ui.selectable_label((st.speed - sp).abs() < 0.01, format!("{sp}x")).clicked() {
-                                            cmd(&["set", "speed", &sp.to_string()]);
+                            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                                for (id, label, lang, sel) in entries {
+                                    if menu_row(ui, label, sel).clicked() {
+                                        let v = id.map_or("no".to_string(), |i| i.to_string());
+                                        cmd(&["set", prop, &v]);
+                                        // Remember the subtitle choice for the next video: Off, or the picked language first in `slang`.
+                                        if kind == "sub" {
+                                            let mut save = vec![("sub_off", if id.is_none() { "1" } else { "" }.to_string())];
+                                            // shortcut: name-only addon languages ("English") fail `valid_langs` and aren't remembered; map names to codes if users hit it.
+                                            if let Some(v) = lang.and_then(|l| prefer_lang(&self.langs[1], l)) {
+                                                self.langs[1] = v.clone();
+                                                save.push(("slang", v));
+                                            }
+                                            for (k, v) in save {
+                                                if let Err(e) = self.db.set_setting(k, &v) {
+                                                    report(&mut self.error, format!("saving {k}: {e:#}"));
+                                                }
+                                            }
                                         }
-                                    }
-                                });
-                                ui.add_space(8.0);
-                                if ui.checkbox(&mut self.hwdec, "Hardware decoding").changed() {
-                                    cmd(&["set", "hwdec", hwdec_value(self.hwdec)]);
-                                    if let Err(e) = self.db.set_setting("hwdec", if self.hwdec { "1" } else { "0" }) {
-                                        report(&mut self.error, format!("saving hwdec: {e:#}"));
                                     }
                                 }
-                                ui.add_space(8.0);
-                                external = ui.button("Open in external player").on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
                             });
-                        });
+                            if kind == "sub" {
+                                menu_heading(ui, "Style");
+                                style.scale = (style.scale * 10.0).round() / 10.0 + stepper(ui, "Size", &format!("{:.1}x", style.scale)) as f64 * 0.1;
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Color").size(15.0).color(Color32::from_gray(210)));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        for (i, (name, hex)) in SUB_COLORS.iter().enumerate().rev() {
+                                            if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::WHITE), style.color == i).clicked() {
+                                                style.color = i;
+                                            }
+                                        }
+                                    });
+                                });
+                                switch_row(ui, "Background box", &mut style.background);
+                                style.delay += stepper(ui, "Delay", &format!("{:+.1}s", style.delay)) as f64 * 0.1;
+                                if style.delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(ACCENT)).frame(false)).clicked() {
+                                    style.delay = 0.0;
+                                }
+                            }
+                            let (i, key) = if kind == "audio" { (0, "alang") } else { (1, "slang") };
+                            menu_heading(ui, "Preferred languages");
+                            let valid = valid_langs(&self.langs[i]);
+                            let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("en,eng").desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
+                            r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, format!("Preferred {kind} languages")));
+                            if let Some(v) = &valid
+                                && r.changed()
+                                && let Err(e) = self.db.set_setting(key, v)
+                            {
+                                report(&mut self.error, format!("saving {key}: {e:#}"));
+                            }
+                            // Typing a subtitle language preference turns subtitles back on after a remembered "Off".
+                            if kind == "sub"
+                                && r.changed()
+                                && valid_langs(&self.langs[1]).is_some_and(|v| !v.is_empty())
+                                && let Err(e) = self.db.set_setting("sub_off", "")
+                            {
+                                report(&mut self.error, format!("saving sub_off: {e:#}"));
+                            }
+                            if valid.is_none() {
+                                ui.label(RichText::new("Use codes like en,eng,pt-BR (max 8)").size(13.0).color(Color32::from_rgb(230, 90, 90)));
+                            }
+                        } else {
+                            menu_heading(ui, "Speed");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                for sp in SPEEDS {
+                                    if pill(ui, &format!("{sp}x"), (st.speed - sp).abs() < 0.01, egui::Role::RadioButton).clicked() {
+                                        cmd(&["set", "speed", &sp.to_string()]);
+                                    }
+                                }
+                            });
+                            menu_heading(ui, "Video");
+                            if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
+                                cmd(&["set", "hwdec", hwdec_value(self.hwdec)]);
+                                if let Err(e) = self.db.set_setting("hwdec", if self.hwdec { "1" } else { "0" }) {
+                                    report(&mut self.error, format!("saving hwdec: {e:#}"));
+                                }
+                            }
+                            ui.add_space(8.0);
+                            external = ui.add(egui::Button::new(RichText::new("Open in external player").size(14.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(16)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0))).on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
+                        }
                     });
                 });
             }
