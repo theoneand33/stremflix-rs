@@ -473,8 +473,24 @@ struct Playing {
     menu: bool,
     /// Seek-bar position while dragging, in seconds.
     scrub: Option<f64>,
-    /// Held while unpaused so the screen doesn't dim, blank or sleep; embedded mpv can't do it itself.
-    awake: Option<keepawake::KeepAwake>,
+    /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
+    awake: Option<Option<keepawake::KeepAwake>>,
+}
+
+impl Drop for Playing {
+    fn drop(&mut self) {
+        release(self.awake.take());
+    }
+}
+
+/// Inhibits screen dimming, blanking and idle sleep until dropped; `None` when no inhibit service is reachable.
+fn keep_awake() -> Option<keepawake::KeepAwake> {
+    keepawake::Builder::default().display(true).idle(true).reason("Video playback").app_name("Stremflix").app_reverse_domain("io.github.stremflix").create().ok()
+}
+
+/// keepawake's Linux drop unwraps the D-Bus UnInhibit call, which fails if the screensaver service went away mid-playback.
+fn release(awake: Option<Option<keepawake::KeepAwake>>) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(awake)));
 }
 
 struct App {
@@ -939,9 +955,11 @@ impl App {
         }
         self.last_poll = Instant::now();
         let paused = p.player.state.paused;
-        if paused != p.awake.is_none() {
-            // Best effort, retried at most once a second: no inhibit service (e.g. headless) just means no inhibit.
-            p.awake = if paused { None } else { keepawake::Builder::default().display(true).idle(true).reason("Video playback").app_name("Stremflix").app_reverse_domain("io.github.stremflix").create().ok() };
+        if paused {
+            release(p.awake.take());
+        } else if p.awake.is_none() {
+            // Not retried until the next pause/play, so a missing service never blocks the UI thread repeatedly.
+            p.awake = Some(keep_awake());
         }
         if let Some((pos, dur)) = p.player.position() {
             (p.pos, p.dur) = (pos, dur);
