@@ -972,7 +972,7 @@ impl App {
                         // Deselect, so picking the catalog again retries.
                         Err(e) => {
                             self.browse = None;
-                            report(&mut self.error, format!("loading addon catalog {}: {e:#}", src.2));
+                            report(&mut self.error, format!("loading addon catalog {}: {e:#}", sanitize_text(&src.2, 300)));
                         }
                     }
                 }
@@ -2588,7 +2588,7 @@ impl App {
         let ctx = ui.ctx().clone();
         ui.separator();
         ui.label(RichText::new("Browse addons").size(20.0).strong().family(bold()).color(Color32::WHITE));
-        let label = |addon: &str, c: &CatalogDef| format!("{addon} - {} ({})", c.name.as_deref().unwrap_or(&c.id), sanitize_text(kind_label(&c.kind), 64));
+        let label = |addon: &str, c: &CatalogDef| sanitize_text(&format!("{addon} - {} ({})", c.name.as_deref().unwrap_or(&c.id), kind_label(&c.kind)), 400);
         let sources: Vec<(AddonCatalogSrc, String)> = self
             .addons
             .iter()
