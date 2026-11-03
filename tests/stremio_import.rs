@@ -56,7 +56,7 @@ fn bitfield_counts_watched_episodes() {
 fn bitfield_maps_to_episode_ids() {
     let s = storage();
     let field = s["library_recent"].split(r#""watched":""#).nth(1).unwrap().split('"').next().unwrap().to_string();
-    let ep = |id: &str, season, episode| Video { id: id.into(), title: None, season: Some(season), episode: Some(episode), released: None };
+    let ep = |id: &str, season, episode| Video { id: id.into(), title: None, season: Some(season), episode: Some(episode), released: None, thumbnail: None };
     let videos = [ep("tt2:1:3", 1, 3), ep("tt2:1:1", 1, 1), ep("tt2:1:2", 1, 2), ep("tt2:1:4", 1, 4), ep("tt2:1:5", 1, 5)];
     // Anchor `tt2:1:1` with length 5 puts it at bit 4, so the field is shifted by 4: only bit 4 (= 1x1) maps.
     assert_eq!(watched_videos(&field, &videos), ["tt2:1:1"]);

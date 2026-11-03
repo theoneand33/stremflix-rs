@@ -213,6 +213,9 @@ pub struct Video {
     /// ISO 8601 release date.
     #[serde(default)]
     pub released: Option<String>,
+    /// Episode still image URL.
+    #[serde(default)]
+    pub thumbnail: Option<String>,
 }
 
 fn lenient_vec<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
@@ -508,6 +511,7 @@ pub fn parse_meta(body: &[u8]) -> Result<Meta> {
     for v in &mut m.videos {
         opt_text(&mut v.title, MAX_TEXT);
         opt_text(&mut v.released, 64);
+        opt_url(&mut v.thumbnail);
     }
     Ok(m)
 }
