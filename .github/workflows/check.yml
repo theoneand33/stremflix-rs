@@ -50,7 +50,6 @@ jobs:
             for f in mpv $(brew deps mpv); do grep -qx "$f" <<<"$installed" || printf '%s\n' "$prefix/Cellar/$f" "$prefix/opt/$f"; done
             echo EOF
           } >> "$GITHUB_OUTPUT"
-          echo "LIBRARY_PATH=$prefix/opt/mpv/lib" >> "$GITHUB_ENV"
       - uses: actions/cache@v6
         id: brew-cache
         if: runner.os == 'macOS'
@@ -60,8 +59,6 @@ jobs:
       - name: Install libmpv (macOS)
         if: runner.os == 'macOS' && steps.brew-cache.outputs.cache-hit != 'true'
         run: brew install mpv
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: runner.os == 'Windows'
       - name: Install libmpv (Windows)
         if: runner.os == 'Windows'
         env:
@@ -75,13 +72,6 @@ jobs:
           if ((Get-FileHash "$env:RUNNER_TEMP\mpv-dev.7z" -Algorithm SHA256).Hash -ne $env:MPV_SHA256) { throw "mpv-dev checksum mismatch" }
           7z x "$env:RUNNER_TEMP\mpv-dev.7z" "-o$dir" -y | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "7z failed" }
-          # the archive ships only a MinGW import lib (libmpv.dll.a); build mpv.lib for MSVC from the DLL's exports
-          $names = dumpbin /nologo /exports "$dir\libmpv-2.dll" | ForEach-Object { if ($_ -match '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(mpv_\w+)') { $Matches[1] } }
-          if (-not $names) { throw "no mpv_ exports found" }
-          Set-Content "$dir\mpv.def" (@('LIBRARY libmpv-2.dll', 'EXPORTS') + $names)
-          lib /nologo /machine:x64 /def:"$dir\mpv.def" /out:"$dir\mpv.lib"
-          if ($LASTEXITCODE -ne 0) { throw "lib.exe failed" }
-          "RUSTFLAGS=-L native=$dir" >> $env:GITHUB_ENV
           $dir >> $env:GITHUB_PATH # tests load libmpv-2.dll at runtime
       - run: cargo build --workspace --all-targets --locked
       - run: cargo test --workspace --locked

@@ -5208,6 +5208,7 @@ dependencies = [
  "flate2",
  "image",
  "keepawake",
+ "libloading",
  "librqbit",
  "librqbit-dualstack-sockets",
  "reqwest",
