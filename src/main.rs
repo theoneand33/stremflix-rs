@@ -1107,7 +1107,7 @@ impl App {
                     let _ = self.db.set_setting(&format!("series:{key}"), &m.id);
                     let _ = self.db.set_setting(&format!("binge:{}:{}", m.kind, m.id), &group.unwrap_or_default());
                 }
-                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], lang("sub_off") == "1", &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
+                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], lang("sub_off") != "0", &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
                         let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, awake: None };
@@ -2286,7 +2286,7 @@ impl App {
                                         cmd(&["set", prop, &v]);
                                         // Remember the subtitle choice for the next video: Off, or the picked language first in `slang`.
                                         if kind == "sub" {
-                                            let mut save = vec![("sub_off", if id.is_none() { "1" } else { "" }.to_string())];
+                                            let mut save = vec![("sub_off", if id.is_none() { "1" } else { "0" }.to_string())];
                                             // shortcut: name-only addon languages ("English") fail `valid_langs` and aren't remembered; map names to codes if users hit it.
                                             if let Some(v) = lang.and_then(|l| prefer_lang(&self.langs[1], l)) {
                                                 self.langs[1] = v.clone();
@@ -2335,7 +2335,7 @@ impl App {
                             if kind == "sub"
                                 && r.changed()
                                 && valid_langs(&self.langs[1]).is_some_and(|v| !v.is_empty())
-                                && let Err(e) = self.db.set_setting("sub_off", "")
+                                && let Err(e) = self.db.set_setting("sub_off", "0")
                             {
                                 report(&mut self.error, format!("saving sub_off: {e:#}"));
                             }
