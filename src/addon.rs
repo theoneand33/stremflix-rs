@@ -641,7 +641,7 @@ const REPO: &str = match option_env!("STREMFLIX_RS_REPO") {
 };
 
 /// Page of a newer release on `release`'s channel, given that channel's GitHub release JSON
-/// (`nightly`: any other commit; tagged: a different latest tag).
+/// (`nightly`: any other commit; tagged: a newer latest tag).
 pub fn newer_release(release: &str, commit: &str, body: &[u8]) -> Result<Option<String>> {
     #[derive(Deserialize)]
     struct Rel {
@@ -650,11 +650,11 @@ pub fn newer_release(release: &str, commit: &str, body: &[u8]) -> Result<Option<
         html_url: String,
     }
     let r: Rel = serde_json::from_slice(body)?;
-    // shortcut: pre-release suffixes are ignored when ordering tags, upgrade if beta-vs-final matters.
+    // shortcut: pre-release suffixes are ignored when ordering tags (release.yml keeps `-` tags out of /latest), so a beta user is not offered its own final; upgrade if that matters.
     let core = |t: &str| t.trim_start_matches('v').split('-').next().unwrap_or("").split('.').map(|n| n.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
     let newer = if release == "nightly" {
         // target_commitish can also be a branch name; only a full SHA is comparable
-        r.target_commitish.len() == 40 && r.target_commitish != commit
+        is_info_hash(&r.target_commitish) && r.target_commitish != commit
     } else {
         match (core(&r.tag_name), core(release)) {
             (Some(latest), Some(cur)) => latest > cur,

@@ -182,5 +182,5 @@ jobs:
               --title "Nightly ($(date -u +%F' '%H:%M) UTC, ${GITHUB_SHA::7})" --notes "Automated build of $GITHUB_SHA." --prerelease
           else
             gh release create "$TAG" *.tar.gz *.zip *.AppImage *.AppImage.zsync --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "$TAG" --generate-notes
+              --title "$TAG" --generate-notes $([[ "$TAG" == *-* ]] && echo --prerelease) # keeps betas out of /releases/latest
           fi
