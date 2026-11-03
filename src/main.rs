@@ -2711,6 +2711,14 @@ mod tests {
     }
 
     #[test]
+    fn torrent_file_detection() {
+        assert!(is_torrent_file("/m/a.torrent") && is_torrent_file(r"C:\m\A.TORRENT"));
+        for not in ["https://x.example/a.torrent", "magnet:?xt=urn:btih:a.torrent", "/m/a.mkv", "/m/torrent"] {
+            assert!(!is_torrent_file(not), "{not}");
+        }
+    }
+
+    #[test]
     fn command_words_respect_quotes() {
         assert_eq!(command_words(r#""C:\Program Files\VLC\vlc.exe" --fs"#), [r"C:\Program Files\VLC\vlc.exe", "--fs"]);
         assert_eq!(command_words("  mpv   --fs "), ["mpv", "--fs"]);

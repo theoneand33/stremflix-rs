@@ -121,6 +121,8 @@ fn addon_order_persists() {
     assert_eq!(urls(&db), [u("c"), u("a"), u("b")]);
     db.add_addon(&u("d"), &m).unwrap();
     assert_eq!(urls(&db).last(), Some(&u("d")), "new addons go last");
+    db.add_addon(&u("c"), &m).unwrap();
+    assert_eq!(urls(&db)[0], u("c"), "reinstall keeps its place");
     drop(db);
     // A database from before the position column: rows keep install order and new ones go last.
     let old = dir.path().join("old.db");

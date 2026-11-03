@@ -89,7 +89,9 @@ impl Db {
 
     pub fn add_addon(&self, transport_url: &str, manifest: &Manifest) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO addons (transport_url, manifest, position) VALUES (?1, ?2, (SELECT coalesce(max(position), 0) + 1 FROM addons))",
+            // A reinstall keeps its priority; a new addon goes last.
+            "INSERT INTO addons (transport_url, manifest, position) VALUES (?1, ?2, (SELECT coalesce(max(position), 0) + 1 FROM addons))
+             ON CONFLICT(transport_url) DO UPDATE SET manifest = excluded.manifest",
             params![transport_url, serde_json::to_string(manifest)?],
         )?;
         Ok(())
