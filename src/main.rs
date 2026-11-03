@@ -1001,6 +1001,13 @@ impl App {
                 let fallback = || if autoplay == Autoplay::Top { streams.iter().find_map(Stream::source) } else { only_source(&streams) };
                 let src = binge.and_then(|g| binge_source(&streams, &g)).or_else(fallback);
                 (self.selected, self.episode) = (Some((meta, streams, subs.clone())), episode);
+                // Details may have arrived first; a deep-linked title only knew its id.
+                if let (Some((sel, ..)), Some(d)) = (self.selected.as_mut(), &self.details)
+                    && sel.name == sel.id
+                    && (d.kind.as_str(), d.id.as_str()) == (sel.kind.as_str(), sel.id.as_str())
+                {
+                    sel.name = d.name.clone();
+                }
                 // `Only` autoplays when there's no choice to make; otherwise show the stream picker.
                 if autoplay != Autoplay::Off {
                     match (src, self.play_key()) {
@@ -1061,6 +1068,10 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     self.open_link(ctx, link);
+                }
+                None if s.is_empty() => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 None => report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200))),
             },
@@ -3008,10 +3019,10 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result {
-    // Only links: macOS Finder adds `-psn_…`, and any other argument would just focus the window.
-    let arg = std::env::args().nth(1).filter(|a| a.starts_with("stremio://"));
+    // Only links count: macOS Finder adds `-psn_…`. A launch without one just focuses the open window.
+    let arg = std::env::args().nth(1).filter(|a| a.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("stremio://")));
     let dir = data_dir();
-    if arg.as_ref().is_some_and(|a| instance::forward(&dir, a)) {
+    if instance::forward(&dir, arg.as_deref().unwrap_or("")) {
         return Ok(());
     }
     let mut app = App::new(dir.clone()).expect("failed to initialise app data");

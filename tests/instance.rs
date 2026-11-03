@@ -11,6 +11,9 @@ fn later_launch_hands_link_to_running_instance() {
     assert!(forward(dir.path(), "stremio:///detail/movie/tt1"));
     assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "stremio:///detail/movie/tt1");
 
+    assert!(forward(dir.path(), ""), "a plain launch is forwarded too");
+    assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "");
+
     // A wrong token is refused, and a link can't smuggle in a second line.
     let file = dir.path().join("instance");
     let good = std::fs::read_to_string(&file).unwrap();

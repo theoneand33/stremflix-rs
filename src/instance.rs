@@ -1,5 +1,5 @@
 //! One window per data directory: the first instance listens on loopback, and later launches
-//! with a `stremio://` link hand it over and exit. The port and a random token sit in a file
+//! (with or without a `stremio://` link) hand it over and exit. The port and a random token sit in a file
 //! only this user can read, so other local users can't push links.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -35,7 +35,7 @@ pub fn listen(dir: &Path, on_link: impl Fn(String) + Send + 'static) -> std::io:
             if BufReader::new((&c).take(MAX_LINE)).read_line(&mut line).is_err() {
                 continue;
             }
-            if let Some(link) = line.trim_end().strip_prefix(token.as_str()).and_then(|r| r.strip_prefix(' ')) {
+            if let Some(link) = line.trim_end_matches(['\r', '\n']).strip_prefix(token.as_str()).and_then(|r| r.strip_prefix(' ')) {
                 on_link(link.to_owned());
                 let _ = (&c).write_all(b"ok\n");
             }
@@ -56,7 +56,11 @@ fn write_private(path: &Path, s: &str) -> std::io::Result<()> {
     o.write(true).create(true).truncate(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    o.open(path)?.write_all(s.as_bytes())
+    let mut f = o.open(path)?;
+    // `mode` only applies to a new file: tighten one left over with looser permissions.
+    #[cfg(unix)]
+    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    f.write_all(s.as_bytes())
 }
 
 /// Make this exe the `stremio://` handler for the current user, unless another app (Stremio) owns it.

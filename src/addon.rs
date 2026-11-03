@@ -434,7 +434,9 @@ pub enum DeepLink {
 
 /// Parse a `stremio://` link; `None` for anything else or invalid parts.
 pub fn parse_deep_link(s: &str) -> Option<DeepLink> {
-    let rest = s.trim().strip_prefix("stremio://")?;
+    let s = s.trim();
+    // Schemes are case-insensitive.
+    let rest = s.get(..10).filter(|p| p.eq_ignore_ascii_case("stremio://")).map(|_| &s[10..])?;
     if let Some(path) = rest.strip_prefix('/') {
         let seg: Vec<String> = path.split(['?', '#']).next()?.split('/').map(|p| percent_encoding::percent_decode_str(p).decode_utf8_lossy().into_owned()).collect();
         return match seg.as_slice() {

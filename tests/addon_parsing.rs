@@ -381,6 +381,7 @@ fn deep_links() {
     assert_eq!(addon("stremio://v3-cinemeta.strem.io/manifest.json").as_deref(), Some("https://v3-cinemeta.strem.io/manifest.json"));
     assert_eq!(addon("stremio://127.0.0.1:7000/cfg/manifest.json").as_deref(), Some("http://127.0.0.1:7000/cfg/manifest.json"));
     assert_eq!(addon("stremio://localhost:7000/manifest.json").as_deref(), Some("http://localhost:7000/manifest.json"));
+    assert_eq!(addon("STREMIO://localhost:7000/manifest.json").as_deref(), Some("http://localhost:7000/manifest.json"));
     assert_eq!(addon("stremio://example.com/other.json"), None);
     assert_eq!(addon("https://example.com/manifest.json"), None);
     assert_eq!(
