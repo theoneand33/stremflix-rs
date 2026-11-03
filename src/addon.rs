@@ -447,7 +447,7 @@ pub fn parse_deep_link(s: &str) -> Option<DeepLink> {
         };
     }
     let u = safe_http_url(&format!("https://{rest}"))?;
-    if !u.path().ends_with("/manifest.json") {
+    if !u.path().ends_with("/manifest.json") || u.query().is_some() || u.fragment().is_some() {
         return None;
     }
     // Local addons (the SDK's own landing page links) serve plain http.

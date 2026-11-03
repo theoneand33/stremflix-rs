@@ -1021,10 +1021,11 @@ impl App {
                     }
                 }
             }
-            Msg::Episodes(meta, mut m, nav) => {
+            Msg::Episodes(mut meta, mut m, nav) => {
                 if nav != self.nav {
                     return;
                 }
+                fill_deep_linked(&mut meta, &m); // before the rename below, which the name guard depends on
                 let mut videos = std::mem::take(&mut m.videos);
                 // A Continue Watching entry only knows the episode title.
                 let meta = MetaPreview { name: m.name.clone(), poster: meta.poster.or(m.poster.clone()), ..meta };
@@ -1539,7 +1540,11 @@ impl App {
     /// `stremio://` link: prefill an addon for the user to confirm with Install, or open a title's page.
     fn open_link(&mut self, ctx: &egui::Context, link: DeepLink) {
         match link {
-            DeepLink::Addon(url) => (self.tab, self.addon_url) = (Tab::Addons, url.into()),
+            DeepLink::Addon(url) => {
+                // Invalidate in-flight play/streams/episodes replies so they can't act over the Addons tab.
+                (self.pending, self.nav) = (None, self.nav + 1);
+                (self.tab, self.addon_url) = (Tab::Addons, url.into());
+            }
             DeepLink::Detail { kind, id, video } => {
                 self.tab = Tab::Home;
                 let meta = MetaPreview { name: id.clone(), id, kind, poster: None, background: None, description: None };

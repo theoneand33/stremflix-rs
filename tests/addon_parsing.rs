@@ -384,6 +384,8 @@ fn deep_links() {
     assert_eq!(addon("STREMIO://localhost:7000/manifest.json").as_deref(), Some("http://localhost:7000/manifest.json"));
     assert_eq!(addon("stremio://example.com/other.json"), None);
     assert_eq!(addon("https://example.com/manifest.json"), None);
+    assert_eq!(addon("stremio://example.com/manifest.json?x=1"), None);
+    assert_eq!(addon("stremio://example.com/manifest.json#y"), None);
     assert_eq!(
         parse_deep_link("stremio:///detail/series/tt0903747/tt0903747%3A1%3A1"),
         Some(DeepLink::Detail { kind: "series".into(), id: "tt0903747".into(), video: Some("tt0903747:1:1".into()) })
