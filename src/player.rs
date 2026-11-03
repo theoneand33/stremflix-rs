@@ -95,6 +95,7 @@ pub struct Track {
     /// "audio", "video" or "sub".
     pub kind: String,
     pub label: String,
+    pub lang: Option<String>,
     pub selected: bool,
 }
 
@@ -189,6 +190,8 @@ pub struct Player {
     source: String,
     /// The file is open (FILE_LOADED seen since the last `loadfile`).
     loaded: bool,
+    /// Subtitles off (last choice was "Off"); kept in sync by the menu so a reload honors it.
+    pub subs_off: bool,
     alive: bool,
     pub state: State,
 }
@@ -271,7 +274,7 @@ pub fn parse_tracks(json: &str) -> Vec<Track> {
                 (Some(x), None) | (None, Some(x)) => x.to_owned(),
                 (None, None) => format!("Track {id}"),
             };
-            Some(Track { id, kind, label, selected: t["selected"].as_bool().unwrap_or(false) })
+            Some(Track { id, kind, label, lang: lang.map(str::to_owned), selected: t["selected"].as_bool().unwrap_or(false) })
         })
         .collect()
 }
@@ -286,6 +289,17 @@ pub fn valid_langs(s: &str) -> Option<String> {
         (2..=3).contains(&head.len()) && head.bytes().all(|b| b.is_ascii_alphabetic()) && parts.all(|p| (2..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
     };
     (tokens.len() <= 8 && tokens.iter().all(|t| ok(t))).then(|| tokens.join(","))
+}
+
+/// `slang` with `lang` moved to the front (case-insensitive dedupe, max 8); None if the result isn't a valid preference.
+pub fn prefer_lang(slang: &str, lang: &str) -> Option<String> {
+    let lang = lang.trim();
+    if lang.is_empty() {
+        return None;
+    }
+    let rest = valid_langs(slang).unwrap_or_default();
+    let list: Vec<&str> = std::iter::once(lang).chain(rest.split(',').filter(|x| !x.is_empty() && !x.eq_ignore_ascii_case(lang))).take(8).collect();
+    valid_langs(&list.join(","))
 }
 
 /// Index of the first addon subtitle whose language matches a `slang` token, in preference order.
@@ -303,12 +317,12 @@ impl Player {
     /// yt-dlp runs only for the exact YouTube URL built from a validated `ytId`; `hwdec` toggles hardware decoding.
     /// Must be called, rendered and dropped with the GUI's GL context current.
     #[allow(clippy::too_many_arguments)] // player setup options; bundling them adds no clarity
-    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], headers: &[(String, String)], hwdec: bool, gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
+    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], subs_off: bool, headers: &[(String, String)], hwdec: bool, gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
         let mpv = unsafe { mpv_create() };
         if mpv.is_null() {
             bail!("failed to create mpv instance");
         }
-        let mut p = Self { mpv, render: std::ptr::null_mut(), wake: Box::into_raw(Box::new(wake)), gl_proc: Box::new(gl_proc), subs: subtitles.to_vec(), slang: slang.to_string(), source: source.to_string(), loaded: false, alive: true, state: State::default() };
+        let mut p = Self { mpv, render: std::ptr::null_mut(), wake: Box::into_raw(Box::new(wake)), gl_proc: Box::new(gl_proc), subs: subtitles.to_vec(), slang: slang.to_string(), subs_off, source: source.to_string(), loaded: false, alive: true, state: State::default() };
         let socket = ipc_socket_path();
         let _ = std::fs::remove_file(&socket);
         let mut opts: Vec<(String, String)> = [
@@ -330,6 +344,9 @@ impl Player {
             if !v.is_empty() {
                 opts.push((k.into(), v.into()));
             }
+        }
+        if subs_off {
+            opts.push(("sid".into(), "no".into()));
         }
         opts.extend(header_options(headers));
         opts.extend(parse_args(&std::env::var("STREMFLIX_RS_MPV_ARGS").unwrap_or_default()));
@@ -380,7 +397,7 @@ impl Player {
     /// buffering or seeking, this reopens it at the target instead: that cancels the stalled read.
     pub fn seek(&mut self, to: f64, relative: bool) -> Result<()> {
         if self.loaded && !self.state.buffering && !self.state.seeking {
-            return self.command(&["seek", &format!("{to:.1}"), if relative { "relative" } else { "absolute" }]);
+            return self.command(&["seek", &format!("{to:.1}"), if relative { "relative+exact" } else { "absolute" }]);
         }
         let mut t = if relative { self.state.pos + to } else { to }.max(0.0);
         if self.state.dur > 0.0 {
@@ -411,10 +428,10 @@ impl Player {
                 0 => break,
                 EVENT_SHUTDOWN => self.alive = false,
                 EVENT_FILE_LOADED => {
-                    // Addon subtitles: select the one matching `slang`; without a preference, the first (like `--sub-file`).
+                    // Addon subtitles: none if off, else the one matching `slang`; without a preference, the first (like `--sub-file`).
                     // Kept, not taken: a reload from `seek` opens the file again.
                     self.loaded = true;
-                    let pick = if self.slang.is_empty() { Some(0) } else { pick_sub(&self.subs, &self.slang) };
+                    let pick = if self.subs_off { None } else if self.slang.is_empty() { Some(0) } else { pick_sub(&self.subs, &self.slang) };
                     for (i, (url, lang)) in self.subs.iter().enumerate() {
                         let _ = self.command(&["sub-add", url, if Some(i) == pick { "select" } else { "auto" }, "", lang]);
                     }
@@ -523,6 +540,16 @@ mod tests {
     }
 
     #[test]
+    fn prefer_lang_moves_choice_first() {
+        assert_eq!(prefer_lang("fr,EN,de", "en").as_deref(), Some("en,fr,de"));
+        assert_eq!(prefer_lang("", "pt-BR").as_deref(), Some("pt-BR"));
+        assert_eq!(prefer_lang("bad!", "en").as_deref(), Some("en"));
+        assert_eq!(prefer_lang("fr,de,es,it,pt,ja,ko,ru", "en").as_deref(), Some("en,fr,de,es,it,pt,ja,ko"));
+        assert_eq!(prefer_lang("en", "English"), None);
+        assert_eq!(prefer_lang("en", " "), None);
+    }
+
+    #[test]
     fn slang_picks_by_preference_order() {
         let s = |l: &str| (String::new(), l.to_string());
         let subs = [s("fre"), s("ENG"), s("pt-BR")];
@@ -572,7 +599,7 @@ mod tests {
     fn parses_track_list() {
         let t = parse_tracks(r#"[{"id":1,"type":"sub","title":"English","lang":"en","selected":true},{"id":2,"type":"audio"},{"type":"sub"}]"#);
         assert_eq!(t.len(), 2);
-        assert_eq!((t[0].label.as_str(), t[0].selected), ("English (en)", true));
+        assert_eq!((t[0].label.as_str(), t[0].lang.as_deref(), t[0].selected), ("English (en)", Some("en"), true));
         assert_eq!(t[1].label, "Track 2");
         assert!(parse_tracks("not json").is_empty());
     }

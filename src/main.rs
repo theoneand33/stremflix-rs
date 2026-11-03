@@ -13,7 +13,7 @@ use stremflix_rs::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, 
 use stremflix_rs::db::{Db, Progress, SavedTitle, Watched};
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{GlProc, Player, SPEEDS, SUB_COLORS, SubStyle, hwdec_value, valid_langs};
+use stremflix_rs::player::{GlProc, Player, SPEEDS, SUB_COLORS, SubStyle, hwdec_value, prefer_lang, valid_langs};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{Profile, TorrentEngine};
 
@@ -946,7 +946,7 @@ impl App {
                     let _ = self.db.set_setting(&format!("series:{key}"), &m.id);
                     let _ = self.db.set_setting(&format!("binge:{}:{}", m.kind, m.id), &group.unwrap_or_default());
                 }
-                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
+                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], lang("sub_off") == "1", &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
                         let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None };
@@ -2059,13 +2059,27 @@ impl App {
                                     ui.add_space(8.0);
                                     let tracks: Vec<_> = st.tracks.iter().filter(|t| t.kind == kind).collect();
                                     let off = !tracks.iter().any(|t| t.selected);
-                                    let entries = (kind == "sub").then_some((None, "Off", off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.selected)));
-                                    for (id, label, sel) in entries {
+                                    let entries = (kind == "sub").then_some((None, "Off", None, off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.lang.as_deref(), t.selected)));
+                                    for (id, label, lang, sel) in entries {
                                         let text = RichText::new(format!("{}  {label}", if sel { icons::CHECK } else { "   " })).size(16.0);
                                         let text = if sel { text.color(Color32::WHITE).family(bold()) } else { text.color(Color32::from_gray(180)) };
                                         if ui.add(egui::Button::new(text).frame(false)).clicked() {
                                             let v = id.map_or("no".to_string(), |i| i.to_string());
                                             cmd(&["set", prop, &v]);
+                                            // Remember the subtitle choice for the next video: Off, or the picked language first in `slang`.
+                                            if kind == "sub" {
+                                                let mut save = vec![("sub_off", if id.is_none() { "1" } else { "" }.to_string())];
+                                                // shortcut: name-only addon languages ("English") fail `valid_langs` and aren't remembered; map names to codes if users hit it.
+                                                if let Some(v) = lang.and_then(|l| prefer_lang(&self.langs[1], l)) {
+                                                    self.langs[1] = v.clone();
+                                                    save.push(("slang", v));
+                                                }
+                                                for (k, v) in save {
+                                                    if let Err(e) = self.db.set_setting(k, &v) {
+                                                        report(&mut self.error, format!("saving {k}: {e:#}"));
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     if kind == "sub" {
@@ -2099,6 +2113,14 @@ impl App {
                                         && let Err(e) = self.db.set_setting(key, v)
                                     {
                                         report(&mut self.error, format!("saving {key}: {e:#}"));
+                                    }
+                                    // Typing a subtitle language preference turns subtitles back on after a remembered "Off".
+                                    if kind == "sub"
+                                        && r.changed()
+                                        && valid_langs(&self.langs[1]).is_some_and(|v| !v.is_empty())
+                                        && let Err(e) = self.db.set_setting("sub_off", "")
+                                    {
+                                        report(&mut self.error, format!("saving sub_off: {e:#}"));
                                     }
                                     if valid.is_none() {
                                         ui.label(RichText::new("Use codes like en,eng,pt-BR (max 8)").size(13.0).color(Color32::from_rgb(230, 90, 90)));
@@ -2153,6 +2175,9 @@ impl App {
         }
         for c in &cmds {
             let args: Vec<&str> = c.iter().map(String::as_str).collect();
+            if let ["set", "sid", v] = args[..] {
+                p.player.subs_off = v == "no";
+            }
             if let Err(e) = p.player.command(&args) {
                 report(&mut self.error, e);
             }
