@@ -631,6 +631,39 @@ pub fn discover_path(kind: &str, id: &str, genre: Option<&str>) -> String {
     }
 }
 
+/// Release this binary was built as (`nightly` or `vX.Y.Z`) and its commit; set by release.yml, absent in source builds.
+pub const RELEASE: Option<&str> = option_env!("STREMFLIX_RS_RELEASE");
+pub const COMMIT: Option<&str> = option_env!("STREMFLIX_RS_COMMIT");
+/// `owner/repo` the build was released from (forks check their own releases).
+const REPO: &str = match option_env!("STREMFLIX_RS_REPO") {
+    Some(r) => r,
+    None => "theoneand33/stremflix-rs",
+};
+
+/// Page of a newer release on `release`'s channel, given that channel's GitHub release JSON
+/// (`nightly`: any other commit; tagged: a newer latest tag).
+pub fn newer_release(release: &str, commit: &str, body: &[u8]) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Rel {
+        tag_name: String,
+        target_commitish: String,
+        html_url: String,
+    }
+    let r: Rel = serde_json::from_slice(body)?;
+    // shortcut: pre-release suffixes are ignored when ordering tags (release.yml keeps `-` tags out of /latest), so a beta user is offered neither its own final nor later betas; upgrade if that matters.
+    let core = |t: &str| t.trim_start_matches('v').split('-').next().unwrap_or("").split('.').map(|n| n.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
+    let newer = if release == "nightly" {
+        // target_commitish can also be a branch name; only a full SHA is comparable
+        is_info_hash(&r.target_commitish) && r.target_commitish != commit
+    } else {
+        match (core(&r.tag_name), core(release)) {
+            (Some(latest), Some(cur)) => latest > cur,
+            _ => r.tag_name != release,
+        }
+    };
+    Ok(newer.then(|| safe_http_url(&r.html_url).map(String::from)).flatten())
+}
+
 #[derive(Clone)]
 pub struct AddonClient {
     /// Built on first request, off the UI thread: building it loads the system TLS roots (~4 ms at startup).
@@ -653,6 +686,7 @@ impl AddonClient {
             reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::limited(3))
+                .user_agent("stremflix-rs") // GitHub's API rejects requests without one
                 .build()
                 .map_err(|e| format!("HTTP client: {e}"))
         });
@@ -669,6 +703,13 @@ impl AddonClient {
             ensure!(body.len() <= MAX_BODY, "response too large");
         }
         Ok(body)
+    }
+
+    /// Release page of a newer build than this one, or `None` (also for source builds).
+    pub async fn check_update(&self) -> Result<Option<String>> {
+        let (Some(release), Some(commit)) = (RELEASE, COMMIT) else { return Ok(None) };
+        let url = Url::parse(&format!("https://api.github.com/repos/{REPO}/releases/"))?.join(if release == "nightly" { "tags/nightly" } else { "latest" })?;
+        newer_release(release, commit, &self.get(url).await?)
     }
 
     pub async fn fetch_manifest(&self, transport_url: &str) -> Result<Manifest> {

@@ -112,6 +112,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "7z failed" }
           "MPV_DIR=$($dir.Replace('\', '/'))" >> $env:GITHUB_ENV # forward slashes for the bash Package step
       - run: cargo build --release --locked --bin stremflix-rs
+        env:
+          # embedded for the in-app update check (src/addon.rs `RELEASE`, `COMMIT`)
+          STREMFLIX_RS_RELEASE: ${{ env.TAG }}
+          STREMFLIX_RS_COMMIT: ${{ github.sha }}
+          STREMFLIX_RS_REPO: ${{ github.repository }}
       - name: Package
         shell: bash
         env:
@@ -134,8 +139,8 @@ jobs:
           LINUXDEPLOY_SHA256: ${{ matrix.linuxdeploy_sha256 }}
           APPIMAGE_EXTRACT_AND_RUN: "1" # runners have no FUSE
           LDAI_OUTPUT: stremflix-rs-${{ env.TAG }}-${{ matrix.target }}.AppImage
-          # embedded so AppImageUpdate can find new builds; nightly is a prerelease, so "latest" would skip it
-          LDAI_UPDATE_INFORMATION: gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|${{ inputs.version && 'latest' || 'nightly' }}|stremflix-rs-*-${{ matrix.target }}.AppImage.zsync
+          # embedded so AppImageUpdate can find new builds; nightly is a prerelease, so "latest" would skip it (same for `-` tags, which use their own tag)
+          LDAI_UPDATE_INFORMATION: gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|${{ inputs.version && (contains(inputs.version, '-') && env.TAG || 'latest') || 'nightly' }}|stremflix-rs-*-${{ matrix.target }}.AppImage.zsync
         run: |
           ld="$RUNNER_TEMP/linuxdeploy"
           curl -fsSL --retry 3 -o "$ld" "$LINUXDEPLOY_URL"
@@ -177,5 +182,5 @@ jobs:
               --title "Nightly ($(date -u +%F' '%H:%M) UTC, ${GITHUB_SHA::7})" --notes "Automated build of $GITHUB_SHA." --prerelease
           else
             gh release create "$TAG" *.tar.gz *.zip *.AppImage *.AppImage.zsync --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "$TAG" --generate-notes
+              --title "$TAG" --generate-notes $([[ "$TAG" == *-* ]] && echo --prerelease) # keeps betas out of /releases/latest
           fi
