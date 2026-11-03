@@ -284,14 +284,20 @@ fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 }
 
 /// Labeled text field and its action button on one centered line; fields of consecutive rows start at the same x.
-/// True when the button is pressed, or Enter in the field, with non-blank text.
-fn form_row(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str, width: f32, action: &str) -> bool {
+/// True when the button is pressed, or Enter in the field, with non-blank text (any text if `allow_blank`).
+/// `tip`: hover text of the button.
+fn form_row(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str, action: &str, tip: Option<&str>, allow_blank: bool) -> bool {
     ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
         let l = ui.label(label);
         ui.add_space((150.0 - l.rect.width()).max(0.0));
-        let r = ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(width)).labelled_by(l.id);
+        let r = ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(400.0)).labelled_by(l.id);
         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        (primary_button(ui, action).clicked() || enter) && !text.trim().is_empty()
+        let b = primary_button(ui, action);
+        let b = match tip {
+            Some(t) => b.on_hover_text(t),
+            None => b,
+        };
+        (b.clicked() || enter) && (allow_blank || !text.trim().is_empty())
     })
     .inner
 }
@@ -1351,7 +1357,10 @@ impl App {
                 // Overlaid left of the play circle; the topmost widget wins the click.
                 let b = egui::Rect::from_min_size(pos2(r.rect.right() - 80.0 - EPISODE_BUTTON.x, r.rect.center().y - EPISODE_BUTTON.y / 2.0), EPISODE_BUTTON);
                 let label = if seen { "Mark unwatched" } else { "Mark watched" };
-                if ui.scope_builder(UiBuilder::new().max_rect(b).layout(Layout::centered_and_justified(egui::Direction::LeftToRight)), |ui| small_button(ui, label)).inner.clicked() {
+                let mark = ui.scope_builder(UiBuilder::new().max_rect(b).layout(Layout::centered_and_justified(egui::Direction::LeftToRight)), |ui| small_button(ui, label)).inner;
+                // The overlay moved the cursor to the button's bottom; put it back under the row.
+                ui.advance_cursor_after_rect(r.rect);
+                if mark.clicked() {
                     toggle = Some((k, !seen));
                 } else if r.clicked() {
                     episode = Some((meta.clone(), v.clone()));
@@ -1826,7 +1835,11 @@ impl App {
                 p.osd_until = now + 3.0;
             }
         });
-        let show = st.paused || st.buffering || vw == 0 || p.menu || p.scrub.is_some() || now < p.osd_until;
+        // Loading keeps the controls up, and they stay 3 s after it ends.
+        if st.buffering || vw == 0 {
+            p.osd_until = now + 3.0;
+        }
+        let show = st.paused || p.menu || p.scrub.is_some() || now < p.osd_until;
         if now < p.osd_until {
             ctx.request_repaint_after(Duration::from_secs_f64(p.osd_until - now));
         }
@@ -1981,8 +1994,8 @@ impl App {
                                     ui.add_space(8.0);
                                     let (i, key) = if kind == "audio" { (0, "alang") } else { (1, "slang") };
                                     let valid = valid_langs(&self.langs[i]);
-                                    ui.label(RichText::new(format!("Preferred {} languages", if kind == "audio" { "audio" } else { "subtitle" })).size(13.0).color(Color32::from_gray(180)));
-                                    let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("Preferred: en,eng").desired_width(200.0));
+                                    let l = ui.label(RichText::new(format!("Preferred {} languages", if kind == "audio" { "audio" } else { "subtitle" })).size(13.0).color(Color32::from_gray(180)));
+                                    let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("Preferred: en,eng").desired_width(200.0)).labelled_by(l.id);
                                     if let Some(v) = &valid
                                         && r.changed()
                                         && let Err(e) = self.db.set_setting(key, v)
@@ -2029,27 +2042,21 @@ impl App {
 
     fn ui_addons(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        if form_row(ui, "Manifest URL:", &mut self.addon_url, "http://127.0.0.1:7070/manifest.json", 400.0, "Install") {
+        if form_row(ui, "Manifest URL:", &mut self.addon_url, "http://127.0.0.1:7070/manifest.json", "Install", None, false) {
             let (client, url) = (self.client.clone(), self.addon_url.trim().to_string());
             self.spawn(&ctx, async move {
                 let m = client.fetch_manifest(&url).await?;
                 Ok(Msg::Installed(url, m, None))
             });
         }
-        // Same layout as `form_row`; blank text is allowed here (auto-detect).
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
-            let l = ui.label("Stremio data:");
-            ui.add_space((150.0 - l.rect.width()).max(0.0));
-            ui.add(egui::TextEdit::singleline(&mut self.import_path).hint_text("Auto-detect local Stremio").desired_width(400.0))
-                .labelled_by(l.id);
-            if primary_button(ui, "Import from Stremio").on_hover_text("Import addons, watched titles and progress").clicked() {
-                let path = Some(PathBuf::from(self.import_path.trim())).filter(|p| !p.as_os_str().is_empty());
-                self.spawn(&ctx, async move {
-                    let (_, imp) = tokio::task::spawn_blocking(move || stremio_import::import(path.as_deref())).await??;
-                    Ok(Msg::Imported(imp))
-                });
-            }
-        });
+        // Blank path = auto-detect.
+        if form_row(ui, "Stremio data:", &mut self.import_path, "Auto-detect local Stremio", "Import from Stremio", Some("Import addons, watched titles and progress"), true) {
+            let path = Some(PathBuf::from(self.import_path.trim())).filter(|p| !p.as_os_str().is_empty());
+            self.spawn(&ctx, async move {
+                let (_, imp) = tokio::task::spawn_blocking(move || stremio_import::import(path.as_deref())).await??;
+                Ok(Msg::Imported(imp))
+            });
+        }
         ui.separator();
         let mut remove = None;
         let mut configure = None;
@@ -2068,7 +2075,7 @@ impl App {
                 ui.label(RichText::new("Needs configuration before use. Press Configure.").weak());
             }
             if let Some((old, pasted)) = self.configuring.as_mut().filter(|(o, _)| o == url)
-                && form_row(ui, "Configured URL:", pasted, "https://.../manifest.json", 400.0, "Replace")
+                && form_row(ui, "Configured URL:", pasted, "https://.../manifest.json", "Replace", None, false)
             {
                 replace = Some((old.clone(), pasted.trim().to_string()));
             }
@@ -2132,7 +2139,7 @@ impl App {
             self.quick_play(&ctx, m);
         }
         ui.separator();
-        if form_row(ui, "Magnet link:", &mut self.magnet, "magnet:?xt=urn:btih:...", 400.0, "Play magnet") {
+        if form_row(ui, "Magnet link:", &mut self.magnet, "magnet:?xt=urn:btih:...", "Play magnet", None, false) {
             match parse_magnet_hash(self.magnet.trim()) {
                 Some(h) => {
                     let m = self.magnet.trim().to_string();
@@ -2141,7 +2148,7 @@ impl App {
                 None => report(&mut self.error, "invalid magnet link"),
             }
         }
-        if form_row(ui, "Folder path:", &mut self.folder, "/path/to/videos", 400.0, "Add folder") {
+        if form_row(ui, "Folder path:", &mut self.folder, "/path/to/videos", "Add folder", None, false) {
             let dir = PathBuf::from(self.folder.trim());
             // Off the UI thread: a big folder or network share can take minutes.
             self.spawn(&ctx, async move {
