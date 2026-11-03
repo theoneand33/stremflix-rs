@@ -52,5 +52,5 @@ Difficulty: **S** under a day · **M** a few days · **L** a week or more · **X
 |---|---|---|---|
 | `stremio://` deep links (install an addon, open a title) | P2 | M | Needs OS protocol registration on each platform. |
 | UI translations (i18n) | P3 | M | |
-| Auto-update | P3 | M | Can check the nightly and stable GitHub releases. |
+| Auto-install updates | P3 | M | Release builds already show a download link for a newer build; downloading and replacing the binary is still missing. |
 | Android, iOS, TV clients | P3 | XL | Out of scope for an egui desktop app. |

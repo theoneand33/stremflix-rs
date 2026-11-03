@@ -112,6 +112,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "7z failed" }
           "MPV_DIR=$($dir.Replace('\', '/'))" >> $env:GITHUB_ENV # forward slashes for the bash Package step
       - run: cargo build --release --locked --bin stremflix-rs
+        env:
+          # embedded for the in-app update check (src/addon.rs `RELEASE`, `COMMIT`)
+          STREMFLIX_RS_RELEASE: ${{ env.TAG }}
+          STREMFLIX_RS_COMMIT: ${{ github.sha }}
       - name: Package
         shell: bash
         env:

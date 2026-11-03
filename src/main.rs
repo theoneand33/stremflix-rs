@@ -158,6 +158,8 @@ enum Msg {
     Imported(Import),
     /// Library folder and its scanned media files.
     Scanned(PathBuf, Result<Vec<LibraryItem>, String>),
+    /// Release page of a newer build, if any.
+    Update(Option<String>),
 }
 
 /// One horizontal catalog row on the home screen.
@@ -739,6 +741,8 @@ struct App {
     hwdec: bool,
     /// Last error, shown in a dismissible red line until cleared.
     error: Option<String>,
+    /// Release page of a newer build, shown until dismissed.
+    update: Option<String>,
     /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
     pill: Option<(Tab, egui::Rect, egui::Rect, f64)>,
     player: Option<Playing>,
@@ -795,6 +799,7 @@ impl App {
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             error: None,
+            update: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
             db,
@@ -1046,6 +1051,7 @@ impl App {
                 self.build_rows(ctx);
                 self.fetch_recent_posters(ctx);
             }
+            Msg::Update(url) => self.update = url,
             Msg::Scanned(dir, res) => {
                 let saved = res.map_err(anyhow::Error::msg).and_then(|items| {
                     self.db.add_library_folder(&dir, &items)?;
@@ -2777,6 +2783,15 @@ impl eframe::App for App {
                     }
                 });
             }
+            if let Some(url) = self.update.clone() {
+                ui.horizontal(|ui| {
+                    ui.label("A new version is available.");
+                    ui.hyperlink_to("Download", url);
+                    if ui.small_button("Dismiss").clicked() {
+                        self.update = None;
+                    }
+                });
+            }
             ui.add_space(8.0);
             // Back lives outside the scroll area, so it stays put while the detail page scrolls.
             if self.selected.is_some() && self.tab == Tab::Home {
@@ -2836,6 +2851,14 @@ fn main() -> eframe::Result {
             app.gl_proc = cc.get_proc_address.clone();
             app.build_rows(&cc.egui_ctx);
             app.fetch_recent_posters(&cc.egui_ctx);
+            let client = app.client.clone();
+            // A failed check (offline, rate limit) only logs: it shouldn't show as an error.
+            app.spawn(&cc.egui_ctx, async move {
+                Ok(Msg::Update(client.check_update().await.unwrap_or_else(|e| {
+                    eprintln!("update check: {e:#}");
+                    None
+                })))
+            });
             Ok(Box::new(app))
         }),
     )

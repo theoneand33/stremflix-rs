@@ -631,6 +631,25 @@ pub fn discover_path(kind: &str, id: &str, genre: Option<&str>) -> String {
     }
 }
 
+/// Release this binary was built as (`nightly` or `vX.Y.Z`) and its commit; set by release.yml, absent in source builds.
+pub const RELEASE: Option<&str> = option_env!("STREMFLIX_RS_RELEASE");
+pub const COMMIT: Option<&str> = option_env!("STREMFLIX_RS_COMMIT");
+const REPO_API: &str = "https://api.github.com/repos/theoneand33/stremflix-rs/releases/";
+
+/// Page of a newer release on `release`'s channel, given that channel's GitHub release JSON
+/// (`nightly`: any other commit; tagged: a different latest tag).
+pub fn newer_release(release: &str, commit: &str, body: &[u8]) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Rel {
+        tag_name: String,
+        target_commitish: String,
+        html_url: String,
+    }
+    let r: Rel = serde_json::from_slice(body)?;
+    let newer = if release == "nightly" { r.target_commitish != commit } else { r.tag_name != release };
+    Ok(newer.then(|| safe_http_url(&r.html_url).map(String::from)).flatten())
+}
+
 #[derive(Clone)]
 pub struct AddonClient {
     /// Built on first request, off the UI thread: building it loads the system TLS roots (~4 ms at startup).
@@ -653,6 +672,7 @@ impl AddonClient {
             reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::limited(3))
+                .user_agent("stremflix-rs") // GitHub's API rejects requests without one
                 .build()
                 .map_err(|e| format!("HTTP client: {e}"))
         });
@@ -669,6 +689,13 @@ impl AddonClient {
             ensure!(body.len() <= MAX_BODY, "response too large");
         }
         Ok(body)
+    }
+
+    /// Release page of a newer build than this one, or `None` (also for source builds).
+    pub async fn check_update(&self) -> Result<Option<String>> {
+        let (Some(release), Some(commit)) = (RELEASE, COMMIT) else { return Ok(None) };
+        let url = Url::parse(REPO_API)?.join(if release == "nightly" { "tags/nightly" } else { "latest" })?;
+        newer_release(release, commit, &self.get(url).await?)
     }
 
     pub async fn fetch_manifest(&self, transport_url: &str) -> Result<Manifest> {
