@@ -2245,23 +2245,20 @@ impl App {
             let t = ctx.animate_bool_with_time(ui.scope_id().with("up_next"), open, 0.4);
             if t > 0.0 {
                 let ease = 1.0 - (1.0 - t).powi(3);
-                let size = vec2(480.0f32.min(rect.width() - 64.0).max(300.0), 160.0);
+                let size = vec2(480.0f32.min(rect.width() - 64.0).max(330.0), 160.0);
                 let card = egui::Rect::from_min_size(pos2(rect.right() - (size.x + 32.0) * ease, rect.bottom() - 130.0 - size.y), size);
                 let paint = ui.painter().clone();
                 // Swallows clicks on the card so they don't pause the video; the buttons, registered later, win.
                 let _ = ui.interact(card, ui.scope_id().with("up_next_card"), Sense::CLICK);
                 paint.rect_filled(card, 12, Color32::from_rgb(22, 22, 26));
-                let thumb = egui::Rect::from_min_size(card.min, vec2(size.y * 1.05, size.y));
+                // The buttons need 312 px; the still takes the rest (none when narrow).
+                let thumb = egui::Rect::from_min_size(card.min, vec2((size.x - 312.0).clamp(0.0, size.y * 1.05), size.y));
                 let left = egui::CornerRadius { nw: 12, sw: 12, ne: 0, se: 0 };
-                match img {
-                    Some((u, b)) => {
-                        let img = egui::Image::from_bytes(format!("bytes://{u}"), b).corner_radius(left);
-                        if let Ok(egui::load::TexturePoll::Ready { texture }) = img.load_for_size(&ctx, thumb.size()) {
-                            img.uv(cover_uv(thumb, texture.size)).paint_at(ui, thumb);
-                        }
-                    }
-                    None => {
-                        paint.rect_filled(thumb, left, Color32::from_gray(40));
+                paint.rect_filled(thumb, left, Color32::from_gray(40));
+                if let (true, Some((u, b))) = (thumb.width() > 0.0, img) {
+                    let img = egui::Image::from_bytes(format!("bytes://{u}"), b).corner_radius(left);
+                    if let Ok(egui::load::TexturePoll::Ready { texture }) = img.load_for_size(&ctx, thumb.size()) {
+                        img.uv(cover_uv(thumb, texture.size)).paint_at(ui, thumb);
                     }
                 }
                 let x = thumb.right() + 28.0;
