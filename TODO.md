@@ -19,12 +19,6 @@ Difficulty: **S** under a day · **M** a few days · **L** a week or more · **X
 | Calendar of upcoming episodes for library series | P2 | M | Depends on the saved library. |
 | New-episode notifications | P2 | M | Depends on the saved library. |
 
-### Addons
-
-| Item | Priority | Difficulty | Notes |
-|---|---|---|---|
-| Browse community addons (`addon_catalog` resource) | P2 | M | |
-
 ### Player
 
 | Item | Priority | Difficulty | Notes |

@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use anyhow::Context;
-use stremflix_rs::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
+use stremflix_rs::addon::{AddonClient, AddonEntry, CatalogDef, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
 use stremflix_rs::db::{Db, Progress, SavedTitle, Watched};
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
@@ -139,6 +139,8 @@ enum Msg {
     Row((String, String, String), Result<Vec<MetaPreview>, String>),
     /// Row source, the `skip` it was requested with, and the next page or error.
     More((String, String, String), usize, Result<Vec<MetaPreview>, String>),
+    /// Addon catalog source (addon URL, type, catalog id) and the addons it lists, or an error.
+    AddonCatalog(AddonCatalogSrc, Result<Vec<AddonEntry>, String>),
     /// Discover grid source and its items or error.
     Discover(DiscoverSrc, Result<Vec<MetaPreview>, String>),
     /// meta, episode (series only), streams, subtitle URLs, what to autoplay on arrival,
@@ -188,6 +190,9 @@ impl Row {
         near_end && self.skippable && !self.loading_more && !self.exhausted && self.items.as_ref().is_some_and(|i| !i.is_empty() && i.len() < ROW_CAP)
     }
 }
+
+/// Addon URL, type and id of an addon catalog.
+type AddonCatalogSrc = (String, String, String);
 
 /// Addon URL, type, catalog id, genre.
 type DiscoverSrc = (String, String, String, Option<String>);
@@ -690,6 +695,8 @@ struct App {
     addon_url: String,
     /// Addon being reconfigured (old transport URL) and the pasted result URL.
     configuring: Option<(String, String)>,
+    /// Addon catalog picked in the Addons tab (addon URL, type, catalog id) and its addons (`None` while loading).
+    browse: Option<(AddonCatalogSrc, Option<Vec<AddonEntry>>)>,
     rows: Vec<Row>,
     search_results: Option<(String, Vec<MetaPreview>)>,
     discover: Discover,
@@ -814,6 +821,7 @@ impl App {
             tab: Tab::Home,
             addon_url: String::new(),
             configuring: None,
+            browse: None,
             rows: Vec::new(),
             search_results: None,
             discover: Discover::default(),
@@ -912,6 +920,10 @@ impl App {
                     }
                     self.configuring = None;
                 }
+                // An install from Browse addons keeps whatever is typed in the URL box.
+                if self.addon_url.trim() == url {
+                    self.addon_url.clear();
+                }
                 self.addons.insert(slot, (url, m));
                 if saved.is_ok() {
                     let urls: Vec<String> = self.addons.iter().map(|(u, _)| u.clone()).collect();
@@ -919,7 +931,6 @@ impl App {
                         report(&mut self.error, format!("saving addon order: {e:#}"));
                     }
                 }
-                self.addon_url.clear();
                 self.build_rows(ctx);
                 self.fetch_recent_posters(ctx);
             }
@@ -950,6 +961,19 @@ impl App {
                     Err(e) => {
                         row.exhausted = true;
                         report(&mut self.error, format!("loading more of {}: {e:#}", row.title));
+                    }
+                }
+            }
+            Msg::AddonCatalog(src, res) => {
+                // Ignore replies for a catalog the user has since switched away from.
+                if self.browse.as_ref().is_some_and(|(cur, _)| *cur == src) {
+                    match res {
+                        Ok(items) => self.browse = Some((src, Some(items))),
+                        // Deselect, so picking the catalog again retries.
+                        Err(e) => {
+                            self.browse = None;
+                            report(&mut self.error, format!("loading addon catalog {}: {e:#}", src.2));
+                        }
                     }
                 }
             }
@@ -2556,6 +2580,77 @@ impl App {
             self.addons.retain(|(x, _)| *x != u);
             self.build_rows(&ctx);
         }
+        self.ui_browse_addons(ui);
+    }
+
+    /// Addons listed by the `addon_catalog` resource of installed addons (e.g. Cinemeta's Community catalog), each installable.
+    fn ui_browse_addons(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.separator();
+        ui.label(RichText::new("Browse addons").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        let label = |addon: &str, c: &CatalogDef| format!("{addon} - {} ({})", c.name.as_deref().unwrap_or(&c.id), kind_label(&c.kind));
+        let sources: Vec<(AddonCatalogSrc, String)> = self
+            .addons
+            .iter()
+            .flat_map(|(u, m)| m.addon_catalogs.iter().map(move |c| ((u.clone(), c.kind.clone(), c.id.clone()), label(&m.name, c))))
+            .collect();
+        if sources.is_empty() {
+            ui.label("Install an addon with addon catalogs to browse more addons, e.g. Cinemeta: https://v3-cinemeta.strem.io/manifest.json");
+            return;
+        }
+        let mut pick = self.browse.as_ref().map(|b| b.0.clone()).filter(|s| sources.iter().any(|(x, _)| x == s));
+        let shown = pick.as_ref().and_then(|p| sources.iter().find(|(x, _)| x == p)).map_or("Pick a catalog", |(_, l)| l.as_str());
+        egui::ComboBox::from_id_salt("addon_catalog").selected_text(shown).show_ui(ui, |ui| {
+            for (src, l) in &sources {
+                ui.selectable_value(&mut pick, Some(src.clone()), l);
+            }
+        });
+        let Some(src) = pick else {
+            self.browse = None;
+            return;
+        };
+        if self.browse.as_ref().map(|b| &b.0) != Some(&src) {
+            self.browse = Some((src.clone(), None));
+            let client = self.client.clone();
+            self.spawn(&ctx, async move {
+                let res = client.addon_catalog(&src.0, &src.1, &src.2).await.map_err(|e| format!("{e:#}"));
+                Ok(Msg::AddonCatalog(src, res))
+            });
+        }
+        let Some(items) = self.browse.as_ref().and_then(|b| b.1.as_ref()) else {
+            ui.spinner();
+            return;
+        };
+        if items.is_empty() {
+            ui.label("No addons in this catalog.");
+        }
+        let mut install = None;
+        for a in items {
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
+                if self.addons.iter().any(|(u, _)| *u == a.transport_url) {
+                    ui.add_enabled_ui(false, |ui| small_button(ui, "Installed"));
+                } else if primary_button(ui, "Install").on_hover_text(&a.transport_url).clicked() {
+                    install = Some(a.transport_url.clone());
+                }
+                ui.label(RichText::new(format!("{} {}", a.manifest.name, a.manifest.version)).strong());
+                // The host shows where the addon really lives, since any listed addon can claim any name.
+                if let Ok(u) = url::Url::parse(&a.transport_url) {
+                    ui.label(RichText::new(u.host_str().unwrap_or_default()).weak());
+                }
+                if let Some(d) = &a.manifest.description {
+                    // One line; the full text is on hover.
+                    ui.add(egui::Label::new(RichText::new(d.replace('\n', " ")).weak()).truncate()).on_hover_text(d);
+                }
+            });
+        }
+        // The listed manifest is only a preview: install what the addon itself serves.
+        if let Some(url) = install {
+            let client = self.client.clone();
+            self.spawn(&ctx, async move {
+                let m = client.fetch_manifest(&url).await?;
+                Ok(Msg::Installed(url, m, None))
+            });
+        }
     }
 
     /// Manifest facts under an addon row: id, types, resources, catalogs, description.
@@ -3041,6 +3136,21 @@ mod tests {
         assert!(app.player.is_none());
         app.handle(&ctx, Msg::Streams(m("b"), None, vec![], vec![], Autoplay::Off, None, 2));
         assert_eq!(app.selected.as_ref().map(|(m, ..)| m.id.as_str()), Some("b"), "current reply applies");
+    }
+
+    #[test]
+    fn addon_catalog_replies() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let src = |id: &str| ("https://a.example/manifest.json".to_string(), "all".to_string(), id.to_string());
+        app.browse = Some((src("community"), None));
+        app.handle(&ctx, Msg::AddonCatalog(src("official"), Ok(vec![])));
+        assert_eq!(app.browse, Some((src("community"), None)), "reply for another catalog");
+        app.handle(&ctx, Msg::AddonCatalog(src("community"), Ok(vec![])));
+        assert_eq!(app.browse, Some((src("community"), Some(vec![]))));
+        app.browse = Some((src("community"), None));
+        app.handle(&ctx, Msg::AddonCatalog(src("community"), Err("boom".into())));
+        assert!(app.browse.is_none() && app.error.is_some(), "a failed load deselects so it can be retried");
     }
 
     #[test]

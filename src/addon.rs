@@ -110,6 +110,9 @@ pub struct Manifest {
     pub types: Vec<String>,
     #[serde(default)]
     pub catalogs: Vec<CatalogDef>,
+    /// Catalogs of other addons, served by the `addon_catalog` resource.
+    #[serde(default, rename = "addonCatalogs")]
+    pub addon_catalogs: Vec<CatalogDef>,
     #[serde(default, rename = "idPrefixes")]
     pub id_prefixes: Option<Vec<String>>,
     #[serde(default, rename = "behaviorHints", deserialize_with = "lenient_hints")]
@@ -439,6 +442,11 @@ pub fn parse_manifest(body: &[u8]) -> Result<Manifest> {
     opt_text(&mut m.description, MAX_LONG_TEXT);
     m.catalogs.retain(|c| valid_id(&c.id) && valid_id(&c.kind));
     m.catalogs.truncate(100);
+    m.addon_catalogs.retain(|c| valid_id(&c.id) && valid_id(&c.kind));
+    m.addon_catalogs.truncate(100);
+    for c in &mut m.addon_catalogs {
+        opt_text(&mut c.name, MAX_TEXT);
+    }
     for c in &mut m.catalogs {
         opt_text(&mut c.name, MAX_TEXT);
         for e in &mut c.extra {
@@ -446,6 +454,33 @@ pub fn parse_manifest(body: &[u8]) -> Result<Manifest> {
         }
     }
     Ok(m)
+}
+
+/// One installable addon listed by an `addon_catalog` resource.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddonEntry {
+    pub transport_url: String,
+    pub manifest: Manifest,
+}
+
+/// `{"addons": [{transportUrl, manifest}]}`; entries with a non-http(s) URL or an invalid manifest are dropped.
+pub fn parse_addon_catalog(body: &[u8]) -> Result<Vec<AddonEntry>> {
+    #[derive(Deserialize)]
+    struct R {
+        addons: Vec<serde_json::Value>,
+    }
+    let r: R = from_json(body)?;
+    Ok(r.addons
+        .into_iter()
+        .take(MAX_ITEMS)
+        .filter_map(|v| {
+            let url = v.get("transportUrl")?.as_str()?;
+            addon_base(url).ok()?;
+            let manifest = parse_manifest(&serde_json::to_vec(v.get("manifest")?).ok()?).ok()?;
+            // Normalized form: the URL parser drops tabs and newlines, so they never reach the UI or the DB.
+            Some(AddonEntry { transport_url: safe_http_url(url)?.into(), manifest })
+        })
+        .collect())
 }
 
 fn clean_preview(mut p: MetaPreview) -> Option<MetaPreview> {
@@ -741,6 +776,10 @@ impl AddonClient {
         let body = self.get(safe_http_url(url).context("poster URL must be http(s)")?).await?;
         check_poster(&body)?;
         Ok(body)
+    }
+
+    pub async fn addon_catalog(&self, transport_url: &str, kind: &str, id: &str) -> Result<Vec<AddonEntry>> {
+        parse_addon_catalog(&self.get(Self::resource_url(transport_url, "addon_catalog", kind, id)?).await?)
     }
 
     pub async fn meta(&self, transport_url: &str, kind: &str, id: &str) -> Result<Meta> {

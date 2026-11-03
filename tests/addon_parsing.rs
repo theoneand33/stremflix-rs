@@ -346,3 +346,26 @@ fn update_check() {
     assert_eq!(newer_release("v1", "a", bad_url).unwrap(), None);
     assert!(newer_release("v1", "a", b"{}").is_err());
 }
+
+#[test]
+fn addon_catalog() {
+    let m = parse_manifest(br#"{"id":"a","version":"1","name":"n","resources":["addon_catalog"],"types":["all"],
+      "addonCatalogs":[{"type":"all","id":"community","name":" Community\u0007"},{"type":"all","id":"a/b"}]}"#).unwrap();
+    assert_eq!(m.addon_catalogs.len(), 1, "invalid id dropped");
+    assert_eq!(m.addon_catalogs[0].name.as_deref(), Some("Community"));
+    // Survives the DB round trip (manifests are stored as serialized JSON).
+    assert_eq!(parse_manifest(serde_json::to_string(&m).unwrap().as_bytes()).unwrap(), m);
+
+    let ok = r#"{"id":"x","version":"1","name":"X","resources":["stream"],"types":["movie"]}"#;
+    let body = format!(r#"{{"addons":[
+      {{"transportName":"http","transportUrl":" https://x.exa\tmple/manifest.json ","manifest":{ok}}},
+      {{"transportUrl":"file:///etc/manifest.json","manifest":{ok}}},
+      {{"transportUrl":"https://y.example/other.json","manifest":{ok}}},
+      {{"transportUrl":"https://z.example/manifest.json","manifest":{{"id":"z"}}}},
+      {{"manifest":{ok}}}, 7]}}"#);
+    let list = parse_addon_catalog(body.as_bytes()).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].transport_url, "https://x.example/manifest.json");
+    assert_eq!(list[0].manifest.name, "X");
+    assert!(parse_addon_catalog(b"{}").is_err());
+}
