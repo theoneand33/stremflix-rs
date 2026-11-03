@@ -36,7 +36,6 @@ Difficulty: **S** under a day · **M** a few days · **L** a week or more · **X
 
 | Item | Priority | Difficulty | Notes |
 |---|---|---|---|
-| Settings page (languages, autoplay, player defaults) | P1 | M | A Settings tab exists for torrent and external-player options; these are still missing. |
 | Transcoding for formats the player can't handle | P3 | L | mpv already plays almost everything, so this is mostly irrelevant. |
 
 ### Accounts and sync
