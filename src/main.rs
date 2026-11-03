@@ -1754,6 +1754,7 @@ impl App {
         let mut cmds: Vec<Vec<String>> = Vec::new();
         let mut cmd = |a: &[&str]| cmds.push(a.iter().map(|s| s.to_string()).collect());
         let (mut back, mut toggle_fs) = (false, false);
+        let mut seek: Option<(f64, bool)> = None;
         let mut style = self.sub_style;
         ui.painter().rect_filled(rect, 0, Color32::BLACK);
 
@@ -1822,8 +1823,8 @@ impl App {
             use egui::Key::*;
             let k = |key| i.key_pressed(key);
             if k(Space) || k(K) { cmd(&["cycle", "pause"]) }
-            if k(ArrowLeft) { cmd(&["seek", "-10"]) }
-            if k(ArrowRight) { cmd(&["seek", "10"]) }
+            if k(ArrowLeft) { seek = Some((-10.0, true)) }
+            if k(ArrowRight) { seek = Some((10.0, true)) }
             if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]) }
             if k(M) { cmd(&["cycle", "mute"]) }
@@ -1894,7 +1895,7 @@ impl App {
                 p.scrub = r.interact_pointer_pos().map(|q| at(q.x));
             }
             if let Some(t) = (r.clicked() || r.drag_stopped()).then(|| r.interact_pointer_pos().map(|q| at(q.x)).or(p.scrub)).flatten() {
-                cmd(&["seek", &format!("{t:.1}"), "absolute"]);
+                seek = Some((t, false));
             }
             if !r.dragged() {
                 p.scrub = None;
@@ -2019,6 +2020,11 @@ impl App {
                 report(&mut self.error, e);
             }
             let _ = p.player.apply_sub_style(&style);
+        }
+        if let Some((to, relative)) = seek
+            && let Err(e) = p.player.seek(to, relative)
+        {
+            report(&mut self.error, e);
         }
         for c in &cmds {
             let args: Vec<&str> = c.iter().map(String::as_str).collect();
