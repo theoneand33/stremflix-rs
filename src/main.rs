@@ -266,6 +266,7 @@ mod icons {
     pub const SPEAKER_HIGH: &str = "\u{E44A}";
     pub const SPEAKER_X: &str = "\u{E45C}";
     pub const SUBTITLES: &str = "\u{E1A8}";
+    pub const X: &str = "\u{E4F6}";
 }
 
 /// Inter (OFL) as the UI font: the closest free match to Netflix Sans, which is proprietary.
@@ -476,6 +477,18 @@ fn start_episode(episodes: &[Video], watched: impl Fn(&Video) -> bool) -> Option
     episodes.iter().rposition(watched).and_then(|i| next_episode(episodes, &episodes[i].id)).or_else(first)
 }
 
+/// Cover-fit UVs: crop an image of `size` to `rect`'s aspect ratio, centered.
+fn cover_uv(rect: egui::Rect, size: egui::Vec2) -> egui::Rect {
+    let (ra, ia) = (rect.aspect_ratio(), size.x / size.y);
+    if ia > ra {
+        let f = ra / ia;
+        egui::Rect::from_min_max(pos2((1.0 - f) / 2.0, 0.0), pos2((1.0 + f) / 2.0, 1.0))
+    } else {
+        let f = ia / ra;
+        egui::Rect::from_min_max(pos2(0.0, (1.0 - f) / 2.0), pos2(1.0, (1.0 + f) / 2.0))
+    }
+}
+
 /// mpv's `keep-open` pauses on the last frame at end of file.
 fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
     paused && dur > 0.0 && pos >= dur - 1.0
@@ -526,6 +539,8 @@ struct Playing {
     hold: Option<f64>,
     /// The last click on the video was a hold release, so the next one must not pair with it into a double-click.
     after_hold: bool,
+    /// The up-next card was dismissed.
+    next_dismissed: bool,
     /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
     awake: Option<Option<keepawake::KeepAwake>>,
 }
@@ -977,7 +992,7 @@ impl App {
                 match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], lang("sub_off") == "1", &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, fast: false, hold: None, after_hold: false, awake: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1784,16 +1799,7 @@ impl App {
         if let Some((u, b)) = bg {
             let img = egui::Image::from_bytes(format!("bytes://{u}"), b).corner_radius(12);
             if let Ok(egui::load::TexturePoll::Ready { texture }) = img.load_for_size(ui.ctx(), rect.size()) {
-                // Cover-fit: crop the image to the banner's aspect ratio.
-                let (ra, ia) = (rect.aspect_ratio(), texture.size.x / texture.size.y);
-                let uv = if ia > ra {
-                    let f = ra / ia;
-                    egui::Rect::from_min_max(pos2((1.0 - f) / 2.0, 0.0), pos2((1.0 + f) / 2.0, 1.0))
-                } else {
-                    let f = ia / ra;
-                    egui::Rect::from_min_max(pos2(0.0, (1.0 - f) / 2.0), pos2(1.0, (1.0 + f) / 2.0))
-                };
-                img.uv(uv).paint_at(ui, rect);
+                img.uv(cover_uv(rect, texture.size)).paint_at(ui, rect);
                 ui.painter().rect_filled(rect, 12, Color32::from_black_alpha(120));
             }
         } else if let Some((u, b)) = poster {
@@ -1882,6 +1888,25 @@ impl App {
         let rect = ui.max_rect();
         let has_next = self.playing_episode() && self.episode.as_ref().is_some_and(|c| next_episode(&self.episodes, &c.id).is_some());
         let mut next = false;
+        // Up-next card: series name, episode label, and its still (else the series background, else poster).
+        let mut want = Vec::new();
+        let up_next = (self.selected.as_ref().zip(self.episode.as_ref()))
+            .filter(|_| has_next)
+            .and_then(|((m, ..), cur)| Some((m, next_episode(&self.episodes, &cur.id)?)))
+            .map(|(m, v)| {
+                let title = v.title.clone().unwrap_or_else(|| format!("Episode {}", v.episode.unwrap_or(0)));
+                let label = match (v.season, v.episode) {
+                    (Some(s), Some(e)) => format!("{title} (S{s}E{e})"),
+                    _ => title,
+                };
+                // First source whose fetch hasn't failed (failed ones are cached as empty bytes).
+                let failed = |u: &String| matches!(self.posters.get(u), Some(Some(b)) if b.is_empty());
+                let url = [v.thumbnail.clone(), m.background.clone(), self.selected_details().and_then(|d| d.background.clone()), m.poster.clone()].into_iter().flatten().find(|u| !failed(u));
+                (m.name.clone(), label, self.image(&url, &mut want))
+            });
+        for u in want {
+            self.fetch_poster(&ctx, u);
+        }
         let Some(p) = &mut self.player else { return };
         let now = ctx.input(|i| i.time);
         let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -2213,6 +2238,65 @@ impl App {
                         });
                     });
                 });
+            }
+        }
+        // Up next: in an episode's last 30 s, a card slides in from the right to play the next one.
+        if let Some((series, label, img)) = up_next {
+            // Needs a duration over 60 s so a short or still-loading stream doesn't show the card at once.
+            let open = !p.next_dismissed && rect.width() >= 362.0 && st.dur > 60.0 && st.dur - st.pos <= 30.0;
+            let t = ctx.animate_bool_with_time(ui.scope_id().with("up_next"), open, 0.4);
+            if t > 0.0 {
+                let ease = 1.0 - (1.0 - t).powi(3);
+                let size = vec2(480.0f32.min(rect.width() - 64.0).max(330.0), 160.0);
+                let card = egui::Rect::from_min_size(pos2(rect.right() - (size.x + 32.0) * ease, rect.bottom() - 130.0 - size.y), size);
+                let paint = ui.painter().clone();
+                // Swallows clicks on the card so they don't pause the video; the buttons, registered later, win.
+                let _ = ui.interact(card, ui.scope_id().with("up_next_card"), Sense::CLICK);
+                paint.rect_filled(card, 12, Color32::from_rgb(22, 22, 26));
+                // The buttons need 316 px; the still takes the rest (14 px at the narrowest).
+                let thumb = egui::Rect::from_min_size(card.min, vec2((size.x - 316.0).clamp(0.0, size.y * 1.05), size.y));
+                let left = egui::CornerRadius { nw: 12, sw: 12, ne: 0, se: 0 };
+                paint.rect_filled(thumb, left, Color32::from_gray(40));
+                if let (true, Some((u, b))) = (thumb.width() > 0.0, img) {
+                    let img = egui::Image::from_bytes(format!("bytes://{u}"), b).corner_radius(left);
+                    if let Ok(egui::load::TexturePoll::Ready { texture }) = img.load_for_size(&ctx, thumb.size()) {
+                        img.uv(cover_uv(thumb, texture.size)).paint_at(ui, thumb);
+                    }
+                }
+                let x = thumb.right() + 28.0;
+                let w = (card.right() - 20.0 - x).max(0.0);
+                let line = |sections: &[(&str, egui::FontFamily, Color32)], size: f32, y: f32| {
+                    let mut job = egui::text::LayoutJob::default();
+                    for (s, family, color) in sections {
+                        job.append(s, 0.0, egui::TextFormat::simple(egui::FontId::new(size, family.clone()), *color));
+                    }
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(w);
+                    paint.galley(pos2(x, y), paint.layout_job(job), Color32::WHITE);
+                };
+                line(&[("Next on ", bold(), Color32::WHITE), (&series, bold(), Color32::from_gray(170))], 17.0, card.top() + 24.0);
+                line(&[(&label, egui::FontFamily::Proportional, Color32::from_gray(225))], 16.0, card.top() + 58.0);
+                // Buttons: Dismiss (text) and Watch now (outlined pill), bottom-right.
+                let by = card.bottom() - 42.0;
+                let watch = egui::Rect::from_center_size(pos2(card.right() - 20.0 - 80.0, by), vec2(160.0, 50.0));
+                let dismiss = egui::Rect::from_center_size(pos2(watch.left() - 16.0 - 60.0, by), vec2(120.0, 50.0));
+                for (r, glyph, family, text, id) in [(dismiss, icons::X, phosphor(), "Dismiss", "up_next_dismiss"), (watch, icons::PLAY, fill(), "Watch now", "up_next_watch")] {
+                    let resp = ui.interact(r, ui.scope_id().with(id), Sense::CLICK).on_hover_cursor(egui::CursorIcon::PointingHand);
+                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
+                    let color = if id == "up_next_watch" || resp.hovered() { Color32::WHITE } else { Color32::from_gray(150) };
+                    if id == "up_next_watch" {
+                        paint.rect_stroke(r, 25, egui::Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Inside);
+                    }
+                    if resp.hovered() {
+                        paint.rect_filled(r, 25, Color32::from_white_alpha(20));
+                    }
+                    let label = paint.layout_no_wrap(text.into(), egui::FontId::proportional(17.0), color);
+                    let left = r.center().x - (label.size().x + 30.0) / 2.0;
+                    paint.text(pos2(left + 9.0, by), egui::Align2::CENTER_CENTER, glyph, egui::FontId::new(18.0, family), color);
+                    paint.galley(pos2(left + 30.0, by - label.size().y / 2.0), label, color);
+                    if resp.clicked() {
+                        if id == "up_next_watch" { next = true } else { p.next_dismissed = true }
+                    }
+                }
             }
         }
         let style = style.clamped();
@@ -2662,7 +2746,7 @@ mod tests {
 
     #[test]
     fn episodes_sort_with_specials_last() {
-        let v = |season, episode| Video { id: format!("tt1:{season:?}:{episode}"), title: None, season, episode: Some(episode), released: None };
+        let v = |season, episode| Video { id: format!("tt1:{season:?}:{episode}"), title: None, season, episode: Some(episode), released: None, thumbnail: None };
         let mut eps = vec![v(Some(0), 1), v(None, 1), v(Some(2), 1), v(Some(1), 2), v(Some(1), 1)];
         sort_episodes(&mut eps);
         let order: Vec<_> = eps.iter().map(|e| (e.season, e.episode)).collect();
@@ -2672,7 +2756,7 @@ mod tests {
 
     #[test]
     fn next_episode_in_watch_order() {
-        let v = |season, episode| Video { id: format!("{season:?}:{episode}"), title: None, season, episode: Some(episode), released: None };
+        let v = |season, episode| Video { id: format!("{season:?}:{episode}"), title: None, season, episode: Some(episode), released: None, thumbnail: None };
         let mut eps = vec![v(Some(1), 1), v(Some(1), 2), v(Some(2), 1), v(Some(0), 1), v(Some(0), 2), v(None, 1)];
         sort_episodes(&mut eps);
         let next = |id: &str| next_episode(&eps, id).map(|n| n.id.as_str());
