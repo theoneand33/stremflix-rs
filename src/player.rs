@@ -279,6 +279,13 @@ pub fn valid_langs(s: &str) -> Option<String> {
     (tokens.len() <= 8 && tokens.iter().all(|t| ok(t))).then(|| tokens.join(","))
 }
 
+/// `slang` with `lang` moved to the front (case-insensitive dedupe, max 8); None if the result isn't a valid preference.
+pub fn prefer_lang(slang: &str, lang: &str) -> Option<String> {
+    let rest = valid_langs(slang).unwrap_or_default();
+    let list: Vec<&str> = std::iter::once(lang).chain(rest.split(',').filter(|x| !x.is_empty() && !x.eq_ignore_ascii_case(lang))).take(8).collect();
+    valid_langs(&list.join(","))
+}
+
 /// Index of the first addon subtitle whose language matches a `slang` token, in preference order.
 /// Compares primary subtags case-insensitively; `en` and `eng` are different tokens, list both.
 fn pick_sub(subs: &[(String, String)], slang: &str) -> Option<usize> {
@@ -513,6 +520,15 @@ mod tests {
         }
         assert!(valid_langs("en,fr,de,es,it,pt,ja,ko").is_some());
         assert!(valid_langs("en,fr,de,es,it,pt,ja,ko,ru").is_none());
+    }
+
+    #[test]
+    fn prefer_lang_moves_choice_first() {
+        assert_eq!(prefer_lang("fr,EN,de", "en").as_deref(), Some("en,fr,de"));
+        assert_eq!(prefer_lang("", "pt-BR").as_deref(), Some("pt-BR"));
+        assert_eq!(prefer_lang("bad!", "en").as_deref(), Some("en"));
+        assert_eq!(prefer_lang("fr,de,es,it,pt,ja,ko,ru", "en").as_deref(), Some("en,fr,de,es,it,pt,ja,ko"));
+        assert_eq!(prefer_lang("en", "English"), None);
     }
 
     #[test]

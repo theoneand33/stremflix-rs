@@ -12,7 +12,7 @@ use stremflix_rs::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, 
 use stremflix_rs::db::{Db, Progress, SavedTitle, Watched};
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{GlProc, Player, SUB_COLORS, SubStyle, valid_langs};
+use stremflix_rs::player::{GlProc, Player, SUB_COLORS, SubStyle, prefer_lang, valid_langs};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::TorrentEngine;
 
@@ -1972,13 +1972,10 @@ impl App {
                                             // Remember the subtitle choice for the next video: Off, or the picked language first in `slang`.
                                             if kind == "sub" {
                                                 let mut save = vec![("sub_off", if id.is_none() { "1" } else { "" }.to_string())];
-                                                if let Some(l) = lang {
-                                                    let rest = valid_langs(&self.langs[1]).unwrap_or_default();
-                                                    let v = std::iter::once(l).chain(rest.split(',').filter(|x| !x.is_empty() && *x != l)).take(8).collect::<Vec<_>>().join(",");
-                                                    if let Some(v) = valid_langs(&v) {
-                                                        self.langs[1] = v.clone();
-                                                        save.push(("slang", v));
-                                                    }
+                                                // shortcut: name-only addon languages ("English") fail `valid_langs` and aren't remembered; map names to codes if users hit it.
+                                                if let Some(v) = lang.and_then(|l| prefer_lang(&self.langs[1], l)) {
+                                                    self.langs[1] = v.clone();
+                                                    save.push(("slang", v));
                                                 }
                                                 for (k, v) in save {
                                                     if let Err(e) = self.db.set_setting(k, &v) {
@@ -2019,6 +2016,14 @@ impl App {
                                         && let Err(e) = self.db.set_setting(key, v)
                                     {
                                         report(&mut self.error, format!("saving {key}: {e:#}"));
+                                    }
+                                    // Typing a subtitle language preference turns subtitles back on after a remembered "Off".
+                                    if kind == "sub"
+                                        && r.changed()
+                                        && valid_langs(&self.langs[1]).is_some_and(|v| !v.is_empty())
+                                        && let Err(e) = self.db.set_setting("sub_off", "")
+                                    {
+                                        report(&mut self.error, format!("saving sub_off: {e:#}"));
                                     }
                                     if valid.is_none() {
                                         ui.label(RichText::new("Use codes like en,eng,pt-BR (max 8)").size(13.0).color(Color32::from_rgb(230, 90, 90)));
