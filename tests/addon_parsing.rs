@@ -216,10 +216,12 @@ fn external_and_youtube_streams() {
         {"externalUrl": "javascript:alert(1)"},
         {"ytId": "dQw4w9WgXcQ", "title": "Trailer"},
         {"ytId": "bad/id&x=1"},
-        {"ytId": "dQw4w9WgXcQ", "url": "https://cdn.example/v.mp4"}
+        {"ytId": "dQw4w9WgXcQ", "url": "https://cdn.example/v.mp4"},
+        {"ytId": "dQw4w9WgXcQ", "url": "ftp://cdn.example/v.mp4"}
     ]}"#;
     let s = parse_streams(body).unwrap();
-    assert_eq!(s.len(), 3, "non-http external URLs and bad ytIds dropped");
+    assert_eq!(s.len(), 4, "non-http external URLs and bad ytIds dropped");
+    assert_eq!(s[3].source().as_deref(), Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "unplayable url falls back to ytId");
     assert_eq!((s[0].external_url.as_deref(), s[0].target()), (Some("https://site.example/watch"), None));
     let yt = s[1].source().unwrap();
     assert_eq!(yt, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");

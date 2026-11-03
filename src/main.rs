@@ -34,9 +34,33 @@ fn is_torrent_file(s: &str) -> bool {
     !s.contains("://") && !s.starts_with("magnet:") && std::path::Path::new(s).extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
 }
 
-/// Start `command` (program and its arguments, split on whitespace) with `url` as the last argument. No shell is involved.
+/// Splits a command line on whitespace; double quotes group words with spaces (e.g. a Windows path).
+fn command_words(s: &str) -> Vec<String> {
+    let (mut words, mut cur, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    for c in s.chars() {
+        match c {
+            '"' => (quoted, any) = (!quoted, true),
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    words.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            c => (cur.push(c), any = true).1,
+        }
+    }
+    if any {
+        words.push(cur);
+    }
+    words
+}
+
+/// Start `command` (program and its arguments) with `url` as the last argument. No shell is involved.
+/// A command that is an existing file is the program alone, so an unquoted path with spaces works.
 fn open_external(command: &str, url: &str) -> anyhow::Result<()> {
-    let mut words = command.split_whitespace();
+    let command = command.trim();
+    let words = if std::path::Path::new(command).is_file() { vec![command.to_string()] } else { command_words(command) };
+    let mut words = words.iter();
     let prog = words.next().context("set an external player in Settings")?;
     let mut child = std::process::Command::new(prog).args(words).arg(url).spawn().with_context(|| format!("start {prog}"))?;
     // Reap it when it exits, so it never lingers as a zombie.
@@ -718,17 +742,23 @@ impl App {
                 if let Err(e) = &saved {
                     report(&mut self.error, format!("saving addon: {e:#}"));
                 }
-                self.addons.retain(|(u, _)| *u != url);
+                // Keep the addon's priority: an update stays in place, a reconfigured one takes the old URL's place, a new one goes last.
+                let is_slot = |u: &String| *u == url || replaces.as_ref() == Some(u);
+                let slot = self.addons.iter().position(|(u, _)| is_slot(u)).unwrap_or(self.addons.len());
+                self.addons.retain(|(u, _)| !is_slot(u));
                 if let Some(old) = replaces {
-                    if old != url {
-                        if saved.is_ok() {
-                            let _ = self.db.remove_addon(&old);
-                        }
-                        self.addons.retain(|(u, _)| *u != old);
+                    if old != url && saved.is_ok() {
+                        let _ = self.db.remove_addon(&old);
                     }
                     self.configuring = None;
                 }
-                self.addons.push((url, m));
+                self.addons.insert(slot, (url, m));
+                if saved.is_ok() {
+                    let urls: Vec<String> = self.addons.iter().map(|(u, _)| u.clone()).collect();
+                    if let Err(e) = self.db.reorder_addons(&urls) {
+                        report(&mut self.error, format!("saving addon order: {e:#}"));
+                    }
+                }
                 self.addon_url.clear();
                 self.build_rows(ctx);
                 self.fetch_recent_posters(ctx);
@@ -2655,6 +2685,31 @@ mod tests {
         })
         .await;
         assert_eq!(out.into_iter().map(Result::unwrap).collect::<Vec<_>>(), [30, 0, 10]);
+    }
+
+    #[test]
+    fn reinstall_keeps_addon_priority() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let m = stremflix_rs::addon::parse_manifest(br#"{"id":"a","version":"1","name":"A","resources":["stream"],"types":["movie"]}"#).unwrap();
+        let u = |n: &str| format!("https://{n}.example/manifest.json");
+        for n in ["a", "b", "c"] {
+            app.handle(&ctx, Msg::Installed(u(n), m.clone(), None));
+        }
+        let order = |app: &App| app.addons.iter().map(|(x, _)| x.clone()).collect::<Vec<_>>();
+        app.handle(&ctx, Msg::Installed(u("a"), m.clone(), None));
+        assert_eq!(order(&app), [u("a"), u("b"), u("c")], "update stays in place");
+        app.handle(&ctx, Msg::Installed(u("b2"), m.clone(), Some(u("b"))));
+        assert_eq!(order(&app), [u("a"), u("b2"), u("c")], "reconfigured addon takes the old place");
+        assert_eq!(app.db.addons().unwrap().into_iter().map(|(x, _)| x).collect::<Vec<_>>(), order(&app), "saved");
+    }
+
+    #[test]
+    fn command_words_respect_quotes() {
+        assert_eq!(command_words(r#""C:\Program Files\VLC\vlc.exe" --fs"#), [r"C:\Program Files\VLC\vlc.exe", "--fs"]);
+        assert_eq!(command_words("  mpv   --fs "), ["mpv", "--fs"]);
+        assert_eq!(command_words(r#"a "" b"#), ["a", "", "b"]);
+        assert!(command_words("   ").is_empty());
     }
 
     #[test]

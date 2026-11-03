@@ -121,4 +121,17 @@ fn addon_order_persists() {
     assert_eq!(urls(&db), [u("c"), u("a"), u("b")]);
     db.add_addon(&u("d"), &m).unwrap();
     assert_eq!(urls(&db).last(), Some(&u("d")), "new addons go last");
+    drop(db);
+    // A database from before the position column: rows keep install order and new ones go last.
+    let old = dir.path().join("old.db");
+    let conn = rusqlite::Connection::open(&old).unwrap();
+    conn.execute_batch("CREATE TABLE addons (transport_url TEXT PRIMARY KEY, manifest TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT (unixepoch()));").unwrap();
+    let json = serde_json::to_string(&m).unwrap();
+    for (n, at) in [("b", 2), ("a", 1)] {
+        conn.execute("INSERT INTO addons VALUES (?1, ?2, ?3)", rusqlite::params![u(n), json, at]).unwrap();
+    }
+    drop(conn);
+    let db = Db::open(&old).unwrap();
+    db.add_addon(&u("c"), &m).unwrap();
+    assert_eq!(urls(&db), [u("a"), u("b"), u("c")]);
 }

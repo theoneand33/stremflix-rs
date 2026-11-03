@@ -329,11 +329,12 @@ impl Stream {
     }
 
     pub fn target(&self) -> Option<PlayTarget> {
+        // An unplayable `url` falls back to `infoHash`, then `ytId`.
         if let Some(u) = &self.url {
-            if u.starts_with("magnet:") {
-                return parse_magnet_hash(u).map(|_| PlayTarget::Magnet(u.clone(), self.file_idx));
+            let t = if u.starts_with("magnet:") { parse_magnet_hash(u).map(|_| PlayTarget::Magnet(u.clone(), self.file_idx)) } else { safe_http_url(u).map(PlayTarget::Http) };
+            if t.is_some() {
+                return t;
             }
-            return safe_http_url(u).map(PlayTarget::Http);
         }
         let Some(hash) = self.info_hash.as_deref().filter(|h| is_info_hash(h)) else {
             return self.yt_id.as_deref().and_then(youtube_url).map(PlayTarget::Http);

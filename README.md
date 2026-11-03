@@ -22,7 +22,7 @@ The Windows release zip includes `libmpv-2.dll`. To build from source on Windows
 
 Playback runs inside the app window. The controls fade after 3 s without input.
 
-Click the video or press Space or K to pause. Press ←/→ to skip 10 s, ↑/↓ for volume, and M to mute. Press F or double-click for full screen. Press Esc to leave full screen or go back. 💬 opens the Audio & Subtitles panel. Its Playback column sets the speed, toggles hardware decoding, and opens the stream in an external player (set the command in **Settings**; the app pauses its own player).
+Click the video or press Space or K to pause. Press ←/→ to skip 10 s, ↑/↓ for volume, and M to mute. Press F or double-click for full screen. Press Esc to leave full screen or go back. 💬 opens the Audio & Subtitles panel. Its Playback column sets the speed, toggles hardware decoding, and opens the stream in an external player (set the command in **Settings**; the app pauses its own player). Quote a program path that has spaces. Torrents and addon request headers stay with the app: leave the app on the player screen while an external player streams a torrent, since going back stops the torrent.
 
 ## Addons and streams
 
@@ -134,7 +134,9 @@ Release archives are named `stremflix-rs-<tag>-<target>` and published on GitHub
 | Target | Archive |
 |---|---|
 | `linux-x86_64` | `.tar.gz` (needs system libmpv), `.AppImage` (bundles libmpv) |
+| `linux-arm64` | `.tar.gz` (needs system libmpv), `.AppImage` (bundles libmpv) |
 | `macos-arm64` | `.tar.gz` |
+| `macos-x86_64` | `.tar.gz` |
 | `windows-x86_64` | `.zip` (includes `libmpv-2.dll`) |
 
 A nightly build runs every 3 hours and is skipped when `main` has no new commits. Tagged releases come from a manual workflow run.

@@ -83,7 +83,7 @@ jobs:
           prefix=$(brew --prefix)
           installed=$(brew list --formula -1)
           {
-            echo "key=brew-mpv-$ImageOS-$ImageVersion-$(brew info --json=v2 mpv | jq -r '.formulae[0] | "\(.versions.stable)_\(.revision)"')"
+            echo "key=brew-mpv-$ImageOS-$ImageVersion-$RUNNER_ARCH-$(brew info --json=v2 mpv | jq -r '.formulae[0] | "\(.versions.stable)_\(.revision)"')"
             echo 'paths<<EOF'
             for f in mpv $(brew deps mpv); do grep -qx "$f" <<<"$installed" || printf '%s\n' "$prefix/Cellar/$f" "$prefix/opt/$f"; done
             echo EOF

@@ -39,7 +39,7 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 - Parsers never panic. Structurally invalid responses are errors. Individually invalid catalog, stream, or subtitle entries are dropped.
 - Text has control and bidi-override characters stripped, and lengths are capped. egui renders plain text only, so markup cannot inject anything.
 - URLs must be `http`/`https` with a host. `file:`, `javascript:`, `data:`, and similar schemes are rejected. Info hashes must be 40 hex characters. Ids may not contain `/` or control characters.
-- The media source is passed to mpv as a `loadfile` argument, so it can never be read as an option. `ytdl` is off except when the source is exactly the YouTube URL built from a valid `ytId`, so mpv never runs yt-dlp on other addon URLs.
+- The media source is passed to mpv as a `loadfile` argument, so it can never be read as an option. `ytdl` is off except when the source is exactly a valid YouTube watch URL (`https://www.youtube.com/watch?v=<11-char id>`, as built from a `ytId`), so mpv never runs yt-dlp on other URLs.
 
 ## Persistence
 
