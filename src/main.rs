@@ -1078,7 +1078,7 @@ impl App {
             Msg::Details(m) => {
                 if self.details_want == (m.kind.clone(), m.id.clone()) {
                     // A deep-linked title only knows its id until its meta arrives.
-                    if let Some((sel, ..)) = self.selected.as_mut().filter(|(s, ..)| s.name == s.id) {
+                    if let Some((sel, ..)) = self.selected.as_mut().filter(|(s, ..)| s.name == s.id && (&s.kind, &s.id) == (&m.kind, &m.id)) {
                         sel.name = m.name.clone();
                     }
                     self.details = Some(m);
@@ -3323,6 +3323,38 @@ mod tests {
         app.handle(&ctx, Msg::Installed(u("b2"), m.clone(), Some(u("b"))));
         assert_eq!(order(&app), [u("a"), u("b2"), u("c")], "reconfigured addon takes the old place");
         assert_eq!(app.db.addons().unwrap().into_iter().map(|(x, _)| x).collect::<Vec<_>>(), order(&app), "saved");
+    }
+
+    #[test]
+    fn deep_link_title_gets_its_name_in_either_order() {
+        let ctx = egui::Context::default();
+        let meta = |id: &str| stremflix_rs::addon::parse_meta(format!(r#"{{"meta":{{"id":"{id}","type":"movie","name":"Name {id}"}}}}"#).as_bytes()).unwrap();
+        let name = |app: &App| app.selected.as_ref().map(|(m, ..)| m.name.clone());
+        let preview = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
+        // Details first, then streams.
+        let (_d, mut app) = test_app();
+        app.nav = 1;
+        app.details_want = ("movie".into(), "tt1".into());
+        app.handle(&ctx, Msg::Details(meta("tt1")));
+        app.handle(&ctx, Msg::Streams(preview("tt1"), None, vec![], vec![], Autoplay::Off, None, 1));
+        assert_eq!(name(&app).as_deref(), Some("Name tt1"));
+        // Streams first, then details; details of another title never rename the selection.
+        let (_d, mut app) = test_app();
+        app.nav = 1;
+        app.handle(&ctx, Msg::Streams(preview("tt1"), None, vec![], vec![], Autoplay::Off, None, 1));
+        app.details_want = ("movie".into(), "tt2".into());
+        app.handle(&ctx, Msg::Details(meta("tt2")));
+        assert_eq!(name(&app).as_deref(), Some("tt1"));
+        app.details_want = ("movie".into(), "tt1".into());
+        app.handle(&ctx, Msg::Details(meta("tt1")));
+        assert_eq!(name(&app).as_deref(), Some("Name tt1"));
+    }
+
+    #[test]
+    fn link_message_prefills_addon_url() {
+        let (_d, mut app) = test_app();
+        app.handle(&egui::Context::default(), Msg::Link("stremio://example.com/manifest.json".into()));
+        assert!(app.tab == Tab::Addons && app.addon_url == "https://example.com/manifest.json");
     }
 
     #[test]

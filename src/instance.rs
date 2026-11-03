@@ -44,7 +44,7 @@ pub fn listen(dir: &Path, on_link: impl Fn(String) + Send + 'static) -> std::io:
     Ok(())
 }
 
-/// 128 random bits from std's OS-seeded SipHash keys (no RNG dependency).
+/// Unpredictable token from std's OS-seeded SipHash keys (no RNG dependency).
 fn token() -> String {
     use std::hash::{BuildHasher, Hasher};
     let r = || std::collections::hash_map::RandomState::new().build_hasher().finish();
@@ -52,15 +52,18 @@ fn token() -> String {
 }
 
 fn write_private(path: &Path, s: &str) -> std::io::Result<()> {
+    // Publish by rename so a concurrent `forward` never reads a half-written file.
+    let tmp = path.with_extension("tmp");
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create(true).truncate(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    let mut f = o.open(path)?;
+    let mut f = o.open(&tmp)?;
     // `mode` only applies to a new file: tighten one left over with looser permissions.
     #[cfg(unix)]
     f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-    f.write_all(s.as_bytes())
+    f.write_all(s.as_bytes())?;
+    std::fs::rename(tmp, path)
 }
 
 /// Make this exe the `stremio://` handler for the current user, unless another app (Stremio) owns it.
