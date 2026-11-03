@@ -86,7 +86,7 @@ const MPV_LIBS: &[&str] = if cfg!(windows) {
     &["libmpv-2.dll", "mpv-2.dll"]
 } else if cfg!(target_os = "macos") {
     // Homebrew's `opt/mpv` path is what the linked binary used; the `lib` symlinks can be missing (e.g. cached Cellar).
-    &["libmpv.2.dylib", "/opt/homebrew/opt/mpv/lib/libmpv.2.dylib", "/usr/local/opt/mpv/lib/libmpv.2.dylib", "/opt/homebrew/lib/libmpv.2.dylib", "/usr/local/lib/libmpv.2.dylib"]
+    &["libmpv.2.dylib", "/opt/homebrew/opt/mpv/lib/libmpv.2.dylib", "/usr/local/opt/mpv/lib/libmpv.2.dylib", "/opt/homebrew/lib/libmpv.2.dylib", "/usr/local/lib/libmpv.2.dylib", "/opt/local/lib/libmpv.2.dylib"]
 } else {
     &["libmpv.so.2", "libmpv.so"]
 };

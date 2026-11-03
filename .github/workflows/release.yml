@@ -149,7 +149,7 @@ jobs:
           "$ld" --appdir AppDir -e target/release/stremflix-rs -l "$mpv" -d "$RUNNER_TEMP/stremflix-rs.desktop" -i "$RUNNER_TEMP/stremflix-rs.png" --output appimage
           # dlopen finds the bundled copy only through the exe's $ORIGIN RUNPATH
           test -e AppDir/usr/lib/libmpv.so.2
-          readelf -d AppDir/usr/bin/stremflix-rs | grep -q 'R.*PATH.*\$ORIGIN'
+          readelf -d AppDir/usr/bin/stremflix-rs | grep -qF '[$ORIGIN/../lib]'
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
