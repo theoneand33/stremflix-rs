@@ -423,6 +423,43 @@ pub fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_TEXT && !s.chars().any(|c| c.is_control() || c == '/')
 }
 
+/// A `stremio://` link from the OS (browser, other apps).
+#[derive(Debug, PartialEq)]
+pub enum DeepLink {
+    /// `stremio://<host>/…/manifest.json`: the addon's https manifest URL (http for loopback hosts).
+    Addon(Url),
+    /// `stremio:///detail/<type>/<id>[/<video id>]`, segments percent-decoded.
+    Detail { kind: String, id: String, video: Option<String> },
+}
+
+/// Parse a `stremio://` link; `None` for anything else or invalid parts.
+pub fn parse_deep_link(s: &str) -> Option<DeepLink> {
+    let s = s.trim();
+    // Schemes are case-insensitive.
+    let rest = s.get(..10).filter(|p| p.eq_ignore_ascii_case("stremio://")).map(|_| &s[10..])?;
+    if let Some(path) = rest.strip_prefix('/') {
+        let seg: Vec<String> = path.split(['?', '#']).next()?.split('/').map(|p| percent_encoding::percent_decode_str(p).decode_utf8_lossy().into_owned()).collect();
+        return match seg.as_slice() {
+            [d, kind, id, video @ ..] if d == "detail" && video.len() <= 1 && [kind, id].into_iter().chain(video).all(|p| valid_id(p) && sanitize_text(p, MAX_TEXT) == *p) => {
+                Some(DeepLink::Detail { kind: kind.clone(), id: id.clone(), video: video.first().cloned() })
+            }
+            _ => None,
+        };
+    }
+    let u = safe_http_url(&format!("https://{rest}"))?;
+    if !u.path().ends_with("/manifest.json") {
+        return None;
+    }
+    // Local addons (the SDK's own landing page links) serve plain http.
+    let local = match u.host() {
+        Some(url::Host::Domain(d)) => d == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    safe_http_url(&format!("{}://{rest}", if local { "http" } else { "https" })).map(DeepLink::Addon)
+}
+
 fn from_json<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
     ensure!(body.len() <= MAX_BODY, "response too large ({} bytes)", body.len());
     serde_json::from_slice(body).context("malformed addon response")

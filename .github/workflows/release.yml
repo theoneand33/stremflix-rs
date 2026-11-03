@@ -121,12 +121,39 @@ jobs:
         shell: bash
         env:
           NAME: stremflix-rs-${{ env.TAG }}-${{ matrix.target }}
+          VERSION: ${{ inputs.version }}
         run: |
           mkdir "$NAME"
           if [ "$RUNNER_OS" = Windows ]; then
             # the exe loads libmpv-2.dll by that name from its own folder first, so ship it unrenamed next to the exe
             cp target/release/stremflix-rs.exe "$MPV_DIR/libmpv-2.dll" README.md "$NAME/"
             7z a -tzip "$NAME.zip" "$NAME" > /dev/null
+          elif [ "$RUNNER_OS" = macOS ]; then
+            # an .app bundle: macOS only routes stremio:// links to apps that declare them in Info.plist
+            app="$NAME/Stremflix-rs.app"
+            mkdir -p "$app/Contents/MacOS"
+            cp target/release/stremflix-rs "$app/Contents/MacOS/"
+            cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>stremflix-rs</string>
+            <key>CFBundleIdentifier</key><string>io.github.theoneand33.stremflix-rs</string>
+            <key>CFBundleName</key><string>Stremflix-rs</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION:-0.0.0}</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>CFBundleURLTypes</key><array><dict>
+              <key>CFBundleURLName</key><string>Stremio link</string>
+              <key>CFBundleURLSchemes</key><array><string>stremio</string></array>
+            </dict></array>
+          </dict></plist>
+          EOF
+            plutil -lint "$app/Contents/Info.plist"
+            # ad-hoc signature over the bundle, so Info.plist is sealed with the binary
+            codesign --force --sign - "$app"
+            cp README.md "$NAME/"
+            tar czf "$NAME.tar.gz" "$NAME"
           else
             cp target/release/stremflix-rs README.md "$NAME/"
             tar czf "$NAME.tar.gz" "$NAME"
@@ -146,7 +173,7 @@ jobs:
           curl -fsSL --retry 3 -o "$ld" "$LINUXDEPLOY_URL"
           echo "$LINUXDEPLOY_SHA256  $ld" | sha256sum -c -
           chmod +x "$ld"
-          printf '%s\n' '[Desktop Entry]' Type=Application Name=Stremflix-rs Exec=stremflix-rs Icon=stremflix-rs Categories=AudioVideo\;Video\;Player\; > "$RUNNER_TEMP/stremflix-rs.desktop"
+          printf '%s\n' '[Desktop Entry]' Type=Application Name=Stremflix-rs 'Exec=stremflix-rs %u' Icon=stremflix-rs Categories=AudioVideo\;Video\;Player\; MimeType=x-scheme-handler/stremio\; > "$RUNNER_TEMP/stremflix-rs.desktop"
           cp assets/icon.png "$RUNNER_TEMP/stremflix-rs.png"
           # the binary dlopens libmpv, so name it explicitly; linuxdeploy bundles it and its deps (glibc, GL and other host libs stay on the excludelist)
           mpv=$(ldconfig -p | awk '/libmpv\.so\.2 /{print $NF; exit}')

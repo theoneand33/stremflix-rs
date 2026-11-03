@@ -9,7 +9,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use anyhow::Context;
-use stremflix_rs::addon::{AddonClient, AddonEntry, CatalogDef, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
+use stremflix_rs::addon::{AddonClient, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
+use stremflix_rs::instance;
 use stremflix_rs::db::{Db, Progress, SavedTitle, Watched};
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
@@ -162,6 +163,8 @@ enum Msg {
     Scanned(PathBuf, Result<Vec<LibraryItem>, String>),
     /// Release page of a newer build, if any.
     Update(Option<String>),
+    /// A `stremio://` link from the command line, a later launch, or macOS.
+    Link(String),
 }
 
 /// One horizontal catalog row on the home screen.
@@ -780,6 +783,14 @@ fn report(slot: &mut Option<String>, e: impl std::fmt::Display) {
     *slot = Some(format!("{e:#}"));
 }
 
+/// A deep-linked title only knows its id until its meta arrives: take the name and artwork from `d`.
+fn fill_deep_linked(sel: &mut MetaPreview, d: &Meta) {
+    if sel.name == sel.id && (&sel.kind, &sel.id) == (&d.kind, &d.id) {
+        sel.name = d.name.clone();
+        (sel.poster, sel.background, sel.description) = (d.poster.clone(), d.background.clone(), d.description.clone());
+    }
+}
+
 fn fmt_time(s: f64) -> String {
     let s = s.max(0.0) as u64;
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
@@ -998,6 +1009,10 @@ impl App {
                 let fallback = || if autoplay == Autoplay::Top { streams.iter().find_map(Stream::source) } else { only_source(&streams) };
                 let src = binge.and_then(|g| binge_source(&streams, &g)).or_else(fallback);
                 (self.selected, self.episode) = (Some((meta, streams, subs.clone())), episode);
+                // Details may have arrived first; a deep-linked title only knew its id.
+                if let (Some((sel, ..)), Some(d)) = (self.selected.as_mut(), &self.details) {
+                    fill_deep_linked(sel, d);
+                }
                 // `Only` autoplays when there's no choice to make; otherwise show the stream picker.
                 if autoplay != Autoplay::Off {
                     match (src, self.play_key()) {
@@ -1053,8 +1068,29 @@ impl App {
                 let autoplay = if show.is_some() { Autoplay::Off } else { Autoplay::Top };
                 self.open_streams(ctx, meta, Some(v), autoplay, binge);
             }
+            Msg::Link(s) => match stremflix_rs::addon::parse_deep_link(&s) {
+                Some(link) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    // Leave the player like its Back button does, or the link opens behind it.
+                    if self.player.is_some() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                        self.stop_player();
+                        self.release_torrents(None);
+                    }
+                    self.open_link(ctx, link);
+                }
+                None if s.is_empty() => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                None => report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200))),
+            },
             Msg::Details(m) => {
                 if self.details_want == (m.kind.clone(), m.id.clone()) {
+                    if let Some((sel, ..)) = self.selected.as_mut() {
+                        fill_deep_linked(sel, &m);
+                    }
                     self.details = Some(m);
                 }
             }
@@ -1498,6 +1534,21 @@ impl App {
         }
         self.fetch_details(ctx, &meta);
         self.open_streams(ctx, meta, None, Autoplay::Top, None);
+    }
+
+    /// `stremio://` link: prefill an addon for the user to confirm with Install, or open a title's page.
+    fn open_link(&mut self, ctx: &egui::Context, link: DeepLink) {
+        match link {
+            DeepLink::Addon(url) => (self.tab, self.addon_url) = (Tab::Addons, url.into()),
+            DeepLink::Detail { kind, id, video } => {
+                self.tab = Tab::Home;
+                let meta = MetaPreview { name: id.clone(), id, kind, poster: None, background: None, description: None };
+                // Only an episode link opens a stream picker; `(id, None)` would autoplay the next episode.
+                let pending = video.filter(|_| meta.kind == "series").map(|v| (meta.id.clone(), Some(v)));
+                self.open_meta(ctx, meta, false);
+                self.pending = pending;
+            }
+        }
     }
 
     /// Continue Watching card: the title's page with its stream picker (for a series, the episode's).
@@ -2978,7 +3029,31 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result {
-    let mut app = App::new(data_dir()).expect("failed to initialise app data");
+    // Only links count: macOS Finder adds `-psn_…`. A launch without one just focuses the open window.
+    let arg = std::env::args_os().nth(1).and_then(|a| a.into_string().ok()).filter(|a| a.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("stremio://")));
+    let dir = data_dir();
+    if instance::forward(&dir, arg.as_deref().unwrap_or("")) {
+        return Ok(());
+    }
+    let mut app = App::new(dir.clone()).expect("failed to initialise app data");
+    let ctx_cell: Arc<std::sync::OnceLock<egui::Context>> = Default::default();
+    let sink = {
+        let (tx, cell) = (app.tx.clone(), ctx_cell.clone());
+        move |link: String| {
+            let _ = tx.send(Msg::Link(link));
+            if let Some(c) = cell.get() {
+                c.request_repaint();
+            }
+        }
+    };
+    if let Some(a) = arg {
+        sink(a);
+    }
+    if let Err(e) = instance::listen(&dir, sink.clone()) {
+        eprintln!("error: links from later launches won't reach this window: {e}");
+    }
+    #[cfg(windows)]
+    std::thread::spawn(instance::register_scheme);
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 700.0])
@@ -2987,40 +3062,102 @@ fn main() -> eframe::Result {
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("bundled icon is a valid PNG")),
         ..Default::default()
     };
-    eframe::run_native(
-        "Stremflix-rs",
-        opts,
-        Box::new(|cc| {
-            egui_extras::install_image_loaders(&cc.egui_ctx);
-            install_fonts(&cc.egui_ctx);
-            let mut v = egui::Visuals::dark();
-            v.panel_fill = Color32::from_rgb(20, 20, 20);
-            v.window_fill = v.panel_fill;
-            v.extreme_bg_color = Color32::from_gray(32);
-            v.selection.bg_fill = RED;
-            // Netflix-style flat buttons: no outline or grow on hover, gray that dims when hovered.
-            let w = &mut v.widgets;
-            for (st, gray) in [(&mut w.inactive, 82), (&mut w.hovered, 56), (&mut w.active, 45), (&mut w.open, 56)] {
-                (st.weak_bg_fill, st.bg_stroke, st.corner_radius, st.expansion) = (Color32::from_gray(gray), egui::Stroke::NONE, 4.into(), 0.0);
-                st.fg_stroke.color = Color32::WHITE;
+    let creator: eframe::AppCreator = Box::new(move |cc| {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+        install_fonts(&cc.egui_ctx);
+        let mut v = egui::Visuals::dark();
+        v.panel_fill = Color32::from_rgb(20, 20, 20);
+        v.window_fill = v.panel_fill;
+        v.extreme_bg_color = Color32::from_gray(32);
+        v.selection.bg_fill = RED;
+        // Netflix-style flat buttons: no outline or grow on hover, gray that dims when hovered.
+        let w = &mut v.widgets;
+        for (st, gray) in [(&mut w.inactive, 82), (&mut w.hovered, 56), (&mut w.active, 45), (&mut w.open, 56)] {
+            (st.weak_bg_fill, st.bg_stroke, st.corner_radius, st.expansion) = (Color32::from_gray(gray), egui::Stroke::NONE, 4.into(), 0.0);
+            st.fg_stroke.color = Color32::WHITE;
+        }
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
+        cc.egui_ctx.set_visuals_of(egui::Theme::Dark, v);
+        cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| s.spacing.button_padding = vec2(14.0, 6.0));
+        app.gl_proc = cc.get_proc_address.clone();
+        app.build_rows(&cc.egui_ctx);
+        app.fetch_recent_posters(&cc.egui_ctx);
+        let client = app.client.clone();
+        // A failed check (offline, rate limit) only logs: it shouldn't show as an error.
+        app.spawn(&cc.egui_ctx, async move {
+            Ok(Msg::Update(client.check_update().await.unwrap_or_else(|e| {
+                eprintln!("update check: {e:#}");
+                None
+            })))
+        });
+        let _ = ctx_cell.set(cc.egui_ctx.clone());
+        Ok(Box::new(app))
+    });
+    #[cfg(not(target_os = "macos"))]
+    return eframe::run_native("Stremflix-rs", opts, creator);
+    // macOS sends links as Apple events, not arguments; the hook must exist before the loop runs.
+    #[cfg(target_os = "macos")]
+    {
+        let event_loop = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build()?;
+        mac_links::install(Box::new(sink));
+        let mut winit_app = eframe::create_native("Stremflix-rs", opts, creator, &event_loop);
+        event_loop.run_app(&mut winit_app)?;
+        // run_native exits the process here; don't wait on the runtime and torrent threads.
+        std::process::exit(0)
+    }
+}
+
+/// Adds `application:openURLs:` to winit's app delegate (winit 0.30 installs its own and exposes no URL events).
+#[cfg(target_os = "macos")]
+mod mac_links {
+    use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
+    use objc2::{msg_send, sel};
+    use std::ffi::{CStr, c_char};
+    use std::sync::OnceLock;
+
+    static SINK: OnceLock<Box<dyn Fn(String) + Send + Sync>> = OnceLock::new();
+
+    type OpenUrls = extern "C-unwind" fn(&AnyObject, Sel, &AnyObject, &AnyObject);
+
+    extern "C-unwind" fn open_urls(_this: &AnyObject, _cmd: Sel, _app: &AnyObject, urls: &AnyObject) {
+        let Some(sink) = SINK.get() else { return };
+        // SAFETY: AppKit passes an NSArray<NSURL>; nil replies read as 0 / null.
+        unsafe {
+            let n: usize = msg_send![urls, count];
+            for i in 0..n {
+                let url: *mut AnyObject = msg_send![urls, objectAtIndex: i];
+                let s: *mut AnyObject = msg_send![url, absoluteString];
+                let p: *const c_char = msg_send![s, UTF8String];
+                if !p.is_null() {
+                    sink(CStr::from_ptr(p).to_string_lossy().into_owned());
+                }
             }
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
-            cc.egui_ctx.set_visuals_of(egui::Theme::Dark, v);
-            cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| s.spacing.button_padding = vec2(14.0, 6.0));
-            app.gl_proc = cc.get_proc_address.clone();
-            app.build_rows(&cc.egui_ctx);
-            app.fetch_recent_posters(&cc.egui_ctx);
-            let client = app.client.clone();
-            // A failed check (offline, rate limit) only logs: it shouldn't show as an error.
-            app.spawn(&cc.egui_ctx, async move {
-                Ok(Msg::Update(client.check_update().await.unwrap_or_else(|e| {
-                    eprintln!("update check: {e:#}");
-                    None
-                })))
-            });
-            Ok(Box::new(app))
-        }),
-    )
+        }
+    }
+
+    /// Call after the event loop is built (winit registers its delegate class then) and before it runs.
+    pub fn install(sink: Box<dyn Fn(String) + Send + Sync>) {
+        let _ = SINK.set(sink);
+        let Some(cls) = AnyClass::get(c"WinitApplicationDelegate") else {
+            return eprintln!("error: stremio:// links unavailable: winit's app delegate not found");
+        };
+        // SAFETY: the signature matches the "v@:@@" encoding of -application:openURLs:.
+        let added = unsafe {
+            let imp = std::mem::transmute::<OpenUrls, Imp>(open_urls);
+            objc2::ffi::class_addMethod(std::ptr::from_ref(cls).cast_mut(), sel!(application:openURLs:), imp, c"v@:@@".as_ptr())
+        };
+        if !added.as_bool() {
+            return eprintln!("error: stremio:// links unavailable: delegate already has application:openURLs:");
+        }
+        // AppKit can cache which selectors a delegate answers when it is set: set it again so the new one counts.
+        // SAFETY: plain messages to the shared NSApplication on the main thread.
+        unsafe {
+            let app: *mut AnyObject = msg_send![objc2::class!(NSApplication), sharedApplication];
+            let delegate: *mut AnyObject = msg_send![app, delegate];
+            let () = msg_send![app, setDelegate: std::ptr::null_mut::<AnyObject>()];
+            let () = msg_send![app, setDelegate: delegate];
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3196,6 +3333,39 @@ mod tests {
         app.handle(&ctx, Msg::Installed(u("b2"), m.clone(), Some(u("b"))));
         assert_eq!(order(&app), [u("a"), u("b2"), u("c")], "reconfigured addon takes the old place");
         assert_eq!(app.db.addons().unwrap().into_iter().map(|(x, _)| x).collect::<Vec<_>>(), order(&app), "saved");
+    }
+
+    #[test]
+    fn deep_link_title_gets_its_name_in_either_order() {
+        let ctx = egui::Context::default();
+        let meta = |id: &str| stremflix_rs::addon::parse_meta(format!(r#"{{"meta":{{"id":"{id}","type":"movie","name":"Name {id}","description":"About {id}"}}}}"#).as_bytes()).unwrap();
+        let name = |app: &App| app.selected.as_ref().map(|(m, ..)| m.name.clone());
+        let preview = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
+        // Details first, then streams.
+        let (_d, mut app) = test_app();
+        app.nav = 1;
+        app.details_want = ("movie".into(), "tt1".into());
+        app.handle(&ctx, Msg::Details(meta("tt1")));
+        app.handle(&ctx, Msg::Streams(preview("tt1"), None, vec![], vec![], Autoplay::Off, None, 1));
+        assert_eq!(name(&app).as_deref(), Some("Name tt1"));
+        // Streams first, then details; details of another title never rename the selection.
+        let (_d, mut app) = test_app();
+        app.nav = 1;
+        app.handle(&ctx, Msg::Streams(preview("tt1"), None, vec![], vec![], Autoplay::Off, None, 1));
+        app.details_want = ("movie".into(), "tt2".into());
+        app.handle(&ctx, Msg::Details(meta("tt2")));
+        assert_eq!(name(&app).as_deref(), Some("tt1"));
+        app.details_want = ("movie".into(), "tt1".into());
+        app.handle(&ctx, Msg::Details(meta("tt1")));
+        assert_eq!(name(&app).as_deref(), Some("Name tt1"));
+        assert_eq!(app.selected.as_ref().unwrap().0.description.as_deref(), Some("About tt1"));
+    }
+
+    #[test]
+    fn link_message_prefills_addon_url() {
+        let (_d, mut app) = test_app();
+        app.handle(&egui::Context::default(), Msg::Link("stremio://example.com/manifest.json".into()));
+        assert!(app.tab == Tab::Addons && app.addon_url == "https://example.com/manifest.json");
     }
 
     #[test]

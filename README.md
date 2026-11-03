@@ -67,6 +67,18 @@ Environment variables:
 | `STREMFLIX_RS_IPC` | mpv IPC endpoint. Default: `$TMPDIR/stremflix-rs-mpv.sock` on Unix, `\\.\pipe\stremflix-rs-mpv` on Windows |
 | `STREMFLIX_RS_NO_DHT` | Set to disable the BitTorrent DHT (offline/CI use) |
 
+### `stremio://` links
+
+The app takes a `stremio://` link as its first argument. `stremio://<host>/…/manifest.json` opens **Addons** with the manifest URL filled in (https, or http for localhost), and you confirm with **Install**. `stremio:///detail/<type>/<id>[/<episode id>]` opens the title's page, or the episode's stream picker. A link opened while the app runs goes to the open window, which comes to the front. Registration:
+
+- **Linux:** the AppImage's desktop entry declares the `stremio` scheme. AppImageLauncher or appimaged installs it.
+- **macOS:** `Stremflix-rs.app` declares it. macOS picks it up once the app is in Applications or has been opened once.
+- **Windows:** the app registers itself for the current user at start, unless another app (such as Stremio) already handles `stremio://`.
+
+```sh
+stremflix-rs 'stremio:///detail/movie/tt0111161'
+```
+
 ### Import from Stremio
 
 **Addons → Import from Stremio** copies your installed addons, watched movies and episodes, and in-progress titles from a local Stremio install. Watched titles appear in **Watch It Again**, and progress appears in **Continue Watching**. Leave the path empty to auto-detect, or point it at a Stremio data folder. The app reads Stremio's files from a temp copy and never changes them. You can re-import safely: newer local progress is kept.
@@ -135,8 +147,8 @@ Release archives are named `stremflix-rs-<tag>-<target>` and published on GitHub
 |---|---|
 | `linux-x86_64` | `.tar.gz` (needs system libmpv), `.AppImage` (bundles libmpv) |
 | `linux-arm64` | `.tar.gz` (needs system libmpv), `.AppImage` (bundles libmpv) |
-| `macos-arm64` | `.tar.gz` |
-| `macos-x86_64` | `.tar.gz` |
+| `macos-arm64` | `.tar.gz` with `Stremflix-rs.app` |
+| `macos-x86_64` | `.tar.gz` with `Stremflix-rs.app` |
 | `windows-x86_64` | `.zip` (includes `libmpv-2.dll`) |
 
 A nightly build runs every 3 hours and is skipped when `main` has no new commits. Tagged releases come from a manual workflow run.

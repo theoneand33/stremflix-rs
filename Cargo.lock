@@ -5211,6 +5211,8 @@ dependencies = [
  "libloading",
  "librqbit",
  "librqbit-dualstack-sockets",
+ "objc2 0.6.5",
+ "percent-encoding",
  "reqwest",
  "rusqlite",
  "rusty-leveldb",
@@ -5221,6 +5223,7 @@ dependencies = [
  "tokio",
  "url",
  "walkdir",
+ "winit",
 ]
 
 [[package]]
