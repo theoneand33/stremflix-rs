@@ -51,7 +51,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: '[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "invalid version: $VERSION"; exit 1; }'
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: samypr100/setup-dev-drive@v4
         if: runner.os == 'Windows'
         with:
@@ -80,7 +80,7 @@ jobs:
             echo EOF
           } >> "$GITHUB_OUTPUT"
           echo "LIBRARY_PATH=$prefix/opt/mpv/lib" >> "$GITHUB_ENV"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: brew-cache
         if: runner.os == 'macOS'
         with:
@@ -146,7 +146,7 @@ jobs:
           cp assets/icon.png "$RUNNER_TEMP/stremflix-rs.png"
           # bundles libmpv and its deps; glibc, GL and other host libs stay on the excludelist
           "$ld" --appdir AppDir -e target/release/stremflix-rs -d "$RUNNER_TEMP/stremflix-rs.desktop" -i "$RUNNER_TEMP/stremflix-rs.png" --output appimage
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -160,7 +160,7 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       - name: Create release
