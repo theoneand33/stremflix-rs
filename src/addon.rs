@@ -634,7 +634,7 @@ pub fn discover_path(kind: &str, id: &str, genre: Option<&str>) -> String {
 #[derive(Clone)]
 pub struct AddonClient {
     /// Built on first request, off the UI thread: building it loads the system TLS roots (~4 ms at startup).
-    http: std::sync::Arc<std::sync::OnceLock<reqwest::Client>>,
+    http: std::sync::Arc<std::sync::OnceLock<Result<reqwest::Client, String>>>,
 }
 
 impl Default for AddonClient {
@@ -648,18 +648,19 @@ impl AddonClient {
         Self { http: Default::default() }
     }
 
-    fn http(&self) -> &reqwest::Client {
-        self.http.get_or_init(|| {
+    fn http(&self) -> Result<&reqwest::Client> {
+        let http = self.http.get_or_init(|| {
             reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::limited(3))
                 .build()
-                .expect("reqwest client")
-        })
+                .map_err(|e| format!("HTTP client: {e}"))
+        });
+        http.as_ref().map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     async fn get(&self, url: Url) -> Result<Vec<u8>> {
-        let mut resp = self.http().get(url.clone()).send().await.with_context(|| format!("GET {url}"))?;
+        let mut resp = self.http()?.get(url.clone()).send().await.with_context(|| format!("GET {url}"))?;
         ensure!(resp.status().is_success(), "GET {url}: HTTP {}", resp.status());
         ensure!(resp.content_length().unwrap_or(0) <= MAX_BODY as u64, "response too large");
         let mut body = Vec::new();

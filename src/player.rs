@@ -93,7 +93,7 @@ const MPV_LIBS: &[&str] = if cfg!(windows) {
 
 static MPV: std::sync::OnceLock<Result<Mpv, String>> = std::sync::OnceLock::new();
 
-/// Loads libmpv once; later calls return the same result. Call it early on a background thread so the first play doesn't wait.
+/// Loads libmpv once; later calls return the same result (a missing libmpv needs an app restart once installed). Call it early on a background thread so the first play doesn't wait.
 pub fn load_mpv() -> Result<(), String> {
     MPV.get_or_init(|| {
         let mut errs = Vec::new();
