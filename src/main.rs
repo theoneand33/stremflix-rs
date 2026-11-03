@@ -1819,8 +1819,10 @@ impl App {
         // Press and hold the video for 2x speed; the release restores 1x and is not a click.
         let was_fast = p.fast;
         // Primary button only; losing focus ends the hold in case the release went to another window.
-        let down = bg.is_pointer_button_down_on() && ctx.input(|i| i.pointer.primary_down() && i.focused);
-        p.fast = down && ctx.input(|i| i.pointer.press_start_time().is_some_and(|t| now - t >= 0.5));
+        let down = ctx.input(|i| i.pointer.primary_down() && i.focused);
+        // egui drops the press from `bg` after 0.8 s or 6 px (no longer a click), so it only arms; the button then holds it.
+        let armed = bg.is_pointer_button_down_on() && ctx.input(|i| i.pointer.press_start_time().is_some_and(|t| now - t >= 0.5));
+        p.fast = down && (was_fast || armed);
         if p.fast != was_fast {
             // Multiply, not set, so the speed in effect before the hold comes back.
             cmd(&["multiply", "speed", if p.fast { "2" } else { "0.5" }]);
