@@ -1899,7 +1899,9 @@ impl App {
                     (Some(s), Some(e)) => format!("{title} (S{s}E{e})"),
                     _ => title,
                 };
-                let url = (v.thumbnail.clone()).or_else(|| m.background.clone()).or_else(|| self.selected_details()?.background.clone()).or_else(|| m.poster.clone());
+                // First source whose fetch hasn't failed (failed ones are cached as empty bytes).
+                let failed = |u: &String| matches!(self.posters.get(u), Some(Some(b)) if b.is_empty());
+                let url = [v.thumbnail.clone(), m.background.clone(), self.selected_details().and_then(|d| d.background.clone()), m.poster.clone()].into_iter().flatten().find(|u| !failed(u));
                 (m.name.clone(), label, self.image(&url, &mut want))
             });
         for u in want {
@@ -2251,7 +2253,7 @@ impl App {
                 // Swallows clicks on the card so they don't pause the video; the buttons, registered later, win.
                 let _ = ui.interact(card, ui.scope_id().with("up_next_card"), Sense::CLICK);
                 paint.rect_filled(card, 12, Color32::from_rgb(22, 22, 26));
-                // The buttons need 316 px; the still takes the rest (none when narrow).
+                // The buttons need 316 px; the still takes the rest (14 px at the narrowest).
                 let thumb = egui::Rect::from_min_size(card.min, vec2((size.x - 316.0).clamp(0.0, size.y * 1.05), size.y));
                 let left = egui::CornerRadius { nw: 12, sw: 12, ne: 0, se: 0 };
                 paint.rect_filled(thumb, left, Color32::from_gray(40));
