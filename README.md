@@ -13,7 +13,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design: egui UI, libmpv playback,
 - Rust 1.85 or newer (edition 2024)
 - libmpv (`libmpv.so.2` and headers, for example `pacman -S mpv` or `apt install libmpv-dev`), linked for the built-in player
 - `ffmpeg`, only needed to generate demo media
-- Linux, macOS, or Windows. Release archives cover `linux-x86_64`, `macos-arm64`, and `windows-x86_64`.
+- `yt-dlp` on `PATH`, only needed for YouTube (`ytId`) streams
+- Linux, macOS, or Windows. Release archives cover `linux-x86_64`, `linux-arm64`, `macos-arm64`, `macos-x86_64`, and `windows-x86_64`.
 
 The Windows release zip includes `libmpv-2.dll`. To build from source on Windows, you need an MSVC build of libmpv. The Windows step in `.github/workflows/release.yml` shows the pinned build that releases use.
 
@@ -21,7 +22,15 @@ The Windows release zip includes `libmpv-2.dll`. To build from source on Windows
 
 Playback runs inside the app window. The controls fade after 3 s without input.
 
-Click the video or press Space or K to pause. Press ←/→ to skip 10 s, ↑/↓ for volume, and M to mute. Press F or double-click for full screen. Press Esc to leave full screen or go back. 💬 opens the Audio & Subtitles panel.
+Click the video or press Space or K to pause. Press ←/→ to skip 10 s, ↑/↓ for volume, and M to mute. Press F or double-click for full screen. Press Esc to leave full screen or go back. 💬 opens the Audio & Subtitles panel. Its Playback column sets the speed, toggles hardware decoding, and opens the stream in an external player (set the command in **Settings**; the app pauses its own player).
+
+## Addons and streams
+
+**Addons** lists installed addons in priority order. **Up** and **Down** change it: the stream list and Home rows follow it. **Details** shows an addon's id, types, resources, and catalogs. The stream list groups streams under the addon that sent them. `externalUrl` streams open in your browser, and `ytId` streams play through yt-dlp.
+
+## Torrents
+
+Play a magnet or a local `.torrent` file from **Library → Torrent**, drop a `.torrent` file on the window, or paste a magnet with no text field focused. Window systems don't pass dropped text to apps, so dragging a magnet link doesn't work. **Settings** sets the torrent folder, a cache size (stopped torrents stay on disk up to it, and are cleared at the next start), and a connection profile (Soft: 40 peers per torrent, Default: 128, Fast: 300).
 
 ## Series
 
@@ -53,7 +62,7 @@ Environment variables:
 
 | Variable | Purpose |
 |---|---|
-| `STREMFLIX_RS_DATA` | Data directory for the DB and torrent downloads. A torrent and its files are deleted when playback stops, and leftovers are cleared at the next start. Default: `$XDG_DATA_HOME/stremflix-rs`, or `%APPDATA%\stremflix-rs` on Windows. Without `XDG_DATA_HOME`, Unix uses `~/.local/share/stremflix-rs`. |
+| `STREMFLIX_RS_DATA` | Data directory for the DB and torrent downloads. With no torrent cache (the default), a torrent and its files are deleted when playback stops. Leftovers are cleared at the next start. Default: `$XDG_DATA_HOME/stremflix-rs`, or `%APPDATA%\stremflix-rs` on Windows. Without `XDG_DATA_HOME`, Unix uses `~/.local/share/stremflix-rs`. |
 | `STREMFLIX_RS_MPV_ARGS` | Extra mpv options, e.g. `--ao=null` for headless runs |
 | `STREMFLIX_RS_IPC` | mpv IPC endpoint. Default: `$TMPDIR/stremflix-rs-mpv.sock` on Unix, `\\.\pipe\stremflix-rs-mpv` on Windows |
 | `STREMFLIX_RS_NO_DHT` | Set to disable the BitTorrent DHT (offline/CI use) |
@@ -105,7 +114,7 @@ The tests cover:
    STREMFLIX_RS_DATA=/tmp/stremflix-rs-demo STREMFLIX_RS_NO_DHT=1 cargo run --bin stremflix-rs
    ```
 4. **Install an addon and play from it.** Open **Addons**, enter `http://127.0.0.1:7070/manifest.json`, and click **Install**. Open **Home**, click the **Test Pattern** card in the **Test Addon - Test Movies** row, then click **Play: Test Addon - Test pattern (HTTP)**. The built-in player opens with the test subtitle loaded.
-5. **Play a torrent.** On **Home**, click **Play: Test Addon - Test pattern (torrent)**. You can also open **Library**, paste the printed magnet into **Magnet link**, and click **Play magnet**. librqbit downloads the file from the local seeder and streams it to the player over `http://127.0.0.1:<port>/torrents/<id>/stream/<file>`.
+5. **Play a torrent.** On **Home**, click **Play: Test Addon - Test pattern (torrent)**. You can also open **Library**, paste the printed magnet into **Torrent**, and click **Play torrent**. librqbit downloads the file from the local seeder and streams it to the player over `http://127.0.0.1:<port>/torrents/<id>/stream/<file>`.
 6. **Play a local file.** Open **Library**, enter the absolute path of `demo-media/library`, click **Add folder**, then click **Play test-pattern-local**.
 7. **Check that progress persists.** Let a video play for a while, then close the app. Restart it with the same command. The **Continue Watching** row on **Home** shows the item at its saved position. Click the card to resume there.
 

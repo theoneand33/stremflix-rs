@@ -74,6 +74,8 @@ impl Db {
         )?;
         // Migrate databases created before posters were stored; fails harmlessly if the column exists.
         let _ = conn.execute("ALTER TABLE progress ADD COLUMN poster TEXT", []);
+        // Addon priority (streams and catalogs follow it); older rows share 0 and keep install order.
+        let _ = conn.execute("ALTER TABLE addons ADD COLUMN position INTEGER NOT NULL DEFAULT 0", []);
         Ok(Self { conn })
     }
 
@@ -87,7 +89,7 @@ impl Db {
 
     pub fn add_addon(&self, transport_url: &str, manifest: &Manifest) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO addons (transport_url, manifest) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO addons (transport_url, manifest, position) VALUES (?1, ?2, (SELECT coalesce(max(position), 0) + 1 FROM addons))",
             params![transport_url, serde_json::to_string(manifest)?],
         )?;
         Ok(())
@@ -98,9 +100,19 @@ impl Db {
         Ok(())
     }
 
-    /// Installed addons; stored manifests are re-validated and corrupt rows skipped.
+    /// Store `urls` (installed addon transport URLs) as the addon priority order, first = highest.
+    pub fn reorder_addons(&self, urls: &[String]) -> Result<()> {
+        self.transaction(|| {
+            for (i, u) in urls.iter().enumerate() {
+                self.conn.execute("UPDATE addons SET position = ?2 WHERE transport_url = ?1", params![u, i as i64])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Installed addons in priority order; stored manifests are re-validated and corrupt rows skipped.
     pub fn addons(&self) -> Result<Vec<(String, Manifest)>> {
-        let mut st = self.conn.prepare("SELECT transport_url, manifest FROM addons ORDER BY installed_at, transport_url")?;
+        let mut st = self.conn.prepare("SELECT transport_url, manifest FROM addons ORDER BY position, installed_at, transport_url")?;
         let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         Ok(rows.filter_map(|r| r.ok()).filter_map(|(u, m)| Some((u, parse_manifest(m.as_bytes()).ok()?))).collect())
     }

@@ -28,7 +28,7 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 ## Protocol notes
 
 - An addon is identified by its transport URL ending in `/manifest.json`. Resources are fetched from `<base>/<resource>/<type>/<id>.json`, with type and id percent-encoded.
-- Streams: `url` (http/https or `magnet:`) or `infoHash` + `fileIdx` + `sources`. `tracker:<url>` sources become `&tr=` in the magnet. `peer:<host:port>` is a **local extension** (becomes `x.pe=`) that the test addon uses to point at its seeder without a tracker or DHT. `externalUrl`/`ytId` streams are ignored.
+- Streams: `url` (http/https or `magnet:`) or `infoHash` + `fileIdx` + `sources`. `tracker:<url>` sources become `&tr=` in the magnet. `peer:<host:port>` is a **local extension** (becomes `x.pe=`) that the test addon uses to point at its seeder without a tracker or DHT. An http(s) `externalUrl` opens in the browser. A `ytId` (11 characters of `[A-Za-z0-9_-]`) becomes `https://www.youtube.com/watch?v=<id>`.
 - `fileIdx` is carried through saved progress as BEP 53 `&so=<idx>`.
 - Series: `meta.videos` gives the episode list and streams are requested with the episode id (`tt…:S:E`), so each episode resumes on its own. `behaviorHints.bingeGroup` marks streams from the same source, and the player autoplays the next episode from the same group.
 - Search uses the catalog `search` extra (`<base>/catalog/<type>/<id>/search=<query>.json`) and only targets catalogs whose required extras are satisfied.
@@ -39,7 +39,7 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 - Parsers never panic. Structurally invalid responses are errors. Individually invalid catalog, stream, or subtitle entries are dropped.
 - Text has control and bidi-override characters stripped, and lengths are capped. egui renders plain text only, so markup cannot inject anything.
 - URLs must be `http`/`https` with a host. `file:`, `javascript:`, `data:`, and similar schemes are rejected. Info hashes must be 40 hex characters. Ids may not contain `/` or control characters.
-- The media source is passed to mpv as a `loadfile` argument, so it can never be read as an option. `--no-ytdl` stops mpv from running youtube-dl on addon URLs.
+- The media source is passed to mpv as a `loadfile` argument, so it can never be read as an option. `ytdl` is off except when the source is exactly the YouTube URL built from a valid `ytId`, so mpv never runs yt-dlp on other addon URLs.
 
 ## Persistence
 

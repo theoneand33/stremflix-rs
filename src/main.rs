@@ -8,13 +8,14 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
-use stremflix_rs::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash};
+use anyhow::Context;
+use stremflix_rs::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
 use stremflix_rs::db::{Db, Progress, SavedTitle, Watched};
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{GlProc, Player, SUB_COLORS, SubStyle, valid_langs};
+use stremflix_rs::player::{GlProc, Player, SPEEDS, SUB_COLORS, SubStyle, hwdec_value, valid_langs};
 use stremflix_rs::stremio_import::{self, Import};
-use stremflix_rs::torrent::TorrentEngine;
+use stremflix_rs::torrent::{Profile, TorrentEngine};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -22,6 +23,25 @@ enum Tab {
     Discover,
     Addons,
     Library,
+    Settings,
+}
+
+/// Torrent cache size choices: label and bytes kept (0 = delete a torrent when its playback stops).
+const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000), ("5 GB", 5_000_000_000), ("10 GB", 10_000_000_000), ("Unlimited", u64::MAX)];
+
+/// A local `.torrent` file path (not a URL or magnet).
+fn is_torrent_file(s: &str) -> bool {
+    !s.contains("://") && !s.starts_with("magnet:") && std::path::Path::new(s).extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+}
+
+/// Start `command` (program and its arguments, split on whitespace) with `url` as the last argument. No shell is involved.
+fn open_external(command: &str, url: &str) -> anyhow::Result<()> {
+    let mut words = command.split_whitespace();
+    let prog = words.next().context("set an external player in Settings")?;
+    let mut child = std::process::Command::new(prog).args(words).arg(url).spawn().with_context(|| format!("start {prog}"))?;
+    // Reap it when it exits, so it never lingers as a zombie.
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 /// Addon subtitles as (url, lang).
@@ -321,7 +341,8 @@ fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream) -> egui::Response {
     let stem = s.hints.filename.as_deref().map(|f| f.rsplit_once('.').map_or(f, |x| x.0)).filter(|f| !f.is_empty());
     let described = stem.is_some_and(|f| parts.iter().any(|p| p.contains(f)));
     let file = if described { String::new() } else { [s.hints.filename.clone(), s.hints.video_size.map(fmt_size)].into_iter().flatten().collect::<Vec<_>>().join("  ·  ") };
-    let details: Vec<&str> = parts.into_iter().chain(Some(file.as_str()).filter(|f| !f.is_empty())).collect();
+    let external = (s.target().is_none()).then_some("Opens in your browser");
+    let details: Vec<&str> = parts.into_iter().chain(Some(file.as_str()).filter(|f| !f.is_empty())).chain(external).collect();
     list_row(ui, n, head, details.join("\n"), 0.0)
 }
 
@@ -462,6 +483,8 @@ struct Playing {
     key: String,
     title: String,
     source: String,
+    /// What mpv opened: `source`, or the local torrent stream URL.
+    url: String,
     /// Torrent being streamed, if any.
     torrent: Option<usize>,
     pos: f64,
@@ -528,6 +551,16 @@ struct App {
     watched_keys: std::collections::HashSet<String>,
     /// Stremio data path to import from; empty = auto-detect.
     import_path: String,
+    /// Addon whose details are shown in the Addons tab.
+    addon_details: Option<String>,
+    /// Torrent download folder as edited (empty = in the data directory); saved when valid.
+    torrent_dir: String,
+    torrent_cache: u64,
+    torrent_profile: Profile,
+    /// External player command, e.g. `vlc` or `mpv --fs`.
+    external_player: String,
+    /// mpv hardware decoding.
+    hwdec: bool,
     /// Last error, shown in a dismissible red line until cleared.
     error: Option<String>,
     /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
@@ -579,6 +612,12 @@ impl App {
             watched: db.watched(50)?,
             watched_keys: db.watched_keys()?,
             import_path: String::new(),
+            addon_details: None,
+            torrent_dir: db.setting("torrent_dir")?.unwrap_or_default(),
+            torrent_cache: db.setting("torrent_cache")?.and_then(|v| v.parse().ok()).unwrap_or(0),
+            torrent_profile: Profile::from_label(&db.setting("torrent_profile")?.unwrap_or_default()),
+            external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
+            hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             error: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
@@ -631,20 +670,38 @@ impl App {
     fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
         self.nav += 1;
         let nav = self.nav;
-        if !source.starts_with("magnet:") {
+        if !source.starts_with("magnet:") && !is_torrent_file(&source) {
             let _ = self.tx.send(Msg::Play(key, title, source.clone(), source, subs, None, nav));
             return;
         }
-        let (cell, dir) = (self.torrent.clone(), self.data_dir.join("torrents"));
+        // A chosen folder gets its own subfolder: the engine clears its folder at start.
+        let dir = match self.db.setting("torrent_dir").ok().flatten().filter(|d| !d.is_empty()) {
+            Some(d) => PathBuf::from(d).join("stremflix-rs-torrents"),
+            None => self.data_dir.join("torrents"),
+        };
+        let (cell, cache, profile) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile);
         let dht = std::env::var_os("STREMFLIX_RS_NO_DHT").is_none();
         self.spawn(ctx, async move {
-            let engine = cell.get_or_try_init(|| TorrentEngine::start(dir, dht)).await?;
+            let engine = cell.get_or_try_init(|| TorrentEngine::start(dir, dht, cache, profile)).await?;
             let (url, id) = engine.stream_url(&source, None).await?;
             Ok(Msg::Play(key, title, source, url, subs, Some(id), nav))
         });
     }
 
-    /// Delete every torrent but `keep`, so none keeps downloading and seeding. Runs on the UI thread,
+    /// Play a magnet link or a local `.torrent` file (typed, pasted or dropped).
+    fn play_torrent(&mut self, ctx: &egui::Context, input: &str) {
+        let input = input.trim();
+        if is_torrent_file(input) {
+            let name = std::path::Path::new(input).file_stem().map_or("Torrent".into(), |n| n.to_string_lossy().into_owned());
+            return self.play(ctx, format!("file:{input}"), name, input.into(), vec![]);
+        }
+        match parse_magnet_hash(input) {
+            Some(h) => self.play(ctx, format!("btih:{h}"), format!("Torrent {}", &h[..8]), input.into(), vec![]),
+            None => report(&mut self.error, "not a magnet link or .torrent file"),
+        }
+    }
+
+    /// Stop every torrent but `keep`, so none keeps downloading and seeding. Runs on the UI thread,
     /// so it always finishes before a later `play` adds the next torrent.
     fn release_torrents(&self, keep: Option<usize>) {
         if let Some(engine) = self.torrent.get() {
@@ -859,10 +916,10 @@ impl App {
                     let _ = self.db.set_setting(&format!("series:{key}"), &m.id);
                     let _ = self.db.set_setting(&format!("binge:{}:{}", m.kind, m.id), &group.unwrap_or_default());
                 }
-                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], &headers, gl_proc, Box::new(move || wake.request_repaint())) {
+                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
-                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1235,6 +1292,7 @@ impl App {
         let client = self.client.clone();
         let id = episode.as_ref().map_or(meta.id.clone(), |v| v.id.clone());
         let stream_addons = self.addons_for("stream", &meta.kind, &id);
+        let names: Vec<String> = stream_addons.iter().map(|u| self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default()).collect();
         let sub_addons = self.addons_for("subtitles", &meta.kind, &id);
         self.nav += 1;
         let nav = self.nav;
@@ -1250,9 +1308,10 @@ impl App {
                 async move { c.subtitles(&u, &k, &i).await }
             };
             let (stream_res, sub_res) = tokio::join!(concurrently(stream_addons, ask_streams), concurrently(sub_addons, ask_subs));
-            for res in stream_res {
+            // Addon priority order, so the picker groups streams by addon.
+            for (res, name) in stream_res.into_iter().zip(names) {
                 match res {
-                    Ok(s) => streams.extend(s),
+                    Ok(s) => streams.extend(s.into_iter().map(|s| Stream { addon: name.clone(), ..s })),
                     Err(e) => errors.push(format!("{e:#}")),
                 }
             }
@@ -1321,10 +1380,18 @@ impl App {
                 }
             });
             ui.add_space(8.0);
-            let playable = streams.iter().filter_map(|s| Some((s, s.source()?)));
-            for (i, (s, src)) in playable.enumerate() {
+            for (i, s) in streams.iter().enumerate() {
+                if (i == 0 || streams[i - 1].addon != s.addon) && !s.addon.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(&s.addon).size(17.0).family(bold()).color(Color32::from_gray(200)));
+                }
                 if stream_row(ui, i + 1, s).clicked() {
-                    play = Some((key.0.clone(), key.1.clone(), src, subs.clone()));
+                    match (s.source(), &s.external_url) {
+                        (Some(src), _) => play = Some((key.0.clone(), key.1.clone(), src, subs.clone())),
+                        // `external_url` is http(s) only (checked in `parse_streams`).
+                        (None, Some(u)) => ctx.open_url(egui::OpenUrl::new_tab(u)),
+                        (None, None) => {}
+                    }
                 }
             }
         }
@@ -1753,7 +1820,7 @@ impl App {
         let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         let mut cmds: Vec<Vec<String>> = Vec::new();
         let mut cmd = |a: &[&str]| cmds.push(a.iter().map(|s| s.to_string()).collect());
-        let (mut back, mut toggle_fs) = (false, false);
+        let (mut back, mut toggle_fs, mut external) = (false, false, false);
         let mut style = self.sub_style;
         ui.painter().rect_filled(rect, 0, Color32::BLACK);
 
@@ -2007,6 +2074,28 @@ impl App {
                                     }
                                 });
                             }
+                            ui.vertical(|ui| {
+                                ui.set_min_width(200.0);
+                                ui.label(RichText::new("Playback").size(20.0).family(bold()).color(Color32::WHITE));
+                                ui.add_space(8.0);
+                                ui.label(RichText::new("Speed").size(16.0).family(bold()).color(Color32::WHITE));
+                                ui.horizontal_wrapped(|ui| {
+                                    for sp in SPEEDS {
+                                        if ui.selectable_label((st.speed - sp).abs() < 0.01, format!("{sp}x")).clicked() {
+                                            cmd(&["set", "speed", &sp.to_string()]);
+                                        }
+                                    }
+                                });
+                                ui.add_space(8.0);
+                                if ui.checkbox(&mut self.hwdec, "Hardware decoding").changed() {
+                                    cmd(&["set", "hwdec", hwdec_value(self.hwdec)]);
+                                    if let Err(e) = self.db.set_setting("hwdec", if self.hwdec { "1" } else { "0" }) {
+                                        report(&mut self.error, format!("saving hwdec: {e:#}"));
+                                    }
+                                }
+                                ui.add_space(8.0);
+                                external = ui.button("Open in external player").on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
+                            });
                         });
                     });
                 });
@@ -2019,6 +2108,12 @@ impl App {
                 report(&mut self.error, e);
             }
             let _ = p.player.apply_sub_style(&style);
+        }
+        if external {
+            match open_external(&self.external_player, &p.url) {
+                Ok(()) => cmds.push(vec!["set".into(), "pause".into(), "yes".into()]),
+                Err(e) => report(&mut self.error, format!("{e:#}")),
+            }
         }
         for c in &cmds {
             let args: Vec<&str> = c.iter().map(String::as_str).collect();
@@ -2061,9 +2156,23 @@ impl App {
         let mut remove = None;
         let mut configure = None;
         let mut replace = None;
-        for (url, m) in &self.addons {
+        let mut swap = None;
+        let mut details = None;
+        let n = self.addons.len();
+        for (i, (url, m)) in self.addons.iter().enumerate() {
             ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
+                // Order is priority: streams and catalogs of higher addons come first.
+                if ui.add_enabled_ui(i > 0, |ui| small_button(ui, "Up")).inner.on_hover_text("Higher priority").clicked() {
+                    swap = Some(i - 1);
+                }
+                if ui.add_enabled_ui(i + 1 < n, |ui| small_button(ui, "Down")).inner.on_hover_text("Lower priority").clicked() {
+                    swap = Some(i);
+                }
                 ui.label(format!("{} {} ({})", m.name, m.version, url));
+                let open = self.addon_details.as_ref() == Some(url);
+                if small_button(ui, if open { "Hide details" } else { "Details" }).clicked() {
+                    details = Some((!open).then(|| url.clone()));
+                }
                 if m.behavior_hints.configurable && small_button(ui, "Configure").clicked() {
                     configure = Some(url.clone());
                 }
@@ -2073,6 +2182,9 @@ impl App {
             });
             if m.behavior_hints.configuration_required {
                 ui.label(RichText::new("Needs configuration before use. Press Configure.").weak());
+            }
+            if self.addon_details.as_ref() == Some(url) {
+                Self::ui_addon_details(ui, m);
             }
             if let Some((old, pasted)) = self.configuring.as_mut().filter(|(o, _)| o == url)
                 && form_row(ui, "Configured URL:", pasted, "https://.../manifest.json", "Replace", None, false)
@@ -2096,10 +2208,99 @@ impl App {
                 Err(e) => report(&mut self.error, e),
             }
         }
+        if let Some(d) = details {
+            self.addon_details = d;
+        }
+        if let Some(i) = swap {
+            self.addons.swap(i, i + 1);
+            let urls: Vec<String> = self.addons.iter().map(|(u, _)| u.clone()).collect();
+            if let Err(e) = self.db.reorder_addons(&urls) {
+                report(&mut self.error, format!("saving addon order: {e:#}"));
+            }
+            self.build_rows(&ctx);
+        }
         if let Some(u) = remove {
             let _ = self.db.remove_addon(&u);
             self.addons.retain(|(x, _)| *x != u);
             self.build_rows(&ctx);
+        }
+    }
+
+    /// Manifest facts under an addon row: id, types, resources, catalogs, description.
+    fn ui_addon_details(ui: &mut egui::Ui, m: &Manifest) {
+        // Types and resource names are not sanitized at parse time; strip control and bidi characters here.
+        let list = |v: Vec<&str>| v.into_iter().map(|t| sanitize_text(t, 64)).collect::<Vec<_>>().join(", ");
+        let catalogs: Vec<&str> = m.catalogs.iter().map(|c| c.name.as_deref().unwrap_or(&c.id)).collect();
+        let gray = Color32::from_gray(170);
+        egui::Frame::new().inner_margin(egui::Margin { left: 24, top: 4, bottom: 8, right: 0 }).show(ui, |ui| {
+            let facts = [
+                ("ID", sanitize_text(&m.id, 300)),
+                ("Version", m.version.clone()),
+                ("Types", list(m.types.iter().map(String::as_str).collect())),
+                ("Resources", list(m.resources.iter().map(|r| r.name()).collect())),
+                ("Catalogs", list(catalogs)),
+            ];
+            for (name, v) in facts.into_iter().filter(|f| !f.1.is_empty()) {
+                ui.add(egui::Label::new(RichText::new(format!("{name}: {v}")).color(gray)).wrap());
+            }
+            if let Some(d) = &m.description {
+                ui.add(egui::Label::new(RichText::new(d).color(Color32::WHITE)).wrap());
+            }
+        });
+    }
+
+    /// Torrent engine and external player options; each is saved as soon as it changes.
+    fn ui_settings(&mut self, ui: &mut egui::Ui) {
+        let mut save: Vec<(&str, String)> = Vec::new();
+        ui.add_space(8.0);
+        ui.label(RichText::new("Torrents").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        let hint = self.data_dir.join("torrents").display().to_string();
+        if form_row(ui, "Cache location:", &mut self.torrent_dir, &hint, "Save", Some("Empty: the app's data folder"), true) {
+            let d = self.torrent_dir.trim().to_string();
+            // Relative paths would depend on the working directory.
+            if d.is_empty() || std::path::Path::new(&d).is_absolute() {
+                save.push(("torrent_dir", d));
+            } else {
+                report(&mut self.error, "cache location must be an absolute path");
+            }
+        }
+        ui.horizontal(|ui| {
+            let l = ui.label("Cache size:");
+            ui.add_space((150.0 - l.rect.width()).max(0.0));
+            let label = CACHE_SIZES.iter().find(|c| c.1 == self.torrent_cache).map_or("Custom", |c| c.0);
+            egui::ComboBox::from_id_salt("torrent_cache").selected_text(label).show_ui(ui, |ui| {
+                for (name, bytes) in CACHE_SIZES {
+                    if ui.selectable_value(&mut self.torrent_cache, bytes, name).changed() {
+                        save.push(("torrent_cache", bytes.to_string()));
+                    }
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            let l = ui.label("Connections:");
+            ui.add_space((150.0 - l.rect.width()).max(0.0));
+            egui::ComboBox::from_id_salt("torrent_profile").selected_text(self.torrent_profile.label()).show_ui(ui, |ui| {
+                for p in Profile::ALL {
+                    if ui.selectable_value(&mut self.torrent_profile, p, p.label()).changed() {
+                        save.push(("torrent_profile", p.label().into()));
+                    }
+                }
+            });
+        });
+        let note = "Stopped torrents stay on disk up to the cache size, and are cleared when the app starts.";
+        ui.label(RichText::new(note).size(13.0).color(Color32::from_gray(170)));
+        if self.torrent.get().is_some() {
+            ui.label(RichText::new("A torrent has already played: restart the app to apply changes.").size(13.0).color(Color32::from_gray(170)));
+        }
+        ui.add_space(16.0);
+        ui.label(RichText::new("Player").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        if form_row(ui, "External player:", &mut self.external_player, "vlc", "Save", Some("Command run with the stream URL; no shell"), true) {
+            save.push(("external_player", self.external_player.trim().to_string()));
+        }
+        for (k, v) in save {
+            if let Err(e) = self.db.set_setting(k, &v) {
+                report(&mut self.error, format!("saving {k}: {e:#}"));
+            }
         }
     }
 
@@ -2139,14 +2340,10 @@ impl App {
             self.quick_play(&ctx, m);
         }
         ui.separator();
-        if form_row(ui, "Magnet link:", &mut self.magnet, "magnet:?xt=urn:btih:...", "Play magnet", None, false) {
-            match parse_magnet_hash(self.magnet.trim()) {
-                Some(h) => {
-                    let m = self.magnet.trim().to_string();
-                    self.play(&ctx, format!("btih:{h}"), format!("Torrent {}", &h[..8]), m, vec![]);
-                }
-                None => report(&mut self.error, "invalid magnet link"),
-            }
+        let tip = "Or drop a .torrent file on the window, or paste a magnet anywhere";
+        if form_row(ui, "Torrent:", &mut self.magnet, "magnet:?xt=urn:btih:... or /path/to/file.torrent", "Play torrent", Some(tip), false) {
+            let m = self.magnet.clone();
+            self.play_torrent(&ctx, &m);
         }
         if form_row(ui, "Folder path:", &mut self.folder, "/path/to/videos", "Add folder", None, false) {
             let dir = PathBuf::from(self.folder.trim());
@@ -2185,6 +2382,16 @@ impl eframe::App for App {
         }
         self.poll_player(&ctx);
         ctx.request_repaint_after(Duration::from_millis(500));
+        // A dropped .torrent file, or a magnet pasted with no text field focused, plays at once.
+        // Window systems deliver dropped files only, not dropped text, so magnets come in by paste.
+        let (dropped, pasted) = ctx.input(|i| {
+            let file = i.raw.dropped_files.iter().filter_map(|f| f.path().to_str().map(String::from)).find(|p| is_torrent_file(p));
+            (file, i.events.iter().find_map(|e| if let egui::Event::Paste(t) = e { Some(t.trim().to_string()) } else { None }))
+        });
+        let pasted = pasted.filter(|t| t.starts_with("magnet:") && ctx.memory(|m| m.focused().is_none()));
+        if let Some(t) = dropped.or(pasted) {
+            self.play_torrent(&ctx, &t);
+        }
         if self.player.is_some() {
             self.ui_player(ui, frame);
             return;
@@ -2199,7 +2406,7 @@ impl eframe::App for App {
                 // Netflix nav: current tab is bold white on a dark gray pill that slides between tabs.
                 let pill_slot = ui.painter().add(egui::Shape::Noop);
                 let mut sel_rect = None;
-                for (tab, name) in [(Tab::Home, "Home"), (Tab::Discover, "Discover"), (Tab::Addons, "Addons"), (Tab::Library, "Library")] {
+                for (tab, name) in [(Tab::Home, "Home"), (Tab::Discover, "Discover"), (Tab::Addons, "Addons"), (Tab::Library, "Library"), (Tab::Settings, "Settings")] {
                     let text = RichText::new(name).size(15.0);
                     let text = if self.tab == tab { text.strong().family(bold()).color(Color32::WHITE) } else { text.color(Color32::from_gray(180)) };
                     // Width of the bold label, so selecting a tab doesn't shift the ones after it.
@@ -2221,7 +2428,7 @@ impl eframe::App for App {
                     // Right-to-left: the field is added first so the icon sits on its left.
                     let bg = ui.painter().add(egui::Shape::Noop);
                     ui.add_space(12.0);
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Titles, people, genres").frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 2, ..Default::default() })).desired_width(220.0)); // top margin: optically center the text
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Titles, people, genres").frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 2, ..Default::default() })).desired_width(170.0)); // top margin: optically center the text; width leaves room for five tabs at the 1000 px default size
                     let (icon, b) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
                     b.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Search"));
                     ui.painter().text(icon.center(), egui::Align2::CENTER_CENTER, icons::MAGNIFYING_GLASS, egui::FontId::proportional(18.0), Color32::from_gray(180));
@@ -2259,6 +2466,7 @@ impl eframe::App for App {
                 Tab::Discover => self.ui_discover(ui),
                 Tab::Addons => self.ui_addons(ui),
                 Tab::Library => self.ui_library(ui),
+                Tab::Settings => self.ui_settings(ui),
             });
         });
     }
