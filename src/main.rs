@@ -279,6 +279,13 @@ enum Menu {
     Playback,
 }
 
+/// Keyboard-focus outline for the popover's custom controls.
+fn focus_ring(ui: &egui::Ui, r: &egui::Response, radius: u8) {
+    if r.has_focus() {
+        ui.painter().rect_stroke(r.rect, radius, egui::Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+    }
+}
+
 /// Small caps section heading inside a player popover.
 fn menu_heading(ui: &mut egui::Ui, text: &str) {
     ui.add_space(12.0);
@@ -288,8 +295,9 @@ fn menu_heading(ui: &mut egui::Ui, text: &str) {
 
 /// Full-width popover row: accent check when selected, highlight on hover, long labels truncated.
 fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-    let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::CLICK);
+    let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
     r.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, label));
+    focus_ring(ui, &r, 6);
     let p = ui.painter();
     if r.hovered() {
         p.rect_filled(rect, 6, Color32::from_white_alpha(14));
@@ -309,18 +317,20 @@ fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
 /// Rounded chip, accent-filled when selected.
 fn pill(ui: &mut egui::Ui, label: &str, selected: bool, role: egui::Role) -> egui::Response {
     let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::new(14.0, if selected { bold() } else { egui::FontFamily::Proportional }), Color32::WHITE);
-    let (rect, r) = ui.allocate_exact_size(vec2(g.size().x + 24.0, 30.0), Sense::CLICK);
+    let (rect, r) = ui.allocate_exact_size(vec2(g.size().x + 24.0, 30.0), Sense::click());
     r.widget_info(|| egui::WidgetInfo::selected(role, true, selected, label));
     let fill = if selected { ACCENT } else { Color32::from_white_alpha(if r.hovered() { 30 } else { 16 }) };
     ui.painter().rect_filled(rect, 15, fill);
+    focus_ring(ui, &r, 15);
     ui.painter().galley(rect.center() - g.size() / 2.0, g, Color32::WHITE);
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Color dot with an accent ring when selected.
 fn swatch(ui: &mut egui::Ui, name: &str, color: Color32, selected: bool) -> egui::Response {
-    let (rect, r) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::CLICK);
+    let (rect, r) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
     r.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, name));
+    focus_ring(ui, &r, 15);
     if selected || r.hovered() {
         ui.painter().circle_stroke(rect.center(), 13.0, egui::Stroke::new(2.0, if selected { ACCENT } else { Color32::from_gray(120) }));
     }
@@ -349,12 +359,13 @@ fn stepper(ui: &mut egui::Ui, label: &str, value: &str) -> i32 {
 
 /// Full-width row with a label and an on/off switch.
 fn switch_row(ui: &mut egui::Ui, label: &str, on: &mut bool) -> egui::Response {
-    let (rect, mut r) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::CLICK);
+    let (rect, mut r) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
     if r.clicked() {
         *on = !*on;
         r.mark_changed();
     }
     r.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, *on, label));
+    focus_ring(ui, &r, 6);
     let p = ui.painter();
     if r.hovered() {
         p.rect_filled(rect, 6, Color32::from_white_alpha(14));
