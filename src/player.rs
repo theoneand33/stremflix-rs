@@ -368,7 +368,7 @@ impl Player {
     /// buffering or seeking, this reopens it at the target instead: that cancels the stalled read.
     pub fn seek(&mut self, to: f64, relative: bool) -> Result<()> {
         if self.loaded && !self.state.buffering && !self.state.seeking {
-            return self.command(&["seek", &format!("{to:.1}"), if relative { "relative" } else { "absolute" }]);
+            return self.command(&["seek", &format!("{to:.1}"), if relative { "relative+exact" } else { "absolute" }]);
         }
         let mut t = if relative { self.state.pos + to } else { to }.max(0.0);
         if self.state.dur > 0.0 {
