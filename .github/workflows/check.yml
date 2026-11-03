@@ -19,7 +19,7 @@ jobs:
       # lld-link is much faster than MSVC link.exe; only read when targeting Windows MSVC
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld.exe
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: samypr100/setup-dev-drive@v4
         if: runner.os == 'Windows'
         with:
@@ -51,7 +51,7 @@ jobs:
             echo EOF
           } >> "$GITHUB_OUTPUT"
           echo "LIBRARY_PATH=$prefix/opt/mpv/lib" >> "$GITHUB_ENV"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: brew-cache
         if: runner.os == 'macOS'
         with:
