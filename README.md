@@ -36,7 +36,7 @@ Play a magnet or a local `.torrent` file from **Library → Torrent**, drop a `.
 
 Open a series to pick a season and an episode. The ⏭ control in the player opens the next episode in the list.
 
-If the stream you were watching has a `bingeGroup` (set by the addon in `behaviorHints`), the next episode autoplays a stream from the same group. Without a match, the app plays the only stream or shows the stream picker.
+If the stream you were watching has a `bingeGroup` (set by the addon in `behaviorHints`), the next episode autoplays a stream from the same group (turn this off with "Play next episode automatically" in Settings). Without a match, the app plays the only stream or shows the stream picker.
 
 ## Play button on posters
 

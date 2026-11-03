@@ -2633,7 +2633,10 @@ impl App {
             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                 save.push(("hwdec", on(self.hwdec)));
             }
-            style.scale = (style.scale * 10.0).round() / 10.0 + stepper(ui, "Subtitle size", &format!("{:.1}x", style.scale)) as f64 * 0.1;
+            let step = stepper(ui, "Subtitle size", &format!("{:.1}x", style.scale));
+            if step != 0 {
+                style.scale = (style.scale * 10.0).round() / 10.0 + step as f64 * 0.1;
+            }
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Subtitle color").size(15.0).color(Color32::from_gray(210)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
