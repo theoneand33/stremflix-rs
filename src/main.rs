@@ -475,6 +475,8 @@ struct Playing {
     scrub: Option<f64>,
     /// Video held down: playing at 2x until release.
     fast: bool,
+    /// Press start (egui clock) of a press that began on the video, while the button stays down.
+    hold: Option<f64>,
 }
 
 struct App {
@@ -864,7 +866,7 @@ impl App {
                 match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], &headers, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
-                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, fast: false };
+                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, fast: false, hold: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1815,14 +1817,16 @@ impl App {
         }
 
         // Click toggles pause, double-click fullscreen; registered first so controls on top win.
-        // DRAG too, so egui keeps the press on `bg` past the 0.8 s / 6 px click limits.
-        let bg = ui.interact(rect, ui.scope_id().with("video"), Sense::CLICK | Sense::DRAG);
+        let bg = ui.interact(rect, ui.scope_id().with("video"), Sense::CLICK);
         // Press and hold the video for 2x speed; the release restores the prior speed and is not a click.
         let was_fast = p.fast;
         // Primary button only; losing focus or the pointer ends the hold in case the release went elsewhere.
         let down = ctx.input(|i| i.pointer.primary_down() && i.focused && i.pointer.has_pointer());
-        let armed = bg.is_pointer_button_down_on() && ctx.input(|i| i.pointer.press_start_time().is_some_and(|t| now - t >= 0.5));
-        p.fast = down && (was_fast || armed);
+        // Record the start on the press frame: egui drops the press from `bg` after 0.8 s or 6 px.
+        let hold = p.hold.or_else(|| bg.is_pointer_button_down_on().then(|| ctx.input(|i| i.pointer.press_start_time())).flatten());
+        let long = hold.is_some_and(|t| now - t >= 0.5);
+        p.hold = hold.filter(|_| down);
+        p.fast = down && long;
         if p.fast != was_fast {
             // shortcut: multiply assumes nothing else changes speed mid-hold; save and restore `speed` once a speed control exists.
             cmd(&["multiply", "speed", if p.fast { "2" } else { "0.5" }]);
@@ -1831,11 +1835,11 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(100)); // reach the threshold and see the release even when paused
         }
         if p.fast {
-            let r = egui::Rect::from_center_size(pos2(rect.center().x, rect.top() + 110.0), vec2(64.0, 32.0));
+            let r = egui::Rect::from_center_size(pos2(rect.center().x, rect.top() + 120.0), vec2(64.0, 32.0));
             ui.painter().rect_filled(r, 16, Color32::from_black_alpha(160));
             ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "2x", egui::FontId::new(17.0, bold()), Color32::WHITE);
         }
-        if bg.clicked() && !was_fast {
+        if bg.clicked() && !long {
             if p.menu { p.menu = false } else { cmd(&["cycle", "pause"]) }
         }
         toggle_fs |= bg.double_clicked();
