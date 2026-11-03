@@ -2227,7 +2227,9 @@ impl eframe::App for App {
 fn main() -> eframe::Result {
     let mut app = App::new(data_dir()).expect("failed to initialise app data");
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0])
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1000.0, 700.0])
+            .with_maximized(true)
             .with_title("Stremflix-rs")
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("bundled icon is a valid PNG")),
         ..Default::default()
