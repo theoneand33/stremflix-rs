@@ -1087,7 +1087,13 @@ impl App {
                     report(&mut self.error, "no OpenGL context for the player");
                     return;
                 };
-                let lang = |k| self.db.setting(k).ok().flatten().unwrap_or_default();
+                let setting = |k| self.db.setting(k).ok().flatten();
+                let lang = |k| setting(k).unwrap_or_default();
+                let subs_off = match setting("sub_off").as_deref() {
+                    Some("0") | Some("") => false, // explicit or legacy "on"
+                    Some(_) => true,
+                    None => lang("slang").is_empty(), // fresh install: off; legacy slang: on
+                };
                 let headers = self.selected.as_ref().map(|(_, streams, _)| request_headers(streams, &source, &url)).unwrap_or_default();
                 // Remember the episode's series (its key holds only the video id) and the stream's binge group
                 // (empty if none), so the series' play button and Continue Watching can find them later.
@@ -1098,7 +1104,7 @@ impl App {
                     let _ = self.db.set_setting(&format!("series:{key}"), &m.id);
                     let _ = self.db.set_setting(&format!("binge:{}:{}", m.kind, m.id), &group.unwrap_or_default());
                 }
-                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], lang("sub_off") != "0", &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
+                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], subs_off, &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
                         let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, awake: None };
