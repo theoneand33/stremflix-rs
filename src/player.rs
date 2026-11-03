@@ -75,7 +75,7 @@ const FORMAT_INT64: c_int = 4;
 const FORMAT_DOUBLE: c_int = 5;
 
 /// Observed properties, in `reply_userdata` order.
-const PROPS: [(&str, c_int); 10] = [
+const PROPS: [(&str, c_int); 11] = [
     ("time-pos", FORMAT_DOUBLE),
     ("duration", FORMAT_DOUBLE),
     ("pause", FORMAT_FLAG),
@@ -86,6 +86,7 @@ const PROPS: [(&str, c_int); 10] = [
     ("dheight", FORMAT_INT64),
     ("track-list", FORMAT_STRING),
     ("speed", FORMAT_DOUBLE),
+    ("seeking", FORMAT_FLAG),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,6 +106,7 @@ pub struct State {
     pub volume: f64,
     pub muted: bool,
     pub buffering: bool,
+    pub seeking: bool,
     /// Display size of the video in pixels; 0 until known.
     pub video: [usize; 2],
     pub tracks: Vec<Track>,
@@ -184,6 +186,9 @@ pub struct Player {
     /// Addon subtitles as (url, lang).
     subs: Vec<(String, String)>,
     slang: String,
+    source: String,
+    /// The file is open (FILE_LOADED seen since the last `loadfile`).
+    loaded: bool,
     alive: bool,
     pub state: State,
 }
@@ -303,7 +308,7 @@ impl Player {
         if mpv.is_null() {
             bail!("failed to create mpv instance");
         }
-        let mut p = Self { mpv, render: std::ptr::null_mut(), wake: Box::into_raw(Box::new(wake)), gl_proc: Box::new(gl_proc), subs: subtitles.to_vec(), slang: slang.to_string(), alive: true, state: State::default() };
+        let mut p = Self { mpv, render: std::ptr::null_mut(), wake: Box::into_raw(Box::new(wake)), gl_proc: Box::new(gl_proc), subs: subtitles.to_vec(), slang: slang.to_string(), source: source.to_string(), loaded: false, alive: true, state: State::default() };
         let socket = ipc_socket_path();
         let _ = std::fs::remove_file(&socket);
         let mut opts: Vec<(String, String)> = [
@@ -370,6 +375,26 @@ impl Player {
         Ok(())
     }
 
+    /// Seeks to `to` seconds, or by `to` if `relative`. mpv runs a seek only after the stream read in
+    /// flight returns, and a torrent read waits for its piece, so while the file is still opening,
+    /// buffering or seeking, this reopens it at the target instead: that cancels the stalled read.
+    pub fn seek(&mut self, to: f64, relative: bool) -> Result<()> {
+        if self.loaded && !self.state.buffering && !self.state.seeking {
+            return self.command(&["seek", &format!("{to:.1}"), if relative { "relative" } else { "absolute" }]);
+        }
+        let mut t = if relative { self.state.pos + to } else { to }.max(0.0);
+        if self.state.dur > 0.0 {
+            t = t.min(self.state.dur);
+        }
+        // `start` then `loadfile`, not loadfile's per-file options: their position changed across mpv versions.
+        self.command(&["set", "start", &format!("{t:.1}")])?;
+        self.command(&["loadfile", &self.source, "replace"])?;
+        self.loaded = false;
+        // Shown at once, and the base for further skips before the reopened file reports its position.
+        self.state.pos = t;
+        Ok(())
+    }
+
     /// Sets the subtitle style properties (async, like every other command).
     pub fn apply_sub_style(&self, st: &SubStyle) -> Result<()> {
         for (k, v) in st.props() {
@@ -387,9 +412,10 @@ impl Player {
                 EVENT_SHUTDOWN => self.alive = false,
                 EVENT_FILE_LOADED => {
                     // Addon subtitles: select the one matching `slang`; without a preference, the first (like `--sub-file`).
-                    let subs = std::mem::take(&mut self.subs);
-                    let pick = if self.slang.is_empty() { Some(0) } else { pick_sub(&subs, &self.slang) };
-                    for (i, (url, lang)) in subs.iter().enumerate() {
+                    // Kept, not taken: a reload from `seek` opens the file again.
+                    self.loaded = true;
+                    let pick = if self.slang.is_empty() { Some(0) } else { pick_sub(&self.subs, &self.slang) };
+                    for (i, (url, lang)) in self.subs.iter().enumerate() {
                         let _ = self.command(&["sub-add", url, if Some(i) == pick { "select" } else { "auto" }, "", lang]);
                     }
                 }
@@ -430,6 +456,7 @@ impl Player {
                 7 => s.video[1] = int(),
                 8 => s.tracks = parse_tracks(&CStr::from_ptr(*(p.data as *const *const c_char)).to_string_lossy()),
                 9 => s.speed = f(),
+                10 => s.seeking = flag(),
                 _ => {}
             }
         }
