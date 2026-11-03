@@ -473,6 +473,8 @@ struct Playing {
     menu: bool,
     /// Seek-bar position while dragging, in seconds.
     scrub: Option<f64>,
+    /// Held while unpaused so the screen doesn't dim, blank or sleep; embedded mpv can't do it itself.
+    awake: Option<keepawake::KeepAwake>,
 }
 
 struct App {
@@ -862,7 +864,7 @@ impl App {
                 match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], &headers, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
-                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None };
+                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -936,6 +938,11 @@ impl App {
             return;
         }
         self.last_poll = Instant::now();
+        let paused = p.player.state.paused;
+        if paused != p.awake.is_none() {
+            // Best effort, retried at most once a second: no inhibit service (e.g. headless) just means no inhibit.
+            p.awake = if paused { None } else { keepawake::Builder::default().display(true).idle(true).reason("Video playback").app_name("Stremflix").app_reverse_domain("io.github.stremflix").create().ok() };
+        }
         if let Some((pos, dur)) = p.player.position() {
             (p.pos, p.dur) = (pos, dur);
             self.save_progress();
