@@ -29,6 +29,7 @@ Difficulty: **S** under a day · **M** a few days · **L** a week or more · **X
 
 | Item | Priority | Difficulty | Notes |
 |---|---|---|---|
+| Settings: default playback speed, subtitle delay, subtitles off by default | P2 | S | The Settings tab has languages, autoplay, hardware decoding and subtitle style. |
 | Send `videoHash` / `videoSize` to subtitle addons (OpenSubtitles matching) | P2 | M | Needs the OpenSubtitles hash of the file. |
 | Chromecast / DLNA casting | P3 | XL | |
 
@@ -36,7 +37,6 @@ Difficulty: **S** under a day · **M** a few days · **L** a week or more · **X
 
 | Item | Priority | Difficulty | Notes |
 |---|---|---|---|
-| Settings page (languages, autoplay, player defaults) | P1 | M | A Settings tab exists for torrent and external-player options; these are still missing. |
 | Transcoding for formats the player can't handle | P3 | L | mpv already plays almost everything, so this is mostly irrelevant. |
 
 ### Accounts and sync

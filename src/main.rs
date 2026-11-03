@@ -737,6 +737,8 @@ struct App {
     external_player: String,
     /// mpv hardware decoding.
     hwdec: bool,
+    /// Play the next episode when one ends.
+    autoplay_next: bool,
     /// Last error, shown in a dismissible red line until cleared.
     error: Option<String>,
     /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
@@ -794,6 +796,7 @@ impl App {
             torrent_profile: Profile::from_label(&db.setting("torrent_profile")?.unwrap_or_default()),
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
+            autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
             error: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
@@ -1167,7 +1170,7 @@ impl App {
             return;
         }
         let st = &p.player.state;
-        if at_end(st.pos, st.dur, st.paused) && self.playing_episode() {
+        if self.autoplay_next && at_end(st.pos, st.dur, st.paused) && self.playing_episode() {
             return self.play_next(ctx);
         }
         let Some(p) = &mut self.player else { return };
@@ -2620,6 +2623,60 @@ impl App {
         if form_row(ui, "External player:", &mut self.external_player, "vlc", "Save", Some("Command run with the stream URL; no shell"), true) {
             save.push(("external_player", self.external_player.trim().to_string()));
         }
+        let on = |b: bool| if b { "1" } else { "0" }.to_string();
+        let mut style = self.sub_style;
+        ui.scope(|ui| {
+            ui.set_max_width(550.0);
+            if switch_row(ui, "Play next episode automatically", &mut self.autoplay_next).changed() {
+                save.push(("autoplay_next", on(self.autoplay_next)));
+            }
+            if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
+                save.push(("hwdec", on(self.hwdec)));
+            }
+            let step = stepper(ui, "Subtitle size", &format!("{:.1}x", style.scale));
+            if step != 0 {
+                style.scale = (style.scale * 10.0).round() / 10.0 + step as f64 * 0.1;
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Subtitle color").size(15.0).color(Color32::from_gray(210)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for (i, (name, hex)) in SUB_COLORS.iter().enumerate().rev() {
+                        if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::WHITE), style.color == i).clicked() {
+                            style.color = i;
+                        }
+                    }
+                });
+            });
+            switch_row(ui, "Subtitle background box", &mut style.background);
+        });
+        let style = style.clamped();
+        if style != self.sub_style {
+            self.sub_style = style;
+            save.push(("sub_style", style.encode()));
+        }
+        ui.add_space(16.0);
+        ui.label(RichText::new("Languages").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        for (i, key, label) in [(0, "alang", "Audio:"), (1, "slang", "Subtitles:")] {
+            ui.horizontal(|ui| {
+                let l = ui.label(label);
+                ui.add_space((150.0 - l.rect.width()).max(0.0));
+                let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("en,eng").desired_width(400.0)).labelled_by(l.id);
+                match valid_langs(&self.langs[i]) {
+                    Some(v) if r.changed() => {
+                        // As in the player: a subtitle language preference turns subtitles back on after a remembered "Off".
+                        if i == 1 && !v.is_empty() {
+                            save.push(("sub_off", String::new()));
+                        }
+                        save.push((key, v));
+                    }
+                    None => {
+                        ui.label(RichText::new("Use codes like en,eng,pt-BR (max 8)").size(13.0).color(Color32::from_rgb(230, 90, 90)));
+                    }
+                    _ => {}
+                }
+            });
+        }
+        ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(Color32::from_gray(170)));
         for (k, v) in save {
             if let Err(e) = self.db.set_setting(k, &v) {
                 report(&mut self.error, format!("saving {k}: {e:#}"));
