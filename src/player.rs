@@ -46,8 +46,25 @@ struct RenderParam {
     data: *mut c_void,
 }
 
-#[link(name = "mpv")]
-unsafe extern "C" {
+// libmpv is loaded at runtime, not linked: its ~340 shared libraries took ~150 ms to load before `main`.
+// Each entry becomes a field holding the symbol and a same-named wrapper, so call sites stay plain calls.
+macro_rules! mpv_api {
+    ($(fn $name:ident($($a:ident: $t:ty),*) $(-> $r:ty)?;)*) => {
+        #[allow(non_snake_case)]
+        struct Mpv {
+            $($name: unsafe extern "C" fn($($t),*) $(-> $r)?,)*
+            _lib: libloading::Library,
+        }
+        impl Mpv {
+            unsafe fn load(lib: libloading::Library) -> Result<Self, libloading::Error> {
+                Ok(Self { $($name: unsafe { *lib.get(concat!(stringify!($name), "\0").as_bytes())? },)* _lib: lib })
+            }
+        }
+        $(unsafe fn $name($($a: $t),*) $(-> $r)? { unsafe { (api().$name)($($a),*) } })*
+    };
+}
+
+mpv_api! {
     fn mpv_create() -> *mut c_void;
     fn mpv_initialize(h: *mut c_void) -> c_int;
     fn mpv_set_option_string(h: *mut c_void, name: *const c_char, data: *const c_char) -> c_int;
@@ -62,6 +79,44 @@ unsafe extern "C" {
     fn mpv_render_context_update(ctx: *mut c_void) -> u64;
     fn mpv_render_context_render(ctx: *mut c_void, params: *mut RenderParam) -> c_int;
     fn mpv_render_context_free(ctx: *mut c_void);
+}
+
+/// File names tried in order; the platform loader searches its usual paths (the exe's folder first on Windows).
+const MPV_LIBS: &[&str] = if cfg!(windows) {
+    &["libmpv-2.dll", "mpv-2.dll"]
+} else if cfg!(target_os = "macos") {
+    // Homebrew's `opt/mpv` path is what the linked binary used; the `lib` symlinks can be missing (e.g. cached Cellar).
+    &["libmpv.2.dylib", "/opt/homebrew/opt/mpv/lib/libmpv.2.dylib", "/usr/local/opt/mpv/lib/libmpv.2.dylib", "/opt/homebrew/lib/libmpv.2.dylib", "/usr/local/lib/libmpv.2.dylib", "/opt/local/lib/libmpv.2.dylib"]
+} else {
+    &["libmpv.so.2", "libmpv.so"]
+};
+
+static MPV: std::sync::OnceLock<Result<Mpv, String>> = std::sync::OnceLock::new();
+
+/// Loads libmpv once; later calls return the same result (a missing libmpv needs an app restart once installed). Call it early on a background thread so the first play doesn't wait.
+pub fn load_mpv() -> Result<(), String> {
+    MPV.get_or_init(|| {
+        let mut errs = Vec::new();
+        for name in MPV_LIBS {
+            // SAFETY: libmpv's initializers are safe to run on any thread.
+            match unsafe { libloading::Library::new(name) } {
+                Ok(lib) => match unsafe { Mpv::load(lib) } {
+                    Ok(api) => return Ok(api),
+                    Err(e) => errs.push(format!("{name}: {e}")),
+                },
+                Err(e) => errs.push(e.to_string()),
+            }
+        }
+        Err(format!("libmpv not found: {}", errs.join("; ")))
+    })
+    .as_ref()
+    .map(|_| ())
+    .map_err(Clone::clone)
+}
+
+/// Only reached through a `Player`, which `launch` creates after `load_mpv` succeeded.
+fn api() -> &'static Mpv {
+    MPV.get().and_then(|r| r.as_ref().ok()).expect("libmpv loaded before use")
 }
 
 const EVENT_SHUTDOWN: c_int = 1;
@@ -318,6 +373,7 @@ impl Player {
     /// Must be called, rendered and dropped with the GUI's GL context current.
     #[allow(clippy::too_many_arguments)] // player setup options; bundling them adds no clarity
     pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], subs_off: bool, headers: &[(String, String)], hwdec: bool, gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
+        load_mpv().map_err(anyhow::Error::msg)?;
         let mpv = unsafe { mpv_create() };
         if mpv.is_null() {
             bail!("failed to create mpv instance");
@@ -527,6 +583,12 @@ impl Drop for Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn libmpv_loads_with_every_symbol() {
+        load_mpv().unwrap();
+        assert!(!unsafe { CStr::from_ptr(mpv_error_string(0)) }.to_bytes().is_empty());
+    }
 
     #[test]
     fn language_validation() {

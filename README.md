@@ -11,12 +11,12 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design: egui UI, libmpv playback,
 ## Requirements
 
 - Rust 1.85 or newer (edition 2024)
-- libmpv (`libmpv.so.2` and headers, for example `pacman -S mpv` or `apt install libmpv-dev`), linked for the built-in player
+- libmpv (`libmpv.so.2`, for example `pacman -S mpv` or `apt install libmpv2`), loaded at runtime by the built-in player and by `cargo test`; building doesn't need it
 - `ffmpeg`, only needed to generate demo media
 - `yt-dlp` on `PATH`, only needed for YouTube (`ytId`) streams
 - Linux, macOS, or Windows. Release archives cover `linux-x86_64`, `linux-arm64`, `macos-arm64`, `macos-x86_64`, and `windows-x86_64`.
 
-The Windows release zip includes `libmpv-2.dll`. To build from source on Windows, you need an MSVC build of libmpv. The Windows step in `.github/workflows/release.yml` shows the pinned build that releases use.
+The Windows release zip includes `libmpv-2.dll`. To run a source build on Windows, put `libmpv-2.dll` next to the exe or on `PATH`. The Windows step in `.github/workflows/release.yml` shows the pinned build that releases use.
 
 ## Player controls
 

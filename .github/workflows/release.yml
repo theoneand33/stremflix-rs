@@ -88,7 +88,6 @@ jobs:
             for f in mpv $(brew deps mpv); do grep -qx "$f" <<<"$installed" || printf '%s\n' "$prefix/Cellar/$f" "$prefix/opt/$f"; done
             echo EOF
           } >> "$GITHUB_OUTPUT"
-          echo "LIBRARY_PATH=$prefix/opt/mpv/lib" >> "$GITHUB_ENV"
       - uses: actions/cache@v6
         id: brew-cache
         if: runner.os == 'macOS'
@@ -98,8 +97,6 @@ jobs:
       - name: Install libmpv (macOS)
         if: runner.os == 'macOS' && steps.brew-cache.outputs.cache-hit != 'true'
         run: brew install mpv
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: runner.os == 'Windows'
       - name: Install libmpv (Windows)
         if: runner.os == 'Windows'
         env:
@@ -113,13 +110,6 @@ jobs:
           if ((Get-FileHash "$env:RUNNER_TEMP\mpv-dev.7z" -Algorithm SHA256).Hash -ne $env:MPV_SHA256) { throw "mpv-dev checksum mismatch" }
           7z x "$env:RUNNER_TEMP\mpv-dev.7z" "-o$dir" -y | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "7z failed" }
-          # the archive ships only a MinGW import lib (libmpv.dll.a); build mpv.lib for MSVC from the DLL's exports
-          $names = dumpbin /nologo /exports "$dir\libmpv-2.dll" | ForEach-Object { if ($_ -match '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(mpv_\w+)') { $Matches[1] } }
-          if (-not $names) { throw "no mpv_ exports found" }
-          Set-Content "$dir\mpv.def" (@('LIBRARY libmpv-2.dll', 'EXPORTS') + $names)
-          lib /nologo /machine:x64 /def:"$dir\mpv.def" /out:"$dir\mpv.lib"
-          if ($LASTEXITCODE -ne 0) { throw "lib.exe failed" }
-          "RUSTFLAGS=-L native=$dir" >> $env:GITHUB_ENV
           "MPV_DIR=$($dir.Replace('\', '/'))" >> $env:GITHUB_ENV # forward slashes for the bash Package step
       - run: cargo build --release --locked --bin stremflix-rs
       - name: Package
@@ -129,7 +119,7 @@ jobs:
         run: |
           mkdir "$NAME"
           if [ "$RUNNER_OS" = Windows ]; then
-            # the exe imports libmpv-2.dll by that exact name, so ship it unrenamed next to the exe
+            # the exe loads libmpv-2.dll by that name from its own folder first, so ship it unrenamed next to the exe
             cp target/release/stremflix-rs.exe "$MPV_DIR/libmpv-2.dll" README.md "$NAME/"
             7z a -tzip "$NAME.zip" "$NAME" > /dev/null
           else
@@ -153,8 +143,13 @@ jobs:
           chmod +x "$ld"
           printf '%s\n' '[Desktop Entry]' Type=Application Name=Stremflix-rs Exec=stremflix-rs Icon=stremflix-rs Categories=AudioVideo\;Video\;Player\; > "$RUNNER_TEMP/stremflix-rs.desktop"
           cp assets/icon.png "$RUNNER_TEMP/stremflix-rs.png"
-          # bundles libmpv and its deps; glibc, GL and other host libs stay on the excludelist
-          "$ld" --appdir AppDir -e target/release/stremflix-rs -d "$RUNNER_TEMP/stremflix-rs.desktop" -i "$RUNNER_TEMP/stremflix-rs.png" --output appimage
+          # the binary dlopens libmpv, so name it explicitly; linuxdeploy bundles it and its deps (glibc, GL and other host libs stay on the excludelist)
+          mpv=$(ldconfig -p | awk '/libmpv\.so\.2 /{print $NF; exit}')
+          [ -n "$mpv" ] || { echo "libmpv.so.2 not found"; exit 1; }
+          "$ld" --appdir AppDir -e target/release/stremflix-rs -l "$mpv" -d "$RUNNER_TEMP/stremflix-rs.desktop" -i "$RUNNER_TEMP/stremflix-rs.png" --output appimage
+          # dlopen finds the bundled copy only through the exe's $ORIGIN RUNPATH
+          test -e AppDir/usr/lib/libmpv.so.2
+          readelf -d AppDir/usr/bin/stremflix-rs | grep -qF '[$ORIGIN/../lib]'
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}

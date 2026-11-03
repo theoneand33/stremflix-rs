@@ -2700,6 +2700,10 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Load libmpv off the UI thread once the first frames are up: loading it earlier delayed them by ~140 ms.
+        if ctx.cumulative_frame_nr() == 2 {
+            std::thread::spawn(stremflix_rs::player::load_mpv);
+        }
         while let Ok(msg) = self.rx.try_recv() {
             self.handle(&ctx, msg);
         }
