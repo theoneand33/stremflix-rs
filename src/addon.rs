@@ -440,7 +440,7 @@ pub fn parse_deep_link(s: &str) -> Option<DeepLink> {
     if let Some(path) = rest.strip_prefix('/') {
         let seg: Vec<String> = path.split(['?', '#']).next()?.split('/').map(|p| percent_encoding::percent_decode_str(p).decode_utf8_lossy().into_owned()).collect();
         return match seg.as_slice() {
-            [d, kind, id, video @ ..] if d == "detail" && video.len() <= 1 && valid_id(kind) && valid_id(id) && video.iter().all(|v| valid_id(v)) => {
+            [d, kind, id, video @ ..] if d == "detail" && video.len() <= 1 && [kind, id].into_iter().chain(video).all(|p| valid_id(p) && sanitize_text(p, MAX_TEXT) == *p) => {
                 Some(DeepLink::Detail { kind: kind.clone(), id: id.clone(), video: video.first().cloned() })
             }
             _ => None,

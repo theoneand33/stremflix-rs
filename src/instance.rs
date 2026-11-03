@@ -53,7 +53,7 @@ fn token() -> String {
 
 fn write_private(path: &Path, s: &str) -> std::io::Result<()> {
     // Publish by rename so a concurrent `forward` never reads a half-written file.
-    let tmp = path.with_extension("tmp");
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create(true).truncate(true);
     #[cfg(unix)]

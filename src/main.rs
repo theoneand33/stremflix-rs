@@ -783,6 +783,14 @@ fn report(slot: &mut Option<String>, e: impl std::fmt::Display) {
     *slot = Some(format!("{e:#}"));
 }
 
+/// A deep-linked title only knows its id until its meta arrives: take the name and artwork from `d`.
+fn fill_deep_linked(sel: &mut MetaPreview, d: &Meta) {
+    if sel.name == sel.id && (&sel.kind, &sel.id) == (&d.kind, &d.id) {
+        sel.name = d.name.clone();
+        (sel.poster, sel.background, sel.description) = (d.poster.clone(), d.background.clone(), d.description.clone());
+    }
+}
+
 fn fmt_time(s: f64) -> String {
     let s = s.max(0.0) as u64;
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
@@ -1002,11 +1010,8 @@ impl App {
                 let src = binge.and_then(|g| binge_source(&streams, &g)).or_else(fallback);
                 (self.selected, self.episode) = (Some((meta, streams, subs.clone())), episode);
                 // Details may have arrived first; a deep-linked title only knew its id.
-                if let (Some((sel, ..)), Some(d)) = (self.selected.as_mut(), &self.details)
-                    && sel.name == sel.id
-                    && (d.kind.as_str(), d.id.as_str()) == (sel.kind.as_str(), sel.id.as_str())
-                {
-                    sel.name = d.name.clone();
+                if let (Some((sel, ..)), Some(d)) = (self.selected.as_mut(), &self.details) {
+                    fill_deep_linked(sel, d);
                 }
                 // `Only` autoplays when there's no choice to make; otherwise show the stream picker.
                 if autoplay != Autoplay::Off {
@@ -1067,6 +1072,12 @@ impl App {
                 Some(link) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    // Leave the player like its Back button does, or the link opens behind it.
+                    if self.player.is_some() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                        self.stop_player();
+                        self.release_torrents(None);
+                    }
                     self.open_link(ctx, link);
                 }
                 None if s.is_empty() => {
@@ -1077,9 +1088,8 @@ impl App {
             },
             Msg::Details(m) => {
                 if self.details_want == (m.kind.clone(), m.id.clone()) {
-                    // A deep-linked title only knows its id until its meta arrives.
-                    if let Some((sel, ..)) = self.selected.as_mut().filter(|(s, ..)| s.name == s.id && (&s.kind, &s.id) == (&m.kind, &m.id)) {
-                        sel.name = m.name.clone();
+                    if let Some((sel, ..)) = self.selected.as_mut() {
+                        fill_deep_linked(sel, &m);
                     }
                     self.details = Some(m);
                 }
@@ -3020,7 +3030,7 @@ impl eframe::App for App {
 
 fn main() -> eframe::Result {
     // Only links count: macOS Finder adds `-psn_…`. A launch without one just focuses the open window.
-    let arg = std::env::args().nth(1).filter(|a| a.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("stremio://")));
+    let arg = std::env::args_os().nth(1).and_then(|a| a.into_string().ok()).filter(|a| a.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("stremio://")));
     let dir = data_dir();
     if instance::forward(&dir, arg.as_deref().unwrap_or("")) {
         return Ok(());
@@ -3328,7 +3338,7 @@ mod tests {
     #[test]
     fn deep_link_title_gets_its_name_in_either_order() {
         let ctx = egui::Context::default();
-        let meta = |id: &str| stremflix_rs::addon::parse_meta(format!(r#"{{"meta":{{"id":"{id}","type":"movie","name":"Name {id}"}}}}"#).as_bytes()).unwrap();
+        let meta = |id: &str| stremflix_rs::addon::parse_meta(format!(r#"{{"meta":{{"id":"{id}","type":"movie","name":"Name {id}","description":"About {id}"}}}}"#).as_bytes()).unwrap();
         let name = |app: &App| app.selected.as_ref().map(|(m, ..)| m.name.clone());
         let preview = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
         // Details first, then streams.
@@ -3348,6 +3358,7 @@ mod tests {
         app.details_want = ("movie".into(), "tt1".into());
         app.handle(&ctx, Msg::Details(meta("tt1")));
         assert_eq!(name(&app).as_deref(), Some("Name tt1"));
+        assert_eq!(app.selected.as_ref().unwrap().0.description.as_deref(), Some("About tt1"));
     }
 
     #[test]

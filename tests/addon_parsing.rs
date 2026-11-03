@@ -389,7 +389,7 @@ fn deep_links() {
         Some(DeepLink::Detail { kind: "series".into(), id: "tt0903747".into(), video: Some("tt0903747:1:1".into()) })
     );
     assert_eq!(parse_deep_link("stremio:///detail/movie/tt1"), Some(DeepLink::Detail { kind: "movie".into(), id: "tt1".into(), video: None }));
-    for bad in ["stremio:///detail/movie", "stremio:///detail/movie/a%2Fb", "stremio:///detail/movie/x%00", "stremio:///search?q=x", "stremio:///detail/movie/tt1/v/extra"] {
+    for bad in ["stremio:///detail/movie", "stremio:///detail/movie/a%2Fb", "stremio:///detail/movie/x%00", "stremio:///detail/movie/a%E2%80%AEb", "stremio:///search?q=x", "stremio:///detail/movie/tt1/v/extra"] {
         assert_eq!(parse_deep_link(bad), None, "{bad}");
     }
 }
