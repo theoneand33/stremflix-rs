@@ -1815,16 +1815,16 @@ impl App {
         }
 
         // Click toggles pause, double-click fullscreen; registered first so controls on top win.
-        let bg = ui.interact(rect, ui.scope_id().with("video"), Sense::CLICK);
-        // Press and hold the video for 2x speed; the release restores 1x and is not a click.
+        // DRAG too, so egui keeps the press on `bg` past the 0.8 s / 6 px click limits.
+        let bg = ui.interact(rect, ui.scope_id().with("video"), Sense::CLICK | Sense::DRAG);
+        // Press and hold the video for 2x speed; the release restores the prior speed and is not a click.
         let was_fast = p.fast;
-        // Primary button only; losing focus ends the hold in case the release went to another window.
-        let down = ctx.input(|i| i.pointer.primary_down() && i.focused);
-        // egui drops the press from `bg` after 0.8 s or 6 px (no longer a click), so it only arms; the button then holds it.
+        // Primary button only; losing focus or the pointer ends the hold in case the release went elsewhere.
+        let down = ctx.input(|i| i.pointer.primary_down() && i.focused && i.pointer.has_pointer());
         let armed = bg.is_pointer_button_down_on() && ctx.input(|i| i.pointer.press_start_time().is_some_and(|t| now - t >= 0.5));
         p.fast = down && (was_fast || armed);
         if p.fast != was_fast {
-            // Multiply, not set, so the speed in effect before the hold comes back.
+            // shortcut: multiply assumes nothing else changes speed mid-hold; save and restore `speed` once a speed control exists.
             cmd(&["multiply", "speed", if p.fast { "2" } else { "0.5" }]);
         }
         if down {
