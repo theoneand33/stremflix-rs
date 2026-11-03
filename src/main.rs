@@ -283,12 +283,34 @@ fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     pill_button(ui, text, 14.0, vec2(0.0, 32.0), white_fill(), Color32::BLACK)
 }
 
+/// Labeled text field and its action button on one centered line; fields of consecutive rows start at the same x.
+/// True when the button is pressed, or Enter in the field, with non-blank text (any text if `allow_blank`).
+/// `tip`: hover text of the button.
+fn form_row(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str, action: &str, tip: Option<&str>, allow_blank: bool) -> bool {
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
+        let l = ui.label(label);
+        ui.add_space((150.0 - l.rect.width()).max(0.0));
+        let r = ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(400.0)).labelled_by(l.id);
+        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let b = primary_button(ui, action);
+        let b = match tip {
+            Some(t) => b.on_hover_text(t),
+            None => b,
+        };
+        (b.clicked() || enter) && (allow_blank || !text.trim().is_empty())
+    })
+    .inner
+}
+
 /// Gray card with centered, wrapped text (used when there's no poster).
 fn card_text(ui: &egui::Ui, rect: egui::Rect, text: &str) {
-    let p = ui.painter();
+    // Clipped: a very long title would otherwise spill past the card.
+    let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     p.rect_filled(rect, 6, Color32::from_gray(40));
-    let g = p.layout(text.to_owned(), egui::FontId::proportional(15.0), ui.visuals().text_color(), rect.width() - 16.0);
-    p.galley(rect.center() - g.size() / 2.0, g, Color32::WHITE);
+    let mut job = egui::text::LayoutJob::simple(text.to_owned(), egui::FontId::proportional(15.0), ui.visuals().text_color(), rect.width() - 16.0);
+    job.halign = Align::Center; // each line centered around x = 0
+    let g = p.layout_job(job);
+    p.galley(pos2(rect.center().x, rect.center().y - g.size().y / 2.0), g, Color32::WHITE);
 }
 
 fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream) -> egui::Response {
@@ -300,7 +322,7 @@ fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream) -> egui::Response {
     let described = stem.is_some_and(|f| parts.iter().any(|p| p.contains(f)));
     let file = if described { String::new() } else { [s.hints.filename.clone(), s.hints.video_size.map(fmt_size)].into_iter().flatten().collect::<Vec<_>>().join("  ·  ") };
     let details: Vec<&str> = parts.into_iter().chain(Some(file.as_str()).filter(|f| !f.is_empty())).collect();
-    list_row(ui, n, head, details.join("\n"))
+    list_row(ui, n, head, details.join("\n"), 0.0)
 }
 
 /// Byte count as decimal MB/GB, like addons label sizes.
@@ -313,16 +335,21 @@ fn episode_row(ui: &mut egui::Ui, v: &Video, watched: bool) -> egui::Response {
     let n = v.episode.unwrap_or(0) as usize;
     let head = v.title.clone().unwrap_or_else(|| format!("Episode {n}"));
     let date: String = v.released.as_deref().map(|d| d.chars().take(10).collect()).unwrap_or_default();
-    list_row(ui, n, if watched { format!("{head}  {}", icons::CHECK) } else { head }, date)
+    list_row(ui, n, if watched { format!("{head}  {}", icons::CHECK) } else { head }, date, EPISODE_BUTTON.x + 12.0)
 }
 
+/// Size of the "Mark watched" pill overlaid on episode rows, left of the play circle.
+const EPISODE_BUTTON: egui::Vec2 = egui::Vec2::new(150.0, 32.0);
+
 /// Netflix episode-list row: index, bold name, gray details, play circle; highlights on hover.
-fn list_row(ui: &mut egui::Ui, n: usize, head: String, details: String) -> egui::Response {
+/// `reserve`: extra width kept free of text on the right (for an overlaid button).
+fn list_row(ui: &mut egui::Ui, n: usize, head: String, details: String, reserve: f32) -> egui::Response {
     let (w, text_x, pad) = (ui.available_width().min(960.0), 84.0, 18.0);
+    let wrap = (w - text_x - 96.0 - reserve).max(40.0);
     let p = ui.painter();
-    let hg = p.layout(head.clone(), egui::FontId::new(17.0, bold()), Color32::WHITE, w - text_x - 96.0);
+    let hg = p.layout(head.clone(), egui::FontId::new(17.0, bold()), Color32::WHITE, wrap);
     let has_details = !details.is_empty();
-    let mut job = egui::text::LayoutJob::simple(details, egui::FontId::proportional(14.0), Color32::from_gray(170), w - text_x - 96.0);
+    let mut job = egui::text::LayoutJob::simple(details, egui::FontId::proportional(14.0), Color32::from_gray(170), wrap);
     job.sections[0].format.line_height = Some(20.0);
     let dg = p.layout_job(job);
     let block = hg.size().y + if has_details { 8.0 + dg.size().y } else { 0.0 };
@@ -835,7 +862,7 @@ impl App {
                 match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], &headers, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
-                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: 0.0, menu: false, scrub: None };
+                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1287,7 +1314,7 @@ impl App {
                 if std::mem::take(&mut self.show_streams) {
                     r.scroll_to_me(Some(Align::TOP));
                 }
-                ui.label(RichText::new(format!("{}  ·  {} subtitle track(s)", key.1, subs.len())).size(15.0).color(Color32::from_gray(170)));
+                ui.label(RichText::new(format!("{}  ·  {} subtitle track{}", key.1, subs.len(), if subs.len() == 1 { "" } else { "s" })).size(15.0).color(Color32::from_gray(170)));
                 let seen = self.watched_keys.contains(&key.0);
                 if small_button(ui, if seen { "Mark unwatched" } else { "Mark watched" }).clicked() {
                     toggle = Some((key.0.clone(), !seen));
@@ -1324,11 +1351,16 @@ impl App {
                 let seen = self.watched_keys.contains(&k);
                 let r = episode_row(ui, v, seen);
                 if self.episode.as_ref() == Some(v) {
-                    ui.painter().rect_stroke(r.rect, 10, (2.0, RED), egui::StrokeKind::Inside);
+                    // Same inset and radius as the row's hover fill.
+                    ui.painter().rect_stroke(r.rect.shrink(4.0), 8, (2.0, RED), egui::StrokeKind::Inside);
                 }
                 // Overlaid left of the play circle; the topmost widget wins the click.
-                let b = egui::Rect::from_center_size(pos2(r.rect.right() - 160.0, r.rect.center().y), vec2(120.0, 32.0));
-                if ui.put(b, egui::Button::new(if seen { "Mark unwatched" } else { "Mark watched" })).clicked() {
+                let b = egui::Rect::from_min_size(pos2(r.rect.right() - 80.0 - EPISODE_BUTTON.x, r.rect.center().y - EPISODE_BUTTON.y / 2.0), EPISODE_BUTTON);
+                let label = if seen { "Mark unwatched" } else { "Mark watched" };
+                let mark = ui.scope_builder(UiBuilder::new().max_rect(b).layout(Layout::centered_and_justified(egui::Direction::LeftToRight)), |ui| small_button(ui, label)).inner;
+                // The overlay moved the cursor to the button's bottom; put it back under the row.
+                ui.advance_cursor_after_rect(r.rect);
+                if mark.clicked() {
                     toggle = Some((k, !seen));
                 } else if r.clicked() {
                     episode = Some((meta.clone(), v.clone()));
@@ -1342,11 +1374,15 @@ impl App {
                     for p in &self.recent {
                         let (r, rect) = card(ui, CARD, &p.title);
                         self.paint_poster(ui, &r, rect, &p.poster, &p.title, &mut want);
-                        let r = r.on_hover_text(format!("{} ({} / {})", p.title, fmt_time(p.position), fmt_time(p.duration)));
-                        let frac = if p.duration > 0.0 { (p.position / p.duration).clamp(0.0, 1.0) as f32 } else { 0.0 };
-                        let bar = egui::Rect::from_min_max(pos2(rect.left() + 10.0, rect.bottom() - 10.0), pos2(rect.right() - 10.0, rect.bottom() - 6.0));
-                        ui.painter().rect_filled(bar, 2, Color32::from_gray(90));
-                        ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, bar.height())), 2, RED);
+                        // Unknown duration: no total and no progress bar.
+                        let at = if p.duration > 0.0 { format!("{} / {}", fmt_time(p.position), fmt_time(p.duration)) } else { fmt_time(p.position) };
+                        let r = r.on_hover_text(format!("{} ({at})", p.title));
+                        if p.duration > 0.0 {
+                            let frac = (p.position / p.duration).clamp(0.0, 1.0) as f32;
+                            let bar = egui::Rect::from_min_max(pos2(rect.left() + 10.0, rect.bottom() - 10.0), pos2(rect.right() - 10.0, rect.bottom() - 6.0));
+                            ui.painter().rect_filled(bar, 2, Color32::from_gray(90));
+                            ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, bar.height())), 2, RED);
+                        }
                         if card_play(ui, &r, rect, &p.title) {
                             play = Some((p.key.clone(), p.title.clone(), p.source.clone(), vec![]));
                         } else if r.clicked() {
@@ -1647,7 +1683,9 @@ impl App {
                 }
                 self.show_streams |= show_streams;
                 let gray = |a| Color32::from_rgba_unmultiplied(109, 109, 110, a);
-                if hero_button(ui, "More info", [gray(179), gray(102)], Color32::WHITE).clicked() {
+                // The open title's page is already showing; reopening it would reload it and reset the season.
+                let is_open = self.selected.as_ref().is_some_and(|(m, ..)| m == meta);
+                if !is_open && hero_button(ui, "More info", [gray(179), gray(102)], Color32::WHITE).clicked() {
                     *open = Some((meta.clone(), false));
                 }
                 let in_lib = self.saved.iter().any(|t| t.key == format!("{}:{}", meta.kind, meta.id));
@@ -1797,6 +1835,10 @@ impl App {
                 p.osd_until = now + 3.0;
             }
         });
+        // Loading keeps the controls up, and they stay 3 s after it ends.
+        if st.buffering || vw == 0 {
+            p.osd_until = now + 3.0;
+        }
         let show = st.paused || p.menu || p.scrub.is_some() || now < p.osd_until;
         if now < p.osd_until {
             ctx.request_repaint_after(Duration::from_secs_f64(p.osd_until - now));
@@ -1808,6 +1850,20 @@ impl App {
         if a > 0.01 {
             let paint = ui.painter().clone().with_layer_id(ui.layer_id());
             let white = Color32::WHITE.gamma_multiply(a);
+            // Black fades behind the top bar and the bottom controls, so white controls stay readable on bright video.
+            let fade = |top: f32, bottom: f32, alpha: [f32; 2]| {
+                let r = egui::Rect::from_x_y_ranges(rect.x_range(), top..=bottom);
+                let c = |al: f32| Color32::from_black_alpha((al * a) as u8);
+                let mut m = egui::Mesh::default();
+                for (v, al) in [(r.left_top(), alpha[0]), (r.right_top(), alpha[0]), (r.left_bottom(), alpha[1]), (r.right_bottom(), alpha[1])] {
+                    m.colored_vertex(v, c(al));
+                }
+                m.add_triangle(0, 1, 2);
+                m.add_triangle(1, 2, 3);
+                paint.add(m);
+            };
+            fade(rect.top(), rect.top() + 110.0, [170.0, 0.0]);
+            fade(rect.bottom() - 170.0, rect.bottom(), [0.0, 200.0]);
             // Icon button: Stremio-style glyph on a rounded highlight that appears on hover.
             let icon = |ui: &mut egui::Ui, c: egui::Pos2, glyph: &str, label: &str| {
                 let r = ui.interact(egui::Rect::from_center_size(c, vec2(56.0, 56.0)), ui.scope_id().with(label), Sense::CLICK);
@@ -1820,7 +1876,11 @@ impl App {
             };
             // Top bar: back chevron + title on the left, full screen on the right.
             back |= icon(ui, rect.min + vec2(44.0, 46.0), icons::CARET_LEFT, "Back to browse").clicked();
-            paint.text(rect.min + vec2(82.0, 46.0), egui::Align2::LEFT_CENTER, &p.title, egui::FontId::proportional(17.0), white);
+            // Truncated with an ellipsis so a long title stops short of the full screen button.
+            let mut job = egui::text::LayoutJob::simple_singleline(p.title.clone(), egui::FontId::proportional(17.0), white);
+            job.wrap = egui::text::TextWrapping::truncate_at_width((rect.width() - 82.0 - 96.0).max(0.0));
+            let title = paint.layout_job(job);
+            paint.galley(rect.min + vec2(82.0, 46.0 - title.size().y / 2.0), title, white);
             toggle_fs |= icon(ui, pos2(rect.right() - 52.0, rect.top() + 46.0), if fs { icons::ARROWS_IN } else { icons::ARROWS_OUT }, if fs { "Exit full screen" } else { "Full screen" }).clicked();
 
             // Seek bar between elapsed and total time: thin track, purple progress and knob; drag or click to seek.
@@ -1874,6 +1934,10 @@ impl App {
             if let Some(q) = vr.interact_pointer_pos().filter(|_| vr.dragged() || vr.clicked()) {
                 let v = ((q.x - vbar.left()) / vbar.width()).clamp(0.0, 1.0) * 100.0;
                 cmd(&["set", "volume", &format!("{v:.0}")]);
+                // The slider shows 0 while muted, so setting a volume also unmutes.
+                if st.muted {
+                    cmd(&["set", "mute", "no"]);
+                }
             }
             let vt = egui::Rect::from_center_size(vbar.center(), vec2(vbar.width(), 4.0));
             let vf = if st.muted { 0.0 } else { (st.volume / 100.0).clamp(0.0, 1.0) as f32 };
@@ -1910,8 +1974,8 @@ impl App {
                                         ui.add_space(12.0);
                                         ui.label(RichText::new("Style").size(16.0).family(bold()).color(Color32::WHITE));
                                         ui.horizontal(|ui| {
-                                            ui.label(format!("Size {:.1}x", style.scale));
-                                            if ui.button("-").clicked() { style.scale -= 0.1 }
+                                            ui.add_sized([90.0, 20.0], egui::Label::new(format!("Size {:.1}x", style.scale)));
+                                            if ui.button("−").clicked() { style.scale -= 0.1 }
                                             if ui.button("+").clicked() { style.scale += 0.1 }
                                         });
                                         ui.horizontal(|ui| {
@@ -1921,8 +1985,8 @@ impl App {
                                         });
                                         ui.checkbox(&mut style.background, "Background box");
                                         ui.horizontal(|ui| {
-                                            ui.label(format!("Delay {:+.1}s", style.delay));
-                                            if ui.button("-").clicked() { style.delay -= 0.1 }
+                                            ui.add_sized([90.0, 20.0], egui::Label::new(format!("Delay {:+.1}s", style.delay)));
+                                            if ui.button("−").clicked() { style.delay -= 0.1 }
                                             if ui.button("+").clicked() { style.delay += 0.1 }
                                             if ui.button("Reset").clicked() { style.delay = 0.0 }
                                         });
@@ -1930,7 +1994,8 @@ impl App {
                                     ui.add_space(8.0);
                                     let (i, key) = if kind == "audio" { (0, "alang") } else { (1, "slang") };
                                     let valid = valid_langs(&self.langs[i]);
-                                    let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("Preferred: en,eng").desired_width(200.0));
+                                    let l = ui.label(RichText::new(format!("Preferred {} languages", if kind == "audio" { "audio" } else { "subtitle" })).size(13.0).color(Color32::from_gray(180)));
+                                    let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("Preferred: en,eng").desired_width(200.0)).labelled_by(l.id);
                                     if let Some(v) = &valid
                                         && r.changed()
                                         && let Err(e) = self.db.set_setting(key, v)
@@ -1977,36 +2042,27 @@ impl App {
 
     fn ui_addons(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        ui.horizontal(|ui| {
-            let l = ui.label("Manifest URL:");
-            ui.add(egui::TextEdit::singleline(&mut self.addon_url).hint_text("http://127.0.0.1:7070/manifest.json").desired_width(400.0))
-                .labelled_by(l.id);
-            if primary_button(ui, "Install").clicked() {
-                let (client, url) = (self.client.clone(), self.addon_url.trim().to_string());
-                self.spawn(&ctx, async move {
-                    let m = client.fetch_manifest(&url).await?;
-                    Ok(Msg::Installed(url, m, None))
-                });
-            }
-        });
-        ui.horizontal(|ui| {
-            let l = ui.label("Stremio data:");
-            ui.add(egui::TextEdit::singleline(&mut self.import_path).hint_text("Auto-detect local Stremio").desired_width(400.0))
-                .labelled_by(l.id);
-            if primary_button(ui, "Import from Stremio").on_hover_text("Import addons, watched titles and progress").clicked() {
-                let path = Some(PathBuf::from(self.import_path.trim())).filter(|p| !p.as_os_str().is_empty());
-                self.spawn(&ctx, async move {
-                    let (_, imp) = tokio::task::spawn_blocking(move || stremio_import::import(path.as_deref())).await??;
-                    Ok(Msg::Imported(imp))
-                });
-            }
-        });
+        if form_row(ui, "Manifest URL:", &mut self.addon_url, "http://127.0.0.1:7070/manifest.json", "Install", None, false) {
+            let (client, url) = (self.client.clone(), self.addon_url.trim().to_string());
+            self.spawn(&ctx, async move {
+                let m = client.fetch_manifest(&url).await?;
+                Ok(Msg::Installed(url, m, None))
+            });
+        }
+        // Blank path = auto-detect.
+        if form_row(ui, "Stremio data:", &mut self.import_path, "Auto-detect local Stremio", "Import from Stremio", Some("Import addons, watched titles and progress"), true) {
+            let path = Some(PathBuf::from(self.import_path.trim())).filter(|p| !p.as_os_str().is_empty());
+            self.spawn(&ctx, async move {
+                let (_, imp) = tokio::task::spawn_blocking(move || stremio_import::import(path.as_deref())).await??;
+                Ok(Msg::Imported(imp))
+            });
+        }
         ui.separator();
         let mut remove = None;
         let mut configure = None;
         let mut replace = None;
         for (url, m) in &self.addons {
-            ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
                 ui.label(format!("{} {} ({})", m.name, m.version, url));
                 if m.behavior_hints.configurable && small_button(ui, "Configure").clicked() {
                     configure = Some(url.clone());
@@ -2018,15 +2074,10 @@ impl App {
             if m.behavior_hints.configuration_required {
                 ui.label(RichText::new("Needs configuration before use. Press Configure.").weak());
             }
-            if let Some((old, pasted)) = self.configuring.as_mut().filter(|(o, _)| o == url) {
-                ui.horizontal(|ui| {
-                    let l = ui.label("Configured manifest URL:");
-                    ui.add(egui::TextEdit::singleline(pasted).hint_text("https://.../manifest.json").desired_width(400.0))
-                        .labelled_by(l.id);
-                    if primary_button(ui, "Replace").clicked() {
-                        replace = Some((old.clone(), pasted.trim().to_string()));
-                    }
-                });
+            if let Some((old, pasted)) = self.configuring.as_mut().filter(|(o, _)| o == url)
+                && form_row(ui, "Configured URL:", pasted, "https://.../manifest.json", "Replace", None, false)
+            {
+                replace = Some((old.clone(), pasted.trim().to_string()));
             }
         }
         if let Some((old, new)) = replace {
@@ -2088,36 +2139,27 @@ impl App {
             self.quick_play(&ctx, m);
         }
         ui.separator();
-        ui.horizontal(|ui| {
-            let l = ui.label("Magnet link:");
-            ui.add(egui::TextEdit::singleline(&mut self.magnet).hint_text("magnet:?xt=urn:btih:...").desired_width(500.0))
-                .labelled_by(l.id);
-            if primary_button(ui, "Play magnet").clicked() {
-                match parse_magnet_hash(self.magnet.trim()) {
-                    Some(h) => {
-                        let m = self.magnet.trim().to_string();
-                        self.play(&ctx, format!("btih:{h}"), format!("Torrent {}", &h[..8]), m, vec![]);
-                    }
-                    None => report(&mut self.error, "invalid magnet link"),
+        if form_row(ui, "Magnet link:", &mut self.magnet, "magnet:?xt=urn:btih:...", "Play magnet", None, false) {
+            match parse_magnet_hash(self.magnet.trim()) {
+                Some(h) => {
+                    let m = self.magnet.trim().to_string();
+                    self.play(&ctx, format!("btih:{h}"), format!("Torrent {}", &h[..8]), m, vec![]);
                 }
+                None => report(&mut self.error, "invalid magnet link"),
             }
-        });
-        ui.horizontal(|ui| {
-            let l = ui.label("Folder path:");
-            ui.add(egui::TextEdit::singleline(&mut self.folder).hint_text("/path/to/videos").desired_width(400.0)).labelled_by(l.id);
-            if primary_button(ui, "Add folder").clicked() {
-                let dir = PathBuf::from(self.folder.trim());
-                // Off the UI thread: a big folder or network share can take minutes.
-                self.spawn(&ctx, async move {
-                    let res = tokio::task::spawn_blocking({
-                        let dir = dir.clone();
-                        move || scan(&dir).map_err(|e| e.to_string())
-                    })
-                    .await?;
-                    Ok(Msg::Scanned(dir, res))
-                });
-            }
-        });
+        }
+        if form_row(ui, "Folder path:", &mut self.folder, "/path/to/videos", "Add folder", None, false) {
+            let dir = PathBuf::from(self.folder.trim());
+            // Off the UI thread: a big folder or network share can take minutes.
+            self.spawn(&ctx, async move {
+                let res = tokio::task::spawn_blocking({
+                    let dir = dir.clone();
+                    move || scan(&dir).map_err(|e| e.to_string())
+                })
+                .await?;
+                Ok(Msg::Scanned(dir, res))
+            });
+        }
         ui.separator();
         let mut play = None;
         for it in &self.library {
@@ -2152,7 +2194,7 @@ impl eframe::App for App {
             ui.set_min_size(ui.available_size());
             // Fixed-height row so the nav and search pills share one center line.
             ui.allocate_ui_with_layout(vec2(ui.available_width(), 44.0), Layout::left_to_right(Align::Center), |ui| {
-                ui.label(RichText::new("STREMFLIX-RS").size(26.0).strong().family(bold()).color(RED));
+                ui.add(egui::Label::new(RichText::new("STREMFLIX-RS").size(26.0).strong().family(bold()).color(RED)).selectable(false));
                 ui.add_space(20.0);
                 // Netflix nav: current tab is bold white on a dark gray pill that slides between tabs.
                 let pill_slot = ui.painter().add(egui::Shape::Noop);
@@ -2160,7 +2202,9 @@ impl eframe::App for App {
                 for (tab, name) in [(Tab::Home, "Home"), (Tab::Discover, "Discover"), (Tab::Addons, "Addons"), (Tab::Library, "Library")] {
                     let text = RichText::new(name).size(15.0);
                     let text = if self.tab == tab { text.strong().family(bold()).color(Color32::WHITE) } else { text.color(Color32::from_gray(180)) };
-                    let r = ui.add(egui::Button::new(text).fill(Color32::TRANSPARENT).min_size(vec2(0.0, 34.0))).on_hover_cursor(egui::CursorIcon::PointingHand);
+                    // Width of the bold label, so selecting a tab doesn't shift the ones after it.
+                    let w = ui.painter().layout_no_wrap(name.into(), egui::FontId::new(15.0, bold()), Color32::WHITE).size().x + 2.0 * ui.spacing().button_padding.x;
+                    let r = ui.add(egui::Button::new(text).fill(Color32::TRANSPARENT).min_size(vec2(w, 34.0))).on_hover_cursor(egui::CursorIcon::PointingHand);
                     if self.tab == tab {
                         sel_rect = Some(r.rect);
                     }
@@ -2201,7 +2245,7 @@ impl eframe::App for App {
             }
             ui.add_space(8.0);
             // Back lives outside the scroll area, so it stays put while the detail page scrolls.
-            if self.selected.is_some() {
+            if self.selected.is_some() && self.tab == Tab::Home {
                 if pill_button(ui, &format!("{}  Back", icons::ARROW_LEFT), 16.0, vec2(0.0, 40.0), white_fill(), Color32::BLACK).on_hover_text("Back to browse").clicked() {
                     (self.selected, self.details) = (None, None);
                     (self.episodes, self.episode) = (Vec::new(), None);
