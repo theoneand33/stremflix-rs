@@ -11,6 +11,7 @@ eframe = { version = "0.37.0", default-features = false, features = ["accesskit"
 egui_extras = { version = "0.37", features = ["image"] }
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+keepawake = "0.6"
 librqbit = { version = "9.1.0", features = ["http-api", "tracing-subscriber-utils"] }
 librqbit-dualstack-sockets = "0.7.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }

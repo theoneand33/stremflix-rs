@@ -12,7 +12,7 @@ use stremflix_rs::addon::{AddonClient, CatalogDef, Manifest, Meta, MetaPreview, 
 use stremflix_rs::db::{Db, Progress, SavedTitle, Watched};
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{GlProc, Player, SUB_COLORS, SubStyle, valid_langs};
+use stremflix_rs::player::{GlProc, Player, SUB_COLORS, SubStyle, prefer_lang, valid_langs};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::TorrentEngine;
 
@@ -479,6 +479,28 @@ struct Playing {
     hold: Option<f64>,
     /// The last click on the video was a hold release, so the next one must not pair with it into a double-click.
     after_hold: bool,
+    /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
+    awake: Option<Option<keepawake::KeepAwake>>,
+}
+
+impl Drop for Playing {
+    fn drop(&mut self) {
+        release_awake(self.awake.take());
+    }
+}
+
+/// Inhibits screen dimming, blanking and idle sleep until dropped; `None` when no inhibit service is reachable.
+fn keep_awake() -> Option<keepawake::KeepAwake> {
+    // Linux: one missing service (ScreenSaver or logind) fails the combined request outright, so fall back to each alone.
+    // catch_unwind: a failed attempt drops its half-built guard, whose unwrap can panic (see release_awake).
+    [(true, true), (true, false), (false, true)].into_iter().find_map(|(display, idle)| {
+        std::panic::catch_unwind(|| keepawake::Builder::default().display(display).idle(idle).reason("Video playback").app_name("Stremflix").app_reverse_domain("io.github.stremflix").create().ok()).ok().flatten()
+    })
+}
+
+/// keepawake's Linux drop unwraps the D-Bus UnInhibit call, which fails if the screensaver service went away mid-playback.
+fn release_awake(awake: Option<Option<keepawake::KeepAwake>>) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(awake)));
 }
 
 struct App {
@@ -865,10 +887,10 @@ impl App {
                     let _ = self.db.set_setting(&format!("series:{key}"), &m.id);
                     let _ = self.db.set_setting(&format!("binge:{}:{}", m.kind, m.id), &group.unwrap_or_default());
                 }
-                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], &headers, gl_proc, Box::new(move || wake.request_repaint())) {
+                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], lang("sub_off") == "1", &headers, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
-                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, fast: false, hold: None, after_hold: false };
+                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, fast: false, hold: None, after_hold: false, awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -942,6 +964,15 @@ impl App {
             return;
         }
         self.last_poll = Instant::now();
+        let paused = p.player.state.paused;
+        if paused {
+            if p.awake.is_some() {
+                release_awake(p.awake.take());
+            }
+        } else if p.awake.is_none() {
+            // Not retried until the next pause/play, so a missing service never blocks the UI thread repeatedly.
+            p.awake = Some(keep_awake());
+        }
         if let Some((pos, dur)) = p.player.position() {
             (p.pos, p.dur) = (pos, dur);
             self.save_progress();
@@ -1760,6 +1791,7 @@ impl App {
         let mut cmds: Vec<Vec<String>> = Vec::new();
         let mut cmd = |a: &[&str]| cmds.push(a.iter().map(|s| s.to_string()).collect());
         let (mut back, mut toggle_fs) = (false, false);
+        let mut seek: Option<(f64, bool)> = None;
         let mut style = self.sub_style;
         ui.painter().rect_filled(rect, 0, Color32::BLACK);
 
@@ -1852,8 +1884,8 @@ impl App {
             use egui::Key::*;
             let k = |key| i.key_pressed(key);
             if k(Space) || k(K) { cmd(&["cycle", "pause"]) }
-            if k(ArrowLeft) { cmd(&["seek", "-10"]) }
-            if k(ArrowRight) { cmd(&["seek", "10"]) }
+            if k(ArrowLeft) { seek = Some((-10.0, true)) }
+            if k(ArrowRight) { seek = Some((10.0, true)) }
             if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]) }
             if k(M) { cmd(&["cycle", "mute"]) }
@@ -1924,7 +1956,7 @@ impl App {
                 p.scrub = r.interact_pointer_pos().map(|q| at(q.x));
             }
             if let Some(t) = (r.clicked() || r.drag_stopped()).then(|| r.interact_pointer_pos().map(|q| at(q.x)).or(p.scrub)).flatten() {
-                cmd(&["seek", &format!("{t:.1}"), "absolute"]);
+                seek = Some((t, false));
             }
             if !r.dragged() {
                 p.scrub = None;
@@ -1991,13 +2023,27 @@ impl App {
                                     ui.add_space(8.0);
                                     let tracks: Vec<_> = st.tracks.iter().filter(|t| t.kind == kind).collect();
                                     let off = !tracks.iter().any(|t| t.selected);
-                                    let entries = (kind == "sub").then_some((None, "Off", off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.selected)));
-                                    for (id, label, sel) in entries {
+                                    let entries = (kind == "sub").then_some((None, "Off", None, off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.lang.as_deref(), t.selected)));
+                                    for (id, label, lang, sel) in entries {
                                         let text = RichText::new(format!("{}  {label}", if sel { icons::CHECK } else { "   " })).size(16.0);
                                         let text = if sel { text.color(Color32::WHITE).family(bold()) } else { text.color(Color32::from_gray(180)) };
                                         if ui.add(egui::Button::new(text).frame(false)).clicked() {
                                             let v = id.map_or("no".to_string(), |i| i.to_string());
                                             cmd(&["set", prop, &v]);
+                                            // Remember the subtitle choice for the next video: Off, or the picked language first in `slang`.
+                                            if kind == "sub" {
+                                                let mut save = vec![("sub_off", if id.is_none() { "1" } else { "" }.to_string())];
+                                                // shortcut: name-only addon languages ("English") fail `valid_langs` and aren't remembered; map names to codes if users hit it.
+                                                if let Some(v) = lang.and_then(|l| prefer_lang(&self.langs[1], l)) {
+                                                    self.langs[1] = v.clone();
+                                                    save.push(("slang", v));
+                                                }
+                                                for (k, v) in save {
+                                                    if let Err(e) = self.db.set_setting(k, &v) {
+                                                        report(&mut self.error, format!("saving {k}: {e:#}"));
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     if kind == "sub" {
@@ -2032,6 +2078,14 @@ impl App {
                                     {
                                         report(&mut self.error, format!("saving {key}: {e:#}"));
                                     }
+                                    // Typing a subtitle language preference turns subtitles back on after a remembered "Off".
+                                    if kind == "sub"
+                                        && r.changed()
+                                        && valid_langs(&self.langs[1]).is_some_and(|v| !v.is_empty())
+                                        && let Err(e) = self.db.set_setting("sub_off", "")
+                                    {
+                                        report(&mut self.error, format!("saving sub_off: {e:#}"));
+                                    }
                                     if valid.is_none() {
                                         ui.label(RichText::new("Use codes like en,eng,pt-BR (max 8)").size(13.0).color(Color32::from_rgb(230, 90, 90)));
                                     }
@@ -2050,8 +2104,16 @@ impl App {
             }
             let _ = p.player.apply_sub_style(&style);
         }
+        if let Some((to, relative)) = seek
+            && let Err(e) = p.player.seek(to, relative)
+        {
+            report(&mut self.error, e);
+        }
         for c in &cmds {
             let args: Vec<&str> = c.iter().map(String::as_str).collect();
+            if let ["set", "sid", v] = args[..] {
+                p.player.subs_off = v == "no";
+            }
             if let Err(e) = p.player.command(&args) {
                 report(&mut self.error, e);
             }
