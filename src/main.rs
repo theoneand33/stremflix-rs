@@ -473,6 +473,12 @@ struct Playing {
     menu: bool,
     /// Seek-bar position while dragging, in seconds.
     scrub: Option<f64>,
+    /// Video held down: playing at 2x until release.
+    fast: bool,
+    /// Press start (egui clock) of a press that began on the video, while the button stays down.
+    hold: Option<f64>,
+    /// The last click on the video was a hold release, so the next one must not pair with it into a double-click.
+    after_hold: bool,
     /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
     awake: Option<Option<keepawake::KeepAwake>>,
 }
@@ -884,7 +890,7 @@ impl App {
                 match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], lang("sub_off") == "1", &headers, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
-                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, awake: None };
+                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, fast: false, hold: None, after_hold: false, awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1846,10 +1852,34 @@ impl App {
 
         // Click toggles pause, double-click fullscreen; registered first so controls on top win.
         let bg = ui.interact(rect, ui.scope_id().with("video"), Sense::CLICK);
-        if bg.clicked() {
+        // Press and hold the video for 2x speed; the release halves it back and is not a click.
+        let was_fast = p.fast;
+        // Primary button only; losing focus or the pointer ends the hold in case the release went elsewhere.
+        let down = ctx.input(|i| i.pointer.primary_down() && i.focused && i.pointer.has_pointer());
+        // Record the start on the press frame: egui drops the press from `bg` after 0.8 s or 6 px.
+        let hold = p.hold.or_else(|| bg.is_pointer_button_down_on().then(|| ctx.input(|i| i.pointer.press_start_time())).flatten());
+        let long = hold.is_some_and(|t| now - t >= 0.5);
+        p.hold = hold.filter(|_| down);
+        p.fast = down && long;
+        if p.fast != was_fast {
+            // shortcut: multiply assumes nothing else changes speed mid-hold; save and restore `speed` once a speed control exists.
+            cmd(&["multiply", "speed", if p.fast { "2" } else { "0.5" }]);
+        }
+        if down {
+            ctx.request_repaint_after(Duration::from_millis(100)); // reach the threshold and see the release even when paused
+        }
+        if p.fast {
+            let r = egui::Rect::from_center_size(pos2(rect.center().x, rect.top() + 130.0), vec2(64.0, 32.0));
+            ui.painter().rect_filled(r, 16, Color32::from_black_alpha(160));
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "2x", egui::FontId::new(17.0, bold()), Color32::WHITE);
+        }
+        if bg.clicked() && !long {
             if p.menu { p.menu = false } else { cmd(&["cycle", "pause"]) }
         }
-        toggle_fs |= bg.double_clicked();
+        toggle_fs |= bg.double_clicked() && !p.after_hold;
+        if bg.clicked() {
+            p.after_hold = long;
+        }
         ctx.input(|i| {
             use egui::Key::*;
             let k = |key| i.key_pressed(key);
