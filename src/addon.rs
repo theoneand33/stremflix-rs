@@ -650,7 +650,7 @@ pub fn newer_release(release: &str, commit: &str, body: &[u8]) -> Result<Option<
         html_url: String,
     }
     let r: Rel = serde_json::from_slice(body)?;
-    // shortcut: pre-release suffixes are ignored when ordering tags (release.yml keeps `-` tags out of /latest), so a beta user is not offered its own final; upgrade if that matters.
+    // shortcut: pre-release suffixes are ignored when ordering tags (release.yml keeps `-` tags out of /latest), so a beta user is offered neither its own final nor later betas; upgrade if that matters.
     let core = |t: &str| t.trim_start_matches('v').split('-').next().unwrap_or("").split('.').map(|n| n.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
     let newer = if release == "nightly" {
         // target_commitish can also be a branch name; only a full SHA is comparable

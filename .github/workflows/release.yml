@@ -139,8 +139,8 @@ jobs:
           LINUXDEPLOY_SHA256: ${{ matrix.linuxdeploy_sha256 }}
           APPIMAGE_EXTRACT_AND_RUN: "1" # runners have no FUSE
           LDAI_OUTPUT: stremflix-rs-${{ env.TAG }}-${{ matrix.target }}.AppImage
-          # embedded so AppImageUpdate can find new builds; nightly is a prerelease, so "latest" would skip it
-          LDAI_UPDATE_INFORMATION: gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|${{ inputs.version && 'latest' || 'nightly' }}|stremflix-rs-*-${{ matrix.target }}.AppImage.zsync
+          # embedded so AppImageUpdate can find new builds; nightly is a prerelease, so "latest" would skip it (same for `-` tags, which use their own tag)
+          LDAI_UPDATE_INFORMATION: gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|${{ inputs.version && (contains(inputs.version, '-') && env.TAG || 'latest') || 'nightly' }}|stremflix-rs-*-${{ matrix.target }}.AppImage.zsync
         run: |
           ld="$RUNNER_TEMP/linuxdeploy"
           curl -fsSL --retry 3 -o "$ld" "$LINUXDEPLOY_URL"
