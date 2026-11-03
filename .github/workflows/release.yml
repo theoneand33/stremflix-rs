@@ -116,6 +116,7 @@ jobs:
           # embedded for the in-app update check (src/addon.rs `RELEASE`, `COMMIT`)
           STREMFLIX_RS_RELEASE: ${{ env.TAG }}
           STREMFLIX_RS_COMMIT: ${{ github.sha }}
+          STREMFLIX_RS_REPO: ${{ github.repository }}
       - name: Package
         shell: bash
         env:

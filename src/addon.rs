@@ -634,7 +634,11 @@ pub fn discover_path(kind: &str, id: &str, genre: Option<&str>) -> String {
 /// Release this binary was built as (`nightly` or `vX.Y.Z`) and its commit; set by release.yml, absent in source builds.
 pub const RELEASE: Option<&str> = option_env!("STREMFLIX_RS_RELEASE");
 pub const COMMIT: Option<&str> = option_env!("STREMFLIX_RS_COMMIT");
-const REPO_API: &str = "https://api.github.com/repos/theoneand33/stremflix-rs/releases/";
+/// `owner/repo` the build was released from (forks check their own releases).
+const REPO: &str = match option_env!("STREMFLIX_RS_REPO") {
+    Some(r) => r,
+    None => "theoneand33/stremflix-rs",
+};
 
 /// Page of a newer release on `release`'s channel, given that channel's GitHub release JSON
 /// (`nightly`: any other commit; tagged: a different latest tag).
@@ -646,7 +650,17 @@ pub fn newer_release(release: &str, commit: &str, body: &[u8]) -> Result<Option<
         html_url: String,
     }
     let r: Rel = serde_json::from_slice(body)?;
-    let newer = if release == "nightly" { r.target_commitish != commit } else { r.tag_name != release };
+    // shortcut: pre-release suffixes are ignored when ordering tags, upgrade if beta-vs-final matters.
+    let core = |t: &str| t.trim_start_matches('v').split('-').next().unwrap_or("").split('.').map(|n| n.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
+    let newer = if release == "nightly" {
+        // target_commitish can also be a branch name; only a full SHA is comparable
+        r.target_commitish.len() == 40 && r.target_commitish != commit
+    } else {
+        match (core(&r.tag_name), core(release)) {
+            (Some(latest), Some(cur)) => latest > cur,
+            _ => r.tag_name != release,
+        }
+    };
     Ok(newer.then(|| safe_http_url(&r.html_url).map(String::from)).flatten())
 }
 
@@ -694,7 +708,7 @@ impl AddonClient {
     /// Release page of a newer build than this one, or `None` (also for source builds).
     pub async fn check_update(&self) -> Result<Option<String>> {
         let (Some(release), Some(commit)) = (RELEASE, COMMIT) else { return Ok(None) };
-        let url = Url::parse(REPO_API)?.join(if release == "nightly" { "tags/nightly" } else { "latest" })?;
+        let url = Url::parse(&format!("https://api.github.com/repos/{REPO}/releases/"))?.join(if release == "nightly" { "tags/nightly" } else { "latest" })?;
         newer_release(release, commit, &self.get(url).await?)
     }
 

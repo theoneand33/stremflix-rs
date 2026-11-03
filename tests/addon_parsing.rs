@@ -333,9 +333,15 @@ fn update_check() {
     let rel = br#"{"tag_name":"v1.2.0","target_commitish":"abc","html_url":"https://github.com/o/r/releases/tag/v1.2.0"}"#;
     assert_eq!(newer_release("v1.1.0", "zzz", rel).unwrap().as_deref(), Some("https://github.com/o/r/releases/tag/v1.2.0"));
     assert_eq!(newer_release("v1.2.0", "zzz", rel).unwrap(), None);
-    let nightly = br#"{"tag_name":"nightly","target_commitish":"abc","html_url":"https://github.com/o/r/releases/tag/nightly"}"#;
-    assert_eq!(newer_release("nightly", "abc", nightly).unwrap(), None);
-    assert!(newer_release("nightly", "def", nightly).unwrap().is_some());
+    // an older latest tag is not offered as an update
+    assert_eq!(newer_release("v1.3.0-beta", "zzz", rel).unwrap(), None);
+    assert!(newer_release("v1.10.0", "zzz", br#"{"tag_name":"v1.9.0","target_commitish":"a","html_url":"https://x.io/"}"#).unwrap().is_none());
+    let sha = "a".repeat(40);
+    let nightly = format!(r#"{{"tag_name":"nightly","target_commitish":"{sha}","html_url":"https://github.com/o/r/releases/tag/nightly"}}"#);
+    assert_eq!(newer_release("nightly", &sha, nightly.as_bytes()).unwrap(), None);
+    assert!(newer_release("nightly", "def", nightly.as_bytes()).unwrap().is_some());
+    let branch = br#"{"tag_name":"nightly","target_commitish":"main","html_url":"https://github.com/o/r/releases/tag/nightly"}"#;
+    assert_eq!(newer_release("nightly", "def", branch).unwrap(), None);
     let bad_url = br#"{"tag_name":"v2","target_commitish":"a","html_url":"javascript:alert(1)"}"#;
     assert_eq!(newer_release("v1", "a", bad_url).unwrap(), None);
     assert!(newer_release("v1", "a", b"{}").is_err());
