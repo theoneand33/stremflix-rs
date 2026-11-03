@@ -520,6 +520,28 @@ struct Playing {
     menu: bool,
     /// Seek-bar position while dragging, in seconds.
     scrub: Option<f64>,
+    /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
+    awake: Option<Option<keepawake::KeepAwake>>,
+}
+
+impl Drop for Playing {
+    fn drop(&mut self) {
+        release_awake(self.awake.take());
+    }
+}
+
+/// Inhibits screen dimming, blanking and idle sleep until dropped; `None` when no inhibit service is reachable.
+fn keep_awake() -> Option<keepawake::KeepAwake> {
+    // Linux: one missing service (ScreenSaver or logind) fails the combined request outright, so fall back to each alone.
+    // catch_unwind: a failed attempt drops its half-built guard, whose unwrap can panic (see release_awake).
+    [(true, true), (true, false), (false, true)].into_iter().find_map(|(display, idle)| {
+        std::panic::catch_unwind(|| keepawake::Builder::default().display(display).idle(idle).reason("Video playback").app_name("Stremflix").app_reverse_domain("io.github.stremflix").create().ok()).ok().flatten()
+    })
+}
+
+/// keepawake's Linux drop unwraps the D-Bus UnInhibit call, which fails if the screensaver service went away mid-playback.
+fn release_awake(awake: Option<Option<keepawake::KeepAwake>>) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(awake)));
 }
 
 struct App {
@@ -949,7 +971,7 @@ impl App {
                 match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], lang("sub_off") == "1", &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1023,6 +1045,15 @@ impl App {
             return;
         }
         self.last_poll = Instant::now();
+        let paused = p.player.state.paused;
+        if paused {
+            if p.awake.is_some() {
+                release_awake(p.awake.take());
+            }
+        } else if p.awake.is_none() {
+            // Not retried until the next pause/play, so a missing service never blocks the UI thread repeatedly.
+            p.awake = Some(keep_awake());
+        }
         if let Some((pos, dur)) = p.player.position() {
             (p.pos, p.dur) = (pos, dur);
             self.save_progress();
