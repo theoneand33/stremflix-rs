@@ -2588,7 +2588,7 @@ impl App {
         let ctx = ui.ctx().clone();
         ui.separator();
         ui.label(RichText::new("Browse addons").size(20.0).strong().family(bold()).color(Color32::WHITE));
-        let label = |addon: &str, c: &CatalogDef| format!("{addon} - {} ({})", c.name.as_deref().unwrap_or(&c.id), kind_label(&c.kind));
+        let label = |addon: &str, c: &CatalogDef| format!("{addon} - {} ({})", c.name.as_deref().unwrap_or(&c.id), sanitize_text(kind_label(&c.kind), 64));
         let sources: Vec<(AddonCatalogSrc, String)> = self
             .addons
             .iter()
@@ -2627,7 +2627,8 @@ impl App {
         let mut install = None;
         for a in items {
             ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
-                if self.addons.iter().any(|(u, _)| *u == a.transport_url) {
+                // Typed URLs are stored as entered; compare the normalized form, as listed URLs are.
+                if self.addons.iter().any(|(u, _)| stremflix_rs::addon::safe_http_url(u).is_some_and(|u| u.as_str() == a.transport_url)) {
                     ui.add_enabled_ui(false, |ui| small_button(ui, "Installed"));
                 } else if primary_button(ui, "Install").on_hover_text(&a.transport_url).clicked() {
                     install = Some(a.transport_url.clone());

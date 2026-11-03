@@ -350,8 +350,10 @@ fn update_check() {
 #[test]
 fn addon_catalog() {
     let m = parse_manifest(br#"{"id":"a","version":"1","name":"n","resources":["addon_catalog"],"types":["all"],
-      "addonCatalogs":[{"type":"all","id":"community","name":" Community\u0007"},{"type":"all","id":"a/b"}]}"#).unwrap();
-    assert_eq!(m.addon_catalogs.len(), 1, "invalid id dropped");
+      "addonCatalogs":[{"type":"all","id":"community","name":" Community\u0007"},{"type":"all","id":"a/b"},{"id":"no-type"},null]}"#).unwrap();
+    assert_eq!(m.addon_catalogs.len(), 1, "invalid and malformed entries dropped");
+    let junk = br#"{"id":"a","version":"1","name":"n","resources":["stream"],"types":["movie"],"addonCatalogs":null}"#;
+    assert!(parse_manifest(junk).unwrap().addon_catalogs.is_empty(), "a malformed field never fails the manifest");
     assert_eq!(m.addon_catalogs[0].name.as_deref(), Some("Community"));
     // Survives the DB round trip (manifests are stored as serialized JSON).
     assert_eq!(parse_manifest(serde_json::to_string(&m).unwrap().as_bytes()).unwrap(), m);

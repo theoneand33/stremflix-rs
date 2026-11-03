@@ -110,8 +110,8 @@ pub struct Manifest {
     pub types: Vec<String>,
     #[serde(default)]
     pub catalogs: Vec<CatalogDef>,
-    /// Catalogs of other addons, served by the `addon_catalog` resource.
-    #[serde(default, rename = "addonCatalogs")]
+    /// Catalogs of other addons, served by the `addon_catalog` resource; malformed entries are dropped.
+    #[serde(default, rename = "addonCatalogs", deserialize_with = "lenient_vec")]
     pub addon_catalogs: Vec<CatalogDef>,
     #[serde(default, rename = "idPrefixes")]
     pub id_prefixes: Option<Vec<String>>,
