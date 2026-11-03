@@ -1328,8 +1328,7 @@ impl App {
                 }
                 // Overlaid left of the play circle; the topmost widget wins the click.
                 let b = egui::Rect::from_center_size(pos2(r.rect.right() - 160.0, r.rect.center().y), vec2(120.0, 32.0));
-                let label = if seen { "Unwatched" } else { "Watched" };
-                if ui.put(b, egui::Button::new(label)).on_hover_text(if seen { "Mark unwatched" } else { "Mark watched" }).clicked() {
+                if ui.put(b, egui::Button::new(if seen { "Mark unwatched" } else { "Mark watched" })).clicked() {
                     toggle = Some((k, !seen));
                 } else if r.clicked() {
                     episode = Some((meta.clone(), v.clone()));

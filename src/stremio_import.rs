@@ -260,11 +260,12 @@ pub fn watched_episodes(field: &str) -> u32 {
 }
 
 /// Ids of `videos` marked watched in a stremio-core bitfield. Like stremio-core, bits follow the videos
-/// sorted by (season, episode, released), re-aligned on the anchor; an unknown anchor marks nothing.
+/// sorted by (season, episode) with specials (season 0) last, then unnumbered videos by release date,
+/// re-aligned on the anchor; an unknown anchor marks nothing.
 pub fn watched_videos(field: &str, videos: &[Video]) -> Vec<String> {
     let Some((anchor, len, bits)) = decode_bitfield(field) else { return Vec::new() };
     let mut ids: Vec<&Video> = videos.iter().collect();
-    ids.sort_by_key(|v| (v.season.zip(v.episode), v.released.as_deref()));
+    ids.sort_by_key(|v| (v.season.zip(v.episode).map(|(s, e)| (s == 0, s, e)).ok_or(()), v.released.is_none(), v.released.as_deref()));
     ids.dedup_by(|a, b| a.id == b.id);
     let Some(at) = ids.iter().position(|v| v.id == anchor) else { return Vec::new() };
     // Bit `i + offset` of the stored field is video `i` now (episodes may have been added since).
