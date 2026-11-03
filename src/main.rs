@@ -485,8 +485,11 @@ impl Drop for Playing {
 
 /// Inhibits screen dimming, blanking and idle sleep until dropped; `None` when no inhibit service is reachable.
 fn keep_awake() -> Option<keepawake::KeepAwake> {
-    // Linux: without a ScreenSaver service the combined request fails outright, so fall back to logind's idle inhibitor.
-    [true, false].into_iter().find_map(|display| keepawake::Builder::default().display(display).idle(true).reason("Video playback").app_name("Stremflix").app_reverse_domain("io.github.stremflix").create().ok())
+    // Linux: one missing service (ScreenSaver or logind) fails the combined request outright, so fall back to each alone.
+    // catch_unwind: a failed attempt drops its half-built guard, whose unwrap can panic (see release_awake).
+    [(true, true), (true, false), (false, true)].into_iter().find_map(|(display, idle)| {
+        std::panic::catch_unwind(|| keepawake::Builder::default().display(display).idle(idle).reason("Video playback").app_name("Stremflix").app_reverse_domain("io.github.stremflix").create().ok()).ok().flatten()
+    })
 }
 
 /// keepawake's Linux drop unwraps the D-Bus UnInhibit call, which fails if the screensaver service went away mid-playback.
@@ -957,7 +960,9 @@ impl App {
         self.last_poll = Instant::now();
         let paused = p.player.state.paused;
         if paused {
-            release_awake(p.awake.take());
+            if p.awake.is_some() {
+                release_awake(p.awake.take());
+            }
         } else if p.awake.is_none() {
             // Not retried until the next pause/play, so a missing service never blocks the UI thread repeatedly.
             p.awake = Some(keep_awake());
