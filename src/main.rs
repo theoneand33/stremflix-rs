@@ -477,6 +477,8 @@ struct Playing {
     fast: bool,
     /// Press start (egui clock) of a press that began on the video, while the button stays down.
     hold: Option<f64>,
+    /// The last click on the video was a hold release, so the next one must not pair with it into a double-click.
+    after_hold: bool,
 }
 
 struct App {
@@ -866,7 +868,7 @@ impl App {
                 match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], &headers, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
-                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, fast: false, hold: None };
+                        let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None, fast: false, hold: None, after_hold: false };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1818,7 +1820,7 @@ impl App {
 
         // Click toggles pause, double-click fullscreen; registered first so controls on top win.
         let bg = ui.interact(rect, ui.scope_id().with("video"), Sense::CLICK);
-        // Press and hold the video for 2x speed; the release restores the prior speed and is not a click.
+        // Press and hold the video for 2x speed; the release halves it back and is not a click.
         let was_fast = p.fast;
         // Primary button only; losing focus or the pointer ends the hold in case the release went elsewhere.
         let down = ctx.input(|i| i.pointer.primary_down() && i.focused && i.pointer.has_pointer());
@@ -1835,14 +1837,17 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(100)); // reach the threshold and see the release even when paused
         }
         if p.fast {
-            let r = egui::Rect::from_center_size(pos2(rect.center().x, rect.top() + 120.0), vec2(64.0, 32.0));
+            let r = egui::Rect::from_center_size(pos2(rect.center().x, rect.top() + 130.0), vec2(64.0, 32.0));
             ui.painter().rect_filled(r, 16, Color32::from_black_alpha(160));
             ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "2x", egui::FontId::new(17.0, bold()), Color32::WHITE);
         }
         if bg.clicked() && !long {
             if p.menu { p.menu = false } else { cmd(&["cycle", "pause"]) }
         }
-        toggle_fs |= bg.double_clicked();
+        toggle_fs |= bg.double_clicked() && !p.after_hold;
+        if bg.clicked() {
+            p.after_hold = long;
+        }
         ctx.input(|i| {
             use egui::Key::*;
             let k = |key| i.key_pressed(key);
