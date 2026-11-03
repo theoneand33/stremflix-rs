@@ -2111,10 +2111,12 @@ impl App {
         if bg.clicked() {
             p.after_hold = long;
         }
+        let focused = ctx.memory(|m| m.focused());
         ctx.input(|i| {
             use egui::Key::*;
             let k = |key| i.key_pressed(key);
-            if k(Space) || k(K) { cmd(&["cycle", "pause"]) }
+            // Space activates a focused popover control, so it must not also toggle pause.
+            if (k(Space) && focused.is_none()) || k(K) { cmd(&["cycle", "pause"]) }
             if k(ArrowLeft) { seek = Some((-10.0, true)) }
             if k(ArrowRight) { seek = Some((10.0, true)) }
             if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
