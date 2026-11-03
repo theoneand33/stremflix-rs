@@ -2241,7 +2241,7 @@ impl App {
         // Up next: in an episode's last 30 s, a card slides in from the right to play the next one.
         if let Some((series, label, img)) = up_next {
             // Needs a duration over 60 s so a short or still-loading stream doesn't show the card at once.
-            let open = !p.next_dismissed && st.dur > 60.0 && st.dur - st.pos <= 30.0;
+            let open = !p.next_dismissed && rect.width() >= 362.0 && st.dur > 60.0 && st.dur - st.pos <= 30.0;
             let t = ctx.animate_bool_with_time(ui.scope_id().with("up_next"), open, 0.4);
             if t > 0.0 {
                 let ease = 1.0 - (1.0 - t).powi(3);
@@ -2251,8 +2251,8 @@ impl App {
                 // Swallows clicks on the card so they don't pause the video; the buttons, registered later, win.
                 let _ = ui.interact(card, ui.scope_id().with("up_next_card"), Sense::CLICK);
                 paint.rect_filled(card, 12, Color32::from_rgb(22, 22, 26));
-                // The buttons need 312 px; the still takes the rest (none when narrow).
-                let thumb = egui::Rect::from_min_size(card.min, vec2((size.x - 312.0).clamp(0.0, size.y * 1.05), size.y));
+                // The buttons need 316 px; the still takes the rest (none when narrow).
+                let thumb = egui::Rect::from_min_size(card.min, vec2((size.x - 316.0).clamp(0.0, size.y * 1.05), size.y));
                 let left = egui::CornerRadius { nw: 12, sw: 12, ne: 0, se: 0 };
                 paint.rect_filled(thumb, left, Color32::from_gray(40));
                 if let (true, Some((u, b))) = (thumb.width() > 0.0, img) {
