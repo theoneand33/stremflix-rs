@@ -306,10 +306,10 @@ fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
 }
 
 /// Rounded chip, accent-filled when selected.
-fn pill(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+fn pill(ui: &mut egui::Ui, label: &str, selected: bool, role: egui::Role) -> egui::Response {
     let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::new(14.0, if selected { bold() } else { egui::FontFamily::Proportional }), Color32::WHITE);
     let (rect, r) = ui.allocate_exact_size(vec2(g.size().x + 24.0, 30.0), Sense::CLICK);
-    r.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, label));
+    r.widget_info(|| egui::WidgetInfo::selected(role, true, selected, label));
     let fill = if selected { ACCENT } else { Color32::from_white_alpha(if r.hovered() { 30 } else { 16 }) };
     ui.painter().rect_filled(rect, 15, fill);
     ui.painter().galley(rect.center() - g.size() / 2.0, g, Color32::WHITE);
@@ -334,11 +334,11 @@ fn stepper(ui: &mut egui::Ui, label: &str, value: &str) -> i32 {
         ui.set_min_height(36.0);
         ui.label(RichText::new(label).size(15.0).color(Color32::from_gray(210)));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if pill(ui, "+", false).on_hover_text(format!("Increase {label}")).clicked() {
+            if pill(ui, "+", false, egui::Role::Button).on_hover_text(format!("Increase {label}")).clicked() {
                 step = 1;
             }
             ui.add_sized([56.0, 30.0], egui::Label::new(RichText::new(value).size(14.0).color(Color32::WHITE)));
-            if pill(ui, "−", false).on_hover_text(format!("Decrease {label}")).clicked() {
+            if pill(ui, "−", false, egui::Role::Button).on_hover_text(format!("Decrease {label}")).clicked() {
                 step = -1;
             }
         });
@@ -2215,7 +2215,7 @@ impl App {
 
             if let Some(m) = p.menu {
                 let i = [Menu::Audio, Menu::Subtitles, Menu::Playback].iter().position(|&x| x == m).unwrap_or(0);
-                // Right-aligned to its button, kept inside the window.
+                // Right edge sits 150 px past its button's center, clamped inside the window.
                 let right = (rect.right() - 52.0 - (2 - i) as f32 * 64.0 + 150.0).min(rect.right() - 16.0);
                 egui::Area::new(ui.scope_id().with(("menu", i))).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_BOTTOM).fixed_pos(pos2(right, y - 70.0)).show(&ctx, |ui| {
                     egui::Frame::new().fill(Color32::from_rgba_unmultiplied(24, 24, 28, 245)).stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(18))).corner_radius(12).inner_margin(egui::Margin::symmetric(12, 14)).show(ui, |ui| {
@@ -2300,7 +2300,7 @@ impl App {
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
                                 for sp in SPEEDS {
-                                    if pill(ui, &format!("{sp}x"), (st.speed - sp).abs() < 0.01).clicked() {
+                                    if pill(ui, &format!("{sp}x"), (st.speed - sp).abs() < 0.01, egui::Role::RadioButton).clicked() {
                                         cmd(&["set", "speed", &sp.to_string()]);
                                     }
                                 }
