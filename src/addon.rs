@@ -247,8 +247,17 @@ pub struct Stream {
     /// e.g. "tracker:<url>", "dht:<hash>"; "peer:<host:port>" is a local extension.
     #[serde(default)]
     pub sources: Vec<String>,
+    /// Page to open in the browser instead of playing; only http(s) is kept.
+    #[serde(default, rename = "externalUrl")]
+    pub external_url: Option<String>,
+    /// YouTube video id, played through mpv's yt-dlp hook.
+    #[serde(default, rename = "ytId")]
+    pub yt_id: Option<String>,
     #[serde(default, rename = "behaviorHints", deserialize_with = "behavior_hints", skip_serializing)]
     pub hints: BehaviorHints,
+    /// Name of the addon that served the stream (set by the client, not the addon).
+    #[serde(skip)]
+    pub addon: String,
 }
 
 /// The parts of a stream's `behaviorHints` this client uses.
@@ -320,13 +329,16 @@ impl Stream {
     }
 
     pub fn target(&self) -> Option<PlayTarget> {
+        // An unplayable `url` falls back to `infoHash`, then `ytId`.
         if let Some(u) = &self.url {
-            if u.starts_with("magnet:") {
-                return parse_magnet_hash(u).map(|_| PlayTarget::Magnet(u.clone(), self.file_idx));
+            let t = if u.starts_with("magnet:") { parse_magnet_hash(u).map(|_| PlayTarget::Magnet(u.clone(), self.file_idx)) } else { safe_http_url(u).map(PlayTarget::Http) };
+            if t.is_some() {
+                return t;
             }
-            return safe_http_url(u).map(PlayTarget::Http);
         }
-        let hash = self.info_hash.as_deref().filter(|h| is_info_hash(h))?;
+        let Some(hash) = self.info_hash.as_deref().filter(|h| is_info_hash(h)) else {
+            return self.yt_id.as_deref().and_then(youtube_url).map(PlayTarget::Http);
+        };
         let mut magnet = format!("magnet:?xt=urn:btih:{}", hash.to_ascii_lowercase());
         for s in &self.sources {
             if let Some(tr) = s.strip_prefix("tracker:").and_then(safe_http_url) {
@@ -357,6 +369,17 @@ pub fn sanitize_text(s: &str, max: usize) -> String {
 pub fn safe_http_url(s: &str) -> Option<Url> {
     let u = Url::parse(s.trim()).ok()?;
     (matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())).then_some(u)
+}
+
+/// Watch URL of a YouTube video id (11 chars of `[A-Za-z0-9_-]`); `None` for anything else.
+pub fn youtube_url(id: &str) -> Option<Url> {
+    (id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+        .then(|| Url::parse(&format!("https://www.youtube.com/watch?v={id}")).unwrap())
+}
+
+/// True only for the exact URL [`youtube_url`] builds, so yt-dlp never runs on arbitrary addon URLs.
+pub fn is_youtube(source: &str) -> bool {
+    source.strip_prefix("https://www.youtube.com/watch?v=").and_then(youtube_url).is_some_and(|u| u.as_str() == source)
 }
 
 pub fn is_info_hash(h: &str) -> bool {
@@ -507,7 +530,8 @@ pub fn parse_streams(body: &[u8]) -> Result<Vec<Stream>> {
             // Shown on one line of the stream row.
             s.hints.filename = s.hints.filename.map(|f| f.replace(['\n', '\t'], " "));
             opt_text(&mut s.hints.filename, MAX_TEXT);
-            s.target().is_some().then_some(s)
+            opt_url(&mut s.external_url);
+            (s.target().is_some() || s.external_url.is_some()).then_some(s)
         })
         .collect())
 }

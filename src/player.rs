@@ -75,7 +75,7 @@ const FORMAT_INT64: c_int = 4;
 const FORMAT_DOUBLE: c_int = 5;
 
 /// Observed properties, in `reply_userdata` order.
-const PROPS: [(&str, c_int); 10] = [
+const PROPS: [(&str, c_int); 11] = [
     ("time-pos", FORMAT_DOUBLE),
     ("duration", FORMAT_DOUBLE),
     ("pause", FORMAT_FLAG),
@@ -85,6 +85,7 @@ const PROPS: [(&str, c_int); 10] = [
     ("dwidth", FORMAT_INT64),
     ("dheight", FORMAT_INT64),
     ("track-list", FORMAT_STRING),
+    ("speed", FORMAT_DOUBLE),
     ("seeking", FORMAT_FLAG),
 ];
 
@@ -110,6 +111,8 @@ pub struct State {
     /// Display size of the video in pixels; 0 until known.
     pub video: [usize; 2],
     pub tracks: Vec<Track>,
+    /// Playback speed multiplier; 0 until mpv reports it.
+    pub speed: f64,
     /// Set when the file failed to open/play.
     pub error: Option<String>,
 }
@@ -123,6 +126,15 @@ pub struct SubStyle {
     pub background: bool,
     /// Seconds; positive shows subtitles later.
     pub delay: f64,
+}
+
+/// Playback speeds offered in the player menu.
+pub const SPEEDS: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+
+/// mpv `hwdec` value: GPU decoders with zero-copy OpenGL interop only, or software decoding.
+/// Copy-back decoders (e.g. vulkan-copy) corrupted frames in testing.
+pub fn hwdec_value(on: bool) -> &'static str {
+    if on { "nvdec,vaapi,videotoolbox,d3d11va" } else { "no" }
 }
 
 /// Preset text colors: label and mpv `sub-color` value.
@@ -302,9 +314,10 @@ impl Player {
     /// `wake` is called from mpv's thread whenever a new frame is ready.
     /// `headers` (validated addon request headers) go to this instance only; each launch is a fresh mpv,
     /// so they never leak to the next stream or host.
+    /// yt-dlp runs only for the exact YouTube URL built from a validated `ytId`; `hwdec` toggles hardware decoding.
     /// Must be called, rendered and dropped with the GUI's GL context current.
     #[allow(clippy::too_many_arguments)] // player setup options; bundling them adds no clarity
-    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], subs_off: bool, headers: &[(String, String)], gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
+    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], subs_off: bool, headers: &[(String, String)], hwdec: bool, gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
         let mpv = unsafe { mpv_create() };
         if mpv.is_null() {
             bail!("failed to create mpv instance");
@@ -317,11 +330,10 @@ impl Player {
             ("input-ipc-server", &*socket.to_string_lossy()),
             ("keep-open", "yes"),
             ("idle", "yes"),
-            ("ytdl", "no"),
+            ("ytdl", if crate::addon::is_youtube(source) { "yes" } else { "no" }),
             ("terminal", "no"),
             ("input-default-bindings", "no"),
-            // GPU decoders with zero-copy OpenGL interop only; copy-back ones (e.g. vulkan-copy) corrupted frames in testing.
-            ("hwdec", "nvdec,vaapi,videotoolbox,d3d11va"),
+            ("hwdec", hwdec_value(hwdec)),
             ("force-media-title", title),
             ("start", &format!("{start:.1}")),
         ]
@@ -460,7 +472,8 @@ impl Player {
                 6 => s.video[0] = int(),
                 7 => s.video[1] = int(),
                 8 => s.tracks = parse_tracks(&CStr::from_ptr(*(p.data as *const *const c_char)).to_string_lossy()),
-                9 => s.seeking = flag(),
+                9 => s.speed = f(),
+                10 => s.seeking = flag(),
                 _ => {}
             }
         }

@@ -209,6 +209,30 @@ fn stream_parsing_and_targets() {
 }
 
 #[test]
+fn external_and_youtube_streams() {
+    let body = br#"{"streams": [
+        {"externalUrl": "https://site.example/watch", "title": "Web"},
+        {"externalUrl": "stremio:///detail/movie/tt1"},
+        {"externalUrl": "javascript:alert(1)"},
+        {"ytId": "dQw4w9WgXcQ", "title": "Trailer"},
+        {"ytId": "bad/id&x=1"},
+        {"ytId": "dQw4w9WgXcQ", "url": "https://cdn.example/v.mp4"},
+        {"ytId": "dQw4w9WgXcQ", "url": "ftp://cdn.example/v.mp4"}
+    ]}"#;
+    let s = parse_streams(body).unwrap();
+    assert_eq!(s.len(), 4, "non-http external URLs and bad ytIds dropped");
+    assert_eq!(s[3].source().as_deref(), Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "unplayable url falls back to ytId");
+    assert_eq!((s[0].external_url.as_deref(), s[0].target()), (Some("https://site.example/watch"), None));
+    let yt = s[1].source().unwrap();
+    assert_eq!(yt, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    assert!(is_youtube(&yt));
+    assert_eq!(s[2].source().as_deref(), Some("https://cdn.example/v.mp4"), "url wins over ytId");
+    for not in ["https://cdn.example/v.mp4", "https://www.youtube.com/watch?v=dQw4w9WgXcQ&x=1", "https://www.youtube.com/watch?v=short"] {
+        assert!(!is_youtube(not), "{not}");
+    }
+}
+
+#[test]
 fn stream_binge_group() {
     let long = "g".repeat(1000);
     let body = format!(

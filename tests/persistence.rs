@@ -101,3 +101,39 @@ fn watched_round_trip() {
     db.set_watched("movie:tt9", false).unwrap();
     assert!(db.watched_keys().unwrap().is_empty());
 }
+
+#[test]
+fn addon_order_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let m = parse_manifest(br#"{"id":"a","version":"1","name":"A","resources":["stream"],"types":["movie"]}"#).unwrap();
+    let urls = |db: &Db| db.addons().unwrap().into_iter().map(|(u, _)| u).collect::<Vec<_>>();
+    let u = |n: &str| format!("https://{n}.example/manifest.json");
+    {
+        let db = Db::open(&path).unwrap();
+        for n in ["a", "b", "c"] {
+            db.add_addon(&u(n), &m).unwrap();
+        }
+        assert_eq!(urls(&db), [u("a"), u("b"), u("c")], "install order");
+        db.reorder_addons(&[u("c"), u("a"), u("b")]).unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    assert_eq!(urls(&db), [u("c"), u("a"), u("b")]);
+    db.add_addon(&u("d"), &m).unwrap();
+    assert_eq!(urls(&db).last(), Some(&u("d")), "new addons go last");
+    db.add_addon(&u("c"), &m).unwrap();
+    assert_eq!(urls(&db)[0], u("c"), "reinstall keeps its place");
+    drop(db);
+    // A database from before the position column: rows keep install order and new ones go last.
+    let old = dir.path().join("old.db");
+    let conn = rusqlite::Connection::open(&old).unwrap();
+    conn.execute_batch("CREATE TABLE addons (transport_url TEXT PRIMARY KEY, manifest TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT (unixepoch()));").unwrap();
+    let json = serde_json::to_string(&m).unwrap();
+    for (n, at) in [("b", 2), ("a", 1)] {
+        conn.execute("INSERT INTO addons VALUES (?1, ?2, ?3)", rusqlite::params![u(n), json, at]).unwrap();
+    }
+    drop(conn);
+    let db = Db::open(&old).unwrap();
+    db.add_addon(&u("c"), &m).unwrap();
+    assert_eq!(urls(&db), [u("a"), u("b"), u("c")]);
+}
