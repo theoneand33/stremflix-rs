@@ -1,5 +1,6 @@
 pub mod addon;
 pub mod db;
+pub mod instance;
 pub mod library;
 pub mod player;
 pub mod torrent;

@@ -371,3 +371,24 @@ fn addon_catalog() {
     assert_eq!(list[0].manifest.name, "X");
     assert!(parse_addon_catalog(b"{}").is_err());
 }
+
+#[test]
+fn deep_links() {
+    let addon = |s: &str| match parse_deep_link(s) {
+        Some(DeepLink::Addon(u)) => Some(u.to_string()),
+        _ => None,
+    };
+    assert_eq!(addon("stremio://v3-cinemeta.strem.io/manifest.json").as_deref(), Some("https://v3-cinemeta.strem.io/manifest.json"));
+    assert_eq!(addon("stremio://127.0.0.1:7000/cfg/manifest.json").as_deref(), Some("http://127.0.0.1:7000/cfg/manifest.json"));
+    assert_eq!(addon("stremio://localhost:7000/manifest.json").as_deref(), Some("http://localhost:7000/manifest.json"));
+    assert_eq!(addon("stremio://example.com/other.json"), None);
+    assert_eq!(addon("https://example.com/manifest.json"), None);
+    assert_eq!(
+        parse_deep_link("stremio:///detail/series/tt0903747/tt0903747%3A1%3A1"),
+        Some(DeepLink::Detail { kind: "series".into(), id: "tt0903747".into(), video: Some("tt0903747:1:1".into()) })
+    );
+    assert_eq!(parse_deep_link("stremio:///detail/movie/tt1"), Some(DeepLink::Detail { kind: "movie".into(), id: "tt1".into(), video: None }));
+    for bad in ["stremio:///detail/movie", "stremio:///detail/movie/a%2Fb", "stremio:///detail/movie/x%00", "stremio:///search?q=x", "stremio:///detail/movie/tt1/v/extra"] {
+        assert_eq!(parse_deep_link(bad), None, "{bad}");
+    }
+}
