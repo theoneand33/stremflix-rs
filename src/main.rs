@@ -2050,6 +2050,9 @@ impl App {
         }
         for c in &cmds {
             let args: Vec<&str> = c.iter().map(String::as_str).collect();
+            if let ["set", "sid", v] = args[..] {
+                p.player.subs_off = v == "no";
+            }
             if let Err(e) = p.player.command(&args) {
                 report(&mut self.error, e);
             }

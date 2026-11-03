@@ -178,8 +178,8 @@ pub struct Player {
     source: String,
     /// The file is open (FILE_LOADED seen since the last `loadfile`).
     loaded: bool,
-    /// Start with subtitles off (last choice was "Off").
-    subs_off: bool,
+    /// Subtitles off (last choice was "Off"); kept in sync by the menu so a reload honors it.
+    pub subs_off: bool,
     alive: bool,
     pub state: State,
 }
@@ -281,6 +281,10 @@ pub fn valid_langs(s: &str) -> Option<String> {
 
 /// `slang` with `lang` moved to the front (case-insensitive dedupe, max 8); None if the result isn't a valid preference.
 pub fn prefer_lang(slang: &str, lang: &str) -> Option<String> {
+    let lang = lang.trim();
+    if lang.is_empty() {
+        return None;
+    }
     let rest = valid_langs(slang).unwrap_or_default();
     let list: Vec<&str> = std::iter::once(lang).chain(rest.split(',').filter(|x| !x.is_empty() && !x.eq_ignore_ascii_case(lang))).take(8).collect();
     valid_langs(&list.join(","))
@@ -529,6 +533,7 @@ mod tests {
         assert_eq!(prefer_lang("bad!", "en").as_deref(), Some("en"));
         assert_eq!(prefer_lang("fr,de,es,it,pt,ja,ko,ru", "en").as_deref(), Some("en,fr,de,es,it,pt,ja,ko"));
         assert_eq!(prefer_lang("en", "English"), None);
+        assert_eq!(prefer_lang("en", " "), None);
     }
 
     #[test]
