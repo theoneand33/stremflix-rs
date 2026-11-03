@@ -859,7 +859,7 @@ impl App {
                     let _ = self.db.set_setting(&format!("series:{key}"), &m.id);
                     let _ = self.db.set_setting(&format!("binge:{}:{}", m.kind, m.id), &group.unwrap_or_default());
                 }
-                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], &headers, gl_proc, Box::new(move || wake.request_repaint())) {
+                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], lang("sub_off") == "1", &headers, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
                         let p = Playing { player, key, title, source, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: false, scrub: None };
@@ -1962,13 +1962,30 @@ impl App {
                                     ui.add_space(8.0);
                                     let tracks: Vec<_> = st.tracks.iter().filter(|t| t.kind == kind).collect();
                                     let off = !tracks.iter().any(|t| t.selected);
-                                    let entries = (kind == "sub").then_some((None, "Off", off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.selected)));
-                                    for (id, label, sel) in entries {
+                                    let entries = (kind == "sub").then_some((None, "Off", None, off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.lang.as_deref(), t.selected)));
+                                    for (id, label, lang, sel) in entries {
                                         let text = RichText::new(format!("{}  {label}", if sel { icons::CHECK } else { "   " })).size(16.0);
                                         let text = if sel { text.color(Color32::WHITE).family(bold()) } else { text.color(Color32::from_gray(180)) };
                                         if ui.add(egui::Button::new(text).frame(false)).clicked() {
                                             let v = id.map_or("no".to_string(), |i| i.to_string());
                                             cmd(&["set", prop, &v]);
+                                            // Remember the subtitle choice for the next video: Off, or the picked language first in `slang`.
+                                            if kind == "sub" {
+                                                let mut save = vec![("sub_off", if id.is_none() { "1" } else { "" }.to_string())];
+                                                if let Some(l) = lang {
+                                                    let rest = valid_langs(&self.langs[1]).unwrap_or_default();
+                                                    let v = std::iter::once(l).chain(rest.split(',').filter(|x| !x.is_empty() && *x != l)).take(8).collect::<Vec<_>>().join(",");
+                                                    if let Some(v) = valid_langs(&v) {
+                                                        self.langs[1] = v.clone();
+                                                        save.push(("slang", v));
+                                                    }
+                                                }
+                                                for (k, v) in save {
+                                                    if let Err(e) = self.db.set_setting(k, &v) {
+                                                        report(&mut self.error, format!("saving {k}: {e:#}"));
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     if kind == "sub" {
