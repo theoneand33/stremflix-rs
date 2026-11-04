@@ -62,7 +62,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Download queue with progress and pause/resume | P2 | M | Builds on the download manager. |
-| Choose files in a multi-file torrent | P2 | S | The largest file is picked silently today. |
 | Download / upload speed limits | P3 | S | librqbit supports rate limits. |
 | Seeding limits (ratio/time) and a torrent manager UI | P3 | S | Torrents are stopped and deleted automatically now. |
 | Custom listen port / UPnP / NAT-PMP | P3 | M | |

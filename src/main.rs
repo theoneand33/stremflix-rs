@@ -72,6 +72,8 @@ fn open_external(command: &str, url: &str) -> anyhow::Result<()> {
 
 /// Addon subtitles as (url, lang).
 type Subs = Vec<(String, String)>;
+/// Media file `(index, name, size)` of a torrent.
+type MediaFile = (usize, String, u64);
 
 /// Order of the saved-titles list in the Library tab.
 #[derive(PartialEq, Clone, Copy)]
@@ -156,6 +158,8 @@ enum Msg {
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs, torrent id, the `nav` it was requested at
     Play(String, String, String, String, Subs, Option<usize>, u64),
+    /// key, title, magnet, subtitle URLs, the media files `(index, name, size)` to choose from, the `nav` it was requested at
+    PickFile(String, String, String, Subs, Vec<MediaFile>, u64),
     /// progress key, poster URL found for a Continue Watching entry
     RecentPoster(String, String),
     /// Stremio storage that was read, and what it holds.
@@ -824,6 +828,8 @@ struct App {
     default_speed: f64,
     /// Last error, shown in a dismissible red line until cleared.
     error: Option<String>,
+    /// A multi-file torrent waiting for the user to pick a file: key, title, magnet, subtitles, files, selected index.
+    file_pick: Option<(String, String, String, Subs, Vec<MediaFile>, usize)>,
     /// Release page of a newer build, shown until dismissed.
     update: Option<String>,
     /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
@@ -898,6 +904,7 @@ impl App {
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
             default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
             error: None,
+            file_pick: None,
             update: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
@@ -975,7 +982,14 @@ impl App {
         self.spawn(ctx, async move {
             let (url, id) = match torrent {
                 true => {
-                    let (url, id) = start.await?.stream_url(&source, None, false).await?;
+                    let engine = start.await?;
+                    if source.starts_with("magnet:") {
+                        let files = engine.media_choices(&source).await?;
+                        if !files.is_empty() {
+                            return Ok(Msg::PickFile(key, title, source, subs, files, nav));
+                        }
+                    }
+                    let (url, id) = engine.stream_url(&source, None, false).await?;
                     (url, Some(id))
                 }
                 false => (source.clone(), None),
@@ -1321,6 +1335,14 @@ impl App {
             }
             Msg::Poster(url, bytes) => {
                 self.posters.insert(url, Some(bytes.into()));
+            }
+            Msg::PickFile(key, title, source, subs, files, nav) => {
+                if nav == self.nav {
+                    let first = files[0].0;
+                    self.file_pick = Some((key, title, source, subs, files, first));
+                } else {
+                    self.release_torrents(self.player.as_ref().and_then(|p| p.torrent));
+                }
             }
             Msg::Play(key, title, source, url, subs, torrent, nav) => {
                 if nav != self.nav {
@@ -3366,6 +3388,24 @@ impl eframe::App for App {
                     }
                 });
             });
+            let mut chosen = None;
+            if let Some((_, title, _, _, files, sel)) = &mut self.file_pick {
+                let mut open = true;
+                egui::Window::new(format!("Choose a file: {}", sanitize_text(title, 80))).open(&mut open).collapsible(false).show(&ctx, |ui| {
+                    for (i, name, len) in files.iter() {
+                        ui.radio_value(sel, *i, format!("{}  ({})", sanitize_text(name, 120), fmt_size(*len)));
+                    }
+                    if ui.button("Play").clicked() {
+                        chosen = Some(*sel);
+                    }
+                });
+                if !open {
+                    self.file_pick = None;
+                }
+            }
+            if let (Some(idx), Some((key, title, source, subs, _, _))) = (chosen, self.file_pick.take()) {
+                self.play(&ctx, key, title, format!("{source}&so={idx}"), subs);
+            }
             if let Some(e) = self.error.clone() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("Error: {e}")).color(Color32::from_rgb(230, 90, 90)));
