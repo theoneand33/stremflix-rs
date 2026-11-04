@@ -44,6 +44,24 @@ pub struct SavedTitle {
     pub poster: Option<String>,
 }
 
+/// A stream saved for offline playback.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Download {
+    pub path: PathBuf,
+    pub kind: String,
+    pub meta_id: String,
+    /// Episode id for series; the meta id for movies.
+    pub video_id: String,
+    pub title: String,
+}
+
+impl Download {
+    /// Progress key, the same as when streaming, so the title resumes either way.
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.kind, self.video_id)
+    }
+}
+
 impl SavedTitle {
     /// Detail-page view of the saved title; `None` if the key has no `<type>:<id>` shape.
     pub fn preview(&self) -> Option<MetaPreview> {
@@ -70,7 +88,9 @@ impl Db {
              CREATE TABLE IF NOT EXISTS watched (key TEXT PRIMARY KEY, title TEXT NOT NULL, poster TEXT,
                  episodes INTEGER NOT NULL, watched_at INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS saved_titles (key TEXT PRIMARY KEY, title TEXT NOT NULL, kind TEXT NOT NULL,
-                 poster TEXT, saved_at INTEGER NOT NULL DEFAULT (unixepoch()));",
+                 poster TEXT, saved_at INTEGER NOT NULL DEFAULT (unixepoch()));
+             CREATE TABLE IF NOT EXISTS downloads (path TEXT PRIMARY KEY, kind TEXT NOT NULL, meta_id TEXT NOT NULL,
+                 video_id TEXT NOT NULL, title TEXT NOT NULL, added_at INTEGER NOT NULL DEFAULT (unixepoch()));",
         )?;
         // Migrate databases created before posters were stored; fails harmlessly if the column exists.
         let _ = conn.execute("ALTER TABLE progress ADD COLUMN poster TEXT", []);
@@ -168,6 +188,33 @@ impl Db {
             .filter_map(|r| r.ok())
             .filter(|t| valid_id(&t.key) && valid_id(&t.kind) && !t.title.trim().is_empty())
             .collect())
+    }
+
+    pub fn add_download(&self, d: &Download) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO downloads (path, kind, meta_id, video_id, title) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![d.path.to_string_lossy(), d.kind, d.meta_id, d.video_id, d.title],
+        )?;
+        Ok(())
+    }
+
+    /// Also drops its resume point if that plays the file, so Continue Watching doesn't open a missing file.
+    pub fn remove_download(&self, d: &Download) -> Result<()> {
+        let path = d.path.to_string_lossy();
+        self.transaction(|| {
+            self.conn.execute("DELETE FROM downloads WHERE path = ?1", [&path])?;
+            self.conn.execute("DELETE FROM progress WHERE key = ?1 AND source = ?2", [d.key().as_str(), &path])?;
+            Ok(())
+        })
+    }
+
+    /// Downloads, newest first.
+    pub fn downloads(&self) -> Result<Vec<Download>> {
+        let mut st = self.conn.prepare("SELECT path, kind, meta_id, video_id, title FROM downloads ORDER BY added_at DESC, rowid DESC")?;
+        let rows = st.query_map([], |r| {
+            Ok(Download { path: PathBuf::from(r.get::<_, String>(0)?), kind: r.get(1)?, meta_id: r.get(2)?, video_id: r.get(3)?, title: r.get(4)? })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {

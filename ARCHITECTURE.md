@@ -4,6 +4,7 @@
 src/addon.rs    Stremio addon protocol: types, sanitizing parsers, async HTTP client
 src/db.rs       SQLite (rusqlite, bundled): addons, library folders/items, settings, progress
 src/library.rs  Recursive media-file scan (walkdir)
+src/download.rs Offline downloads: safe file names, streaming a URL (or the local torrent stream) to a file
 src/player.rs   libmpv (FFI) in-process: OpenGL-rendered frames, observed properties, IPC server
 src/torrent.rs  librqbit session + its HTTP streaming API on 127.0.0.1
 src/stremio_import.rs  Reads a local Stremio's localStorage (WebKit SQLite or Chromium LevelDB via rusty-leveldb)
@@ -44,3 +45,5 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 ## Persistence
 
 SQLite in WAL mode at `$STREMFLIX_RS_DATA/stremflix-rs.db`. Progress keys are `<type>:<id>` for addon items, `file:<path>` for local files, and `btih:<hash>` for raw magnets. Each row stores a resumable source: URL, magnet, or path.
+
+Downloads go to `$STREMFLIX_RS_DATA/downloads/`, named from the sanitized title (never from addon or torrent file paths), written to `<name>.part` and renamed when complete. The `downloads` table keeps path, type, meta id, video id and title; playing one uses the streaming progress key `<type>:<video id>`. A downloading torrent is pinned so other playback doesn't stop it.
