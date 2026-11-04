@@ -129,7 +129,7 @@ fn parse_year(s: &str) -> Option<i32> {
 
 /// Year and IMDb rating of a title's details.
 fn saved_facts(d: &Meta) -> (Option<i32>, Option<f64>) {
-    (d.release_info.as_deref().and_then(parse_year), d.imdb_rating.as_deref().and_then(|r| r.trim().parse().ok()))
+    (d.release_info.as_deref().and_then(parse_year), d.imdb_rating.as_deref().and_then(|r| r.trim().parse::<f64>().ok()).filter(|r| (0.0..=10.0).contains(r)))
 }
 
 /// Saved titles of `kind`, newest first unless sorted: by title (case-insensitive), or best first with missing values last.
@@ -3624,6 +3624,16 @@ mod tests {
         assert_eq!(parse_year("2010–2015"), Some(2010));
         assert_eq!(parse_year("n/a"), None);
         assert_eq!(saved_view(&[], LibKind::All, LibSort::Title).len(), 0);
+    }
+
+    #[test]
+    fn saved_facts_rejects_non_finite_ratings() {
+        let rated = |r: &str| serde_json::from_value::<Meta>(serde_json::json!({"id": "tt1", "type": "movie", "name": "x", "imdbRating": r})).unwrap();
+        assert_eq!(saved_facts(&rated("NaN")).1, None);
+        assert_eq!(saved_facts(&rated("inf")).1, None);
+        assert_eq!(saved_facts(&rated("infinity")).1, None);
+        assert_eq!(saved_facts(&rated("11")).1, None);
+        assert_eq!(saved_facts(&rated("8.5")).1, Some(8.5));
     }
 
     #[test]
