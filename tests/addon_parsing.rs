@@ -156,6 +156,21 @@ fn meta_detail_fields() {
 }
 
 #[test]
+fn meta_trailers() {
+    let m = parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": "One", "trailerStreams": [
+        {"title": "Official", "ytId": "dQw4w9WgXcQ", "url": "https://evil.example/x"},
+        {"title": "Bad", "ytId": "../../etc"}, {"title": "Torrent", "infoHash": "0123456789abcdef0123456789abcdef01234567"}, 3
+    ], "trailers": [{"source": "aaaaaaaaaaa", "type": "Trailer"}]}}"#)
+    .unwrap();
+    assert_eq!(m.trailers.len(), 1, "invalid ids, non-YouTube and malformed entries dropped; legacy ignored");
+    assert_eq!(m.trailers[0].source().as_deref(), Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "url stripped");
+    assert_eq!(m.trailers[0].title.as_deref(), Some("Official"));
+    let m = parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": "One", "trailers": [{"source": "aaaaaaaaaaa", "type": "Trailer"}, {"source": 5}]}}"#).unwrap();
+    assert_eq!((m.trailers.len(), m.trailers[0].yt_id.as_deref()), (1, Some("aaaaaaaaaaa")), "legacy fallback");
+    assert!(parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": "One", "trailers": "x"}}"#).unwrap().trailers.is_empty());
+}
+
+#[test]
 fn meta_videos_parsing() {
     let m = parse_meta(br#"{"meta": {"id": "tt9", "type": "series", "name": "Show", "videos": [
         {"id": "tt9:1:2", "name": "Pilot\u0007 ", "season": 1, "episode": 2, "released": "2020-01-01T00:00:00.000Z", "thumbnail": "https://img.example/e.jpg"},

@@ -24,7 +24,7 @@ Requirements:
 
 - Rust 1.85+ (edition 2024)
 - libmpv at runtime and for `cargo test` (`pacman -S mpv`, `apt install libmpv2`). On Windows, put `libmpv-2.dll` next to the exe or on `PATH`.
-- Optional: `yt-dlp` on `PATH` for YouTube (`ytId`) streams, `ffmpeg` for demo media
+- Optional: `yt-dlp` on `PATH` for YouTube (`ytId`) streams and trailers, `ffmpeg` for demo media
 
 ```sh
 cargo build                     # app (stremflix-rs) and test-addon
@@ -43,7 +43,7 @@ cargo test
 
 ### Addons and search
 
-Addons lists installed addons in priority order; Up/Down reorder them, and the stream list and Home rows follow. Details shows an addon's id, types, resources, and catalogs. Streams are grouped by addon. `externalUrl` streams open in the browser; `ytId` streams play through yt-dlp.
+Addons lists installed addons in priority order; Up/Down reorder them, and the stream list and Home rows follow. Details shows an addon's id, types, resources, and catalogs. Streams are grouped by addon. `externalUrl` streams open in the browser; `ytId` streams play through yt-dlp, as do the trailer buttons on a title's detail page (from `trailerStreams` or legacy `trailers`).
 
 The header search queries every catalog that supports the `search` extra. Results appear as a row on Home.
 

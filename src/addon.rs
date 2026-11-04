@@ -193,6 +193,19 @@ pub struct Meta {
     /// Episodes of a series; malformed entries are dropped.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub videos: Vec<Video>,
+    /// YouTube trailers (`trailerStreams`, else legacy `trailers`); each has a valid `ytId` and nothing else to play.
+    #[serde(default, rename = "trailerStreams", deserialize_with = "lenient_vec")]
+    pub trailers: Vec<Stream>,
+    #[serde(default, rename = "trailers", deserialize_with = "lenient_vec", skip_serializing)]
+    legacy_trailers: Vec<LegacyTrailer>,
+}
+
+/// Legacy `trailers` entry: `{"source": "<ytId>", "type": "Trailer"}`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct LegacyTrailer {
+    source: String,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -585,6 +598,17 @@ pub fn parse_meta(body: &[u8]) -> Result<Meta> {
         opt_text(&mut v.released, 64);
         opt_url(&mut v.thumbnail);
     }
+    if m.trailers.is_empty() {
+        m.trailers = m.legacy_trailers.iter().map(|t| Stream { yt_id: Some(t.source.clone()), title: t.kind.clone(), ..Default::default() }).collect();
+    }
+    m.legacy_trailers.clear();
+    // Only the YouTube id is kept, so a trailer can never play an arbitrary URL or torrent.
+    m.trailers = std::mem::take(&mut m.trailers)
+        .into_iter()
+        .filter(|t| t.yt_id.as_deref().and_then(youtube_url).is_some())
+        .map(|t| Stream { title: t.title.map(|x| sanitize_text(&x, MAX_TEXT)).filter(|x| !x.is_empty()), yt_id: t.yt_id, ..Default::default() })
+        .take(MAX_TAGS)
+        .collect();
     Ok(m)
 }
 
