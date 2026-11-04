@@ -822,6 +822,8 @@ struct App {
     autoplay_next: bool,
     /// Playback speed every video starts at.
     default_speed: f64,
+    /// Arrow-key seek in seconds: plain and with Shift.
+    seek_steps: [u32; 2],
     /// Last error, shown in a dismissible red line until cleared.
     error: Option<String>,
     /// Release page of a newer build, shown until dismissed.
@@ -897,6 +899,7 @@ impl App {
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
             default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
+            seek_steps: [seek_step(db.setting("seek_step")?, 10), seek_step(db.setting("seek_step_shift")?, 30)],
             error: None,
             update: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
@@ -2467,8 +2470,9 @@ impl App {
             // Space activates a focused popover control, so it must not also toggle pause.
             // A short Space press pauses on release; a hold is 2x speed, like the mouse.
             if (i.key_released(Space) && focused.is_none() && !long) || k(K) { cmd(&["cycle", "pause"]) }
-            if k(ArrowLeft) { seek = Some((-10.0, true)) }
-            if k(ArrowRight) { seek = Some((10.0, true)) }
+            let step = self.seek_steps[i.modifiers.shift as usize] as f64;
+            if k(ArrowLeft) { seek = Some((-step, true)) }
+            if k(ArrowRight) { seek = Some((step, true)) }
             if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]) }
             if k(M) { cmd(&["cycle", "mute"]) }
@@ -3155,6 +3159,14 @@ impl App {
             self.sub_style = style;
             save.push(("sub_style", style.encode()));
         }
+        ui.horizontal(|ui| {
+            for (i, key, label) in [(0, "seek_step", "Arrow-key seek"), (1, "seek_step_shift", "Shift + arrow seek")] {
+                ui.label(label);
+                if ui.add(egui::DragValue::new(&mut self.seek_steps[i]).range(SEEK_STEP_RANGE).suffix(" s")).changed() {
+                    save.push((key, self.seek_steps[i].to_string()));
+                }
+            }
+        });
         ui.add_space(16.0);
         ui.label(RichText::new("Languages").size(20.0).strong().family(bold()).color(Color32::WHITE));
         for (i, key, label) in [(0, "alang", "Audio:"), (1, "slang", "Subtitles:")] {
@@ -3542,6 +3554,13 @@ mod mac_links {
     }
 }
 
+const SEEK_STEP_RANGE: std::ops::RangeInclusive<u32> = 1..=600;
+
+/// Saved seek step in seconds; a missing, unparsable or out-of-range value falls back to `default`.
+fn seek_step(v: Option<String>, default: u32) -> u32 {
+    v.and_then(|v| v.parse().ok()).filter(|v| SEEK_STEP_RANGE.contains(v)).unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3784,6 +3803,14 @@ mod tests {
         assert_eq!(command_words("  mpv   --fs "), ["mpv", "--fs"]);
         assert_eq!(command_words(r#"a "" b"#), ["a", "", "b"]);
         assert!(command_words("   ").is_empty());
+    }
+
+    #[test]
+    fn seek_step_validates() {
+        assert_eq!(seek_step(Some("15".into()), 10), 15);
+        for bad in [None, Some("0".into()), Some("601".into()), Some("-5".into()), Some("x".into())] {
+            assert_eq!(seek_step(bad, 10), 10);
+        }
     }
 
     #[test]
