@@ -446,6 +446,11 @@ fn hero_button(ui: &mut egui::Ui, text: &str, fill: [Color32; 2], text_color: Co
     pill_button(ui, text, 18.0, vec2(130.0, 46.0), fill, text_color)
 }
 
+/// An update must keep the installed addon's id, or it would replace a different addon.
+fn same_addon(installed: &Manifest, fetched: &Manifest) -> bool {
+    installed.id == fetched.id
+}
+
 /// Small secondary pill for toolbar actions (Uninstall, Clear, Stop …).
 fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     pill_button(ui, text, 14.0, vec2(0.0, 32.0), gray_fill(), Color32::WHITE)
@@ -2845,7 +2850,7 @@ impl App {
                 for chunk in urls.chunks(4) {
                     let res = concurrently(chunk.to_vec(), |u| {
                         let c = client.clone();
-                        async move { Ok((u.clone(), c.fetch_manifest(&u).await.map_err(|e| format!("{e:#}")))) }
+                        async move { Ok((u.clone(), c.fetch_manifest(&u).await.map_err(|e| e.root_cause().to_string()))) }
                     })
                     .await;
                     out.extend(res.into_iter().flatten());
@@ -2883,6 +2888,9 @@ impl App {
                 }
             });
             match self.addon_updates.iter().find(|(u, _)| u == url).map(|(_, r)| r) {
+                Some(Ok(new)) if !same_addon(m, new) => {
+                    ui.label(RichText::new("Addon id changed; not offered").weak());
+                }
                 Some(Ok(new)) if stremflix_rs::addon::is_newer(&new.version, &m.version) => {
                     ui.horizontal(|ui| {
                         ui.label(format!("Update available: {} \u{2192} {}", m.version, new.version));
@@ -2908,9 +2916,11 @@ impl App {
                 replace = Some((old.clone(), pasted.trim().to_string()));
             }
         }
-        if let Some((url, m)) = update {
+        if let Some((url, new)) = update
+            && self.addons.iter().any(|(u, m)| *u == url && same_addon(m, &new))
+        {
             self.addon_updates.retain(|(u, _)| *u != url);
-            self.handle(&ctx, Msg::Installed(url, m, None));
+            self.handle(&ctx, Msg::Installed(url, new, None));
         }
         if let Some((old, new)) = replace {
             let client = self.client.clone();
@@ -3775,8 +3785,20 @@ mod tests {
         assert!(!is_newer("1.0", "1.0.0"));
         assert!(!is_newer("1.0.0", "1.0.1"));
         assert!(is_newer("v1.1.0", "1.0.0"));
-        assert!(is_newer("1.0.0-beta", "1.0.0"), "non-numeric falls back to inequality");
+        assert!(!is_newer("1.0.0-beta", "1.0.0"), "same core, suffix only");
+        assert!(is_newer("1.1.0-beta", "1.0.0"));
+        assert!(!is_newer("1.0.0", "1.0.0-beta"));
+        assert!(is_newer("1.0.1+build5", "1.0.0"));
         assert!(!is_newer("1.0.0-beta", "1.0.0-beta"));
+        assert!(!is_newer("nightly", "1.0.0"), "non-numeric is never offered");
+        assert!(!is_newer("1.0.0", "nightly"));
+    }
+
+    #[test]
+    fn update_keeps_addon_id() {
+        let m = |id: &str| stremflix_rs::addon::parse_manifest(format!(r#"{{"id":"{id}","version":"1","name":"A","resources":["stream"],"types":["movie"]}}"#).as_bytes()).unwrap();
+        assert!(same_addon(&m("a"), &m("a")));
+        assert!(!same_addon(&m("a"), &m("b")));
     }
 
     #[test]
