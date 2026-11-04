@@ -694,6 +694,7 @@ fn enc(s: &str) -> String {
 pub const HASH_CHUNK: usize = 64 * 1024;
 
 /// OpenSubtitles hash: file size plus the little-endian u64 words of its first and last 64 KiB, wrapping.
+/// For files under 128 KiB the two chunks overlap, as in the reference algorithm; files under 64 KiB get no hash.
 pub fn opensubtitles_hash(size: u64, head: &[u8], tail: &[u8]) -> String {
     let sum = |b: &[u8]| b.as_chunks::<8>().0.iter().fold(0u64, |a, w| a.wrapping_add(u64::from_le_bytes(*w)));
     format!("{:016x}", size.wrapping_add(sum(head)).wrapping_add(sum(tail)))
@@ -869,6 +870,7 @@ impl AddonClient {
         });
         let size = match (resp.status().as_u16(), range) {
             (206, Some((first, t))) if first == start => t,
+            // No range support: the head still reads, but the tail request then lands in `bail!` below.
             (200, _) if start == 0 => resp.content_length().context("no length")?,
             _ => bail!("no range support"),
         };
@@ -876,9 +878,8 @@ impl AddonClient {
         while body.len() < HASH_CHUNK
             && let Some(c) = resp.chunk().await?
         {
-            body.extend_from_slice(&c);
+            body.extend_from_slice(&c[..c.len().min(HASH_CHUNK - body.len())]);
         }
-        body.truncate(HASH_CHUNK);
         Ok((body, size))
     }
 

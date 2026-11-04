@@ -263,7 +263,7 @@ fn stream_behavior_hints() {
                 "X-Inject": "a\r\nX-Evil: 1", "X-Nul": "a\u0000b", "Bad Name": "v", "Bad:Name": "v", "": "v", "Host": "evil.example",
                 "Content-Length": "0", "X-Num": 7, "X-Uni": "café", "X-Long": "{long}"}}}}}}}},
         {{"url": "https://a.example/2", "behaviorHints": {{"videoSize": -1, "filename": 3, "videoHash": "../../x.json", "proxyHeaders": {{"request": "junk"}}}}}},
-        {{"url": "https://a.example/3", "behaviorHints": {{"proxyHeaders": {{"request": {{{many}}}}}}}}}
+        {{"url": "https://a.example/3", "behaviorHints": {{"videoHash": "8e245d9679d31e1g", "proxyHeaders": {{"request": {{{many}}}}}}}}}
     ]}}"#,
         long = "x".repeat(5000),
         many = many.join(",")
@@ -278,6 +278,7 @@ fn stream_behavior_hints() {
     assert_eq!(h.request_headers[1].1, "Moz (KHTML, like Gecko)");
     assert_eq!((s[1].hints.video_size, &s[1].hints.filename, s[1].hints.request_headers.len()), (None, &None, 0));
     assert_eq!(s[2].hints.request_headers.len(), 32);
+    assert_eq!(s[2].hints.video_hash, None, "16 chars but not hex");
     assert!(valid_header("X-Debrid-Token", "abc, def;q=1") && !valid_header("X-A", "a\nb") && !valid_header("TE", "trailers"));
 }
 

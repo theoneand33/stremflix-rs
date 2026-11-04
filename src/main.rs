@@ -633,13 +633,18 @@ struct SubLookup {
 /// else read from `url`), so OpenSubtitles can match the exact file. Matches come first, then the earlier `subs`;
 /// on timeout or without a hash, `subs` unchanged.
 async fn hashed_subs(client: AddonClient, l: SubLookup, url: &str, subs: Subs) -> Subs {
+    // Playback waits on this; one shared deadline, so a slow hash or addon cannot hold it up for long
+    // and a slow addon does not discard the fast ones' matches.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
     let ask = async {
         // Without a hash the addons would only repeat the earlier lookup.
         let (hash, size) = match l.hints.video_hash.clone() {
             Some(h) => (h, l.hints.video_size),
-            None => match client.video_hash(url, &l.headers).await {
-                Ok((h, n)) => (h, Some(n)),
-                Err(_) => return Vec::new(),
+            // Playlists and YouTube pages are not the video file, so they have no hash.
+            None if stremflix_rs::addon::is_youtube(url) || [".m3u8", ".mpd"].iter().any(|x| url.split('?').next().unwrap_or("").ends_with(x)) => return Vec::new(),
+            None => match tokio::time::timeout_at(deadline, client.video_hash(url, &l.headers)).await {
+                Ok(Ok((h, n))) => (h, Some(n)),
+                _ => return Vec::new(),
             },
         };
         let extra: Vec<(&str, String)> = [("videoHash", Some(hash)), ("videoSize", size.map(|n| n.to_string())), ("filename", l.hints.filename.clone())]
@@ -648,12 +653,11 @@ async fn hashed_subs(client: AddonClient, l: SubLookup, url: &str, subs: Subs) -
             .collect();
         let ask = |u: String| {
             let (c, k, i, e) = (client.clone(), l.kind.clone(), l.id.clone(), extra.clone());
-            async move { c.subtitles(&u, &k, &i, &e).await }
+            async move { tokio::time::timeout_at(deadline, c.subtitles(&u, &k, &i, &e)).await? }
         };
         concurrently(l.addons.clone(), ask).await.into_iter().flatten().flatten().map(|s| (s.url, s.lang)).collect::<Subs>()
     };
-    // Playback waits on this; a slow hash or addon must not hold it up for long.
-    let mut out = tokio::time::timeout(Duration::from_secs(4), ask).await.unwrap_or_default();
+    let mut out = ask.await;
     for s in subs {
         if !out.iter().any(|(u, _)| *u == s.0) {
             out.push(s);
@@ -3384,11 +3388,18 @@ mod tests {
         let l = |hints| SubLookup { addons: vec![format!("{base}/manifest.json")], kind: "movie".into(), id: test_addon::META_ID.into(), hints, headers: vec![] };
         let test_en = (format!("{base}/subs/test-en.vtt"), "eng".to_string());
         let old = vec![("https://x.example/a.srt".to_string(), "fre".to_string()), test_en.clone()];
-        let out = hashed_subs(AddonClient::new(), l(hints), "/local/file.mkv", old.clone()).await;
+        let out = hashed_subs(AddonClient::new(), l(hints.clone()), "/local/file.mkv", old.clone()).await;
         assert_eq!(out, [test_en, old[0].clone()], "match first, deduped by URL");
         let out = hashed_subs(AddonClient::new(), l(Default::default()), "/local/file.mkv", old.clone()).await;
         assert_eq!(out, old, "no hash: unchanged");
+        // An addon that never answers times out alone; the fast one's match is kept.
+        let hang = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut slow = l(hints);
+        slow.addons.insert(0, format!("http://{}/manifest.json", hang.local_addr().unwrap()));
+        let out = hashed_subs(AddonClient::new(), slow, "/local/file.mkv", vec![]).await;
+        assert_eq!(out, [(format!("{base}/subs/test-en.vtt"), "eng".to_string())]);
     }
+
 
     #[tokio::test]
     async fn concurrently_keeps_item_order() {
