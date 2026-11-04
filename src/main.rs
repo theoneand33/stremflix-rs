@@ -15,7 +15,7 @@ use stremflix_rs::db::{Db, Download, Progress, SavedTitle, Watched};
 use stremflix_rs::download;
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{GlProc, Player, SPEEDS, SUB_COLORS, SubStyle, hwdec_value, prefer_lang, valid_langs};
+use stremflix_rs::player::{GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{Profile, TorrentEngine};
 
@@ -721,6 +721,10 @@ struct Playing {
     after_hold: bool,
     /// The up-next card was dismissed.
     next_dismissed: bool,
+    /// Per-session picture scaling: aspect override index into `ASPECTS`, fill (crop) instead of fit, zoom in tenths.
+    aspect: usize,
+    fill: bool,
+    zoom: i32,
     /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
     awake: Option<Option<keepawake::KeepAwake>>,
 }
@@ -1366,7 +1370,7 @@ impl App {
                         if self.default_speed != 1.0 {
                             let _ = player.command(&["set", "speed", &self.default_speed.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, awake: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, aspect: 0, fill: false, zoom: 0, awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -2694,6 +2698,27 @@ impl App {
                                 }
                             });
                             menu_heading(ui, "Video");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                for (i, (name, v)) in ASPECTS.iter().enumerate() {
+                                    if pill(ui, name, p.aspect == i, egui::Role::RadioButton).clicked() {
+                                        p.aspect = i;
+                                        cmd(&["set", "video-aspect-override", v]);
+                                    }
+                                }
+                            });
+                            if switch_row(ui, "Fill screen (crop)", &mut p.fill).changed() {
+                                cmd(&["set", "panscan", if p.fill { "1.0" } else { "0.0" }]);
+                            }
+                            let step = stepper(ui, "Zoom", &format!("{:+.1}", p.zoom as f64 / 10.0));
+                            if step != 0 {
+                                p.zoom = (p.zoom + step).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
+                                cmd(&["set", "video-zoom", &zoom_value(p.zoom)]);
+                            }
+                            if p.zoom != 0 && ui.add(egui::Button::new(RichText::new("Reset zoom").size(13.0).color(ACCENT)).frame(false)).clicked() {
+                                p.zoom = 0;
+                                cmd(&["set", "video-zoom", "0"]);
+                            }
                             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                                 cmd(&["set", "hwdec", hwdec_value(self.hwdec)]);
                                 if let Err(e) = self.db.set_setting("hwdec", if self.hwdec { "1" } else { "0" }) {
