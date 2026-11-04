@@ -138,7 +138,7 @@ mod tests {
         assert_eq!(file_name(&"x".repeat(500), None).len(), 124);
         assert!(file_name(&"é".repeat(500), None).len() <= 124, "capped by bytes");
         assert_eq!(file_name("nul", None), "_nul.mkv");
-        assert_eq!(subtitle_name("../x/Film: 2", "eng"), ".._x_Film_ 2 eng.srt");
+        assert_eq!(subtitle_name("../x/Film: 2", "eng"), "___x_Film_ 2 eng.srt");
     }
 
     #[test]
