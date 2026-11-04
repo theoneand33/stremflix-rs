@@ -185,6 +185,8 @@ enum Msg {
     Episodes(MetaPreview, Meta, u64),
     /// Full meta of a movie (genres, cast, ...) for the detail page.
     Details(Meta),
+    /// `new_eps_gen`, a saved series and its recently released episodes.
+    NewEpisodes(u64, MetaPreview, Vec<Video>),
     /// poster URL, image bytes (empty on failure)
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs, torrent id, the `nav` it was requested at
@@ -228,6 +230,33 @@ struct Row {
     loading_more: bool,
     /// Last page was empty, had nothing new, or failed.
     exhausted: bool,
+}
+
+/// How far back an episode's release date still counts as new.
+const NEW_EPISODE_DAYS: i64 = 14;
+
+/// Days since 1970-01-01 (UTC) today.
+fn unix_days() -> i64 {
+    (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) / 86400) as i64
+}
+
+/// `YYYY-MM-DD` of a day count since 1970-01-01 (civil-from-days).
+fn date_string(days: i64) -> String {
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + i64::from(m <= 2))
+}
+
+/// Numbered episodes released on `since..=today` (`YYYY-MM-DD`), in list order.
+fn recent_episodes(videos: Vec<Video>, since: &str, today: &str) -> Vec<Video> {
+    let day = |v: &Video| v.released.as_deref().and_then(|d| d.get(..10)).map(str::to_owned);
+    videos.into_iter().filter(|v| v.episode.is_some() && v.season != Some(0) && day(v).is_some_and(|d| d.as_str() >= since && d.as_str() <= today)).collect()
 }
 
 /// Max items kept per catalog row.
@@ -907,6 +936,10 @@ struct App {
     library: Vec<LibraryItem>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
+    /// Saved series with episodes released in the last `NEW_EPISODE_DAYS` days (watched ones are hidden when drawn).
+    new_episodes: Vec<(MetaPreview, Vec<Video>)>,
+    /// Bumped on each `build_rows`; stale `Msg::NewEpisodes` replies are dropped.
+    new_eps_gen: u64,
     /// Finished downloads, newest first, and those still running.
     downloads: Vec<Download>,
     downloading: Vec<Download>,
@@ -1005,6 +1038,8 @@ impl App {
             addons: db.addons()?,
             library: db.library_items()?,
             saved: db.saved_titles()?,
+            new_episodes: Vec::new(),
+            new_eps_gen: 0,
             downloads: db.downloads()?,
             downloading: Vec::new(),
             lib_sort: LibSort::Added,
@@ -1389,6 +1424,28 @@ impl App {
                 }
                 None => report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200))),
             },
+            Msg::NewEpisodes(epoch, meta, mut videos) => {
+                if epoch == self.new_eps_gen {
+                    self.new_episodes.retain(|(m, _)| m.id != meta.id);
+                    sort_episodes(&mut videos);
+                    // Episodes imported as watched from Stremio, as in `Msg::Episodes`.
+                    let bk = format!("bitfield:{}:{}", meta.kind, meta.id);
+                    if let Ok(Some(field)) = self.db.setting(&bk) {
+                        let keys: Vec<String> = stremio_import::watched_videos(&field, &videos).into_iter().map(|id| format!("{}:{id}", meta.kind)).collect();
+                        if !keys.is_empty() {
+                            match self.db.apply_watched_bitfield(&bk, &keys) {
+                                Ok(marked) => self.watched_keys.extend(marked),
+                                Err(e) => report(&mut self.error, format!("saving watched episodes: {e:#}")),
+                            }
+                        }
+                    }
+                    let today = unix_days();
+                    let videos = recent_episodes(videos, &date_string(today - (NEW_EPISODE_DAYS - 1)), &date_string(today));
+                    if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) && !videos.is_empty() {
+                        self.new_episodes.push((meta, videos));
+                    }
+                }
+            }
             Msg::Details(m) => {
                 if self.details_want == (m.kind.clone(), m.id.clone()) {
                     if let Some((sel, ..)) = self.selected.as_mut() {
@@ -1706,6 +1763,8 @@ impl App {
 
     /// Rebuild home rows from installed catalogs: generic Trending/Popular rows first, then the rest.
     fn build_rows(&mut self, ctx: &egui::Context) {
+        self.new_eps_gen += 1;
+        self.new_episodes.clear();
         let cats: Vec<(&String, &String, &CatalogDef)> = self
             .addons
             .iter()
@@ -1746,6 +1805,31 @@ impl App {
             self.spawn(ctx, async move {
                 let res = client.catalog(&src.0, &src.1, &src.2, 0).await.map_err(|e| format!("{e:#}"));
                 Ok(Msg::Row(src, res))
+            });
+        }
+        self.fetch_new_episodes(ctx);
+    }
+
+    /// Ask a meta addon for the episodes of each saved series and keep those released recently.
+    fn fetch_new_episodes(&self, ctx: &egui::Context) {
+        // At most 4 meta requests in flight, so a long library doesn't flood the addons.
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
+        for meta in self.saved.iter().filter(|t| t.kind == "series").filter_map(SavedTitle::preview) {
+            let addons = self.addons_for("meta", &meta.kind, &meta.id);
+            let (client, tx, ctx, epoch, slots) = (self.client.clone(), self.tx.clone(), ctx.clone(), self.new_eps_gen, slots.clone());
+            // Not `spawn`: a series whose meta fails to load just has no row entry.
+            self.rt.spawn(async move {
+                let Ok(_permit) = slots.acquire_owned().await else { return };
+                for u in &addons {
+                    // Like `open_meta`: an addon without episodes doesn't end the search.
+                    if let Ok(m) = client.meta(u, &meta.kind, &meta.id).await
+                        && !m.videos.is_empty()
+                    {
+                        let _ = tx.send(Msg::NewEpisodes(epoch, meta, m.videos));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
             });
         }
     }
@@ -2088,6 +2172,7 @@ impl App {
             let _ = self.tx.send(Msg::Play(key, format!("{} - {}", d.name, t.title.as_deref().unwrap_or("Trailer")), src.clone(), src, vec![], None, self.nav));
         }
         let mut episode = None;
+        let mut fresh_click: Option<(MetaPreview, String)> = None;
         let mut toggle: Option<(String, bool)> = None;
         let mut bulk: Option<(Vec<String>, bool)> = None;
         let mut save = None;
@@ -2223,6 +2308,28 @@ impl App {
                 });
             });
         }
+        let mut fresh: Vec<(&MetaPreview, &Video)> = self
+            .new_episodes
+            .iter()
+            .filter(|(m, _)| self.saved.iter().any(|t| t.key == format!("series:{}", m.id)))
+            .filter_map(|(m, vs)| vs.iter().filter(|v| !self.watched_keys.contains(&format!("{}:{}", m.kind, v.id))).max_by_key(|v| (v.released.as_deref().and_then(|d| d.get(..10)), v.season, v.episode)).map(|v| (m, v)))
+            .collect();
+        fresh.sort_by(|a, b| b.1.released.cmp(&a.1.released));
+        if !fresh.is_empty() {
+            Self::row_title(ui, "New Episodes");
+            egui::ScrollArea::horizontal().id_salt("new_episodes").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (m, v) in fresh {
+                        let label = format!("{} S{}E{}", m.name, v.season.unwrap_or(0), v.episode.unwrap_or(0));
+                        let (r, rect) = card(ui, CARD, &label);
+                        self.paint_poster(ui, &r, rect, &m.poster, &m.name, &mut want);
+                        if r.on_hover_text(label).clicked() {
+                            fresh_click = Some((m.clone(), v.id.clone()));
+                        }
+                    }
+                });
+            });
+        }
         if !self.watched.is_empty() {
             Self::row_title(ui, "Watch It Again");
             egui::ScrollArea::horizontal().id_salt("watched").show(ui, |ui| {
@@ -2311,6 +2418,12 @@ impl App {
         }
         if let Some((m, v)) = episode {
             self.open_streams(&ctx, m, Some(v), Autoplay::Only, None);
+        }
+        // Load the series page first, so no other series' episode list stays under it.
+        if let Some((m, id)) = fresh_click {
+            let sid = m.id.clone();
+            self.open_meta(&ctx, m, false);
+            self.pending = Some((sid, Some(id)));
         }
         if let Some((k, t, s, subs)) = play {
             self.play(&ctx, k, t, s, subs);
@@ -4138,6 +4251,26 @@ fn seek_step(v: Option<String>, default: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_episodes_window() {
+        assert_eq!(date_string(0), "1970-01-01");
+        assert_eq!(date_string(19782), "2024-02-29");
+        let v = |id: &str, season, rel: Option<&str>| Video { id: id.into(), title: None, season, episode: Some(1), released: rel.map(Into::into), thumbnail: None };
+        let vs = vec![
+            v("old", Some(1), Some("2024-01-01T00:00:00.000Z")),
+            v("new", Some(1), Some("2024-03-05T00:00:00.000Z")),
+            v("future", Some(1), Some("2024-04-01")),
+            v("special", Some(0), Some("2024-03-05")),
+            v("undated", Some(1), None),
+        ];
+        let ids: Vec<_> = recent_episodes(vs, "2024-02-20", "2024-03-06").into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, ["new"]);
+        // Both ends of the window are inclusive; a day outside either is not.
+        let edge = vec![v("before", Some(1), Some("2024-02-19")), v("since", Some(1), Some("2024-02-20")), v("today", Some(1), Some("2024-03-06")), v("after", Some(1), Some("2024-03-07"))];
+        let ids: Vec<_> = recent_episodes(edge, "2024-02-20", "2024-03-06").into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, ["since", "today"]);
+    }
 
     #[test]
     fn buffered_frac_clamps() {
