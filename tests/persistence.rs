@@ -64,6 +64,47 @@ fn saved_titles_round_trip() {
 }
 
 #[test]
+fn custom_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let movie = SavedTitle { key: "movie:tt1".into(), title: "One".into(), kind: "movie".into(), poster: None };
+    let show = SavedTitle { key: "series:tt2".into(), title: "Two".into(), kind: "series".into(), poster: None };
+    drop(Db::open(&path).unwrap()); // the migration runs again below without error
+    let db = Db::open(&path).unwrap();
+    let a = db.create_list("  Faves ").unwrap();
+    let b = db.create_list("Later").unwrap();
+    assert!(db.create_list("faves").is_err(), "unique ignoring case");
+    assert!(db.create_list("   ").is_err());
+    assert!(db.create_list(&"x".repeat(61)).is_err());
+    db.create_list(&"é".repeat(60)).unwrap();
+    db.rename_list(b, "Weekend").unwrap();
+    assert!(db.rename_list(b, "FAVES").is_err());
+    // Adding to a list saves the title too.
+    db.set_in_list(a, &movie, true).unwrap();
+    db.set_in_list(a, &movie, true).unwrap(); // idempotent
+    db.set_in_list(a, &show, true).unwrap();
+    db.set_in_list(b, &movie, true).unwrap();
+    assert_eq!(db.saved_titles().unwrap().len(), 2);
+    let lists = db.lists().unwrap();
+    assert_eq!(lists.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["Faves", "Weekend", &"é".repeat(60)]);
+    assert_eq!(lists[0].keys.len(), 2);
+    db.set_in_list(a, &show, false).unwrap();
+    assert_eq!(db.saved_titles().unwrap().len(), 2, "leaving a list keeps the title saved");
+    // Unsaving removes the title from every list.
+    db.remove_saved_title("movie:tt1").unwrap();
+    assert!(db.lists().unwrap().iter().all(|l| l.keys.is_empty()));
+    // Deleting a list cascades to its items but keeps saved titles.
+    db.set_in_list(a, &show, true).unwrap();
+    db.delete_list(a).unwrap();
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.lists().unwrap().len(), 2);
+    assert_eq!(db.saved_titles().unwrap(), vec![show]);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(conn.query_row("SELECT count(*) FROM list_items", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[test]
 fn migrates_progress_without_poster() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.db");

@@ -11,7 +11,7 @@ use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use anyhow::Context;
 use stremflix_rs::addon::{AddonClient, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
 use stremflix_rs::instance;
-use stremflix_rs::db::{Db, Download, Progress, SavedTitle, Watched};
+use stremflix_rs::db::{Db, Download, List, Progress, SavedTitle, Watched};
 use stremflix_rs::download;
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
@@ -792,6 +792,11 @@ struct App {
     library: Vec<LibraryItem>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
+    /// User lists of saved titles; `lib_list` is the one shown in Library (`None` = all saved).
+    lists: Vec<List>,
+    lib_list: Option<i64>,
+    /// Name typed for a new or renamed list.
+    list_name: String,
     /// Finished downloads, newest first, and those still running.
     downloads: Vec<Download>,
     downloading: Vec<Download>,
@@ -878,6 +883,9 @@ impl App {
             addons: db.addons()?,
             library: db.library_items()?,
             saved: db.saved_titles()?,
+            lists: db.lists()?,
+            lib_list: None,
+            list_name: String::new(),
             downloads: db.downloads()?,
             downloading: Vec::new(),
             lib_sort: LibSort::Added,
@@ -1634,6 +1642,7 @@ impl App {
         let key = format!("{}:{}", meta.kind, meta.id);
         let res = if self.saved.iter().any(|t| t.key == key) {
             self.saved.retain(|t| t.key != key);
+            self.lists.iter_mut().for_each(|l| _ = l.keys.remove(&key));
             self.db.remove_saved_title(&key)
         } else {
             let t = SavedTitle { key, title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone() };
@@ -1643,6 +1652,49 @@ impl App {
         if let Err(e) = res {
             report(&mut self.error, format!("saving library: {e:#}"));
         }
+    }
+
+    /// Re-read lists (and saved titles, which joining a list can add) after a list change; `res` errors are shown.
+    fn lists_changed(&mut self, res: anyhow::Result<()>) {
+        if let Err(e) = res {
+            report(&mut self.error, format!("saving list: {e:#}"));
+        }
+        self.saved = self.db.saved_titles().unwrap_or_default();
+        self.lists = self.db.lists().unwrap_or_default();
+        if !self.lists.iter().any(|l| Some(l.id) == self.lib_list) {
+            self.lib_list = None;
+        }
+    }
+
+    /// "Add to list" menu: a checkbox per list, plus a new list that gets `meta`.
+    fn list_menu(&mut self, ui: &mut egui::Ui, meta: &MetaPreview) {
+        let t = SavedTitle { key: format!("{}:{}", meta.kind, meta.id), title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone() };
+        ui.menu_button(format!("{}  Add to list", icons::PLUS), |ui| {
+            let mut change = None;
+            for l in &self.lists {
+                let mut on = l.keys.contains(&t.key);
+                if ui.checkbox(&mut on, &l.name).changed() {
+                    change = Some((l.id, on));
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.list_name).hint_text("New list…").char_limit(60).desired_width(140.0));
+                if ui.button("Create").clicked() {
+                    match self.db.create_list(&self.list_name) {
+                        Ok(id) => {
+                            self.list_name.clear();
+                            change = Some((id, true));
+                        }
+                        Err(e) => report(&mut self.error, format!("creating list: {e:#}")),
+                    }
+                }
+            });
+            if let Some((id, on)) = change {
+                let res = self.db.set_in_list(id, &t, on);
+                self.lists_changed(res);
+            }
+        });
     }
 
     /// Progress key and player title of the selected movie or episode.
@@ -2277,6 +2329,7 @@ impl App {
                 if hero_button(ui, &label, [gray(179), gray(102)], Color32::WHITE).clicked() {
                     self.toggle_saved(meta);
                 }
+                self.list_menu(ui, meta);
             });
             ui.add_space(12.0);
             if let Some(d) = &meta.description {
@@ -3200,13 +3253,44 @@ impl App {
                     ui.selectable_value(&mut self.lib_kind, k, k.label());
                 }
             });
+            let list = self.lists.iter().find(|l| Some(l.id) == self.lib_list);
+            egui::ComboBox::from_id_salt("lib_list").selected_text(list.map_or("All saved", |l| l.name.as_str())).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.lib_list, None, "All saved");
+                for l in &self.lists {
+                    ui.selectable_value(&mut self.lib_list, Some(l.id), &l.name);
+                }
+            });
+            ui.add(egui::TextEdit::singleline(&mut self.list_name).hint_text("List name").char_limit(60).desired_width(140.0));
+            let mut res = None;
+            if ui.button("New list").clicked() {
+                res = Some(self.db.create_list(&self.list_name).map(|id| self.lib_list = Some(id)));
+            }
+            if let Some(id) = self.lib_list {
+                if ui.button("Rename").clicked() {
+                    res = Some(self.db.rename_list(id, &self.list_name));
+                }
+                if ui.button("Delete list").on_hover_text("Its titles stay saved").clicked() {
+                    res = Some(self.db.delete_list(id));
+                }
+            }
+            if let Some(res) = res {
+                if res.is_ok() {
+                    self.list_name.clear();
+                }
+                self.lists_changed(res);
+            }
         });
         ui.add_space(4.0);
-        let items: Vec<MetaPreview> = saved_view(&self.saved, self.lib_kind, self.lib_sort).into_iter().filter_map(SavedTitle::preview).collect();
+        let list = self.lists.iter().find(|l| Some(l.id) == self.lib_list);
+        let items: Vec<MetaPreview> = saved_view(&self.saved, self.lib_kind, self.lib_sort)
+            .into_iter()
+            .filter(|t| list.is_none_or(|l| l.keys.contains(&t.key)))
+            .filter_map(SavedTitle::preview)
+            .collect();
         if self.saved.is_empty() {
             ui.label(RichText::new("Nothing saved yet. Open a title and choose \"Add to library\".").color(Color32::from_gray(170)));
         } else if items.is_empty() {
-            ui.label(RichText::new("No saved titles of this type.").color(Color32::from_gray(170)));
+            ui.label(RichText::new(if list.is_some() { "No titles of this type in this list." } else { "No saved titles of this type." }).color(Color32::from_gray(170)));
         }
         self.ui_cards(ui, "saved", &items, &mut want, &mut open, &mut quick);
         for u in want {
