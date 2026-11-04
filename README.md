@@ -49,7 +49,7 @@ The header search queries every catalog that supports the `search` extra. Result
 
 ### Playing
 
-Hover a poster and press its play button. Continue Watching titles resume with the same stream; a series resumes the episode in progress or starts the next one. Clicking elsewhere on a poster opens the stream picker.
+Hover a poster and press its play button. Continue Watching titles resume with the same stream; a series resumes the episode in progress or starts the next one. Clicking elsewhere on a poster opens the stream picker. The × in a Continue Watching card's corner removes it from the row.
 
 For series, pick a season and episode. ⏭ in the player opens the next episode. If the current stream has a `bingeGroup`, the next episode autoplays a stream from the same group (toggle in Settings); otherwise the app plays the only stream or shows the picker.
 

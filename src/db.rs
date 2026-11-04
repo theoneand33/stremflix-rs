@@ -194,6 +194,12 @@ impl Db {
         Ok(())
     }
 
+    /// Drop a resume point without marking it watched (removes it from Continue Watching).
+    pub fn remove_progress(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
     pub fn progress(&self, key: &str) -> Result<Option<Progress>> {
         Ok(self
             .conn

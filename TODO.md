@@ -29,7 +29,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Custom lists / collections | P2 | M | Stremio "My List" style folders; today only one saved-titles list. |
 | Mark a whole season or series watched | P2 | S | Episodes are marked one at a time. |
-| Remove individual Continue Watching entries | P2 | S | Currently only auto-clears at 90%. |
 | More library sorts (recently watched, rating, year) | P2 | S | Added and Title only. |
 | Bulk selection in the library | P3 | M | |
 | User profiles (household, child-safe) | P3 | L | Stremio supporter feature. |

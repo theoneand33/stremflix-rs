@@ -27,6 +27,11 @@ fn data_survives_reopen() {
     assert_eq!(db.setting("missing").unwrap(), None);
     assert_eq!(db.progress("movie:tt1").unwrap().unwrap(), Progress { position: 50.0, ..prog });
     assert_eq!(db.recent_progress(10).unwrap().len(), 1);
+    db.save_progress(&Progress { key: "movie:tt2".into(), title: "Two".into(), source: "s".into(), position: 1.0, duration: 0.0, poster: None }).unwrap();
+    db.remove_progress("movie:tt1").unwrap();
+    db.remove_progress("movie:missing").unwrap(); // no-op
+    assert_eq!(db.recent_progress(10).unwrap().iter().map(|p| p.key.as_str()).collect::<Vec<_>>(), ["movie:tt2"]);
+    assert!(db.watched_keys().unwrap().is_empty()); // removing is not marking watched
 
     db.remove_addon("https://x.example/manifest.json").unwrap();
     drop(db);
