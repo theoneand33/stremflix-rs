@@ -82,9 +82,10 @@ impl CatalogDef {
         self.extra.iter().any(|e| e.is_required) || !self.extra_required.is_empty()
     }
 
-    /// Extras the user can pick a value for (`genre`, `year`, `sort`, ...): those declaring options.
+    /// Extras the user can pick a value for (`genre`, `year`, `sort`, ...): those declaring options,
+    /// minus `skip`/`search` (handled elsewhere).
     pub fn pickers(&self) -> impl Iterator<Item = &ExtraDef> {
-        self.extra.iter().filter(|e| !e.options.is_empty())
+        self.extra.iter().filter(|e| !e.options.is_empty() && !matches!(e.name.as_str(), "skip" | "search"))
     }
 
     /// `current` kept where still a valid option, plus the first option of each required picker.
@@ -685,6 +686,15 @@ mod configure_tests {
         assert_eq!(configure_url("http://127.0.0.1:7070/manifest.json").unwrap().as_str(), "http://127.0.0.1:7070/configure");
         assert!(configure_url("stremio://a.example/manifest.json").is_err());
         assert!(configure_url("https://a.example/other.json").is_err());
+    }
+
+    #[test]
+    fn pickers_exclude_skip_and_search() {
+        let body = r#"{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"],"catalogs":[{"type":"movie","id":"c","extra":[
+            {"name":"genre","options":["A"]},{"name":"skip","options":["0","100"]},{"name":"search","options":["x"]}]}]}"#;
+        let m = parse_manifest(body.as_bytes()).unwrap();
+        let names: Vec<_> = m.catalogs[0].pickers().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["genre"]);
     }
 
     #[test]
