@@ -172,6 +172,8 @@ enum Msg {
     Link(String),
     /// A download that finished, or why it failed.
     Downloaded(Download, Result<(), String>),
+    /// A media key or OS media overlay button.
+    Media(souvlaki::MediaControlEvent),
 }
 
 /// One horizontal catalog row on the home screen.
@@ -695,6 +697,55 @@ where
     out
 }
 
+/// What an OS media control event does to the player.
+#[derive(Debug, PartialEq)]
+enum MediaAction {
+    Cmd(&'static [&'static str]),
+    /// Seconds, and whether relative.
+    Seek(f64, bool),
+    Next,
+    Stop,
+}
+
+fn media_action(e: souvlaki::MediaControlEvent) -> Option<MediaAction> {
+    use souvlaki::{MediaControlEvent as E, SeekDirection};
+    let sign = |d| if d == SeekDirection::Forward { 1.0 } else { -1.0 };
+    Some(match e {
+        E::Play => MediaAction::Cmd(&["set", "pause", "no"]),
+        E::Pause => MediaAction::Cmd(&["set", "pause", "yes"]),
+        E::Toggle => MediaAction::Cmd(&["cycle", "pause"]),
+        E::Next => MediaAction::Next,
+        E::Stop => MediaAction::Stop,
+        E::Seek(d) => MediaAction::Seek(10.0 * sign(d), true),
+        E::SeekBy(d, by) => MediaAction::Seek(by.as_secs_f64() * sign(d), true),
+        E::SetPosition(p) => MediaAction::Seek(p.0.as_secs_f64(), false),
+        _ => return None,
+    })
+}
+
+/// OS media controls, sending their events to the UI thread; `None` (logged) where unavailable.
+fn media_controls(cc: &eframe::CreationContext, tx: Sender<Msg>) -> Option<souvlaki::MediaControls> {
+    #[cfg(windows)]
+    let hwnd = match raw_window_handle::HasWindowHandle::window_handle(cc).map(|h| h.as_raw()) {
+        Ok(raw_window_handle::RawWindowHandle::Win32(h)) => Some(h.hwnd.get() as *mut std::ffi::c_void),
+        _ => {
+            eprintln!("media controls: no window handle");
+            return None;
+        }
+    };
+    #[cfg(not(windows))]
+    let hwnd = None;
+    let config = souvlaki::PlatformConfig { display_name: "Stremflix-rs", dbus_name: "stremflix_rs", hwnd };
+    let mut controls = souvlaki::MediaControls::new(config).inspect_err(|e| eprintln!("media controls: {e:?}")).ok()?;
+    let ctx = cc.egui_ctx.clone();
+    // shortcut: without a D-Bus session souvlaki's MPRIS thread panics (logged on stderr) and the app runs on without controls; pre-check the bus if that noise matters.
+    let attached = controls.attach(move |e| {
+        let _ = tx.send(Msg::Media(e));
+        ctx.request_repaint();
+    });
+    attached.inspect_err(|e| eprintln!("media controls: {e:?}")).ok().map(|()| controls)
+}
+
 struct Playing {
     player: Player,
     key: String,
@@ -834,6 +885,9 @@ struct App {
     gl_proc: Option<GlProc>,
     /// Video framebuffer, its texture (owned by egui once registered) and pixel size; reused across playbacks.
     video: Option<(glow::Framebuffer, glow::Texture, egui::TextureId, [usize; 2])>,
+    media: Option<souvlaki::MediaControls>,
+    /// Title, paused and duration (s) last published to the media controls.
+    media_shown: Option<(String, bool, u64)>,
 }
 
 fn data_dir() -> PathBuf {
@@ -932,6 +986,8 @@ impl App {
             last_poll: Instant::now(),
             gl_proc: None,
             video: None,
+            media: None,
+            media_shown: None,
         };
         if app.addons.is_empty() {
             app.tab = Tab::Addons;
@@ -1293,6 +1349,7 @@ impl App {
                 }
             }
             Msg::Update(url) => self.update = url,
+            Msg::Media(e) => self.media_event(ctx, e),
             Msg::Downloaded(d, res) => {
                 self.downloading.retain(|x| x.path != d.path);
                 let res = match res.map_err(anyhow::Error::msg) {
@@ -1420,6 +1477,52 @@ impl App {
     fn stop_player(&mut self) {
         self.save_progress();
         self.player = None;
+    }
+
+    /// A media key or OS overlay button; ignored when nothing plays.
+    fn media_event(&mut self, ctx: &egui::Context, e: souvlaki::MediaControlEvent) {
+        let Some(p) = &mut self.player else { return };
+        let res = match media_action(e) {
+            Some(MediaAction::Cmd(args)) => p.player.command(args),
+            Some(MediaAction::Seek(to, relative)) => p.player.seek(to, relative),
+            Some(MediaAction::Next) => {
+                if self.playing_episode() {
+                    self.play_next(ctx);
+                }
+                return;
+            }
+            Some(MediaAction::Stop) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                self.stop_player();
+                return self.release_torrents(None);
+            }
+            None => return,
+        };
+        if let Err(e) = res {
+            report(&mut self.error, e);
+        }
+    }
+
+    /// Publish the title, duration and play state to the OS media controls when they change.
+    fn publish_media(&mut self) {
+        let Some(mc) = &mut self.media else { return };
+        let shown = self.player.as_ref().map(|p| (p.title.clone(), p.player.state.paused, p.player.state.dur as u64));
+        if shown == self.media_shown {
+            return;
+        }
+        // Errors are ignored: without a D-Bus session every call fails, and the failure was logged at startup.
+        // shortcut: the position is sent only with these changes, so a seek leaves the OS's interpolated position stale until the next pause/play.
+        let _ = match &shown {
+            None => mc.set_playback(souvlaki::MediaPlayback::Stopped),
+            Some((title, paused, dur)) => {
+                let duration = (*dur > 0).then(|| Duration::from_secs(*dur));
+                let _ = mc.set_metadata(souvlaki::MediaMetadata { title: Some(title), duration, ..Default::default() });
+                let pos = self.player.as_ref().map_or(0.0, |p| p.player.state.pos);
+                let progress = Duration::try_from_secs_f64(pos).ok().map(souvlaki::MediaPosition);
+                mc.set_playback(if *paused { souvlaki::MediaPlayback::Paused { progress } } else { souvlaki::MediaPlayback::Playing { progress } })
+            }
+        };
+        self.media_shown = shown;
     }
 
     fn poll_player(&mut self, ctx: &egui::Context) {
@@ -3305,6 +3408,7 @@ impl eframe::App for App {
             self.handle(&ctx, msg);
         }
         self.poll_player(&ctx);
+        self.publish_media();
         ctx.request_repaint_after(Duration::from_millis(500));
         // A dropped .torrent file, or a magnet pasted with no text field focused, plays at once.
         // Window systems deliver dropped files only, not dropped text, so magnets come in by paste.
@@ -3461,6 +3565,7 @@ fn main() -> eframe::Result {
         cc.egui_ctx.set_visuals_of(egui::Theme::Dark, v);
         cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| s.spacing.button_padding = vec2(14.0, 6.0));
         app.gl_proc = cc.get_proc_address.clone();
+        app.media = media_controls(cc, app.tx.clone());
         app.build_rows(&cc.egui_ctx);
         app.fetch_recent_posters(&cc.egui_ctx);
         app.sync_account(&cc.egui_ctx);
@@ -3564,6 +3669,22 @@ mod tests {
         assert_eq!(keys(saved_view(&items, LibKind::Series, LibSort::Title)), ["series:tt2"]);
         assert!(saved_view(&items, LibKind::Series, LibSort::Added).len() == 1);
         assert_eq!(saved_view(&[], LibKind::All, LibSort::Title).len(), 0);
+    }
+
+    #[test]
+    fn media_events_map_to_player_actions() {
+        use souvlaki::{MediaControlEvent as E, MediaPosition, SeekDirection::*};
+        let s = Duration::from_secs;
+        assert_eq!(media_action(E::Toggle), Some(MediaAction::Cmd(&["cycle", "pause"])));
+        assert_eq!(media_action(E::Play), Some(MediaAction::Cmd(&["set", "pause", "no"])));
+        assert_eq!(media_action(E::Pause), Some(MediaAction::Cmd(&["set", "pause", "yes"])));
+        assert_eq!(media_action(E::Next), Some(MediaAction::Next));
+        assert_eq!(media_action(E::Stop), Some(MediaAction::Stop));
+        assert_eq!(media_action(E::Seek(Backward)), Some(MediaAction::Seek(-10.0, true)));
+        assert_eq!(media_action(E::SeekBy(Forward, s(30))), Some(MediaAction::Seek(30.0, true)));
+        assert_eq!(media_action(E::SetPosition(MediaPosition(s(95)))), Some(MediaAction::Seek(95.0, false)));
+        assert_eq!(media_action(E::Previous), None);
+        assert_eq!(media_action(E::Quit), None);
     }
 
     #[test]
