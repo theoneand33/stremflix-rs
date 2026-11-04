@@ -69,6 +69,8 @@ pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path) -> Resu
         req = req.header(k.as_str(), v.as_str());
     }
     let mut resp = req.send().await.context("download")?.error_for_status()?;
+    let kind = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
+    ensure!(!["mpegurl", "dash+xml"].iter().any(|t| kind.contains(t)), "{kind} is a streaming playlist, not a video file, so it can't be downloaded");
     let len = resp.content_length();
     let tmp = part(dest);
     let mut f = tokio::fs::File::create(&tmp).await?;
@@ -79,8 +81,24 @@ pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path) -> Resu
     }
     ensure!(len.is_none_or(|n| n == got), "download cut off at {got} of {} bytes", len.unwrap_or(0));
     f.sync_all().await?;
-    tokio::fs::rename(&tmp, dest).await?;
-    Ok(())
+    finish(&tmp, dest)
+}
+
+/// Move `part` to `dest`, failing rather than overwriting a file created there since `reserve`.
+fn finish(part: &Path, dest: &Path) -> Result<()> {
+    match std::fs::hard_link(part, dest) {
+        Ok(()) => {
+            // The file is complete; a stale `.part` is cleared at the next start.
+            let _ = std::fs::remove_file(part);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e).with_context(|| format!("{} already exists", dest.display())),
+        // shortcut: no hard links on this file system (e.g. FAT), so check then rename; racy, but only against other apps writing our downloads folder.
+        Err(_) => {
+            ensure!(!dest.exists(), "{} already exists", dest.display());
+            Ok(std::fs::rename(part, dest)?)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -108,6 +126,20 @@ mod tests {
         assert!(part(&a).exists() && !a.exists());
         clear_partial(dir.path());
         assert!(!part(&a).exists() && !part(&b).exists());
+    }
+
+    #[test]
+    fn finish_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = reserve(dir.path(), "a.mp4").unwrap();
+        std::fs::write(part(&dest), b"new").unwrap();
+        std::fs::write(&dest, b"theirs").unwrap();
+        assert!(finish(&part(&dest), &dest).is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"theirs");
+        std::fs::remove_file(&dest).unwrap();
+        finish(&part(&dest), &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert!(!part(&dest).exists());
     }
 
     #[tokio::test]

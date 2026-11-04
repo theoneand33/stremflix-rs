@@ -198,9 +198,14 @@ impl Db {
         Ok(())
     }
 
-    pub fn remove_download(&self, path: &Path) -> Result<()> {
-        self.conn.execute("DELETE FROM downloads WHERE path = ?1", [path.to_string_lossy()])?;
-        Ok(())
+    /// Also drops its resume point if that plays the file, so Continue Watching doesn't open a missing file.
+    pub fn remove_download(&self, d: &Download) -> Result<()> {
+        let path = d.path.to_string_lossy();
+        self.transaction(|| {
+            self.conn.execute("DELETE FROM downloads WHERE path = ?1", [&path])?;
+            self.conn.execute("DELETE FROM progress WHERE key = ?1 AND source = ?2", [d.key().as_str(), &path])?;
+            Ok(())
+        })
     }
 
     /// Downloads, newest first.

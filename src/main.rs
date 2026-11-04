@@ -635,6 +635,11 @@ struct SubLookup {
     headers: Vec<(String, String)>,
 }
 
+/// HLS/DASH manifest URL: a list of segments, not the video file.
+fn is_playlist(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|u| [".m3u8", ".mpd"].iter().any(|x| u.path().to_ascii_lowercase().ends_with(x)))
+}
+
 /// Re-ask subtitle addons with the stream's `videoHash`/`videoSize`/`filename` (the hash from the stream's hints,
 /// else read from `url`), so OpenSubtitles can match the exact file. Matches come first, then the earlier `subs`;
 /// on timeout or without a hash, `subs` unchanged.
@@ -647,7 +652,7 @@ async fn hashed_subs(client: AddonClient, l: SubLookup, url: &str, subs: Subs) -
         let (hash, size) = match l.hints.video_hash.clone() {
             Some(h) => (h, l.hints.video_size),
             // Playlists and YouTube pages are not the video file, so they have no hash.
-            None if stremflix_rs::addon::is_youtube(url) || url::Url::parse(url).is_ok_and(|u| [".m3u8", ".mpd"].iter().any(|x| u.path().to_ascii_lowercase().ends_with(x))) => return Vec::new(),
+            None if stremflix_rs::addon::is_youtube(url) || is_playlist(url) => return Vec::new(),
             None => match tokio::time::timeout_at(deadline, client.video_hash(url, &l.headers)).await {
                 Ok(Ok((h, n))) => (h, Some(n)),
                 _ => return Vec::new(),
@@ -1231,14 +1236,15 @@ impl App {
             Msg::Update(url) => self.update = url,
             Msg::Downloaded(d, res) => {
                 self.downloading.retain(|x| x.path != d.path);
-                match res.map_err(anyhow::Error::msg).and_then(|()| self.db.add_download(&d)) {
+                let res = match res.map_err(anyhow::Error::msg) {
+                    // A failed fetch leaves only our `.part`; `d.path` may be someone else's file.
+                    Err(e) => Err(e).inspect_err(|_| drop(std::fs::remove_file(download::part(&d.path)))),
+                    // A failed DB insert leaves our finished file.
+                    Ok(()) => self.db.add_download(&d).inspect_err(|_| drop(std::fs::remove_file(&d.path))),
+                };
+                match res {
                     Ok(()) => self.downloads.insert(0, d),
-                    Err(e) => {
-                        // A failed fetch leaves the `.part`; a failed DB insert leaves the finished file.
-                        let _ = std::fs::remove_file(download::part(&d.path));
-                        let _ = std::fs::remove_file(&d.path);
-                        report(&mut self.error, format!("download {}: {e:#}", d.title));
-                    }
+                    Err(e) => report(&mut self.error, format!("download {}: {e:#}", d.title)),
                 }
             }
             Msg::Scanned(dir, res) => {
@@ -1803,8 +1809,8 @@ impl App {
                     ui.add_space(8.0);
                     ui.label(RichText::new(&s.addon).size(17.0).family(bold()).color(Color32::from_gray(200)));
                 }
-                // YouTube needs yt-dlp, which only mpv runs.
-                let src = s.source().filter(|src| !stremflix_rs::addon::is_youtube(src));
+                // YouTube needs yt-dlp, which only mpv runs; a playlist GET would save only the manifest.
+                let src = s.source().filter(|src| !stremflix_rs::addon::is_youtube(src) && !is_playlist(src));
                 let r = stream_row(ui, i + 1, s, if src.is_some() { EPISODE_BUTTON.x + 12.0 } else { 0.0 });
                 if let Some(src) = src {
                     // Overlaid like the episode rows' "Mark watched".
@@ -3113,7 +3119,7 @@ impl App {
                     play = Some(d.clone());
                 }
                 if small_button(ui, "Delete").clicked() {
-                    delete = Some(d.path.clone());
+                    delete = Some(d.clone());
                 }
                 ui.label(d.path.display().to_string());
             });
@@ -3121,11 +3127,14 @@ impl App {
         if let Some(d) = play {
             self.play(&ctx, d.key(), d.title, d.path.to_string_lossy().into_owned(), vec![]);
         }
-        if let Some(path) = delete {
-            let gone = std::fs::remove_file(&path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) });
-            match gone.map_err(anyhow::Error::from).and_then(|()| self.db.remove_download(&path)) {
-                Ok(()) => self.downloads.retain(|d| d.path != path),
-                Err(e) => report(&mut self.error, format!("delete {}: {e:#}", path.display())),
+        if let Some(d) = delete {
+            let gone = std::fs::remove_file(&d.path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) });
+            match gone.map_err(anyhow::Error::from).and_then(|()| self.db.remove_download(&d)) {
+                Ok(()) => {
+                    self.downloads.retain(|x| x.path != d.path);
+                    self.recent = self.db.recent_progress(20).unwrap_or_default();
+                }
+                Err(e) => report(&mut self.error, format!("delete {}: {e:#}", d.path.display())),
             }
         }
         ui.separator();

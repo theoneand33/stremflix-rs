@@ -157,6 +157,12 @@ fn downloads_round_trip() {
     let db = Db::open(&path).unwrap();
     assert_eq!(db.downloads().unwrap(), [movie.clone(), ep.clone()], "newest first");
     assert_eq!((ep.key(), movie.key()), ("series:tt2:1:2".to_string(), "movie:tt1".to_string()));
-    db.remove_download(&movie.path).unwrap();
-    assert_eq!(db.downloads().unwrap(), [ep]);
+    let prog = |key: String, source: &str| Progress { key, title: "t".into(), source: source.into(), position: 1.0, duration: 2.0, poster: None };
+    db.save_progress(&prog(movie.key(), "/d/One.mp4")).unwrap();
+    db.save_progress(&prog(ep.key(), "https://x/ep.mkv")).unwrap();
+    db.remove_download(&movie).unwrap();
+    db.remove_download(&ep).unwrap();
+    assert_eq!(db.downloads().unwrap(), []);
+    assert_eq!(db.progress(&movie.key()).unwrap(), None, "resume point on the deleted file is dropped");
+    assert!(db.progress(&ep.key()).unwrap().is_some(), "a streamed resume point is kept");
 }
