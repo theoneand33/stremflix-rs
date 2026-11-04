@@ -512,8 +512,10 @@ impl Player {
         let s = &mut self.state;
         if p.data.is_null() {
             // Property unavailable (e.g. no file yet): keep numbers, clear what is file-specific.
-            if idx == 8 {
-                s.tracks.clear();
+            match idx {
+                8 => s.tracks.clear(),
+                11 => s.cached_to = 0.0,
+                _ => {}
             }
             return;
         }
