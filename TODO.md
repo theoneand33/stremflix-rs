@@ -110,7 +110,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | System media controls (MPRIS / SMTC / Now Playing) | P2 | M | Play/pause and now-playing from the OS or keyboard media keys. |
 | Tray icon and minimize-to-tray with background playback | P2 | M | |
 | Dark/light theme and accent customization | P2 | S | Dark only today. |
-| UI scale / zoom | P2 | S | HiDPI and TV-sized screens. |
 | Remember last tab and window state on launch | P3 | S | |
 | Command-line flags for play/open | P3 | S | Only `stremio://` links are parsed now. |
 | Screen-reader labels and focus-order polish | P3 | M | AccessKit is enabled; coverage is partial. |
