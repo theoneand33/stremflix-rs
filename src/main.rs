@@ -135,6 +135,8 @@ enum Autoplay {
 enum Msg {
     Error(String),
     Installed(String, Manifest, Option<String>),
+    /// Fresh manifest (or error) per installed addon URL, from "Check for updates".
+    UpdateCheck(Vec<(String, Result<Manifest, String>)>),
     /// Search title and results.
     Catalog(String, Vec<MetaPreview>),
     /// Row source (addon URL, type, catalog id) and its items or error.
@@ -757,6 +759,9 @@ struct App {
     tab: Tab,
     addons: Vec<(String, Manifest)>,
     addon_url: String,
+    /// Last "Check for updates" result per addon URL.
+    addon_updates: Vec<(String, Result<Manifest, String>)>,
+    checking_updates: bool,
     /// Addon being reconfigured (old transport URL) and the pasted result URL.
     configuring: Option<(String, String)>,
     /// Addon catalog picked in the Addons tab (addon URL, type, catalog id) and its addons (`None` while loading).
@@ -909,6 +914,8 @@ impl App {
             rx,
             tab: Tab::Home,
             addon_url: String::new(),
+            addon_updates: Vec::new(),
+            checking_updates: false,
             configuring: None,
             browse: None,
             rows: Vec::new(),
@@ -1088,6 +1095,10 @@ impl App {
                 }
                 self.build_rows(ctx);
                 self.fetch_recent_posters(ctx);
+            }
+            Msg::UpdateCheck(res) => {
+                self.checking_updates = false;
+                self.addon_updates = res;
             }
             Msg::Catalog(name, items) => {
                 self.search_results = Some((name, items));
@@ -2825,7 +2836,25 @@ impl App {
                 Ok(Msg::Imported(imp))
             });
         }
+        if ui.add_enabled(!self.checking_updates && !self.addons.is_empty(), egui::Button::new(if self.checking_updates { "Checking..." } else { "Check for updates" })).clicked() {
+            self.checking_updates = true;
+            let (client, urls) = (self.client.clone(), self.addons.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>());
+            self.spawn(&ctx, async move {
+                let mut out = Vec::new();
+                // Four at a time keeps a long addon list from opening dozens of connections.
+                for chunk in urls.chunks(4) {
+                    let res = concurrently(chunk.to_vec(), |u| {
+                        let c = client.clone();
+                        async move { Ok((u.clone(), c.fetch_manifest(&u).await.map_err(|e| format!("{e:#}")))) }
+                    })
+                    .await;
+                    out.extend(res.into_iter().flatten());
+                }
+                Ok(Msg::UpdateCheck(out))
+            });
+        }
         ui.separator();
+        let mut update = None;
         let mut remove = None;
         let mut configure = None;
         let mut replace = None;
@@ -2853,6 +2882,20 @@ impl App {
                     remove = Some(url.clone());
                 }
             });
+            match self.addon_updates.iter().find(|(u, _)| u == url).map(|(_, r)| r) {
+                Some(Ok(new)) if stremflix_rs::addon::is_newer(&new.version, &m.version) => {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Update available: {} \u{2192} {}", m.version, new.version));
+                        if small_button(ui, "Update").clicked() {
+                            update = Some((url.clone(), new.clone()));
+                        }
+                    });
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(format!("Unreachable: {e}")).weak());
+                }
+                _ => {}
+            }
             if m.behavior_hints.configuration_required {
                 ui.label(RichText::new("Needs configuration before use. Press Configure.").weak());
             }
@@ -2864,6 +2907,10 @@ impl App {
             {
                 replace = Some((old.clone(), pasted.trim().to_string()));
             }
+        }
+        if let Some((url, m)) = update {
+            self.addon_updates.retain(|(u, _)| *u != url);
+            self.handle(&ctx, Msg::Installed(url, m, None));
         }
         if let Some((old, new)) = replace {
             let client = self.client.clone();
@@ -3718,6 +3765,18 @@ mod tests {
         })
         .await;
         assert_eq!(out.into_iter().map(Result::unwrap).collect::<Vec<_>>(), [30, 0, 10]);
+    }
+
+    #[test]
+    fn version_compare() {
+        use stremflix_rs::addon::is_newer;
+        assert!(is_newer("1.10.0", "1.9.9"));
+        assert!(is_newer("2", "1.9"));
+        assert!(!is_newer("1.0", "1.0.0"));
+        assert!(!is_newer("1.0.0", "1.0.1"));
+        assert!(is_newer("v1.1.0", "1.0.0"));
+        assert!(is_newer("1.0.0-beta", "1.0.0"), "non-numeric falls back to inequality");
+        assert!(!is_newer("1.0.0-beta", "1.0.0-beta"));
     }
 
     #[test]

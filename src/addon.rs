@@ -148,6 +148,21 @@ fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<
     Ok(ManifestHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired") })
 }
 
+/// Whether `new` is a newer version than `old`: numeric dot parts compare numerically,
+/// anything else (pre-release tags, odd formats) counts as newer when merely different.
+pub fn is_newer(new: &str, old: &str) -> bool {
+    let parts = |v: &str| v.trim().trim_start_matches('v').split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
+    match (parts(new), parts(old)) {
+        (Some(mut a), Some(mut b)) => {
+            let n = a.len().max(b.len());
+            a.resize(n, 0);
+            b.resize(n, 0);
+            a > b
+        }
+        _ => new.trim() != old.trim(),
+    }
+}
+
 impl Manifest {
     pub fn has_resource(&self, name: &str) -> bool {
         self.resources.iter().any(|r| r.name() == name)
