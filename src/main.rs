@@ -339,6 +339,11 @@ fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Bounds a UI zoom factor to 0.75-2.0 in 0.05 steps; non-finite falls back to 1.0.
+fn clamp_scale(z: f32) -> f32 {
+    if z.is_finite() { ((z * 20.0).round() / 20.0).clamp(0.75, 2.0) } else { 1.0 }
+}
+
 /// Rounded chip, accent-filled when selected.
 fn pill(ui: &mut egui::Ui, label: &str, selected: bool, role: egui::Role) -> egui::Response {
     let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::new(14.0, if selected { bold() } else { egui::FontFamily::Proportional }), Color32::WHITE);
@@ -891,6 +896,7 @@ struct App {
     hwdec: bool,
     /// Play the next episode when one ends.
     autoplay_next: bool,
+    ui_scale: f32,
     /// Playback speed every video starts at.
     default_speed: f64,
     /// Player volume (0-130) every video starts at; saved when the user changes it.
@@ -979,6 +985,7 @@ impl App {
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
             volume: db.setting("volume")?.and_then(|v| v.parse().ok()).filter(|v| (0.0..=130.0).contains(v)).unwrap_or(100.0),
+            ui_scale: clamp_scale(db.setting("ui_scale")?.and_then(|v| v.parse().ok()).unwrap_or(1.0)),
             default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
             seek_steps: [seek_step(db.setting("seek_step")?, 10), seek_step(db.setting("seek_step_shift")?, 30)],
             error: None,
@@ -3393,6 +3400,16 @@ impl App {
             ui.label(RichText::new("A torrent has already played: restart the app to apply changes.").size(13.0).color(Color32::from_gray(170)));
         }
         ui.add_space(16.0);
+        ui.label(RichText::new("Appearance").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.scope(|ui| {
+            ui.set_max_width(550.0);
+            let step = stepper(ui, "UI scale", &format!("{:.0}%", self.ui_scale * 100.0));
+            if step != 0 {
+                ui.ctx().set_zoom_factor(clamp_scale(self.ui_scale + step as f32 * 0.25));
+            }
+        });
+        ui.label(RichText::new("Also Ctrl and +, Ctrl and −, Ctrl and 0.").size(13.0).color(Color32::from_gray(170)));
+        ui.add_space(16.0);
         ui.label(RichText::new("Player").size(20.0).strong().family(bold()).color(Color32::WHITE));
         if form_row(ui, "External player:", &mut self.external_player, "vlc", "Save", Some("Command run with the stream URL; no shell"), true) {
             save.push(("external_player", self.external_player.trim().to_string()));
@@ -3596,6 +3613,17 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // egui's built-in zoom keys change the factor too: bound it, then persist any change.
+        let zoom = clamp_scale(ctx.zoom_factor());
+        if zoom != ctx.zoom_factor() {
+            ctx.set_zoom_factor(zoom);
+        }
+        if zoom != self.ui_scale {
+            self.ui_scale = zoom;
+            if let Err(e) = self.db.set_setting("ui_scale", &zoom.to_string()) {
+                report(&mut self.error, format!("saving ui_scale: {e:#}"));
+            }
+        }
         ctx.input(|i| self.window.track(i.viewport()));
         // Load libmpv off the UI thread once the first frames are up: loading it earlier delayed them by ~140 ms.
         if ctx.cumulative_frame_nr() == 2 {
@@ -3881,6 +3909,7 @@ fn main() -> eframe::Result {
             (st.weak_bg_fill, st.bg_stroke, st.corner_radius, st.expansion) = (Color32::from_gray(gray), egui::Stroke::NONE, 4.into(), 0.0);
             st.fg_stroke.color = Color32::WHITE;
         }
+        cc.egui_ctx.set_zoom_factor(app.ui_scale);
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         cc.egui_ctx.set_visuals_of(egui::Theme::Dark, v);
         cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| s.spacing.button_padding = vec2(14.0, 6.0));
@@ -3977,6 +4006,14 @@ fn seek_step(v: Option<String>, default: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_scale_bounds_and_rounds() {
+        assert_eq!(clamp_scale(0.1), 0.75);
+        assert_eq!(clamp_scale(9.0), 2.0);
+        assert_eq!(clamp_scale(1.1000001), 1.1);
+        assert_eq!(clamp_scale(f32::NAN), 1.0);
+    }
 
     #[test]
     fn geo_round_trips_and_rejects_junk() {
