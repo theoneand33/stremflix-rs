@@ -62,7 +62,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| Download manager: save a title for offline playback | P1 | M | Stremio supporters feature and its top request; the torrent engine already has the bytes. |
 | Download queue with progress and pause/resume | P2 | M | Builds on the download manager. |
 | Choose files in a multi-file torrent | P2 | S | The largest file is picked silently today. |
 | Download / upload speed limits | P3 | S | librqbit supports rate limits. |

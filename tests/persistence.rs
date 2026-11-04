@@ -1,5 +1,5 @@
 use stremflix_rs::addon::parse_manifest;
-use stremflix_rs::db::{Db, Progress, SavedTitle, Watched};
+use stremflix_rs::db::{Db, Download, Progress, SavedTitle, Watched};
 use stremflix_rs::library::LibraryItem;
 
 #[test]
@@ -141,4 +141,22 @@ fn addon_order_persists() {
     let db = Db::open(&old).unwrap();
     db.add_addon(&u("c"), &m).unwrap();
     assert_eq!(urls(&db), [u("a"), u("b"), u("c")]);
+}
+
+#[test]
+fn downloads_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let ep = Download { path: "/d/Show S1E2.mkv".into(), kind: "series".into(), meta_id: "tt2".into(), video_id: "tt2:1:2".into(), title: "Show S1E2".into() };
+    let movie = Download { path: "/d/One.mp4".into(), kind: "movie".into(), meta_id: "tt1".into(), video_id: "tt1".into(), title: "One".into() };
+    {
+        let db = Db::open(&path).unwrap();
+        db.add_download(&ep).unwrap();
+        db.add_download(&movie).unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.downloads().unwrap(), [movie.clone(), ep.clone()], "newest first");
+    assert_eq!((ep.key(), movie.key()), ("series:tt2:1:2".to_string(), "movie:tt1".to_string()));
+    db.remove_download(&movie.path).unwrap();
+    assert_eq!(db.downloads().unwrap(), [ep]);
 }

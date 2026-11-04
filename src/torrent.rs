@@ -64,6 +64,8 @@ pub struct TorrentEngine {
     http: SocketAddr,
     /// Bytes of stopped torrents kept on disk for a quick replay; 0 deletes them at once.
     cache: u64,
+    /// Torrents being downloaded, once per download: never stopped by [`release_except`](Self::release_except).
+    pinned: std::sync::Mutex<Vec<usize>>,
 }
 
 impl TorrentEngine {
@@ -86,7 +88,7 @@ impl TorrentEngine {
         let api = Api::new(session.clone(), None, None);
         let server = librqbit::http_api::HttpApi::new(api, Some(librqbit::http_api::HttpApiOptions { read_only: true, ..Default::default() }));
         tokio::spawn(server.make_http_api_and_run(listener, None));
-        Ok(Self { session, http, cache })
+        Ok(Self { session, http, cache, pinned: Default::default() })
     }
 
     /// Add a magnet or local `.torrent` file and return a local HTTP URL streaming the chosen (or largest) file, and the torrent's id.
@@ -127,10 +129,21 @@ impl TorrentEngine {
         Ok((format!("http://{}/torrents/{}/stream/{idx}", self.http, handle.id()), handle.id()))
     }
 
-    /// Stop every torrent but `keep`, so none keeps downloading or seeding. Stopped torrents stay on disk
+    /// Keep torrent `id` running while a download reads it (`on`), or drop one such hold.
+    pub fn pin(&self, id: usize, on: bool) {
+        let mut p = self.pinned.lock().unwrap();
+        if on {
+            p.push(id);
+        } else if let Some(i) = p.iter().position(|&x| x == id) {
+            p.remove(i);
+        }
+    }
+
+    /// Stop every torrent but `keep` and pinned ones, so none keeps downloading or seeding. Stopped torrents stay on disk
     /// while they fit in the cache; the oldest are deleted with their files first.
     pub async fn release_except(&self, keep: Option<usize>) {
-        let stopped: Vec<_> = self.session.with_torrents(|it| it.filter(|(id, _)| Some(*id) != keep).map(|(id, h)| (id, h.clone())).collect());
+        let pinned = self.pinned.lock().unwrap().clone();
+        let stopped: Vec<_> = self.session.with_torrents(|it| it.filter(|(id, _)| Some(*id) != keep && !pinned.contains(id)).map(|(id, h)| (id, h.clone())).collect());
         for (_, h) in stopped.iter().filter(|(_, h)| !h.is_paused()) {
             if let Err(e) = self.session.pause(h).await {
                 eprintln!("pause torrent {}: {e:#}", h.id());

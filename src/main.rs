@@ -11,7 +11,8 @@ use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use anyhow::Context;
 use stremflix_rs::addon::{AddonClient, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
 use stremflix_rs::instance;
-use stremflix_rs::db::{Db, Progress, SavedTitle, Watched};
+use stremflix_rs::db::{Db, Download, Progress, SavedTitle, Watched};
+use stremflix_rs::download;
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
 use stremflix_rs::player::{GlProc, Player, SPEEDS, SUB_COLORS, SubStyle, hwdec_value, prefer_lang, valid_langs};
@@ -165,6 +166,8 @@ enum Msg {
     Update(Option<String>),
     /// A `stremio://` link from the command line, a later launch, or macOS.
     Link(String),
+    /// A download that finished, or why it failed.
+    Downloaded(Download, Result<(), String>),
 }
 
 /// One horizontal catalog row on the home screen.
@@ -477,7 +480,7 @@ fn card_text(ui: &egui::Ui, rect: egui::Rect, text: &str) {
     p.galley(pos2(rect.center().x, rect.center().y - g.size().y / 2.0), g, Color32::WHITE);
 }
 
-fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream) -> egui::Response {
+fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream, reserve: f32) -> egui::Response {
     let mut parts = [&s.name, &s.title, &s.description].into_iter().flatten().map(|x| x.trim()).filter(|x| !x.is_empty());
     let head = parts.next().unwrap_or("Stream").replace('\n', " ");
     let parts: Vec<&str> = parts.collect();
@@ -487,7 +490,7 @@ fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream) -> egui::Response {
     let file = if described { String::new() } else { [s.hints.filename.clone(), s.hints.video_size.map(fmt_size)].into_iter().flatten().collect::<Vec<_>>().join("  ·  ") };
     let external = (s.target().is_none()).then_some("Opens in your browser");
     let details: Vec<&str> = parts.into_iter().chain(Some(file.as_str()).filter(|f| !f.is_empty())).chain(external).collect();
-    list_row(ui, n, head, details.join("\n"), 0.0)
+    list_row(ui, n, head, details.join("\n"), reserve)
 }
 
 /// Byte count as decimal MB/GB, like addons label sizes.
@@ -739,7 +742,7 @@ struct App {
     db: Db,
     data_dir: PathBuf,
     client: AddonClient,
-    torrent: Arc<tokio::sync::OnceCell<TorrentEngine>>,
+    torrent: Arc<tokio::sync::OnceCell<Arc<TorrentEngine>>>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     tab: Tab,
@@ -780,6 +783,9 @@ struct App {
     library: Vec<LibraryItem>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
+    /// Finished downloads, newest first, and those still running.
+    downloads: Vec<Download>,
+    downloading: Vec<Download>,
     lib_sort: LibSort,
     lib_kind: LibKind,
     recent: Vec<Progress>,
@@ -850,6 +856,7 @@ fn fmt_time(s: f64) -> String {
 impl App {
     fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
         let db = Db::open(&data_dir.join("stremflix-rs.db"))?;
+        download::clear_partial(&data_dir.join("downloads"));
         let (tx, rx) = channel();
         let mut app = Self {
             sub_style: db.setting("sub_style")?.map(|s| SubStyle::decode(&s)).unwrap_or_default(),
@@ -857,6 +864,8 @@ impl App {
             addons: db.addons()?,
             library: db.library_items()?,
             saved: db.saved_titles()?,
+            downloads: db.downloads()?,
+            downloading: Vec::new(),
             lib_sort: LibSort::Added,
             lib_kind: LibKind::All,
             recent: db.recent_progress(20)?,
@@ -931,18 +940,11 @@ impl App {
             let _ = self.tx.send(Msg::Play(key, title, source.clone(), source, subs, None, nav));
             return;
         }
-        // A chosen folder gets its own subfolder: the engine clears its folder at start.
-        let dir = match self.db.setting("torrent_dir").ok().flatten().filter(|d| !d.is_empty()) {
-            Some(d) => PathBuf::from(d).join("stremflix-rs-torrents"),
-            None => self.data_dir.join("torrents"),
-        };
-        let (cell, cache, profile, client) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile, self.client.clone());
-        let dht = std::env::var_os("STREMFLIX_RS_NO_DHT").is_none();
+        let (start, client) = (self.engine(), self.client.clone());
         self.spawn(ctx, async move {
             let (url, id) = match torrent {
                 true => {
-                    let engine = cell.get_or_try_init(|| TorrentEngine::start(dir, dht, cache, profile)).await?;
-                    let (url, id) = engine.stream_url(&source, None).await?;
+                    let (url, id) = start.await?.stream_url(&source, None).await?;
                     (url, Some(id))
                 }
                 false => (source.clone(), None),
@@ -953,6 +955,18 @@ impl App {
             };
             Ok(Msg::Play(key, title, source, url, subs, id, nav))
         });
+    }
+
+    /// The torrent engine, started on first use.
+    fn engine(&self) -> impl Future<Output = anyhow::Result<Arc<TorrentEngine>>> + Send + 'static {
+        // A chosen folder gets its own subfolder: the engine clears its folder at start.
+        let dir = match self.db.setting("torrent_dir").ok().flatten().filter(|d| !d.is_empty()) {
+            Some(d) => PathBuf::from(d).join("stremflix-rs-torrents"),
+            None => self.data_dir.join("torrents"),
+        };
+        let (cell, cache, profile) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile);
+        let dht = std::env::var_os("STREMFLIX_RS_NO_DHT").is_none();
+        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile).await.map(Arc::new) }).await.cloned() }
     }
 
     /// What a hash-matched subtitle query needs for the selected title's stream `source`;
@@ -976,6 +990,32 @@ impl App {
             Some(h) => self.play(ctx, format!("btih:{h}"), format!("Torrent {}", &h[..8]), input.into(), vec![]),
             None => report(&mut self.error, "not a magnet link or .torrent file"),
         }
+    }
+
+    /// Save stream `source` (http URL or magnet) to the downloads folder as `d`, in the background.
+    /// `hint` (a file name or URL path) gives the file extension.
+    fn download(&mut self, ctx: &egui::Context, mut d: Download, source: String, headers: Vec<(String, String)>, hint: Option<String>) {
+        match download::reserve(&self.data_dir.join("downloads"), &download::file_name(&d.title, hint.as_deref())) {
+            Ok(p) => d.path = p,
+            Err(e) => return report(&mut self.error, format!("download: {e:#}")),
+        }
+        self.downloading.push(d.clone());
+        let engine = source.starts_with("magnet:").then(|| self.engine());
+        self.spawn(ctx, async move {
+            let res = async {
+                let Some(engine) = engine else { return download::fetch(&source, &headers, &d.path).await };
+                let engine = engine.await?;
+                let (url, id) = engine.stream_url(&source, None).await?;
+                // Pinned so playing or stopping another title doesn't pause it mid-download.
+                engine.pin(id, true);
+                let res = download::fetch(&url, &[], &d.path).await;
+                // shortcut: the torrent keeps its cache copy and runs until the next playback releases it; fine for a few downloads.
+                engine.pin(id, false);
+                res
+            };
+            let res = res.await.map_err(|e| format!("{e:#}"));
+            Ok(Msg::Downloaded(d, res))
+        });
     }
 
     /// Stop every torrent but `keep`, so none keeps downloading and seeding. Runs on the UI thread,
@@ -1190,6 +1230,16 @@ impl App {
                 self.fetch_recent_posters(ctx);
             }
             Msg::Update(url) => self.update = url,
+            Msg::Downloaded(d, res) => {
+                self.downloading.retain(|x| x.path != d.path);
+                match res.map_err(anyhow::Error::msg).and_then(|()| self.db.add_download(&d)) {
+                    Ok(()) => self.downloads.insert(0, d),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(download::part(&d.path));
+                        report(&mut self.error, format!("download {}: {e:#}", d.title));
+                    }
+                }
+            }
             Msg::Scanned(dir, res) => {
                 let saved = res.map_err(anyhow::Error::msg).and_then(|items| {
                     self.db.add_library_folder(&dir, &items)?;
@@ -1728,8 +1778,9 @@ impl App {
         }
         let mut episode = None;
         let mut toggle: Option<(String, bool)> = None;
+        let mut save = None;
         // Movies show their streams; a series shows them once an episode is picked.
-        if let Some((_, streams, subs)) = &self.selected
+        if let Some((m, streams, subs)) = &self.selected
             && let Some(key) = self.play_key()
             && (self.episodes.is_empty() || self.episode.is_some())
         {
@@ -1751,7 +1802,25 @@ impl App {
                     ui.add_space(8.0);
                     ui.label(RichText::new(&s.addon).size(17.0).family(bold()).color(Color32::from_gray(200)));
                 }
-                if stream_row(ui, i + 1, s).clicked() {
+                // YouTube needs yt-dlp, which only mpv runs.
+                let src = s.source().filter(|src| !stremflix_rs::addon::is_youtube(src));
+                let r = stream_row(ui, i + 1, s, if src.is_some() { EPISODE_BUTTON.x + 12.0 } else { 0.0 });
+                if let Some(src) = src {
+                    // Overlaid like the episode rows' "Mark watched".
+                    let b = egui::Rect::from_min_size(pos2(r.rect.right() - 80.0 - EPISODE_BUTTON.x, r.rect.center().y - EPISODE_BUTTON.y / 2.0), EPISODE_BUTTON);
+                    let dl = ui.scope_builder(UiBuilder::new().max_rect(b).layout(Layout::centered_and_justified(egui::Direction::LeftToRight)), |ui| small_button(ui, "Download")).inner;
+                    ui.advance_cursor_after_rect(r.rect);
+                    if dl.clicked() {
+                        let video_id = self.episode.as_ref().map_or(&m.id, |v| &v.id).clone();
+                        let d = Download { path: PathBuf::new(), kind: m.kind.clone(), meta_id: m.id.clone(), video_id, title: key.1.clone() };
+                        let url = match s.target() { Some(PlayTarget::Http(u)) => Some(u), _ => None };
+                        let hint = s.hints.filename.clone().or_else(|| url.as_ref().map(|u| u.path().to_string()));
+                        let headers = if url.is_some() { s.hints.request_headers.clone() } else { vec![] };
+                        save = Some((d, src, headers, hint));
+                        continue;
+                    }
+                }
+                if r.clicked() {
                     match (s.source(), &s.external_url) {
                         (Some(src), _) => play = Some((key.0.clone(), key.1.clone(), src, subs.clone())),
                         // `external_url` is http(s) only (checked in `parse_streams`).
@@ -1911,6 +1980,9 @@ impl App {
                 Ok(()) => self.recent = self.db.recent_progress(20).unwrap_or_default(),
                 Err(e) => report(&mut self.error, format!("removing from Continue Watching: {e:#}")),
             }
+        }
+        if let Some((d, src, headers, hint)) = save {
+            self.download(&ctx, d, src, headers, hint);
         }
         if let Some((m, autoplay)) = open {
             self.open_meta(&ctx, m, autoplay);
@@ -3018,6 +3090,39 @@ impl App {
         }
         if let Some(m) = quick {
             self.quick_play(&ctx, m);
+        }
+        ui.separator();
+        ui.label(RichText::new("Downloads").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        if self.downloads.is_empty() && self.downloading.is_empty() {
+            ui.label(RichText::new("Nothing downloaded yet. Open a title and choose \"Download\" on a stream.").color(Color32::from_gray(170)));
+        }
+        for d in &self.downloading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("Downloading {}", d.title));
+            });
+        }
+        let (mut play, mut delete) = (None, None);
+        for d in &self.downloads {
+            ui.horizontal(|ui| {
+                if primary_button(ui, &format!("Play {}", d.title)).clicked() {
+                    play = Some(d.clone());
+                }
+                if small_button(ui, "Delete").clicked() {
+                    delete = Some(d.path.clone());
+                }
+                ui.label(d.path.display().to_string());
+            });
+        }
+        if let Some(d) = play {
+            self.play(&ctx, d.key(), d.title, d.path.to_string_lossy().into_owned(), vec![]);
+        }
+        if let Some(path) = delete {
+            let gone = std::fs::remove_file(&path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) });
+            match gone.map_err(anyhow::Error::from).and_then(|()| self.db.remove_download(&path)) {
+                Ok(()) => self.downloads.retain(|d| d.path != path),
+                Err(e) => report(&mut self.error, format!("delete {}: {e:#}", path.display())),
+            }
         }
         ui.separator();
         let tip = "Or drop a .torrent file on the window, or paste a magnet anywhere";
