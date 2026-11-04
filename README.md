@@ -94,6 +94,10 @@ Addons → Import from Stremio copies addons, watched titles (Watch It Again), a
 
 Only the Linux Flatpak (Stremio 5) is tested against a real install; fixtures cover the rest. `cargo test --test stremio_import -- --ignored --nocapture` reads this machine's Stremio into a temp DB.
 
+### Stremio account
+
+Settings → Stremio account signs in to api.strem.io and copies the account's addons, library (as saved titles), and watched titles, on sign-in, at startup, and with Sync. Sync is one-way: nothing is uploaded, and already installed addons are kept. The auth key is stored in the local DB; Sign out forgets it. Account progress needs the stream that was playing, which the account doesn't hold, so it isn't copied.
+
 ## End-to-end demo
 
 ```sh

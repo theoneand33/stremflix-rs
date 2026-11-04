@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use stremflix_rs::db::Db;
 use stremflix_rs::addon::Video;
-use stremflix_rs::stremio_import::{import, parse, read_storage, watched_episodes, watched_videos};
+use stremflix_rs::stremio_import::{from_account, import, parse, read_storage, watched_episodes, watched_videos};
 
 /// A Stremio 5 localStorage snapshot: 2 addons (1 invalid), a movie in progress, a watched series,
 /// a watched movie, and an item with a `javascript:` poster.
@@ -101,6 +101,46 @@ fn parses_and_saves_without_clobbering_newer_progress() {
     db.save_progress(&stremflix_rs::db::Progress { position: 99.0, ..p.clone() }).unwrap();
     imp.save(&db).unwrap();
     assert_eq!(db.progress("movie:tt1").unwrap().unwrap().position, 99.0);
+}
+
+#[test]
+fn account_sync_imports_addons_library_and_saved_titles() {
+    let addons = serde_json::json!({"addons": [
+        {"transportUrl": "https://a.example/manifest.json", "manifest": {"id": "a", "version": "1", "name": "A", "resources": ["stream"], "types": ["movie"]}},
+        {"transportUrl": "file:///etc/manifest.json", "manifest": {"id": "b", "version": "1", "name": "B", "resources": [], "types": []}}]});
+    let item = |id: &str, extra: serde_json::Value| {
+        let mut v = serde_json::json!({"_id": id, "name": format!("Title {id}"), "type": "movie", "_mtime": "2026-01-01T00:00:00.000Z", "state": {}});
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        v
+    };
+    let library = serde_json::json!([
+        item("tt1", serde_json::json!({})),
+        item("tt2", serde_json::json!({"removed": true, "state": {"flaggedWatched": 1}})),
+        item("tt3", serde_json::json!({"temp": true})),
+        item("bad/id", serde_json::json!({}))]);
+    let imp = from_account(&addons, &library).unwrap();
+    assert_eq!(imp.addons.len(), 1, "file: transport URL is rejected");
+    assert_eq!(imp.saved.iter().map(|t| t.key.as_str()).collect::<Vec<_>>(), ["movie:tt1"], "removed, temp and invalid items aren't saved");
+    assert_eq!(imp.watched.iter().map(|(w, _)| w.key.as_str()).collect::<Vec<_>>(), ["movie:tt2"], "removed items keep their history");
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("a.db")).unwrap();
+    imp.save(&db).unwrap();
+    imp.save(&db).unwrap(); // a re-sync is idempotent
+    assert_eq!(db.saved_titles().unwrap().len(), 1);
+    assert_eq!(db.addons().unwrap().len(), 1);
+    db.remove_saved_title("movie:tt1").unwrap();
+    imp.save(&db).unwrap();
+    assert!(db.saved_titles().unwrap().is_empty(), "a title removed here stays removed after a re-sync");
+}
+
+#[test]
+fn api_errors_are_reported() {
+    use stremflix_rs::addon::api_result;
+    assert_eq!(api_result(br#"{"result":{"authKey":"k"}}"#).unwrap()["authKey"], "k");
+    let e = api_result(br#"{"error":{"message":"Wrong passphrase","code":2}}"#).unwrap_err().to_string();
+    assert!(e.contains("Wrong passphrase"), "{e}");
+    assert!(api_result(br#"{"result":null}"#).is_err());
+    assert!(api_result(b"<html>").is_err());
 }
 
 #[test]

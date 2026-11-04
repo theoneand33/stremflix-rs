@@ -17,7 +17,7 @@ use std::time::SystemTime;
 use walkdir::WalkDir;
 
 use crate::addon::{Manifest, Stream, Video, addon_base, parse_manifest, safe_http_url, sanitize_text, valid_id};
-use crate::db::{Db, Progress, Watched};
+use crate::db::{Db, Progress, SavedTitle, Watched};
 
 #[derive(Debug, Default)]
 pub struct Import {
@@ -27,6 +27,8 @@ pub struct Import {
     pub watched: Vec<(Watched, String)>,
     /// Series key (`<type>:<id>`) and its raw watched-episodes bitfield, mapped to episodes once their list loads.
     pub bitfields: Vec<(String, String)>,
+    /// Library titles (not removed, not history-only), saved with "Add to library".
+    pub saved: Vec<SavedTitle>,
 }
 
 impl Import {
@@ -48,6 +50,14 @@ impl Import {
         }
         for (key, field) in &self.bitfields {
             db.set_setting(&format!("bitfield:{key}"), field)?;
+        }
+        // Only once per title, so one removed here doesn't come back at the next sync.
+        for t in &self.saved {
+            let seen = format!("synced:{}", t.key);
+            if db.setting(&seen)?.is_none() {
+                db.add_saved_title(t)?;
+                db.set_setting(&seen, "1")?;
+            }
         }
         Ok(())
     }
@@ -222,6 +232,11 @@ struct Item {
     #[serde(rename = "_mtime", default)]
     mtime: String,
     state: ItemState,
+    #[serde(default)]
+    removed: bool,
+    /// Only watched, never added to the library.
+    #[serde(default)]
+    temp: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -319,6 +334,9 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
         if title.is_empty() {
             continue;
         }
+        if !it.removed && !it.temp {
+            imp.saved.push(SavedTitle { key: key.clone(), title: title.clone(), kind: it.kind.clone(), poster: poster.clone() });
+        }
         let video = s.video_id.clone().unwrap_or(it.id.clone());
         if s.time_offset > 0
             && let Some(source) = streams.get(&(it.id.clone(), video.clone()))
@@ -345,4 +363,16 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
         }
     }
     Ok(imp)
+}
+
+/// Build an import from Stremio account API results: `addonCollectionGet` and `datastoreGet` of `libraryItem`.
+/// Shaped like localStorage and parsed by [`parse`], so it gets the same validation.
+pub fn from_account(addons: &Value, library: &Value) -> Result<Import> {
+    let items: serde_json::Map<String, Value> =
+        library.as_array().into_iter().flatten().filter_map(|it| Some((it["_id"].as_str()?.to_string(), it.clone()))).collect();
+    let kv = HashMap::from([
+        ("profile".to_string(), serde_json::json!({ "addons": addons["addons"] }).to_string()),
+        ("library".to_string(), serde_json::json!({ "items": items }).to_string()),
+    ]);
+    parse(&kv)
 }
