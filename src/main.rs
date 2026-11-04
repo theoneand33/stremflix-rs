@@ -15,7 +15,7 @@ use stremflix_rs::db::{self, Db, Download, Progress, SavedTitle, Watched};
 use stremflix_rs::download;
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
+use stremflix_rs::player::{GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{Profile, TorrentEngine};
 
@@ -337,6 +337,11 @@ fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     let g = p.layout_job(job);
     p.galley(pos2(rect.left() + 40.0, rect.center().y - g.size().y / 2.0), g, color);
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Bounds a UI zoom factor to 0.75-2.0 in 0.05 steps; non-finite falls back to 1.0.
+fn clamp_scale(z: f32) -> f32 {
+    if z.is_finite() { ((z * 20.0).round() / 20.0).clamp(0.75, 2.0) } else { 1.0 }
 }
 
 /// Rounded chip, accent-filled when selected.
@@ -896,6 +901,7 @@ struct App {
     hwdec: bool,
     /// Play the next episode when one ends.
     autoplay_next: bool,
+    ui_scale: f32,
     /// Playback speed every video starts at.
     default_speed: f64,
     /// Arrow-key seek in seconds: plain and with Shift.
@@ -981,6 +987,7 @@ impl App {
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
+            ui_scale: clamp_scale(db.setting("ui_scale")?.and_then(|v| v.parse().ok()).unwrap_or(1.0)),
             default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
             seek_steps: [seek_step(db.setting("seek_step")?, 10), seek_step(db.setting("seek_step_shift")?, 30)],
             error: None,
@@ -2863,6 +2870,17 @@ impl App {
                                         }
                                     });
                                 });
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Outline").size(15.0).color(Color32::from_gray(210)));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        for (i, (name, hex)) in SUB_OUTLINES.iter().enumerate().rev() {
+                                            if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::BLACK), style.outline == i).clicked() {
+                                                style.outline = i;
+                                            }
+                                        }
+                                    });
+                                });
+                                style.pos += stepper(ui, "Position", &format!("{}%", style.pos)) as f64 * 5.0;
                                 switch_row(ui, "Background box", &mut style.background);
                                 style.delay += stepper(ui, "Delay", &format!("{:+.1}s", style.delay)) as f64 * 0.1;
                                 if style.delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(ACCENT)).frame(false)).clicked() {
@@ -3372,6 +3390,16 @@ impl App {
             ui.label(RichText::new("A torrent has already played: restart the app to apply changes.").size(13.0).color(Color32::from_gray(170)));
         }
         ui.add_space(16.0);
+        ui.label(RichText::new("Appearance").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.scope(|ui| {
+            ui.set_max_width(550.0);
+            let step = stepper(ui, "UI scale", &format!("{:.0}%", self.ui_scale * 100.0));
+            if step != 0 {
+                ui.ctx().set_zoom_factor(clamp_scale(self.ui_scale + step as f32 * 0.25));
+            }
+        });
+        ui.label(RichText::new("Also Ctrl and +, Ctrl and −, Ctrl and 0.").size(13.0).color(Color32::from_gray(170)));
+        ui.add_space(16.0);
         ui.label(RichText::new("Player").size(20.0).strong().family(bold()).color(Color32::WHITE));
         if form_row(ui, "External player:", &mut self.external_player, "vlc", "Save", Some("Command run with the stream URL; no shell"), true) {
             save.push(("external_player", self.external_player.trim().to_string()));
@@ -3400,6 +3428,17 @@ impl App {
                     }
                 });
             });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Subtitle outline").size(15.0).color(Color32::from_gray(210)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for (i, (name, hex)) in SUB_OUTLINES.iter().enumerate().rev() {
+                        if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::BLACK), style.outline == i).clicked() {
+                            style.outline = i;
+                        }
+                    }
+                });
+            });
+            style.pos += stepper(ui, "Subtitle position", &format!("{}%", style.pos)) as f64 * 5.0;
             switch_row(ui, "Subtitle background box", &mut style.background);
             style.delay += stepper(ui, "Subtitle delay", &format!("{:+.1}s", style.delay)) as f64 * 0.1;
             if style.delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(ACCENT)).frame(false)).clicked() {
@@ -3575,6 +3614,17 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // egui's built-in zoom keys change the factor too: bound it, then persist any change.
+        let zoom = clamp_scale(ctx.zoom_factor());
+        if zoom != ctx.zoom_factor() {
+            ctx.set_zoom_factor(zoom);
+        }
+        if zoom != self.ui_scale {
+            self.ui_scale = zoom;
+            if let Err(e) = self.db.set_setting("ui_scale", &zoom.to_string()) {
+                report(&mut self.error, format!("saving ui_scale: {e:#}"));
+            }
+        }
         ctx.input(|i| self.window.track(i.viewport()));
         // Load libmpv off the UI thread once the first frames are up: loading it earlier delayed them by ~140 ms.
         if ctx.cumulative_frame_nr() == 2 {
@@ -3860,6 +3910,7 @@ fn main() -> eframe::Result {
             (st.weak_bg_fill, st.bg_stroke, st.corner_radius, st.expansion) = (Color32::from_gray(gray), egui::Stroke::NONE, 4.into(), 0.0);
             st.fg_stroke.color = Color32::WHITE;
         }
+        cc.egui_ctx.set_zoom_factor(app.ui_scale);
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         cc.egui_ctx.set_visuals_of(egui::Theme::Dark, v);
         cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| s.spacing.button_padding = vec2(14.0, 6.0));
@@ -3963,6 +4014,14 @@ mod tests {
         assert_eq!(buffered_frac(10.0, 0.0, 100.0), 0.1);
         assert_eq!(buffered_frac(10.0, 500.0, 100.0), 1.0);
         assert_eq!(buffered_frac(10.0, 50.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn clamp_scale_bounds_and_rounds() {
+        assert_eq!(clamp_scale(0.1), 0.75);
+        assert_eq!(clamp_scale(9.0), 2.0);
+        assert_eq!(clamp_scale(1.1000001), 1.1);
+        assert_eq!(clamp_scale(f32::NAN), 1.0);
     }
 
     #[test]
