@@ -910,6 +910,21 @@ impl AddonClient {
         crate::stremio_import::from_account(&addons, &library)
     }
 
+    /// Upload `up` to the account: its addon list becomes the local one (account-only addons kept at the end),
+    /// and changed library items are put. Returns the number of addons and library items sent.
+    pub async fn stremio_push(&self, auth_key: &str, up: &crate::stremio_import::Upload) -> Result<(usize, usize)> {
+        let remote = self.stremio_api("addonCollectionGet", serde_json::json!({"type": "AddonCollectionGet", "authKey": auth_key, "update": false})).await?;
+        let library = self.stremio_api("datastoreGet", serde_json::json!({"authKey": auth_key, "collection": "libraryItem", "ids": [], "all": true})).await?;
+        ensure!(library.is_array(), "Stremio API: unexpected library response");
+        let addons = crate::stremio_import::addon_collection(&up.addons, &remote)?;
+        let changes = crate::stremio_import::library_changes(up, &library);
+        self.stremio_api("addonCollectionSet", serde_json::json!({"type": "AddonCollectionSet", "authKey": auth_key, "addons": addons})).await?;
+        if !changes.is_empty() {
+            self.stremio_api("datastorePut", serde_json::json!({"authKey": auth_key, "collection": "libraryItem", "changes": changes})).await?;
+        }
+        Ok((addons.len(), changes.len()))
+    }
+
     pub async fn fetch_manifest(&self, transport_url: &str) -> Result<Manifest> {
         addon_base(transport_url)?;
         parse_manifest(&self.get(safe_http_url(transport_url).unwrap()).await?)

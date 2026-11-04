@@ -377,6 +377,19 @@ impl Db {
         )?;
         Ok(st.query_map([limit as i64], row_progress)?.filter_map(|r| r.ok()).collect())
     }
+
+    /// All resume points and when each was saved, in Stremio's ISO 8601 form (`2026-01-02T03:04:05.000Z`).
+    pub fn progress_times(&self) -> Result<Vec<(Progress, String)>> {
+        let mut st = self.conn.prepare(
+            "SELECT key, title, source, position, duration, poster, strftime('%Y-%m-%dT%H:%M:%fZ', updated_at, 'unixepoch') FROM progress",
+        )?;
+        Ok(st.query_map([], |r| Ok((row_progress(r)?, r.get(6)?)))?.filter_map(|r| r.ok()).collect())
+    }
+
+    /// The current time, in the same form as [`Db::progress_times`].
+    pub fn now_iso(&self) -> Result<String> {
+        Ok(self.conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |r| r.get(0))?)
+    }
 }
 
 fn row_progress(r: &rusqlite::Row) -> rusqlite::Result<Progress> {

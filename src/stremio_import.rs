@@ -395,3 +395,121 @@ pub fn from_account(addons: &Value, library: &Value) -> Result<Import> {
     ]);
     parse(&kv)
 }
+
+/// Local state to upload to a Stremio account, read from the DB before the requests run.
+#[derive(Debug, Default)]
+pub struct Upload {
+    pub addons: Vec<(String, Manifest)>,
+    pub saved: Vec<SavedTitle>,
+    /// Resume points and when each was saved (ISO 8601).
+    pub progress: Vec<(Progress, String)>,
+    /// Keys marked watched here or imported (see [`Db::watched_keys`]).
+    pub watched: std::collections::HashSet<String>,
+    /// `_mtime` of every changed item (ISO 8601).
+    pub now: String,
+}
+
+impl Upload {
+    pub fn read(db: &Db) -> Result<Self> {
+        let (addons, saved, progress) = (db.addons()?, db.saved_titles()?, db.progress_times()?);
+        Ok(Upload { addons, saved, progress, watched: db.watched_keys()?, now: db.now_iso()? })
+    }
+}
+
+/// `addons` for `addonCollectionSet`: local addons in local order as `{transportUrl, transportName, manifest, flags}`,
+/// then the account's addons missing here, unchanged (they are never deleted). A local addon keeps the
+/// account's flags and the manifest fields this app doesn't store (logo, ...).
+pub fn addon_collection(local: &[(String, Manifest)], remote: &Value) -> Result<Vec<Value>> {
+    let remote = remote["addons"].as_array().context("Stremio API: unexpected addon response")?;
+    let find = |u: &str| remote.iter().find(|a| a["transportUrl"] == u);
+    let mut out = Vec::new();
+    for (url, m) in local {
+        let old = find(url);
+        let mut manifest = old.map(|a| a["manifest"].clone()).filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+        if let (Some(o), Value::Object(l)) = (manifest.as_object_mut(), serde_json::to_value(m)?) {
+            o.extend(l);
+        }
+        let flags = old.map(|a| a["flags"].clone()).filter(Value::is_object);
+        out.push(serde_json::json!({
+            "transportUrl": url, "transportName": "", "manifest": manifest,
+            "flags": flags.unwrap_or_else(|| serde_json::json!({"official": false, "protected": false})),
+        }));
+    }
+    let is_local = |a: &Value| local.iter().any(|(u, _)| a["transportUrl"] == u.as_str());
+    out.extend(remote.iter().filter(|a| !is_local(a)).cloned());
+    Ok(out)
+}
+
+/// A new history-only `libraryItem` in stremio-core's full shape, which its clients need to read it.
+fn new_item(kind: &str, id: &str, name: &str, poster: &Option<String>, now: &str) -> Value {
+    serde_json::json!({
+        "_id": id, "name": name, "type": kind, "poster": poster, "posterShape": "poster",
+        "removed": true, "temp": true, "_ctime": now, "_mtime": now,
+        "state": {"lastWatched": null, "timeWatched": 0, "timeOffset": 0, "overallTimeWatched": 0, "timesWatched": 0,
+                  "flaggedWatched": 0, "duration": 0, "video_id": null, "watched": null, "noNotif": false},
+        "behaviorHints": {"defaultVideoId": null, "featuredVideoId": null, "hasScheduledVideos": false},
+    })
+}
+
+/// `changes` for `datastorePut` on `libraryItem`: only items that differ from the account's `remote` items,
+/// each with `_mtime` = `now`. Account-only items aren't sent, so nothing is deleted there.
+/// Progress newer than the account's `lastWatched` wins; saved titles are un-removed; movies watched here are flagged.
+/// shortcut: episodes watched here aren't written to the series' `watched` bitfield; upgrade when one is built locally.
+pub fn library_changes(up: &Upload, remote: &Value) -> Vec<Value> {
+    let mut items: std::collections::BTreeMap<String, Value> = remote
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|it| it["state"].is_object())
+        .filter_map(|it| Some((format!("{}:{}", it["type"].as_str()?, it["_id"].as_str()?), it.clone())))
+        .collect();
+    let mut changed = std::collections::BTreeSet::new();
+    for t in &up.saved {
+        let Some(id) = t.key.strip_prefix(&format!("{}:", t.kind)) else { continue };
+        let it = items.entry(t.key.clone()).or_insert_with(|| new_item(&t.kind, id, &t.title, &t.poster, &up.now));
+        if it["removed"] != false || it["temp"] != false {
+            (it["removed"], it["temp"]) = (false.into(), false.into());
+            changed.insert(t.key.clone());
+        }
+    }
+    for (p, at) in &up.progress {
+        // The title it belongs to: an episode's key is `<series key>:<season>:<episode>`.
+        let known = items.keys().filter(|k| p.key == **k || p.key.starts_with(&format!("{k}:"))).max_by_key(|k| k.len()).cloned();
+        let key = match known {
+            Some(k) => k,
+            // An episode's progress title is the episode's, so only movies are added from progress.
+            None if p.key.strip_prefix("movie:").is_some_and(valid_id) => {
+                items.insert(p.key.clone(), new_item("movie", &p.key[6..], &p.title, &p.poster, &up.now));
+                p.key.clone()
+            }
+            None => continue,
+        };
+        let it = items.get_mut(&key).expect("found or inserted above");
+        let Some(video) = p.key.strip_prefix(&format!("{}:", it["type"].as_str().unwrap_or_default())) else { continue };
+        let video = video.to_string();
+        let s = &mut it["state"];
+        if p.position <= 0.0 || s["lastWatched"].as_str().is_some_and(|l| l >= at.as_str()) {
+            continue;
+        }
+        s["timeOffset"] = ((p.position * 1000.0) as u64).into();
+        s["duration"] = ((p.duration * 1000.0) as u64).into();
+        s["lastWatched"] = at.as_str().into();
+        s["video_id"] = video.into();
+        changed.insert(key);
+    }
+    for k in up.watched.iter().filter(|k| k.starts_with("movie:")) {
+        let Some(s) = items.get_mut(k).map(|it| &mut it["state"]) else { continue };
+        if s["flaggedWatched"].as_u64().unwrap_or(0) == 0 && s["timesWatched"].as_u64().unwrap_or(0) == 0 {
+            (s["flaggedWatched"], s["timesWatched"]) = (1.into(), 1.into());
+            changed.insert(k.clone());
+        }
+    }
+    changed
+        .into_iter()
+        .filter_map(|k| items.remove(&k))
+        .map(|mut it| {
+            it["_mtime"] = up.now.as_str().into();
+            it
+        })
+        .collect()
+}

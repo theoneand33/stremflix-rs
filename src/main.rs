@@ -164,6 +164,8 @@ enum Msg {
     SignedIn(String, Result<String, String>),
     /// Account auth key a sync ran with, and what it pulled or the error.
     Synced(String, Result<Import, String>),
+    /// Account auth key an upload ran with, and its summary or the error.
+    Uploaded(String, Result<String, String>),
     /// Library folder and its scanned media files.
     Scanned(PathBuf, Result<Vec<LibraryItem>, String>),
     /// Release page of a newer build, if any.
@@ -808,6 +810,10 @@ struct App {
     account: Option<String>,
     /// A sign-in or sync is running.
     account_busy: bool,
+    /// "Upload to account" was clicked and waits for confirmation.
+    confirm_upload: bool,
+    /// Result of the last upload.
+    account_note: Option<String>,
     /// Addon whose details are shown in the Addons tab.
     addon_details: Option<String>,
     /// Torrent download folder as edited (empty = in the data directory); saved when valid.
@@ -889,6 +895,8 @@ impl App {
             login: Default::default(),
             account: db.setting("stremio_auth")?.filter(|k| !k.is_empty()).map(|_| db.setting("stremio_email").ok().flatten().filter(|e| !e.is_empty()).unwrap_or_else(|| "a Stremio account".into())),
             account_busy: false,
+            confirm_upload: false,
+            account_note: None,
             addon_details: None,
             torrent_dir: db.setting("torrent_dir")?.unwrap_or_default(),
             torrent_cache: db.setting("torrent_cache")?.and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -958,6 +966,25 @@ impl App {
         self.spawn(ctx, async move {
             let imp = client.stremio_pull(&key).await.map_err(|e| format!("Stremio account sync: {e:#}"));
             Ok(Msg::Synced(key, imp))
+        });
+    }
+
+    /// Push local addons and library to the signed-in Stremio account.
+    fn upload_account(&mut self, ctx: &egui::Context) {
+        if self.account_busy {
+            return;
+        }
+        let Some(key) = self.db.setting("stremio_auth").ok().flatten().filter(|k| !k.is_empty()) else { return };
+        let up = match stremio_import::Upload::read(&self.db) {
+            Ok(up) => up,
+            Err(e) => return report(&mut self.error, format!("reading library: {e:#}")),
+        };
+        (self.account_busy, self.account_note) = (true, None);
+        let client = self.client.clone();
+        self.spawn(ctx, async move {
+            let r = client.stremio_push(&key, &up).await;
+            let r = r.map(|(a, l)| format!("Uploaded {a} addons and {l} changed library items.")).map_err(|e| format!("Stremio account upload: {e:#}"));
+            Ok(Msg::Uploaded(key, r))
         });
     }
 
@@ -1256,6 +1283,15 @@ impl App {
                     self.account_busy = false;
                     match imp {
                         Ok(imp) => self.handle(ctx, Msg::Imported(imp)),
+                        Err(e) => report(&mut self.error, e),
+                    }
+                }
+            }
+            Msg::Uploaded(key, r) => {
+                if self.db.setting("stremio_auth").ok().flatten().as_deref() == Some(key.as_str()) {
+                    self.account_busy = false;
+                    match r {
+                        Ok(note) => self.account_note = Some(note),
                         Err(e) => report(&mut self.error, e),
                     }
                 }
@@ -3017,6 +3053,9 @@ impl App {
                 if ui.add_enabled_ui(!busy, |ui| primary_button(ui, "Sync")).inner.on_hover_text("Copy the account's addons and library here").clicked() {
                     self.sync_account(&ctx);
                 }
+                if ui.add_enabled_ui(!busy, |ui| small_button(ui, "Upload to account")).inner.on_hover_text("Copy addons and library from here to the account").clicked() {
+                    self.confirm_upload = true;
+                }
                 if busy {
                     ui.spinner();
                 }
@@ -3026,7 +3065,7 @@ impl App {
                     match cleared {
                         Ok(()) => {
                             // A running sync for this key is dropped when it ends.
-                            (self.account, self.account_busy) = (None, false);
+                            (self.account, self.account_busy, self.confirm_upload, self.account_note) = (None, false, false, None);
                             let client = self.client.clone();
                             // Best effort: the key is already forgotten locally.
                             self.rt.spawn(async move { client.stremio_logout(&key).await.inspect_err(|e| eprintln!("Stremio sign-out: {e:#}")) });
@@ -3035,6 +3074,21 @@ impl App {
                     }
                 }
             });
+            if self.confirm_upload {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Overwrites the account's addon list with this order (addons only on the account are kept, last). Library titles and progress are added or updated, never deleted.").size(13.0).color(Color32::from_gray(170)));
+                    if primary_button(ui, "Upload").clicked() {
+                        self.confirm_upload = false;
+                        self.upload_account(&ctx);
+                    }
+                    if small_button(ui, "Cancel").clicked() {
+                        self.confirm_upload = false;
+                    }
+                });
+            }
+            if let Some(note) = &self.account_note {
+                ui.label(RichText::new(note).size(13.0).color(Color32::from_gray(170)));
+            }
         } else {
             let mut go = false;
             ui.horizontal(|ui| {
@@ -3049,7 +3103,7 @@ impl App {
                     ui.spinner();
                 }
             });
-            ui.label(RichText::new("Copies your addons, library and watched titles from api.strem.io; nothing is uploaded.").size(13.0).color(Color32::from_gray(170)));
+            ui.label(RichText::new("Copies your addons, library and watched titles from api.strem.io. Settings can upload them back after signing in.").size(13.0).color(Color32::from_gray(170)));
             let email = self.login.0.trim().to_string();
             if go && !email.is_empty() && !self.login.1.is_empty() {
                 // Not kept after use, even if signing in fails.

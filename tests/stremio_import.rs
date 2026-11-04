@@ -190,6 +190,71 @@ fn imported_saved_titles_keep_stremio_order() {
 }
 
 #[test]
+fn upload_builds_addon_collection_and_library_changes() {
+    use stremflix_rs::db::{Progress, SavedTitle};
+    use stremflix_rs::stremio_import::{Upload, addon_collection, library_changes};
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("a.db")).unwrap();
+    let m = |id: &str| stremflix_rs::addon::parse_manifest(format!(r#"{{"id":"{id}","version":"2","name":"N{id}","resources":["stream"],"types":["movie"]}}"#).as_bytes()).unwrap();
+    db.add_addon("https://b.example/manifest.json", &m("b")).unwrap();
+    db.add_addon("https://a.example/manifest.json", &m("a")).unwrap();
+    let saved = |key: &str, kind: &str| SavedTitle { key: key.into(), title: format!("T {key}"), kind: kind.into(), poster: None };
+    db.add_saved_title(&saved("movie:tt1", "movie")).unwrap();
+    db.add_saved_title(&saved("series:tt2", "series")).unwrap();
+    let prog = |key: &str| Progress { key: key.into(), title: "P".into(), source: "https://s.example/v".into(), position: 12.5, duration: 100.0, poster: None };
+    for k in ["series:tt2:1:3", "movie:tt5", "series:tt9:1:1", "movie:tt6", "file:/x.mkv"] {
+        db.save_progress(&prog(k)).unwrap();
+    }
+    db.set_watched("movie:tt1", true).unwrap();
+    let up = Upload::read(&db).unwrap();
+    assert!(up.now.ends_with('Z') && up.now.len() == 24, "{}", up.now);
+
+    let remote = serde_json::json!({"addons": [
+        {"transportUrl": "https://a.example/manifest.json", "transportName": "", "flags": {"official": true, "protected": true},
+         "manifest": {"id": "a", "version": "1", "name": "A", "resources": ["stream"], "types": ["movie"], "logo": "https://l.example/a.png"}},
+        {"transportUrl": "https://r.example/manifest.json", "manifest": {"id": "r"}, "flags": {"official": false, "protected": false}}]});
+    let addons = addon_collection(&up.addons, &remote).unwrap();
+    let urls: Vec<_> = addons.iter().map(|a| a["transportUrl"].as_str().unwrap()).collect();
+    assert_eq!(urls, ["https://b.example/manifest.json", "https://a.example/manifest.json", "https://r.example/manifest.json"], "local order, account-only addons kept last");
+    assert_eq!(addons[0]["flags"], serde_json::json!({"official": false, "protected": false}));
+    assert_eq!(addons[0]["transportName"], "");
+    assert_eq!((addons[1]["flags"]["protected"].as_bool(), addons[1]["manifest"]["version"].as_str()), (Some(true), Some("2")), "account flags kept, local manifest wins");
+    assert_eq!(addons[1]["manifest"]["logo"], "https://l.example/a.png", "fields not stored here are kept");
+    assert_eq!(addons[2], remote["addons"][1]);
+    assert!(addon_collection(&up.addons, &serde_json::json!({})).is_err());
+
+    let item = |id: &str, kind: &str, extra: serde_json::Value| {
+        let mut v = serde_json::json!({"_id": id, "name": format!("R {id}"), "type": kind, "removed": false, "temp": false,
+            "_mtime": "2026-01-01T00:00:00.000Z", "state": {"lastWatched": "2026-01-01T00:00:00.000Z", "timesWatched": 0, "flaggedWatched": 0}});
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        v
+    };
+    let library = serde_json::json!([
+        item("tt2", "series", serde_json::json!({"removed": true})),
+        item("tt6", "movie", serde_json::json!({"state": {"lastWatched": "2999-01-01T00:00:00.000Z"}})),
+        item("tt7", "movie", serde_json::json!({}))]);
+    let changes = library_changes(&up, &library);
+    let by_id = |id: &str| changes.iter().find(|c| c["_id"] == id).cloned();
+    let ids: Vec<_> = changes.iter().map(|c| c["_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["tt1", "tt5", "tt2"], "changed items only: no account-only (tt7), older-than-account (tt6) or unknown series (tt9) items");
+    assert!(changes.iter().all(|c| c["_mtime"] == up.now.as_str()));
+    let tt1 = by_id("tt1").unwrap();
+    assert_eq!((tt1["removed"].as_bool(), tt1["state"]["flaggedWatched"].as_u64(), tt1["posterShape"].as_str()), (Some(false), Some(1), Some("poster")));
+    let tt2 = by_id("tt2").unwrap();
+    assert_eq!((tt2["removed"].as_bool(), tt2["name"].as_str()), (Some(false), Some("R tt2")), "account item un-removed, its fields kept");
+    assert_eq!((tt2["state"]["video_id"].as_str(), tt2["state"]["timeOffset"].as_u64(), tt2["state"]["duration"].as_u64()), (Some("tt2:1:3"), Some(12500), Some(100000)));
+    let tt5 = by_id("tt5").unwrap();
+    assert_eq!((tt5["temp"].as_bool(), tt5["removed"].as_bool()), (Some(true), Some(true)), "progress-only movie is history, not library");
+
+    // The account reads what was sent like any other library.
+    let imp = from_account(&serde_json::json!({"addons": addons}), &serde_json::Value::Array(changes)).unwrap();
+    let mut keys: Vec<_> = imp.saved.iter().map(|(t, _)| t.key.as_str()).collect();
+    keys.sort();
+    assert_eq!(keys, ["movie:tt1", "series:tt2"]);
+    assert_eq!(imp.addons.len(), 2, "manifest-less account addon is skipped on pull");
+}
+
+#[test]
 fn api_errors_are_reported() {
     use stremflix_rs::addon::api_result;
     assert_eq!(api_result(br#"{"result":{"authKey":"k"}}"#).unwrap()["authKey"], "k");
