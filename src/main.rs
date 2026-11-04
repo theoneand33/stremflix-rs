@@ -189,6 +189,35 @@ struct Row {
     exhausted: bool,
 }
 
+/// Stable id of a Home row: `<addon url>|<type>|<catalog id>`.
+fn row_key(src: &(String, String, String)) -> String {
+    format!("{}|{}|{}", src.0, src.1, src.2)
+}
+
+/// Indices into `keys` with the keys in `order` first (unknown or repeated ones skipped), the rest in their own order.
+fn arrange_rows(keys: &[String], order: &[String]) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for k in order {
+        if let Some(i) = keys.iter().position(|x| x == k)
+            && !out.contains(&i)
+        {
+            out.push(i);
+        }
+    }
+    let rest: Vec<usize> = (0..keys.len()).filter(|i| !out.contains(i)).collect();
+    out.extend(rest);
+    out
+}
+
+/// Keys contain `|` and URLs, so settings hold them as a JSON array.
+fn encode_keys(keys: &[String]) -> String {
+    serde_json::to_string(keys).unwrap_or_default()
+}
+
+fn decode_keys(s: &str) -> Vec<String> {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
 /// Max items kept per catalog row.
 const ROW_CAP: usize = 1000;
 /// Posters kept in memory (bytes and decoded textures) before the cache is cleared.
@@ -818,6 +847,11 @@ struct App {
     external_player: String,
     /// mpv hardware decoding.
     hwdec: bool,
+    /// Custom Home row order and hidden rows (row keys).
+    home_order: Vec<String>,
+    home_hidden: Vec<String>,
+    /// Every Home row as (key, title) in display order, hidden ones included.
+    home_all: Vec<(String, String)>,
     /// Play the next episode when one ends.
     autoplay_next: bool,
     /// Playback speed every video starts at.
@@ -895,6 +929,9 @@ impl App {
             torrent_profile: Profile::from_label(&db.setting("torrent_profile")?.unwrap_or_default()),
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
+            home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
+            home_hidden: decode_keys(&db.setting("home_hidden")?.unwrap_or_default()),
+            home_all: Vec::new(),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
             default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
             error: None,
@@ -1505,13 +1542,18 @@ impl App {
             let suffix = if name.to_lowercase().contains(&kind.to_lowercase()) { String::new() } else { format!(" ({kind})") };
             rows.push((format!("{addon} - {name}{suffix}"), i));
         }
-        self.rows = rows
+        let rows: Vec<Row> = rows
             .into_iter()
             .map(|(title, i)| {
                 let (u, _, c) = cats[i];
                 Row { title, src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: c.supports("skip"), fetched: 0, loading_more: false, exhausted: false }
             })
             .collect();
+        let keys: Vec<String> = rows.iter().map(|r| row_key(&r.src)).collect();
+        let mut rows: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
+        let ordered: Vec<Row> = arrange_rows(&keys, &self.home_order).into_iter().filter_map(|i| rows[i].take()).collect();
+        self.home_all = ordered.iter().map(|r| (row_key(&r.src), r.title.clone())).collect();
+        self.rows = ordered.into_iter().filter(|r| !self.home_hidden.contains(&row_key(&r.src))).collect();
         for src in self.rows.iter().map(|r| r.src.clone()).collect::<Vec<_>>() {
             let client = self.client.clone();
             self.spawn(ctx, async move {
@@ -3178,6 +3220,46 @@ impl App {
             });
         }
         ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(Color32::from_gray(170)));
+        ui.add_space(16.0);
+        ui.label(RichText::new("Customize Home").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        let (mut swap, mut toggle, mut reset) = (None, None, false);
+        let n = self.home_all.len();
+        for (i, (key, title)) in self.home_all.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.add_enabled_ui(i > 0, |ui| small_button(ui, "Up")).inner.clicked() {
+                    swap = Some(i - 1);
+                }
+                if ui.add_enabled_ui(i + 1 < n, |ui| small_button(ui, "Down")).inner.clicked() {
+                    swap = Some(i);
+                }
+                let hidden = self.home_hidden.contains(key);
+                if small_button(ui, if hidden { "Show" } else { "Hide" }).clicked() {
+                    toggle = Some(key.clone());
+                }
+                ui.label(if hidden { RichText::new(title).weak() } else { RichText::new(title) });
+            });
+        }
+        if small_button(ui, "Reset").on_hover_text("Addon order, nothing hidden").clicked() {
+            reset = true;
+        }
+        if swap.is_some() || toggle.is_some() || reset {
+            if let Some(i) = swap {
+                self.home_all.swap(i, i + 1);
+                self.home_order = self.home_all.iter().map(|(k, _)| k.clone()).collect();
+            }
+            if let Some(k) = toggle {
+                match self.home_hidden.iter().position(|x| *x == k) {
+                    Some(p) => drop(self.home_hidden.remove(p)),
+                    None => self.home_hidden.push(k),
+                }
+            }
+            if reset {
+                (self.home_order, self.home_hidden) = (Vec::new(), Vec::new());
+            }
+            save.push(("home_order", encode_keys(&self.home_order)));
+            save.push(("home_hidden", encode_keys(&self.home_hidden)));
+            self.build_rows(&ctx);
+        }
         for (k, v) in save {
             if let Err(e) = self.db.set_setting(k, &v) {
                 report(&mut self.error, format!("saving {k}: {e:#}"));
@@ -3718,6 +3800,18 @@ mod tests {
         })
         .await;
         assert_eq!(out.into_iter().map(Result::unwrap).collect::<Vec<_>>(), [30, 0, 10]);
+    }
+
+    #[test]
+    fn home_rows_order_and_keys() {
+        let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let keys = k(&["a", "b", "c", "d"]);
+        assert_eq!(arrange_rows(&keys, &k(&["c", "zz", "a", "c"])), [2, 0, 1, 3], "stale and repeated keys ignored, rest keep priority");
+        assert_eq!(arrange_rows(&keys, &[]), [0, 1, 2, 3]);
+        let odd = k(&["http://h/m.json|movie|top \"x\"", "b"]);
+        assert_eq!(decode_keys(&encode_keys(&odd)), odd);
+        assert!(decode_keys("garbage").is_empty());
+        assert_eq!(row_key(&("u".into(), "movie".into(), "top".into())), "u|movie|top");
     }
 
     #[test]
