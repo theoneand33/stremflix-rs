@@ -921,6 +921,8 @@ struct Playing {
     hold: Option<f64>,
     /// The last click on the video was a hold release, so the next one must not pair with it into a double-click.
     after_hold: bool,
+    /// Wheel scroll not yet turned into volume steps (points).
+    wheel: f32,
     /// The up-next card was dismissed.
     next_dismissed: bool,
     search: SubSearch,
@@ -1681,7 +1683,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -2927,6 +2929,7 @@ impl App {
             p.after_hold = long;
         }
         let focused = ctx.memory(|m| m.focused());
+        let line = ctx.options(|o| o.input_options.line_scroll_speed); // read outside ctx.input to avoid nested locking
         let mut new_vol = None;
         ctx.input(|i| {
             use egui::Key::*;
@@ -2943,6 +2946,13 @@ impl App {
             // mpv pauses on its own after a frame step.
             if k(Period) { cmd(&["frame-step"]) }
             if k(Comma) { cmd(&["frame-back-step"]) }
+            // Wheel over the bare video only: `hovered` is false under a popover or a control.
+            if bg.hovered() && p.menu.is_none() {
+                let n = wheel_steps(&mut p.wheel, i.smooth_scroll_delta.y, line);
+                if n != 0 { cmd(&["add", "volume", &(n * 5).to_string()]); new_vol = Some(st.volume + f64::from(n * 5)) }
+            } else {
+                p.wheel = 0.0;
+            }
             toggle_fs |= k(F);
             if k(Escape) {
                 if fs { toggle_fs = true } else { back = true }
@@ -4373,6 +4383,15 @@ mod mac_links {
     }
 }
 
+/// Turn wheel scroll (points) into whole volume steps, keeping the remainder; one wheel line is one step.
+fn wheel_steps(acc: &mut f32, dy: f32, line: f32) -> i32 {
+    if dy * *acc < 0.0 { *acc = 0.0; } // a direction change starts fresh
+    *acc += dy;
+    let n = (*acc / line).trunc();
+    *acc -= n * line;
+    n as i32
+}
+
 const SEEK_STEP_RANGE: std::ops::RangeInclusive<u32> = 1..=600;
 
 /// Saved seek step in seconds; a missing, unparsable or out-of-range value falls back to `default`.
@@ -4383,6 +4402,20 @@ fn seek_step(v: Option<String>, default: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_accumulates_to_steps() {
+        let mut acc = 0.0;
+        // egui's native line_scroll_speed: one real notch is 40 pt.
+        assert_eq!(wheel_steps(&mut acc, 40.0, 40.0), 1);
+        assert_eq!((0..5).map(|_| wheel_steps(&mut acc, 40.0, 40.0)).sum::<i32>(), 5);
+        assert_eq!(wheel_steps(&mut acc, -80.0, 40.0), -2);
+        assert_eq!((0..4).map(|_| wheel_steps(&mut acc, 10.0, 40.0)).sum::<i32>(), 1);
+        assert_eq!(wheel_steps(&mut acc, 0.0, 40.0), 0);
+        // A +30 leftover must not cancel a fresh -40 notch.
+        acc = 30.0;
+        assert_eq!(wheel_steps(&mut acc, -40.0, 40.0), -1);
+    }
 
     #[test]
     fn accent_name_decodes_with_fallback() {
