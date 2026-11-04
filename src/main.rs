@@ -641,7 +641,7 @@ async fn hashed_subs(client: AddonClient, l: SubLookup, url: &str, subs: Subs) -
         let (hash, size) = match l.hints.video_hash.clone() {
             Some(h) => (h, l.hints.video_size),
             // Playlists and YouTube pages are not the video file, so they have no hash.
-            None if stremflix_rs::addon::is_youtube(url) || [".m3u8", ".mpd"].iter().any(|x| url.split('?').next().unwrap_or("").ends_with(x)) => return Vec::new(),
+            None if stremflix_rs::addon::is_youtube(url) || url::Url::parse(url).is_ok_and(|u| [".m3u8", ".mpd"].iter().any(|x| u.path().to_ascii_lowercase().ends_with(x))) => return Vec::new(),
             None => match tokio::time::timeout_at(deadline, client.video_hash(url, &l.headers)).await {
                 Ok(Ok((h, n))) => (h, Some(n)),
                 _ => return Vec::new(),
