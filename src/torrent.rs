@@ -65,7 +65,8 @@ pub struct TorrentEngine {
     /// Bytes of stopped torrents kept on disk for a quick replay; 0 deletes them at once.
     cache: u64,
     /// Torrents being downloaded, once per download: never stopped by [`release_except`](Self::release_except).
-    pinned: std::sync::Mutex<Vec<usize>>,
+    /// Held across a whole release and across [`stream_url`](Self::stream_url)'s unpause+pin, so neither interleaves.
+    pinned: tokio::sync::Mutex<Vec<usize>>,
 }
 
 impl TorrentEngine {
@@ -92,7 +93,8 @@ impl TorrentEngine {
     }
 
     /// Add a magnet or local `.torrent` file and return a local HTTP URL streaming the chosen (or largest) file, and the torrent's id.
-    pub async fn stream_url(&self, magnet: &str, file_idx: Option<usize>) -> Result<(String, usize)> {
+    /// `pin` holds the torrent for a download (see `pinned`); undo with [`unpin`](Self::unpin).
+    pub async fn stream_url(&self, magnet: &str, file_idx: Option<usize>, pin: bool) -> Result<(String, usize)> {
         let (add, peers, file_idx) = if magnet.starts_with("magnet:") {
             parse_magnet_hash(magnet).context("invalid magnet link")?;
             // `so=<idx>` (BEP 53 select-only) carries the addon's fileIdx through saved progress.
@@ -116,25 +118,27 @@ impl TorrentEngine {
             AddTorrentResponse::Added(_, h) | AddTorrentResponse::AlreadyManaged(_, h) => h,
             AddTorrentResponse::ListOnly(_) => bail!("unexpected list-only response"),
         };
-        // A cached torrent was paused when its playback stopped.
-        if handle.is_paused() {
-            self.session.unpause(&handle).await?;
-        }
         let lengths: Vec<u64> = handle.with_metadata(|m| m.file_infos.iter().map(|f| f.len).collect())?;
         let idx = match file_idx {
             Some(i) if i < lengths.len() => i,
             Some(i) => bail!("fileIdx {i} out of range ({} files)", lengths.len()),
             None => (0..lengths.len()).max_by_key(|&i| lengths[i]).context("torrent has no files")?,
         };
+        // A cached torrent was paused when its playback stopped. Last, so a pin can't leak on an error above.
+        let mut pinned = self.pinned.lock().await;
+        if handle.is_paused() {
+            self.session.unpause(&handle).await?;
+        }
+        if pin {
+            pinned.push(handle.id());
+        }
         Ok((format!("http://{}/torrents/{}/stream/{idx}", self.http, handle.id()), handle.id()))
     }
 
-    /// Keep torrent `id` running while a download reads it (`on`), or drop one such hold.
-    pub fn pin(&self, id: usize, on: bool) {
-        let mut p = self.pinned.lock().unwrap();
-        if on {
-            p.push(id);
-        } else if let Some(i) = p.iter().position(|&x| x == id) {
+    /// Drop one download's hold on torrent `id` taken by `stream_url(.., pin: true)`.
+    pub async fn unpin(&self, id: usize) {
+        let mut p = self.pinned.lock().await;
+        if let Some(i) = p.iter().position(|&x| x == id) {
             p.remove(i);
         }
     }
@@ -142,7 +146,7 @@ impl TorrentEngine {
     /// Stop every torrent but `keep` and pinned ones, so none keeps downloading or seeding. Stopped torrents stay on disk
     /// while they fit in the cache; the oldest are deleted with their files first.
     pub async fn release_except(&self, keep: Option<usize>) {
-        let pinned = self.pinned.lock().unwrap().clone();
+        let pinned = self.pinned.lock().await;
         let stopped: Vec<_> = self.session.with_torrents(|it| it.filter(|(id, _)| Some(*id) != keep && !pinned.contains(id)).map(|(id, h)| (id, h.clone())).collect());
         for (_, h) in stopped.iter().filter(|(_, h)| !h.is_paused()) {
             if let Err(e) = self.session.pause(h).await {
@@ -172,5 +176,24 @@ mod tests {
         assert!(evict(&t, 60).is_empty() && evict(&t, u64::MAX).is_empty());
         assert_eq!(evict(&[(1, 0)], 0), [1], "empty torrents go too");
         assert_eq!((Profile::from_label("Fast"), Profile::from_label("junk")), (Profile::Fast, Profile::Default));
+    }
+
+    #[tokio::test]
+    async fn pinned_torrent_survives_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.mkv"), vec![7u8; 64 * 1024]).unwrap();
+        let t = librqbit::create_torrent(&src.join("a.mkv"), Default::default(), &librqbit::spawn_utils::BlockingSpawner::new(1)).await.unwrap();
+        let file = dir.path().join("a.torrent");
+        std::fs::write(&file, t.as_bytes().unwrap()).unwrap();
+        let engine = TorrentEngine::start(dir.path().join("dl"), false, u64::MAX, Profile::Default).await.unwrap();
+        let (_, id) = engine.stream_url(file.to_str().unwrap(), None, true).await.unwrap();
+        let paused = || engine.session.get(id.into()).unwrap().is_paused();
+        engine.release_except(None).await;
+        assert!(!paused(), "pinned: kept running");
+        engine.unpin(id).await;
+        engine.release_except(None).await;
+        assert!(paused(), "unpinned: stopped");
     }
 }

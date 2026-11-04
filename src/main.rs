@@ -944,7 +944,7 @@ impl App {
         self.spawn(ctx, async move {
             let (url, id) = match torrent {
                 true => {
-                    let (url, id) = start.await?.stream_url(&source, None).await?;
+                    let (url, id) = start.await?.stream_url(&source, None, false).await?;
                     (url, Some(id))
                 }
                 false => (source.clone(), None),
@@ -1005,12 +1005,11 @@ impl App {
             let res = async {
                 let Some(engine) = engine else { return download::fetch(&source, &headers, &d.path).await };
                 let engine = engine.await?;
-                let (url, id) = engine.stream_url(&source, None).await?;
                 // Pinned so playing or stopping another title doesn't pause it mid-download.
-                engine.pin(id, true);
+                let (url, id) = engine.stream_url(&source, None, true).await?;
                 let res = download::fetch(&url, &[], &d.path).await;
                 // shortcut: the torrent keeps its cache copy and runs until the next playback releases it; fine for a few downloads.
-                engine.pin(id, false);
+                engine.unpin(id).await;
                 res
             };
             let res = res.await.map_err(|e| format!("{e:#}"));
@@ -1235,7 +1234,9 @@ impl App {
                 match res.map_err(anyhow::Error::msg).and_then(|()| self.db.add_download(&d)) {
                     Ok(()) => self.downloads.insert(0, d),
                     Err(e) => {
+                        // A failed fetch leaves the `.part`; a failed DB insert leaves the finished file.
                         let _ = std::fs::remove_file(download::part(&d.path));
+                        let _ = std::fs::remove_file(&d.path);
                         report(&mut self.error, format!("download {}: {e:#}", d.title));
                     }
                 }
@@ -3105,7 +3106,10 @@ impl App {
         let (mut play, mut delete) = (None, None);
         for d in &self.downloads {
             ui.horizontal(|ui| {
-                if primary_button(ui, &format!("Play {}", d.title)).clicked() {
+                // Stale if the file was removed outside the app; Delete still clears the row.
+                let on_disk = d.path.exists();
+                let btn = ui.add_enabled_ui(on_disk, |ui| primary_button(ui, &format!("Play {}", d.title))).inner;
+                if btn.on_disabled_hover_text("File is missing").clicked() {
                     play = Some(d.clone());
                 }
                 if small_button(ui, "Delete").clicked() {

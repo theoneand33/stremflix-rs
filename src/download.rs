@@ -10,9 +10,16 @@ use crate::library::MEDIA_EXTS;
 /// File name for `title` with no path separators, `..` or control characters, so addon text can't
 /// escape the downloads folder. The extension comes from `hint` (a file name or URL path) if it's a media type.
 pub fn file_name(title: &str, hint: Option<&str>) -> String {
-    let stem: String = title.chars().map(|c| if c.is_alphanumeric() || " -_()[],'&".contains(c) { c } else { '_' }).take(120).collect();
+    let mut stem: String = title.chars().map(|c| if c.is_alphanumeric() || " -_()[],'&".contains(c) { c } else { '_' }).collect();
+    // Bytes, not chars: file systems cap names at 255 bytes, and non-ASCII takes up to 4 each.
+    while stem.len() > 120 {
+        stem.pop();
+    }
     let stem = stem.trim();
     let stem = if stem.is_empty() { "download" } else { stem };
+    // Windows reserves these device names even with an extension.
+    const RESERVED: [&str; 22] = ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"];
+    let stem = if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(stem)) { format!("_{stem}") } else { stem.to_string() };
     let ext = (hint.and_then(|h| Path::new(h).extension()?.to_str()).map(str::to_ascii_lowercase))
         .filter(|e| MEDIA_EXTS.contains(&e.as_str()))
         .unwrap_or_else(|| "mkv".into());
@@ -88,6 +95,8 @@ mod tests {
         assert_eq!(file_name("  ", Some("x.exe")), "download.mkv", "blank title, non-media extension");
         assert_eq!(file_name("..", None), "__.mkv");
         assert_eq!(file_name(&"x".repeat(500), None).len(), 124);
+        assert!(file_name(&"é".repeat(500), None).len() <= 124, "capped by bytes");
+        assert_eq!(file_name("nul", None), "_nul.mkv");
     }
 
     #[test]
