@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use stremflix_rs::db::Db;
+use stremflix_rs::db::{Db, Watched};
+use stremflix_rs::stremio_import::Import;
 use stremflix_rs::addon::Video;
 use stremflix_rs::stremio_import::{from_account, import, parse, read_storage, watched_episodes, watched_videos};
 
@@ -93,6 +94,9 @@ fn parses_and_saves_without_clobbering_newer_progress() {
     imp.save(&db).unwrap();
     imp.save(&db).unwrap(); // re-import is idempotent
     assert_eq!(db.addons().unwrap().len(), 1);
+    let mut saved: Vec<_> = db.saved_titles().unwrap().into_iter().map(|t| t.key).collect();
+    saved.sort();
+    assert_eq!(saved, ["movie:tt1", "movie:tt3", "series:tt2"]);
     assert!(db.setting("bitfield:series:tt2").unwrap().is_some_and(|f| f.starts_with("tt2:1:1:5:")));
     assert_eq!(db.recent_progress(10).unwrap().len(), 2);
     // Newest watched first.
@@ -156,6 +160,18 @@ fn unwatched_episode_survives_bitfield() {
     let keys = ["series:tt2:1:1".to_string(), "series:tt2:1:2".to_string()];
     assert_eq!(db.apply_watched_bitfield("bitfield:series:tt2", &keys).unwrap(), ["series:tt2:1:2"]);
     assert!(!db.watched_keys().unwrap().contains("series:tt2:1:1"));
+
+    // An imported series with 2 watched episodes: unwatching them counts down, then drops it for good.
+    let imp = Import { watched: vec![(Watched { key: "series:tt2".into(), title: "Show".into(), poster: None, episodes: 2 }, "2026-01-01T00:00:00Z".into())], ..Default::default() };
+    imp.save(&db).unwrap();
+    db.set_watched("series:tt2:1:3", true).unwrap();
+    db.set_watched("series:tt2:1:3", false).unwrap();
+    assert_eq!(db.watched(10).unwrap()[0].episodes, 1);
+    db.set_watched("series:tt2:1:2", false).unwrap();
+    assert!(db.watched(10).unwrap().is_empty());
+    imp.save(&db).unwrap();
+    assert!(db.watched(10).unwrap().is_empty(), "a sync doesn't bring back a series unwatched here");
+    db.set_watched("series:tt2:1:9", false).unwrap(); // never watched: changes nothing
 }
 
 #[test]

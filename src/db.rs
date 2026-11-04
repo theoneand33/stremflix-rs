@@ -80,9 +80,13 @@ impl Db {
         // ones left by an older version are fixed here.
         #[cfg(unix)]
         for ext in ["", "-wal", "-shm"] {
-            let f = PathBuf::from(format!("{}{ext}", path.display()));
-            if f.exists() {
-                std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+            let mut f = path.as_os_str().to_os_string();
+            f.push(ext);
+            // Some filesystems (FAT, network shares) have no Unix modes: not a reason to refuse to start.
+            if let Err(e) = std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("making {} owner-only: {e}", PathBuf::from(f).display());
             }
         }
         conn.execute_batch(
@@ -317,10 +321,18 @@ impl Db {
                 self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
                 self.conn.execute("DELETE FROM settings WHERE key = ?1", [format!("unwatched:{key}")])?;
             } else {
-                self.conn.execute("DELETE FROM settings WHERE key = ?1", [&k])?;
+                let was = self.conn.execute("DELETE FROM settings WHERE key = ?1", [&k])? > 0;
                 self.set_setting(&format!("unwatched:{key}"), "1")?;
                 // Also clears a title imported from Stremio.
                 self.conn.execute("DELETE FROM watched WHERE key = ?1", [key])?;
+                // An episode of an imported series (`<series key>:...`): one fewer watched; at none the series
+                // leaves Watch It Again and is remembered, so a sync doesn't bring it back.
+                let parent = "substr(?1, 1, length(key) + 1) = key || ':'";
+                if was {
+                    self.conn.execute(&format!("INSERT OR REPLACE INTO settings (key, value) SELECT 'unwatched:' || key, '1' FROM watched WHERE episodes <= 1 AND {parent}"), [key])?;
+                    self.conn.execute(&format!("DELETE FROM watched WHERE episodes <= 1 AND {parent}"), [key])?;
+                    self.conn.execute(&format!("UPDATE watched SET episodes = episodes - 1 WHERE {parent}"), [key])?;
+                }
             }
             Ok(())
         })

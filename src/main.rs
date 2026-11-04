@@ -2807,7 +2807,7 @@ impl App {
             });
         }
         // Blank path = auto-detect.
-        if form_row(ui, "Stremio data:", &mut self.import_path, "Auto-detect local Stremio", "Import from Stremio", Some("Import addons, watched titles and progress"), true) {
+        if form_row(ui, "Stremio data:", &mut self.import_path, "Auto-detect local Stremio", "Import from Stremio", Some("Import addons, library, watched titles and progress"), true) {
             let path = Some(PathBuf::from(self.import_path.trim())).filter(|p| !p.as_os_str().is_empty());
             self.spawn(&ctx, async move {
                 let (_, imp) = tokio::task::spawn_blocking(move || stremio_import::import(path.as_deref())).await??;

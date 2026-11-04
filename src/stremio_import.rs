@@ -1,4 +1,5 @@
-//! Import addons, watch progress and watched titles from a local Stremio installation.
+//! Import addons, library titles, watch progress and watched titles from a local Stremio installation
+//! or (via [`from_account`]) a Stremio account.
 //!
 //! Stremio 5 (stremio-web + stremio-core) keeps its state as JSON in the webview's localStorage
 //! under the keys `profile` (addons), `library`/`library_recent` (titles + progress) and `streams`
@@ -326,6 +327,8 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
             if let Ok(it) = serde_json::from_value::<Item>(v.clone())
                 && valid_id(&it.id)
                 && valid_id(&it.kind)
+                // Like stremio-core's library and Continue Watching: `other` items are skipped.
+                && it.kind != "other"
                 && items.get(&it.id).is_none_or(|old| old.mtime <= it.mtime)
             {
                 items.insert(it.id.clone(), it);
@@ -340,8 +343,7 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
         if title.is_empty() {
             continue;
         }
-        // Like stremio-core's library: `other` items aren't shown.
-        if !it.removed && !it.temp && it.kind != "other" {
+        if !it.removed && !it.temp {
             imp.saved.push(SavedTitle { key: key.clone(), title: title.clone(), kind: it.kind.clone(), poster: poster.clone() });
         }
         let video = s.video_id.clone().unwrap_or(it.id.clone());
