@@ -3450,18 +3450,23 @@ impl std::str::FromStr for Geo {
 impl Geo {
     /// Fullscreen is transient and a maximized rect is not the restore size, so those keep the last normal rect.
     fn track(&mut self, vp: &egui::ViewportInfo) {
-        if vp.minimized == Some(true) {
+        if vp.minimized == Some(true) || vp.fullscreen == Some(true) {
             return;
         }
-        self.maximized = vp.maximized.unwrap_or(false);
-        if self.maximized || vp.fullscreen == Some(true) {
+        // Unknown (None) keeps the last known state.
+        if let Some(m) = vp.maximized {
+            self.maximized = m;
+        }
+        if self.maximized {
             return;
         }
+        // Clamp to the ranges from_str accepts, or one bad field would discard the whole record on next launch.
         if let Some(r) = vp.inner_rect {
-            self.size = [r.width(), r.height()];
+            self.size = [r.width().clamp(200.0, 16384.0), r.height().clamp(150.0, 16384.0)];
         }
         // shortcut: Wayland reports no outer position, so only size is restored there.
-        self.pos = vp.outer_rect.map(|r| [r.min.x, r.min.y]).or(self.pos);
+        let pos = vp.outer_rect.map(|r| [r.min.x, r.min.y]).filter(|p| p.iter().all(|v| v.abs() <= 10000.0));
+        self.pos = pos.or(self.pos);
     }
 }
 
@@ -3613,6 +3618,19 @@ mod tests {
         assert!("1,2,3".parse::<Geo>().is_err() && "x".parse::<Geo>().is_err() && "800,600,0,1".parse::<Geo>().is_err());
         assert!("20000,600,0".parse::<Geo>().is_err() && "800,20000,0".parse::<Geo>().is_err());
         assert_eq!("800,600,0,-32000,-32000".parse(), Ok(Geo { size: [800.0, 600.0], pos: None, maximized: false }));
+    }
+
+    #[test]
+    fn geo_track_keeps_state_and_stays_parseable() {
+        let r = |w, h| egui::Rect::from_min_size(egui::pos2(50_000.0, 5.0), egui::vec2(w, h));
+        let vp = |maximized, fullscreen, w, h| egui::ViewportInfo { maximized, fullscreen, inner_rect: Some(r(w, h)), outer_rect: Some(r(w, h)), ..Default::default() };
+        let mut g = Geo { maximized: true, ..Default::default() };
+        g.track(&vp(None, Some(true), 1920.0, 1080.0));
+        g.track(&vp(None, None, 1920.0, 1080.0));
+        assert!(g.maximized && g.size == [1000.0, 700.0]);
+        g.track(&vp(Some(false), None, 10.0, 99999.0));
+        assert!(!g.maximized && g.size == [200.0, 16384.0] && g.pos.is_none());
+        assert_eq!(g.to_string().parse(), Ok(g));
     }
 
     #[test]
