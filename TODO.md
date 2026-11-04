@@ -17,16 +17,13 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Calendar of upcoming episodes for library series | P2 | M | Depends on the saved library. |
 | New-episode notifications | P2 | M | Depends on the saved library. |
-| "New Episodes" row for library series | P2 | S | Depends on the saved library and addon episode metadata. |
 | Hide / reorder Home catalog rows | P2 | M | Rows follow addon priority only. |
-| Search within the saved library | P2 | S | |
 
 ### Library and organization
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Custom lists / collections | P2 | M | Stremio "My List" style folders; today only one saved-titles list. |
-| More library sorts (recently watched, rating, year) | P2 | S | Added and Title only. |
 | Bulk selection in the library | P3 | M | |
 | User profiles (household, child-safe) | P3 | L | Stremio supporter feature. |
 
@@ -35,11 +32,7 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
-| Remember volume, speed and audio track across sessions | P2 | S | Other settings persist; these three reset each title. |
-| Subtitle outline color and position | P2 | S | Style has size, color and background only. |
-| Buffered range on the seek bar | P2 | S | Stremio shows buffered progress in grey. |
 | Auto-load sidecar subtitles next to local files | P2 | S | `.srt`/`.ass`/`.vtt` beside the video; only addon subtitles today. |
-| In-app subtitle search and download | P2 | M | Complements `videoHash` matching. |
 | Skip intro / recap / credits from addon markers | P2 | M | Stremio supporter feature; needs an addon source for the timestamps. |
 | Playback stats overlay (peers, speed, dropped frames) | P2 | S | Stremio has a Network button; useful for torrents. |
 | Sleep timer | P3 | S | |
@@ -100,7 +93,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Android, iOS, TV clients | P3 | XL | Out of scope for an egui desktop app. |
 | Tray icon and minimize-to-tray with background playback | P2 | M | |
 | Dark/light theme and accent customization | P2 | S | Dark only today. |
-| UI scale / zoom | P2 | S | HiDPI and TV-sized screens. |
 | Remember last tab and window state on launch | P3 | S | |
 | Command-line flags for play/open | P3 | S | Only `stremio://` links are parsed now. |
 | Screen-reader labels and focus-order polish | P3 | M | AccessKit is enabled; coverage is partial. |
