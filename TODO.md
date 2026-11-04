@@ -15,7 +15,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| Trailers (`trailers` / `ytId`) | P2 | M | Needs YouTube resolution; mpv with yt-dlp can play them. |
 | Calendar of upcoming episodes for library series | P2 | M | Depends on the saved library. |
 | New-episode notifications | P2 | M | Depends on the saved library. |
 | Year / sort / other catalog extras | P1 | M | Discover offers only `genre` and `search`; addons commonly declare `year` and `sort`. |

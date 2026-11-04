@@ -572,6 +572,9 @@ fn binge_source(streams: &[Stream], group: &str) -> Option<String> {
     streams.iter().filter(|s| s.hints.binge_group.as_deref() == Some(group)).find_map(Stream::source)
 }
 
+/// Progress-key prefix of trailers, which are never saved to history; `/` keeps it off any `<kind>:<id>` key.
+const TRAILER: &str = "trailer/";
+
 /// The addon's `proxyHeaders` for playing `url`, only when it is that addon's own http(s) stream:
 /// never for torrents (`url` is then the local torrent server, not `source`) or local files.
 fn request_headers(streams: &[Stream], source: &str, url: &str) -> Vec<(String, String)> {
@@ -1195,7 +1198,8 @@ impl App {
     }
 
     fn save_progress(&mut self) {
-        if let Some(p) = &self.player {
+        // Trailers never enter Continue Watching or the watched list.
+        if let Some(p) = self.player.as_ref().filter(|p| !p.key.starts_with(TRAILER)) {
             let prog = Progress { key: p.key.clone(), title: p.title.clone(), source: p.source.clone(), position: p.pos, duration: p.dur, poster: p.poster.clone() };
             self.record_progress(prog);
         }
@@ -1643,8 +1647,13 @@ impl App {
                 ui.spinner();
             }
         }
-        if let Some(d) = self.selected_details() {
-            Self::ui_details(ui, d);
+        if let Some(d) = self.selected_details()
+            && let Some(t) = Self::ui_details(ui, d)
+            && let Some(src) = t.source()
+        {
+            // Not `play`: its `nav` bump would drop the title's still-loading streams and episodes.
+            let key = format!("{TRAILER}{}", t.yt_id.clone().unwrap_or_default());
+            let _ = self.tx.send(Msg::Play(key, format!("{} - {}", d.name, t.title.as_deref().unwrap_or("Trailer")), src.clone(), src, vec![], None, self.nav));
         }
         let mut episode = None;
         let mut toggle: Option<(String, bool)> = None;
@@ -2058,8 +2067,9 @@ impl App {
         });
     }
 
-    /// Detail facts under the banner: year, runtime, rating, genres, cast, director, links.
-    fn ui_details(ui: &mut egui::Ui, d: &Meta) {
+    /// Detail facts under the banner: year, runtime, rating, genres, cast, director, links, trailers.
+    /// Returns the trailer the user clicked.
+    fn ui_details<'a>(ui: &mut egui::Ui, d: &'a Meta) -> Option<&'a Stream> {
         ui.add_space(14.0);
         let gray = Color32::from_gray(170);
         let facts: Vec<String> = [d.release_info.clone(), d.runtime.clone(), d.imdb_rating.as_ref().map(|r| format!("IMDb {r}"))]
@@ -2083,6 +2093,17 @@ impl App {
                 }
             });
         }
+        let mut clicked = None;
+        if !d.trailers.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for t in &d.trailers {
+                    if ui.button(format!("▶ {}", t.title.as_deref().unwrap_or("Trailer"))).clicked() {
+                        clicked = Some(t);
+                    }
+                }
+            });
+        }
+        clicked
     }
 
     /// Full-window Netflix-style player: letterboxed video, controls that fade out after
