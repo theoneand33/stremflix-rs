@@ -152,8 +152,8 @@ enum Msg {
     Episodes(MetaPreview, Meta, u64),
     /// Full meta of a movie (genres, cast, ...) for the detail page.
     Details(Meta),
-    /// A saved series and its recently released episodes.
-    NewEpisodes(MetaPreview, Vec<Video>),
+    /// `new_eps_gen`, a saved series and its recently released episodes.
+    NewEpisodes(u64, MetaPreview, Vec<Video>),
     /// poster URL, image bytes (empty on failure)
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs, torrent id, the `nav` it was requested at
@@ -821,8 +821,10 @@ struct App {
     library: Vec<LibraryItem>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
-/// Saved series with episodes released in the last `NEW_EPISODE_DAYS` days (watched ones are hidden when drawn).
-new_episodes: Vec<(MetaPreview, Vec<Video>)>,
+    /// Saved series with episodes released in the last `NEW_EPISODE_DAYS` days (watched ones are hidden when drawn).
+    new_episodes: Vec<(MetaPreview, Vec<Video>)>,
+    /// Bumped on each `build_rows`; stale `Msg::NewEpisodes` replies are dropped.
+    new_eps_gen: u64,
     /// Finished downloads, newest first, and those still running.
     downloads: Vec<Download>,
     downloading: Vec<Download>,
@@ -909,7 +911,8 @@ impl App {
             addons: db.addons()?,
             library: db.library_items()?,
             saved: db.saved_titles()?,
-new_episodes: Vec::new(),
+            new_episodes: Vec::new(),
+            new_eps_gen: 0,
             downloads: db.downloads()?,
             downloading: Vec::new(),
             lib_sort: LibSort::Added,
@@ -1265,10 +1268,12 @@ new_episodes: Vec::new(),
                 }
                 None => report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200))),
             },
-            Msg::NewEpisodes(meta, videos) => {
-                self.new_episodes.retain(|(m, _)| m.id != meta.id);
-                if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) && !videos.is_empty() {
-                    self.new_episodes.push((meta, videos));
+            Msg::NewEpisodes(epoch, meta, videos) => {
+                if epoch == self.new_eps_gen {
+                    self.new_episodes.retain(|(m, _)| m.id != meta.id);
+                    if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) && !videos.is_empty() {
+                        self.new_episodes.push((meta, videos));
+                    }
                 }
             }
             Msg::Details(m) => {
@@ -1515,6 +1520,8 @@ new_episodes: Vec::new(),
 
     /// Rebuild home rows from installed catalogs: generic Trending/Popular rows first, then the rest.
     fn build_rows(&mut self, ctx: &egui::Context) {
+        self.new_eps_gen += 1;
+        self.new_episodes.clear();
         let cats: Vec<(&String, &String, &CatalogDef)> = self
             .addons
             .iter()
@@ -1562,14 +1569,17 @@ new_episodes: Vec::new(),
 
     /// Ask a meta addon for the episodes of each saved series and keep those released recently.
     fn fetch_new_episodes(&self, ctx: &egui::Context) {
+        // At most 4 meta requests in flight, so a long library doesn't flood the addons.
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
         for meta in self.saved.iter().filter(|t| t.kind == "series").filter_map(SavedTitle::preview) {
             let addons = self.addons_for("meta", &meta.kind, &meta.id);
-            let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), ctx.clone());
+            let (client, tx, ctx, epoch, slots) = (self.client.clone(), self.tx.clone(), ctx.clone(), self.new_eps_gen, slots.clone());
             // Not `spawn`: a series whose meta fails to load just has no row entry.
             self.rt.spawn(async move {
+                let Ok(_permit) = slots.acquire_owned().await else { return };
                 for u in &addons {
                     if let Ok(m) = client.meta(u, &meta.kind, &meta.id).await {
-                        let _ = tx.send(Msg::NewEpisodes(meta, recent_episodes(m.videos, &date_string(unix_days() - NEW_EPISODE_DAYS), &date_string(unix_days()))));
+                        let _ = tx.send(Msg::NewEpisodes(epoch, meta, recent_episodes(m.videos, &date_string(unix_days() - NEW_EPISODE_DAYS), &date_string(unix_days()))));
                         ctx.request_repaint();
                         return;
                     }
@@ -2030,6 +2040,7 @@ new_episodes: Vec::new(),
         let mut fresh: Vec<(&MetaPreview, &Video)> = self
             .new_episodes
             .iter()
+            .filter(|(m, _)| self.saved.iter().any(|t| t.key == format!("series:{}", m.id)))
             .filter_map(|(m, vs)| vs.iter().rev().find(|v| !self.watched_keys.contains(&format!("{}:{}", m.kind, v.id))).map(|v| (m, v)))
             .collect();
         fresh.sort_by(|a, b| b.1.released.cmp(&a.1.released));
