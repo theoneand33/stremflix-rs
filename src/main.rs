@@ -1927,6 +1927,7 @@ impl App {
             let _ = self.tx.send(Msg::Play(key, format!("{} - {}", d.name, t.title.as_deref().unwrap_or("Trailer")), src.clone(), src, vec![], None, self.nav));
         }
         let mut episode = None;
+        let mut fresh_click: Option<(MetaPreview, String)> = None;
         let mut toggle: Option<(String, bool)> = None;
         let mut save = None;
         // Movies show their streams; a series shows them once an episode is picked.
@@ -2070,7 +2071,7 @@ impl App {
                         let (r, rect) = card(ui, CARD, &label);
                         self.paint_poster(ui, &r, rect, &m.poster, &m.name, &mut want);
                         if r.on_hover_text(label).clicked() {
-                            episode = Some((m.clone(), v.clone()));
+                            fresh_click = Some((m.clone(), v.id.clone()));
                         }
                     }
                 });
@@ -2161,6 +2162,12 @@ impl App {
         }
         if let Some((m, v)) = episode {
             self.open_streams(&ctx, m, Some(v), Autoplay::Only, None);
+        }
+        // Load the series page first, so no other series' episode list stays under it.
+        if let Some((m, id)) = fresh_click {
+            let sid = m.id.clone();
+            self.open_meta(&ctx, m, false);
+            self.pending = Some((sid, Some(id)));
         }
         if let Some((k, t, s, subs)) = play {
             self.play(&ctx, k, t, s, subs);
