@@ -40,24 +40,38 @@ fn genre_extra() {
       {"type":"movie","id":"s","extra":[{"name":"search","isRequired":true}]},
       {"type":"movie","id":"legacy","extraRequired":["genre"]}]}"#).unwrap();
     let c = &m.catalogs;
-    assert_eq!(c[0].genres(), ["Action", "Sci-Fi", "Action"], "sanitized, empty and non-string options dropped");
-    assert!(c[0].requires_genre() && c[0].discoverable());
-    assert!(c[1].genres().is_empty() && !c[1].requires_genre() && c[1].discoverable());
+    assert_eq!(c[0].extra[0].options, ["Action", "Sci-Fi", "Action"], "sanitized, empty and non-string options dropped");
+    assert!(c[0].discoverable() && c[0].pickers().count() == 1);
+    assert!(c[1].pickers().count() == 0 && c[1].discoverable());
     assert!(!c[2].discoverable(), "required genre without options");
-    assert!(!c[3].discoverable(), "required non-genre extra");
-    assert!(c[4].requires_genre() && !c[4].discoverable());
+    assert!(!c[3].discoverable(), "required extra without options");
+    assert!(!c[4].discoverable());
     let many: Vec<String> = (0..500).map(|i| format!("\"g{i}\"")).collect();
     let body = format!(r#"{{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"],"catalogs":[{{"type":"movie","id":"g","extra":[{{"name":"genre","options":[{}]}}]}}]}}"#, many.join(","));
-    assert_eq!(parse_manifest(body.as_bytes()).unwrap().catalogs[0].genres().len(), 200);
+    assert_eq!(parse_manifest(body.as_bytes()).unwrap().catalogs[0].extra[0].options.len(), 200);
 }
 
 #[test]
 fn discover_url() {
-    assert_eq!(discover_path("movie", "top", None), "catalog/movie/top.json");
-    assert_eq!(discover_path("movie", "top", Some("Sci-Fi & Fantasy")), "catalog/movie/top/genre=Sci-Fi%20%26%20Fantasy.json");
-    assert_eq!(discover_path("movie", "top", Some("a/b=c?")), "catalog/movie/top/genre=a%2Fb%3Dc%3F.json");
+    let x = |v: &[(&str, &str)]| v.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect::<Vec<_>>();
+    assert_eq!(discover_path("movie", "top", &[]), "catalog/movie/top.json");
+    assert_eq!(discover_path("movie", "top", &x(&[("genre", "Sci-Fi & Fantasy")])), "catalog/movie/top/genre=Sci-Fi%20%26%20Fantasy.json");
+    assert_eq!(discover_path("movie", "top", &x(&[("genre", "a/b=c?")])), "catalog/movie/top/genre=a%2Fb%3Dc%3F.json");
+    assert_eq!(discover_path("movie", "top", &x(&[("year", "2020"), ("sort", "a&b")])), "catalog/movie/top/year=2020&sort=a%26b.json");
     let base = addon_base("https://x.example/a/manifest.json").unwrap();
-    assert_eq!(base.join(&discover_path("series", "top", Some("a/../b"))).unwrap().as_str(), "https://x.example/a/catalog/series/top/genre=a%2F..%2Fb.json");
+    assert_eq!(base.join(&discover_path("series", "top", &x(&[("genre", "a/../b")]))).unwrap().as_str(), "https://x.example/a/catalog/series/top/genre=a%2F..%2Fb.json");
+}
+
+#[test]
+fn valid_extras() {
+    let m = parse_manifest(br#"{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"],"catalogs":[
+      {"type":"movie","id":"c","extra":[{"name":"genre","options":["A","B"]},{"name":"year","isRequired":true,"options":["2020","2021"]},{"name":"skip"}]}]}"#).unwrap();
+    let c = &m.catalogs[0];
+    let x = |v: &[(&str, &str)]| v.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect::<Vec<_>>();
+    assert!(c.discoverable() && c.pickers().count() == 2, "skip has no options");
+    assert_eq!(c.valid_extras(&[]), x(&[("year", "2020")]), "required defaults to first option, optional stays unset");
+    assert_eq!(c.valid_extras(&x(&[("year", "2021"), ("genre", "B")])), x(&[("genre", "B"), ("year", "2021")]));
+    assert_eq!(c.valid_extras(&x(&[("genre", "Z"), ("year", "1999"), ("x", "1")])), x(&[("year", "2020")]), "stale values dropped");
 }
 
 #[test]
