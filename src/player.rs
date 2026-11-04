@@ -497,6 +497,14 @@ impl Player {
         Ok(())
     }
 
+    /// Adds a subtitle from `url` and selects it; kept so a reload re-adds it.
+    pub fn add_sub(&mut self, url: &str, lang: &str) -> Result<()> {
+        self.command(&["sub-add", url, "select", "", lang])?;
+        self.subs.push((url.into(), lang.into()));
+        self.subs_off = false;
+        Ok(())
+    }
+
     /// Sets the subtitle style properties (async, like every other command).
     pub fn apply_sub_style(&self, st: &SubStyle) -> Result<()> {
         for (k, v) in st.props() {
