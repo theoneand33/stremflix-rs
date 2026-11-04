@@ -88,19 +88,25 @@ impl CatalogDef {
         self.extra.iter().filter(|e| !e.options.is_empty() && !matches!(e.name.as_str(), "skip" | "search"))
     }
 
+    /// Required by the `extra` list or the legacy `extraRequired` field.
+    fn is_required(&self, name: &str) -> bool {
+        self.extra.iter().any(|e| e.name == name && e.is_required) || self.extra_required.iter().any(|n| n == name)
+    }
+
     /// `current` kept where still a valid option, plus the first option of each required picker.
     pub fn valid_extras(&self, current: &[(String, String)]) -> Vec<(String, String)> {
         self.pickers()
             .filter_map(|e| {
                 let kept = current.iter().find(|(n, v)| *n == e.name && e.options.contains(v));
-                kept.cloned().or_else(|| e.is_required.then(|| (e.name.clone(), e.options[0].clone())))
+                kept.cloned().or_else(|| self.is_required(&e.name).then(|| (e.name.clone(), e.options[0].clone())))
             })
             .collect()
     }
 
-    /// Browsable on Discover: every required extra has options to pick from.
+    /// Browsable on Discover: every required extra (either source) has a picker to fill it.
     pub fn discoverable(&self) -> bool {
-        self.extra.iter().all(|e| !e.is_required || !e.options.is_empty()) && self.extra_required.is_empty()
+        let required = self.extra.iter().filter(|e| e.is_required).map(|e| &e.name).chain(&self.extra_required);
+        required.into_iter().all(|n| self.pickers().any(|p| p.name == *n))
     }
 }
 
@@ -695,6 +701,18 @@ mod configure_tests {
         let m = parse_manifest(body.as_bytes()).unwrap();
         let names: Vec<_> = m.catalogs[0].pickers().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["genre"]);
+    }
+
+    #[test]
+    fn required_extras_need_a_picker() {
+        let cat = |c: &str| parse_manifest(format!(r#"{{"id":"a","version":"1","name":"n","resources":["catalog"],"types":["movie"],"catalogs":[{c}]}}"#).as_bytes()).unwrap().catalogs.remove(0);
+        // Legacy `extraRequired` plus options in `extra`: browsable, defaulting to the first option.
+        let c = cat(r#"{"type":"movie","id":"t","extra":[{"name":"genre","options":["Action","Drama"]}],"extraRequired":["genre"]}"#);
+        assert!(c.discoverable());
+        assert_eq!(c.valid_extras(&[]), [("genre".to_string(), "Action".to_string())]);
+        // Required names without a picker (no options, or `skip`/`search`) stay hidden.
+        assert!(!cat(r#"{"type":"movie","id":"t","extraRequired":["genre"]}"#).discoverable());
+        assert!(!cat(r#"{"type":"movie","id":"t","extra":[{"name":"skip","isRequired":true,"options":["0"]}]}"#).discoverable());
     }
 
     #[test]
