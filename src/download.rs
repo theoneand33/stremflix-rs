@@ -63,7 +63,7 @@ pub fn clear_partial(dir: &Path) {
 /// Download `url` (with the addon's request `headers`) into `part(dest)`, then move it to `dest`.
 pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path) -> Result<()> {
     // No total timeout: a movie can take hours. A stalled connection still fails.
-    let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(120)).build()?;
+    let client = reqwest::Client::builder().user_agent("stremflix-rs").connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(120)).build()?;
     let mut req = client.get(url);
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
@@ -71,7 +71,8 @@ pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path) -> Resu
     let mut resp = req.send().await.context("download")?.error_for_status()?;
     let kind = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
     ensure!(!["mpegurl", "dash+xml"].iter().any(|t| kind.contains(t)), "{kind} is a streaming playlist, not a video file, so it can't be downloaded");
-    let len = resp.content_length();
+    // A live or endless stream has no length; refusing it keeps a download from filling the disk.
+    let Some(len) = resp.content_length() else { anyhow::bail!("the server gave no file size (likely a live stream), so it can't be downloaded") };
     let tmp = part(dest);
     let mut f = tokio::fs::File::create(&tmp).await?;
     let mut got = 0u64;
@@ -79,7 +80,7 @@ pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path) -> Resu
         f.write_all(&chunk).await?;
         got += chunk.len() as u64;
     }
-    ensure!(len.is_none_or(|n| n == got), "download cut off at {got} of {} bytes", len.unwrap_or(0));
+    ensure!(len == got, "download cut off at {got} of {len} bytes");
     f.sync_all().await?;
     finish(&tmp, dest)
 }
