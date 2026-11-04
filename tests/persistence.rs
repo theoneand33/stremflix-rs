@@ -114,6 +114,22 @@ fn watched_round_trip() {
 }
 
 #[test]
+fn set_watched_many_marks_all_and_clears_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("m.db")).unwrap();
+    let keys: Vec<String> = (1..=3).map(|n| format!("series:tt1:1:{n}")).collect();
+    let prog = Progress { key: keys[1].clone(), title: "T".into(), source: "s".into(), position: 10.0, duration: 100.0, poster: None };
+    db.save_progress(&prog).unwrap();
+
+    db.set_watched_many(&keys, true).unwrap();
+    assert!(keys.iter().all(|k| db.watched_keys().unwrap().contains(k)));
+    assert!(db.progress(&keys[1]).unwrap().is_none()); // left Continue Watching
+
+    db.set_watched_many(&keys, false).unwrap();
+    assert!(db.watched_keys().unwrap().is_empty());
+}
+
+#[test]
 fn addon_order_persists() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("app.db");
