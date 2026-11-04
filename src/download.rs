@@ -71,8 +71,10 @@ pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path) -> Resu
     let mut resp = req.send().await.context("download")?.error_for_status()?;
     let kind = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
     ensure!(!["mpegurl", "dash+xml"].iter().any(|t| kind.contains(t)), "{kind} is a streaming playlist, not a video file, so it can't be downloaded");
+    ensure!(!kind.starts_with("text/html"), "the server sent a web page, not a video file");
     // A live or endless stream has no length; refusing it keeps a download from filling the disk.
     let Some(len) = resp.content_length() else { anyhow::bail!("the server gave no file size (likely a live stream), so it can't be downloaded") };
+    ensure!(len > 0, "the server sent an empty file");
     let tmp = part(dest);
     let mut f = tokio::fs::File::create(&tmp).await?;
     let mut got = 0u64;
