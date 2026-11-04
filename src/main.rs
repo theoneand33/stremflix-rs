@@ -2726,6 +2726,9 @@ impl App {
             if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]) }
             if k(M) { cmd(&["cycle", "mute"]) }
+            // mpv pauses on its own after a frame step.
+            if k(Period) { cmd(&["frame-step"]) }
+            if k(Comma) { cmd(&["frame-back-step"]) }
             toggle_fs |= k(F);
             if k(Escape) {
                 if fs { toggle_fs = true } else { back = true }
