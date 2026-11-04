@@ -183,7 +183,7 @@ fn unwatched_episode_survives_bitfield() {
 fn imported_saved_titles_keep_stremio_order() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("a.db")).unwrap();
-    let t = |id: &str| stremflix_rs::db::SavedTitle { key: format!("movie:{id}"), title: id.into(), kind: "movie".into(), poster: None };
+    let t = |id: &str| stremflix_rs::db::SavedTitle { key: format!("movie:{id}"), title: id.into(), kind: "movie".into(), poster: None, year: None, rating: None, last_watched: None };
     let imp = Import { saved: vec![(t("old"), "2024-01-01T00:00:00Z".into()), (t("new"), "2025-01-01T00:00:00Z".into())], ..Default::default() };
     imp.save(&db).unwrap();
     assert_eq!(db.saved_titles().unwrap().iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["new", "old"]);
