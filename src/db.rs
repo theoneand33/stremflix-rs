@@ -42,6 +42,11 @@ pub struct SavedTitle {
     pub title: String,
     pub kind: String,
     pub poster: Option<String>,
+    /// Release year and IMDb rating, when known (older rows and imports: `None` until the detail page loads).
+    pub year: Option<i32>,
+    pub rating: Option<f64>,
+    /// Unix time of the latest progress or watched mark on the title or any of its episodes; read-only, set by `saved_titles`.
+    pub last_watched: Option<i64>,
 }
 
 /// A stream saved for offline playback.
@@ -108,6 +113,9 @@ impl Db {
         // Migrate databases created before posters were stored; fails harmlessly if the column exists.
         let _ = conn.execute("ALTER TABLE progress ADD COLUMN poster TEXT", []);
         // Addon priority (streams and catalogs follow it); older rows share 0 and keep install order.
+        // Library sorts by year and rating; older rows stay NULL and sort last.
+        let _ = conn.execute("ALTER TABLE saved_titles ADD COLUMN year INTEGER", []);
+        let _ = conn.execute("ALTER TABLE saved_titles ADD COLUMN rating REAL", []);
         let _ = conn.execute("ALTER TABLE addons ADD COLUMN position INTEGER NOT NULL DEFAULT 0", []);
         Ok(Self { conn })
     }
@@ -185,9 +193,19 @@ impl Db {
     pub fn add_saved_title(&self, t: &SavedTitle) -> Result<()> {
         self.conn.execute("DELETE FROM settings WHERE key = ?1", [format!("unsaved:{}", t.key)])?;
         self.conn.execute(
-            "INSERT INTO saved_titles (key, title, kind, poster) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster)",
-            params![t.key, t.title, t.kind, t.poster],
+            "INSERT INTO saved_titles (key, title, kind, poster, year, rating) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster),
+                 year = coalesce(excluded.year, year), rating = coalesce(excluded.rating, rating)",
+            params![t.key, t.title, t.kind, t.poster, t.year, t.rating],
+        )?;
+        Ok(())
+    }
+
+    /// Fill the year and rating of a saved title (a no-op if it isn't saved); keeps stored values when `None`.
+    pub fn set_saved_facts(&self, key: &str, year: Option<i32>, rating: Option<f64>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE saved_titles SET year = coalesce(?2, year), rating = coalesce(?3, rating) WHERE key = ?1",
+            params![key, year, rating],
         )?;
         Ok(())
     }
@@ -213,9 +231,23 @@ impl Db {
     /// Saved titles, newest first; rows with a malformed key or type are skipped.
     pub fn saved_titles(&self) -> Result<Vec<SavedTitle>> {
         // rowid, not key, breaks same-second ties so the order matches insertion order.
-        let mut st = self.conn.prepare("SELECT key, title, kind, poster FROM saved_titles ORDER BY saved_at DESC, rowid DESC")?;
+        let mut st = self.conn.prepare(
+            "SELECT key, title, kind, poster, year, rating,
+                 max(coalesce((SELECT max(updated_at) FROM progress WHERE key = s.key OR substr(key, 1, length(s.key) + 1) = s.key || ':'), 0),
+                     coalesce((SELECT max(watched_at) FROM watched WHERE key = s.key), 0))
+             FROM saved_titles s ORDER BY saved_at DESC, rowid DESC",
+        )?;
         let rows = st.query_map([], |r| {
-            Ok(SavedTitle { key: r.get(0)?, title: r.get(1)?, kind: r.get(2)?, poster: r.get(3)? })
+            let at: i64 = r.get(6)?;
+            Ok(SavedTitle {
+                key: r.get(0)?,
+                title: r.get(1)?,
+                kind: r.get(2)?,
+                poster: r.get(3)?,
+                year: r.get(4)?,
+                rating: r.get(5)?,
+                last_watched: (at > 0).then_some(at),
+            })
         })?;
         Ok(rows
             .filter_map(|r| r.ok())
