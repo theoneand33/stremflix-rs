@@ -822,6 +822,8 @@ struct App {
     autoplay_next: bool,
     /// Playback speed every video starts at.
     default_speed: f64,
+    /// Player volume (0-130) every video starts at; saved when the user changes it.
+    volume: f64,
     /// Last error, shown in a dismissible red line until cleared.
     error: Option<String>,
     /// Release page of a newer build, shown until dismissed.
@@ -896,6 +898,7 @@ impl App {
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
+            volume: db.setting("volume")?.and_then(|v| v.parse().ok()).filter(|v| (0.0..=130.0).contains(v)).unwrap_or(100.0),
             default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
             error: None,
             update: None,
@@ -1365,6 +1368,9 @@ impl App {
                         let _ = player.apply_sub_style(&self.sub_style);
                         if self.default_speed != 1.0 {
                             let _ = player.command(&["set", "speed", &self.default_speed.to_string()]);
+                        }
+                        if self.volume != 100.0 {
+                            let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
                         let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, awake: None };
                         self.player = Some(p);
@@ -2461,6 +2467,7 @@ impl App {
             p.after_hold = long;
         }
         let focused = ctx.memory(|m| m.focused());
+        let mut new_vol = None;
         ctx.input(|i| {
             use egui::Key::*;
             let k = |key| i.key_pressed(key);
@@ -2469,8 +2476,8 @@ impl App {
             if (i.key_released(Space) && focused.is_none() && !long) || k(K) { cmd(&["cycle", "pause"]) }
             if k(ArrowLeft) { seek = Some((-10.0, true)) }
             if k(ArrowRight) { seek = Some((10.0, true)) }
-            if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
-            if k(ArrowDown) { cmd(&["add", "volume", "-5"]) }
+            if k(ArrowUp) { cmd(&["add", "volume", "5"]); new_vol = Some(st.volume + 5.0) }
+            if k(ArrowDown) { cmd(&["add", "volume", "-5"]); new_vol = Some(st.volume - 5.0) }
             if k(M) { cmd(&["cycle", "mute"]) }
             toggle_fs |= k(F);
             if k(Escape) {
@@ -2579,6 +2586,7 @@ impl App {
             if let Some(q) = vr.interact_pointer_pos().filter(|_| vr.dragged() || vr.clicked()) {
                 let v = ((q.x - vbar.left()) / vbar.width()).clamp(0.0, 1.0) * 100.0;
                 cmd(&["set", "volume", &format!("{v:.0}")]);
+                new_vol = Some(v.round().into());
                 // The slider shows 0 while muted, so setting a volume also unmutes.
                 if st.muted {
                     cmd(&["set", "mute", "no"]);
@@ -2626,6 +2634,15 @@ impl App {
                                         let v = id.map_or("no".to_string(), |i| i.to_string());
                                         cmd(&["set", prop, &v]);
                                         // Remember the subtitle choice for the next video: Off, or the picked language first in `slang`.
+                                        if kind == "audio" {
+                                            // Remember the audio language: the picked track's language first in `alang`.
+                                            if let Some(v) = lang.and_then(|l| prefer_lang(&self.langs[0], l)) {
+                                                self.langs[0] = v.clone();
+                                                if let Err(e) = self.db.set_setting("alang", &v) {
+                                                    report(&mut self.error, format!("saving alang: {e:#}"));
+                                                }
+                                            }
+                                        }
                                         if kind == "sub" {
                                             let mut save = vec![("sub_off", if id.is_none() { "1" } else { "0" }.to_string())];
                                             // shortcut: name-only addon languages ("English") fail `valid_langs` and aren't remembered; map names to codes if users hit it.
@@ -2690,6 +2707,11 @@ impl App {
                                 for sp in SPEEDS {
                                     if pill(ui, &format!("{sp}x"), (st.speed - sp).abs() < 0.01, egui::Role::RadioButton).clicked() {
                                         cmd(&["set", "speed", &sp.to_string()]);
+                                        // Also the starting speed of the next video, like the Default speed setting.
+                                        self.default_speed = sp;
+                                        if let Err(e) = self.db.set_setting("default_speed", &sp.to_string()) {
+                                            report(&mut self.error, format!("saving default_speed: {e:#}"));
+                                        }
                                     }
                                 }
                             });
@@ -2773,6 +2795,12 @@ impl App {
                 report(&mut self.error, e);
             }
             let _ = p.player.apply_sub_style(&style);
+        }
+        if let Some(v) = new_vol.map(|v| v.clamp(0.0, 130.0)).filter(|v| *v != self.volume) {
+            self.volume = v;
+            if let Err(e) = self.db.set_setting("volume", &v.to_string()) {
+                report(&mut self.error, format!("saving volume: {e:#}"));
+            }
         }
         if external {
             match open_external(&self.external_player, &p.url) {
