@@ -816,6 +816,9 @@ struct App {
     torrent_profile: Profile,
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
+    /// Settings > Data: path typed for an import, and the last export/import result.
+    data_import: String,
+    data_msg: Option<String>,
     /// mpv hardware decoding.
     hwdec: bool,
     /// Play the next episode when one ends.
@@ -893,6 +896,8 @@ impl App {
             torrent_dir: db.setting("torrent_dir")?.unwrap_or_default(),
             torrent_cache: db.setting("torrent_cache")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             torrent_profile: Profile::from_label(&db.setting("torrent_profile")?.unwrap_or_default()),
+            data_import: String::new(),
+            data_msg: None,
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
@@ -3060,6 +3065,23 @@ impl App {
                     Ok(Msg::SignedIn(email, key))
                 });
             }
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new("Data").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        if small_button(ui, "Export data…").on_hover_text("Write addons, saved titles, progress and settings to a JSON file in the data folder").clicked() {
+            match self.db.export_file(&self.data_dir.join("exports")) {
+                Ok(p) => self.data_msg = Some(format!("Exported to {}", p.display())),
+                Err(e) => report(&mut self.error, format!("exporting: {e:#}")),
+            }
+        }
+        if form_row(ui, "Import data…:", &mut self.data_import, "/path/to/stremflix-rs-export.json", "Import", Some("Merges the file into your data; nothing is deleted"), false) {
+            match self.db.import_file(std::path::Path::new(self.data_import.trim())) {
+                Ok(m) => self.data_msg = Some(format!("{m}. Restart the app to apply.")),
+                Err(e) => report(&mut self.error, format!("importing: {e:#}")),
+            }
+        }
+        if let Some(m) = &self.data_msg {
+            ui.label(RichText::new(m).size(13.0).color(Color32::from_gray(170)));
         }
         ui.add_space(8.0);
         ui.label(RichText::new("Torrents").size(20.0).strong().family(bold()).color(Color32::WHITE));

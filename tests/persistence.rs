@@ -183,3 +183,52 @@ fn db_files_are_owner_only() {
         assert_eq!(std::fs::metadata(f).unwrap().permissions().mode() & 0o777, 0o600, "{}", f.display());
     }
 }
+
+#[test]
+fn export_import_round_trip_and_rejects() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Db::open(&dir.path().join("a.db")).unwrap();
+    let manifest = parse_manifest(br#"{"id":"a","version":"1","name":"A","resources":["stream"],"types":["movie"]}"#).unwrap();
+    a.add_addon("https://x.example/manifest.json", &manifest).unwrap();
+    a.add_saved_title(&SavedTitle { key: "movie:tt1".into(), title: "One".into(), kind: "movie".into(), poster: None }).unwrap();
+    a.save_progress(&Progress { key: "movie:tt1".into(), title: "One".into(), source: "https://x.example/v.mp4".into(), position: 5.0, duration: 9.0, poster: None }).unwrap();
+    // Download resume points, the auth key and the external player command stay out of the file.
+    a.add_download(&Download { path: "/d/two.mp4".into(), kind: "movie".into(), meta_id: "tt2".into(), video_id: "tt2".into(), title: "Two".into() }).unwrap();
+    a.save_progress(&Progress { key: "movie:tt2".into(), title: "Two".into(), source: "/d/two.mp4".into(), position: 1.0, duration: 9.0, poster: None }).unwrap();
+    a.save_watched(&Watched { key: "movie:tt3".into(), title: "Three".into(), poster: None, episodes: 0 }, "2024-01-01T00:00:00Z").unwrap();
+    a.set_watched("movie:tt4", true).unwrap();
+    a.set_setting("hwdec", "0").unwrap();
+    a.set_setting("stremio_auth", "SECRET").unwrap();
+    a.set_setting("external_player", "rm -rf").unwrap();
+    let json = a.export_json().unwrap();
+    assert!(!json.contains("SECRET") && !json.contains("/d/two.mp4") && !json.contains("rm -rf"));
+
+    let b = Db::open(&dir.path().join("b.db")).unwrap();
+    b.import_json(&json).unwrap();
+    assert_eq!(b.addons().unwrap(), a.addons().unwrap());
+    assert_eq!(b.saved_titles().unwrap(), a.saved_titles().unwrap());
+    assert_eq!(b.progress("movie:tt1").unwrap(), a.progress("movie:tt1").unwrap());
+    assert_eq!(b.progress("movie:tt2").unwrap(), None);
+    assert_eq!(b.watched(10).unwrap(), a.watched(10).unwrap());
+    assert!(b.watched_keys().unwrap().contains("movie:tt4"));
+    assert_eq!(b.setting("hwdec").unwrap().as_deref(), Some("0"));
+    assert_eq!(b.setting("stremio_auth").unwrap(), None);
+    // Newer local progress survives a re-import; existing data is kept.
+    b.save_progress(&Progress { key: "movie:tt1".into(), title: "One".into(), source: "https://x.example/v.mp4".into(), position: 7.0, duration: 9.0, poster: None }).unwrap();
+    b.import_json(&json).unwrap();
+    assert_eq!(b.progress("movie:tt1").unwrap().unwrap().position, 7.0);
+
+    let bad = |s: String| Db::open(&dir.path().join("c.db")).unwrap().import_json(&s).unwrap_err().to_string();
+    assert!(bad(r#"{"format":"other","version":1}"#.into()).contains("not a stremflix-rs export"));
+    assert!(bad(r#"{"format":"stremflix-rs-export","version":2}"#.into()).contains("version"));
+    assert!(bad("x".repeat(17 << 20)).contains("16 MiB"));
+    // A bad addon URL is dropped, not imported.
+    let c = Db::open(&dir.path().join("d.db")).unwrap();
+    let doc = json.replace("https://x.example/manifest.json", "file:///etc/manifest.json");
+    c.import_json(&doc).unwrap();
+    assert!(c.addons().unwrap().is_empty());
+    // The size cap applies to files too.
+    let big = dir.path().join("big.json");
+    std::fs::write(&big, vec![b' '; (16 << 20) + 1]).unwrap();
+    assert!(c.import_file(&big).unwrap_err().to_string().contains("16 MiB"));
+}
