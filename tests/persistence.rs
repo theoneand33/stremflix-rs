@@ -195,13 +195,14 @@ fn export_import_round_trip_and_rejects() {
     // Download resume points, the auth key and the external player command stay out of the file.
     a.add_download(&Download { path: "/d/two.mp4".into(), kind: "movie".into(), meta_id: "tt2".into(), video_id: "tt2".into(), title: "Two".into() }).unwrap();
     a.save_progress(&Progress { key: "movie:tt2".into(), title: "Two".into(), source: "/d/two.mp4".into(), position: 1.0, duration: 9.0, poster: None }).unwrap();
+    a.save_progress(&Progress { key: "file:/d/three.mp4".into(), title: "Three".into(), source: "/d/three.mp4".into(), position: 1.0, duration: 9.0, poster: None }).unwrap();
     a.save_watched(&Watched { key: "movie:tt3".into(), title: "Three".into(), poster: None, episodes: 0 }, "2024-01-01T00:00:00Z").unwrap();
     a.set_watched("movie:tt4", true).unwrap();
     a.set_setting("hwdec", "0").unwrap();
     a.set_setting("stremio_auth", "SECRET").unwrap();
     a.set_setting("external_player", "rm -rf").unwrap();
     let json = a.export_json().unwrap();
-    assert!(!json.contains("SECRET") && !json.contains("/d/two.mp4") && !json.contains("rm -rf"));
+    assert!(!json.contains("SECRET") && !json.contains("/d/two.mp4") && !json.contains("/d/three.mp4") && !json.contains("rm -rf"));
 
     let b = Db::open(&dir.path().join("b.db")).unwrap();
     b.import_json(&json).unwrap();
@@ -231,4 +232,24 @@ fn export_import_round_trip_and_rejects() {
     let big = dir.path().join("big.json");
     std::fs::write(&big, vec![b' '; (16 << 20) + 1]).unwrap();
     assert!(c.import_file(&big).unwrap_err().to_string().contains("16 MiB"));
+}
+
+#[test]
+fn import_rejects_local_and_bad_magnet_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let row = |key: &str, source: &str| format!(r#"{{"key":"{key}","title":"T","source":"{source}","position":1,"duration":9,"updated_at":1}}"#);
+    let hash = "a".repeat(40);
+    let doc = format!(
+        r#"{{"format":"stremflix-rs-export","version":1,"progress":[{},{},{},{}]}}"#,
+        row("file:/etc/passwd", "/etc/passwd"),
+        row("movie:tt5", "magnet:?xt=urn:btih:nothex"),
+        row("movie:tt6", &format!("magnet:?xt=urn:btih:{hash}")),
+        row("movie:tt7", "https://x.example/v.mp4"),
+    );
+    let db = Db::open(&dir.path().join("e.db")).unwrap();
+    db.import_json(&doc).unwrap();
+    assert_eq!(db.progress("file:/etc/passwd").unwrap(), None);
+    assert_eq!(db.progress("movie:tt5").unwrap(), None);
+    assert!(db.progress("movie:tt6").unwrap().is_some());
+    assert!(db.progress("movie:tt7").unwrap().is_some());
 }

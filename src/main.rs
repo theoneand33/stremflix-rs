@@ -3074,6 +3074,7 @@ impl App {
                 Err(e) => report(&mut self.error, format!("exporting: {e:#}")),
             }
         }
+        ui.label(RichText::new("The export includes addon URLs, which can hold account tokens. Keep it private.").size(13.0).color(Color32::from_gray(170)));
         if form_row(ui, "Import data…:", &mut self.data_import, "/path/to/stremflix-rs-export.json", "Import", Some("Merges the file into your data; nothing is deleted"), false) {
             match self.db.import_file(std::path::Path::new(self.data_import.trim())) {
                 Ok(m) => self.data_msg = Some(format!("{m}. Restart the app to apply.")),

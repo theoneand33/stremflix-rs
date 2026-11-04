@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
-use crate::addon::{Manifest, MetaPreview, addon_base, parse_manifest, safe_http_url, valid_id};
+use crate::addon::{Manifest, MetaPreview, addon_base, parse_manifest, parse_magnet_hash, safe_http_url, valid_id};
 use serde_json::{Value, json};
 use crate::library::LibraryItem;
 
@@ -12,6 +12,11 @@ use crate::library::LibraryItem;
 const EXPORT_SETTINGS: [&str; 9] = ["autoplay_next", "hwdec", "sub_style", "sub_off", "torrent_cache", "torrent_profile", "default_speed", "alang", "slang"];
 const EXPORT_FORMAT: &str = "stremflix-rs-export";
 pub const MAX_IMPORT_BYTES: u64 = 16 << 20;
+
+/// A progress row is kept only if it resumes a web URL or a magnet with a real info hash, never a local path.
+fn resumable_source(key: &str, source: &str) -> bool {
+    !key.starts_with("file:") && (safe_http_url(source).is_some() || parse_magnet_hash(source).is_some())
+}
 
 pub struct Db {
     conn: Connection,
@@ -266,11 +271,12 @@ impl Db {
         let saved = rows("SELECT key, title, kind, poster, saved_at FROM saved_titles ORDER BY saved_at, rowid", |r| {
             Ok(json!({"key": r.get::<_, String>(0)?, "title": r.get::<_, String>(1)?, "kind": r.get::<_, String>(2)?, "poster": r.get::<_, Option<String>>(3)?, "saved_at": r.get::<_, i64>(4)?}))
         })?;
-        // Rows resuming a download are left out: their source is a local file path.
-        let progress = rows("SELECT key, title, source, position, duration, poster, updated_at FROM progress WHERE source NOT IN (SELECT path FROM downloads) ORDER BY updated_at", |r| {
+        // Same rule as import: local-file rows (download resume points, `file:` keys) are left out.
+        let mut progress = rows("SELECT key, title, source, position, duration, poster, updated_at FROM progress WHERE source NOT IN (SELECT path FROM downloads) ORDER BY updated_at", |r| {
             Ok(json!({"key": r.get::<_, String>(0)?, "title": r.get::<_, String>(1)?, "source": r.get::<_, String>(2)?, "position": r.get::<_, f64>(3)?,
                 "duration": r.get::<_, f64>(4)?, "poster": r.get::<_, Option<String>>(5)?, "updated_at": r.get::<_, i64>(6)?}))
         })?;
+        progress.retain(|p| resumable_source(p["key"].as_str().unwrap_or_default(), p["source"].as_str().unwrap_or_default()));
         let watched = rows("SELECT key, title, poster, episodes, watched_at FROM watched ORDER BY watched_at", |r| {
             Ok(json!({"key": r.get::<_, String>(0)?, "title": r.get::<_, String>(1)?, "poster": r.get::<_, Option<String>>(2)?, "episodes": r.get::<_, u32>(3)?, "watched_at": r.get::<_, i64>(4)?}))
         })?;
@@ -320,8 +326,7 @@ impl Db {
             for p in list("progress") {
                 let (Some(key), Some(title), Some(source)) = (text(p, "key"), text(p, "title"), text(p, "source")) else { continue };
                 let (pos, dur) = (p["position"].as_f64().unwrap_or(-1.0), p["duration"].as_f64().unwrap_or(-1.0));
-                let source_ok = safe_http_url(&source).is_some() || source.starts_with("magnet:") || key.starts_with("file:");
-                if valid_id(&key) && source_ok && pos.is_finite() && dur.is_finite() && pos >= 0.0 && dur >= 0.0 {
+                if valid_id(&key) && resumable_source(&key, &source) && pos.is_finite() && dur.is_finite() && pos >= 0.0 && dur >= 0.0 {
                     self.conn.execute(
                         "INSERT INTO progress (key, title, source, position, duration, poster, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                          ON CONFLICT(key) DO UPDATE SET title = excluded.title, source = excluded.source, position = excluded.position,
