@@ -141,9 +141,14 @@ impl LibKind {
     }
 }
 
-/// Saved titles of `kind`, newest first unless sorted by title (case-insensitive).
-fn saved_view(items: &[SavedTitle], kind: LibKind, sort: LibSort) -> Vec<&SavedTitle> {
-    let mut v: Vec<&SavedTitle> = items.iter().filter(|t| kind.matches(&t.kind)).collect();
+/// Case-insensitive substring match; a blank query matches everything.
+fn title_matches(title: &str, query: &str) -> bool {
+    title.to_lowercase().contains(&query.trim().to_lowercase())
+}
+
+/// Saved titles of `kind` matching `query`, newest first unless sorted by title (case-insensitive).
+fn saved_view<'a>(items: &'a [SavedTitle], kind: LibKind, sort: LibSort, query: &str) -> Vec<&'a SavedTitle> {
+    let mut v: Vec<&SavedTitle> = items.iter().filter(|t| kind.matches(&t.kind) && title_matches(&t.title, query)).collect();
     if sort == LibSort::Title {
         v.sort_by_key(|t| t.title.to_lowercase());
     }
@@ -902,6 +907,8 @@ struct App {
     downloading: Vec<Download>,
     lib_sort: LibSort,
     lib_kind: LibKind,
+    /// Title filter of the Library tab.
+    lib_query: String,
     recent: Vec<Progress>,
     watched: Vec<Watched>,
     /// Keys (`<type>:<id>`) of movies and episodes marked watched.
@@ -997,6 +1004,7 @@ impl App {
             downloading: Vec::new(),
             lib_sort: LibSort::Added,
             lib_kind: LibKind::All,
+            lib_query: String::new(),
             recent: db.recent_progress(20)?,
             watched: db.watched(50)?,
             watched_keys: db.watched_keys()?,
@@ -3626,13 +3634,17 @@ impl App {
                     ui.selectable_value(&mut self.lib_kind, k, k.label());
                 }
             });
+            let edit = ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Filter by title").desired_width(180.0));
+            if (edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape))) || (!self.lib_query.is_empty() && small_button(ui, "x").on_hover_text("Clear filter").clicked()) {
+                self.lib_query.clear();
+            }
         });
         ui.add_space(4.0);
-        let items: Vec<MetaPreview> = saved_view(&self.saved, self.lib_kind, self.lib_sort).into_iter().filter_map(SavedTitle::preview).collect();
+        let items: Vec<MetaPreview> = saved_view(&self.saved, self.lib_kind, self.lib_sort, &self.lib_query).into_iter().filter_map(SavedTitle::preview).collect();
         if self.saved.is_empty() {
             ui.label(RichText::new("Nothing saved yet. Open a title and choose \"Add to library\".").color(Color32::from_gray(170)));
         } else if items.is_empty() {
-            ui.label(RichText::new("No saved titles of this type.").color(Color32::from_gray(170)));
+            ui.label(RichText::new("No saved titles match.").color(Color32::from_gray(170)));
         }
         self.ui_cards(ui, "saved", &items, &mut want, &mut open, &mut quick);
         for u in want {
@@ -3705,7 +3717,7 @@ impl App {
         }
         ui.separator();
         let mut play = None;
-        for it in &self.library {
+        for it in self.library.iter().filter(|it| title_matches(&it.title, &self.lib_query)) {
             ui.horizontal(|ui| {
                 if primary_button(ui, &format!("Play {}", it.title)).clicked() {
                     play = Some(it.clone());
@@ -4159,13 +4171,24 @@ mod tests {
         // Newest first, as stored.
         let items = [t("series:tt2", "beta"), t("movie:tt3", "Alpha"), t("movie:tt1", "gamma")];
         let keys = |v: Vec<&SavedTitle>| v.into_iter().map(|t| t.key.clone()).collect::<Vec<_>>();
-        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Added)), ["series:tt2", "movie:tt3", "movie:tt1"]);
-        assert_eq!(keys(saved_view(&items, LibKind::Movie, LibSort::Added)), ["movie:tt3", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Added, "")), ["series:tt2", "movie:tt3", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::Movie, LibSort::Added, "")), ["movie:tt3", "movie:tt1"]);
         // Case-insensitive title order, and the filter holds while sorting.
-        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Title)), ["movie:tt3", "series:tt2", "movie:tt1"]);
-        assert_eq!(keys(saved_view(&items, LibKind::Series, LibSort::Title)), ["series:tt2"]);
-        assert!(saved_view(&items, LibKind::Series, LibSort::Added).len() == 1);
-        assert_eq!(saved_view(&[], LibKind::All, LibSort::Title).len(), 0);
+        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Title, "")), ["movie:tt3", "series:tt2", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::Series, LibSort::Title, "")), ["series:tt2"]);
+        assert!(saved_view(&items, LibKind::Series, LibSort::Added, "").len() == 1);
+        assert_eq!(saved_view(&[], LibKind::All, LibSort::Title, "").len(), 0);
+        // Query combines with kind and sort.
+        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Title, " A ")), ["movie:tt3", "series:tt2", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::Movie, LibSort::Added, "ALPH")), ["movie:tt3"]);
+    }
+
+    #[test]
+    fn title_match_folds_case() {
+        assert!(title_matches("Amélie", "AMÉL"));
+        assert!(title_matches("Straße", "straße"));
+        assert!(title_matches("anything", "  "));
+        assert!(!title_matches("Alpha", "beta"));
     }
 
     #[test]
