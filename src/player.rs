@@ -613,9 +613,10 @@ mod tests {
         for f in ["Movie.mkv", "movie.SRT", "Movie.en.ass", "Movie.pt-BR.vtt", "Movie2.srt", "Other.srt", "Movie.txt"] {
             std::fs::write(dir.path().join(f), "").unwrap();
         }
-        let got: Vec<_> = sidecar_subs(&dir.path().join("Movie.mkv")).into_iter().map(|(p, l)| (p.rsplit('/').next().unwrap().to_string(), l)).collect();
+        let got: Vec<_> = sidecar_subs(&dir.path().join("Movie.mkv")).into_iter().map(|(p, l)| (Path::new(&p).file_name().unwrap().to_string_lossy().into_owned(), l)).collect();
         assert_eq!(got, [("Movie.en.ass", "en"), ("Movie.pt-BR.vtt", ""), ("movie.SRT", "")].map(|(p, l)| (p.to_string(), l.to_string())));
         assert!(sidecar_subs(Path::new("https://x/Movie.mkv")).is_empty());
+        assert!(sidecar_subs(&dir.path().join("Missing.mkv")).is_empty());
     }
 
     #[test]
