@@ -130,7 +130,7 @@ const FORMAT_INT64: c_int = 4;
 const FORMAT_DOUBLE: c_int = 5;
 
 /// Observed properties, in `reply_userdata` order.
-const PROPS: [(&str, c_int); 11] = [
+const PROPS: [(&str, c_int); 12] = [
     ("time-pos", FORMAT_DOUBLE),
     ("duration", FORMAT_DOUBLE),
     ("pause", FORMAT_FLAG),
@@ -142,6 +142,7 @@ const PROPS: [(&str, c_int); 11] = [
     ("track-list", FORMAT_STRING),
     ("speed", FORMAT_DOUBLE),
     ("seeking", FORMAT_FLAG),
+    ("demuxer-cache-time", FORMAT_DOUBLE),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -163,6 +164,8 @@ pub struct State {
     pub muted: bool,
     pub buffering: bool,
     pub seeking: bool,
+    /// Absolute time in seconds the demuxer cache reaches; 0 until known.
+    pub cached_to: f64,
     /// Display size of the video in pixels; 0 until known.
     pub video: [usize; 2],
     pub tracks: Vec<Track>,
@@ -530,6 +533,7 @@ impl Player {
                 8 => s.tracks = parse_tracks(&CStr::from_ptr(*(p.data as *const *const c_char)).to_string_lossy()),
                 9 => s.speed = f(),
                 10 => s.seeking = flag(),
+                11 => s.cached_to = f(),
                 _ => {}
             }
         }
