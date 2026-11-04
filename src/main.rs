@@ -72,6 +72,8 @@ fn open_external(command: &str, url: &str) -> anyhow::Result<()> {
 
 /// Addon subtitles as (url, lang).
 type Subs = Vec<(String, String)>;
+/// Media file `(index, name, size)` of a torrent.
+type MediaFile = (usize, String, u64);
 
 /// Order of the saved-titles list in the Library tab.
 #[derive(PartialEq, Clone, Copy)]
@@ -158,6 +160,8 @@ enum Msg {
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs, torrent id, the `nav` it was requested at
     Play(String, String, String, String, Subs, Option<usize>, u64),
+    /// key, title, magnet, subtitle URLs, the media files `(index, name, size)` to choose from, the `nav` it was requested at
+    PickFile(String, String, String, Subs, Vec<MediaFile>, u64),
     /// progress key, poster URL found for a Continue Watching entry
     RecentPoster(String, String),
     /// Stremio storage that was read, and what it holds.
@@ -893,6 +897,8 @@ struct App {
     seek_steps: [u32; 2],
     /// Last error, shown in a dismissible red line until cleared.
     error: Option<String>,
+    /// A multi-file torrent waiting for the user to pick a file: key, title, magnet, subtitles, files, selected index.
+    file_pick: Option<(String, String, String, Subs, Vec<MediaFile>, usize)>,
     /// Release page of a newer build, shown until dismissed.
     update: Option<String>,
     /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
@@ -973,6 +979,7 @@ impl App {
             default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
             seek_steps: [seek_step(db.setting("seek_step")?, 10), seek_step(db.setting("seek_step_shift")?, 30)],
             error: None,
+            file_pick: None,
             update: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
@@ -1044,6 +1051,7 @@ impl App {
 
     /// Resolve `source` (http URL, magnet, or local path) and start playback.
     fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
+        self.clear_file_pick();
         self.nav += 1;
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
@@ -1056,7 +1064,14 @@ impl App {
         self.spawn(ctx, async move {
             let (url, id) = match torrent {
                 true => {
-                    let (url, id) = start.await?.stream_url(&source, None, false).await?;
+                    let engine = start.await?;
+                    if source.starts_with("magnet:") {
+                        let files = engine.media_choices(&source).await?;
+                        if !files.is_empty() {
+                            return Ok(Msg::PickFile(key, title, source, subs, files, nav));
+                        }
+                    }
+                    let (url, id) = engine.stream_url(&source, None, false).await?;
                     (url, Some(id))
                 }
                 false => (source.clone(), None),
@@ -1135,6 +1150,13 @@ impl App {
         if let Some(engine) = self.torrent.get() {
             // shortcut: blocks the UI up to 2 s while librqbit deletes; fine for a few torrents at a time.
             let _ = self.rt.block_on(tokio::time::timeout(Duration::from_secs(2), engine.release_except(keep)));
+        }
+    }
+
+    /// Drop a pending file picker and stop its torrent, which nothing else will play.
+    fn clear_file_pick(&mut self) {
+        if self.file_pick.take().is_some() {
+            self.release_torrents(self.player.as_ref().and_then(|p| p.torrent));
         }
     }
 
@@ -1407,6 +1429,14 @@ impl App {
             }
             Msg::Poster(url, bytes) => {
                 self.posters.insert(url, Some(bytes.into()));
+            }
+            Msg::PickFile(key, title, source, subs, files, nav) => {
+                if nav == self.nav {
+                    let first = files[0].0;
+                    self.file_pick = Some((key, title, source, subs, files, first));
+                } else {
+                    self.release_torrents(self.player.as_ref().and_then(|p| p.torrent));
+                }
             }
             Msg::Play(key, title, source, url, subs, torrent, nav) => {
                 if nav != self.nav {
@@ -1842,6 +1872,7 @@ impl App {
         }
         let client = self.client.clone();
         let addons = self.addons_for("meta", &meta.kind, &meta.id);
+        self.clear_file_pick();
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -1881,6 +1912,7 @@ impl App {
         match link {
             DeepLink::Addon(url) => {
                 // Invalidate in-flight play/streams/episodes replies so they can't act over the Addons tab.
+                self.clear_file_pick();
                 (self.pending, self.nav) = (None, self.nav + 1);
                 (self.tab, self.addon_url) = (Tab::Addons, url.into());
             }
@@ -1919,6 +1951,7 @@ impl App {
         let stream_addons = self.addons_for("stream", &meta.kind, &id);
         let names: Vec<String> = stream_addons.iter().map(|u| self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default()).collect();
         let sub_addons = self.addons_for("subtitles", &meta.kind, &id);
+        self.clear_file_pick();
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -3649,6 +3682,24 @@ impl eframe::App for App {
                     }
                 });
             });
+            let mut chosen = None;
+            if let Some((_, title, _, _, files, sel)) = &mut self.file_pick {
+                let mut open = true;
+                egui::Window::new(format!("Choose a file: {}", sanitize_text(title, 80))).open(&mut open).collapsible(false).show(&ctx, |ui| {
+                    for (i, name, len) in files.iter() {
+                        ui.radio_value(sel, *i, format!("{}  ({})", sanitize_text(name, 120), fmt_size(*len)));
+                    }
+                    if ui.button("Play").clicked() {
+                        chosen = Some(*sel);
+                    }
+                });
+                if !open {
+                    self.clear_file_pick();
+                }
+            }
+            if let (Some(idx), Some((key, title, source, subs, _, _))) = (chosen, self.file_pick.take()) {
+                self.play(&ctx, key, title, format!("{source}&so={idx}"), subs);
+            }
             if let Some(e) = self.error.clone() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("Error: {e}")).color(Color32::from_rgb(230, 90, 90)));
@@ -3673,6 +3724,7 @@ impl eframe::App for App {
                     (self.selected, self.details) = (None, None);
                     (self.episodes, self.episode) = (Vec::new(), None);
                     self.scroll_top = true;
+                    self.clear_file_pick();
                     self.nav += 1;
                 }
                 ui.add_space(6.0);
