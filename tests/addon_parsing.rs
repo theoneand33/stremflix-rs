@@ -168,6 +168,8 @@ fn meta_trailers() {
     let m = parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": "One", "trailers": [{"source": "aaaaaaaaaaa", "type": "Trailer"}, {"source": 5}]}}"#).unwrap();
     assert_eq!((m.trailers.len(), m.trailers[0].yt_id.as_deref()), (1, Some("aaaaaaaaaaa")), "legacy fallback");
     assert!(parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": "One", "trailers": "x"}}"#).unwrap().trailers.is_empty());
+    let m = parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": "One", "trailerStreams": [{"ytId": "bad"}], "trailers": [{"source": "aaaaaaaaaaa"}]}}"#).unwrap();
+    assert_eq!(m.trailers.len(), 1, "legacy used when every trailerStreams entry is invalid");
 }
 
 #[test]

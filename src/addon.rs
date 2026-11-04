@@ -13,7 +13,7 @@ const MAX_LONG_TEXT: usize = 4000;
 const MAX_ITEMS: usize = 500;
 /// Long-running series have well over `MAX_ITEMS` episodes.
 const MAX_VIDEOS: usize = 5000;
-/// Cap on genres, cast, directors and links of a meta.
+/// Cap on genres, cast, directors, links and trailers of a meta.
 const MAX_TAGS: usize = 30;
 /// Max options kept per catalog extra (e.g. genres).
 const MAX_OPTIONS: usize = 200;
@@ -598,17 +598,19 @@ pub fn parse_meta(body: &[u8]) -> Result<Meta> {
         opt_text(&mut v.released, 64);
         opt_url(&mut v.thumbnail);
     }
+    // Only the YouTube id is kept, so a trailer can never play an arbitrary URL or torrent.
+    let keep = |list: Vec<Stream>| -> Vec<Stream> {
+        list.into_iter()
+            .filter(|t| t.yt_id.as_deref().and_then(youtube_url).is_some())
+            .map(|t| Stream { title: t.title.map(|x| sanitize_text(&x, MAX_TEXT)).filter(|x| !x.is_empty()), yt_id: t.yt_id, ..Default::default() })
+            .take(MAX_TAGS)
+            .collect()
+    };
+    m.trailers = keep(std::mem::take(&mut m.trailers));
     if m.trailers.is_empty() {
-        m.trailers = m.legacy_trailers.iter().map(|t| Stream { yt_id: Some(t.source.clone()), title: t.kind.clone(), ..Default::default() }).collect();
+        m.trailers = keep(m.legacy_trailers.drain(..).map(|t| Stream { yt_id: Some(t.source), title: t.kind, ..Default::default() }).collect());
     }
     m.legacy_trailers.clear();
-    // Only the YouTube id is kept, so a trailer can never play an arbitrary URL or torrent.
-    m.trailers = std::mem::take(&mut m.trailers)
-        .into_iter()
-        .filter(|t| t.yt_id.as_deref().and_then(youtube_url).is_some())
-        .map(|t| Stream { title: t.title.map(|x| sanitize_text(&x, MAX_TEXT)).filter(|x| !x.is_empty()), yt_id: t.yt_id, ..Default::default() })
-        .take(MAX_TAGS)
-        .collect();
     Ok(m)
 }
 

@@ -572,11 +572,11 @@ fn binge_source(streams: &[Stream], group: &str) -> Option<String> {
     streams.iter().filter(|s| s.hints.binge_group.as_deref() == Some(group)).find_map(Stream::source)
 }
 
-/// The addon's `proxyHeaders` for playing `url`, only when it is that addon's own http(s) stream:
-/// never for torrents (`url` is then the local torrent server, not `source`) or local files.
 /// Progress-key prefix of trailers, which are never saved to history.
 const TRAILER: &str = "trailer:";
 
+/// The addon's `proxyHeaders` for playing `url`, only when it is that addon's own http(s) stream:
+/// never for torrents (`url` is then the local torrent server, not `source`) or local files.
 fn request_headers(streams: &[Stream], source: &str, url: &str) -> Vec<(String, String)> {
     let own = |s: &&Stream| matches!(s.target(), Some(PlayTarget::Http(u)) if u.as_str() == url);
     (source == url).then(|| streams.iter().find(own)).flatten().map(|s| s.hints.request_headers.clone()).unwrap_or_default()
