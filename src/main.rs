@@ -11,11 +11,11 @@ use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use anyhow::Context;
 use stremflix_rs::addon::{AddonClient, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
 use stremflix_rs::instance;
-use stremflix_rs::db::{Db, Download, Progress, SavedTitle, Watched};
+use stremflix_rs::db::{self, Db, Download, Progress, SavedTitle, Watched};
 use stremflix_rs::download;
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{GlProc, Player, SPEEDS, SUB_COLORS, SubStyle, hwdec_value, prefer_lang, valid_langs};
+use stremflix_rs::player::{GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{Profile, TorrentEngine};
 
@@ -72,6 +72,8 @@ fn open_external(command: &str, url: &str) -> anyhow::Result<()> {
 
 /// Addon subtitles as (url, lang).
 type Subs = Vec<(String, String)>;
+/// Media file `(index, name, size)` of a torrent.
+type MediaFile = (usize, String, u64);
 
 /// Order of the saved-titles list in the Library tab.
 #[derive(PartialEq, Clone, Copy)]
@@ -135,6 +137,8 @@ enum Autoplay {
 enum Msg {
     Error(String),
     Installed(String, Manifest, Option<String>),
+    /// Fresh manifest (or error) per installed addon URL, from "Check for updates".
+    UpdateCheck(Vec<(String, Result<Manifest, String>)>),
     /// Search title and results.
     Catalog(String, Vec<MetaPreview>),
     /// Row source (addon URL, type, catalog id) and its items or error.
@@ -156,6 +160,8 @@ enum Msg {
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs, torrent id, the `nav` it was requested at
     Play(String, String, String, String, Subs, Option<usize>, u64),
+    /// key, title, magnet, subtitle URLs, the media files `(index, name, size)` to choose from, the `nav` it was requested at
+    PickFile(String, String, String, Subs, Vec<MediaFile>, u64),
     /// progress key, poster URL found for a Continue Watching entry
     RecentPoster(String, String),
     /// Stremio storage that was read, and what it holds.
@@ -172,6 +178,8 @@ enum Msg {
     Link(String),
     /// A download that finished, or why it failed.
     Downloaded(Download, Result<(), String>),
+    /// A media key or OS media overlay button.
+    Media(souvlaki::MediaControlEvent),
 }
 
 /// One horizontal catalog row on the home screen.
@@ -444,6 +452,11 @@ fn hero_button(ui: &mut egui::Ui, text: &str, fill: [Color32; 2], text_color: Co
     pill_button(ui, text, 18.0, vec2(130.0, 46.0), fill, text_color)
 }
 
+/// An update must keep the installed addon's id, or it would replace a different addon.
+fn same_addon(installed: &Manifest, fetched: &Manifest) -> bool {
+    installed.id == fetched.id
+}
+
 /// Small secondary pill for toolbar actions (Uninstall, Clear, Stop …).
 fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     pill_button(ui, text, 14.0, vec2(0.0, 32.0), gray_fill(), Color32::WHITE)
@@ -700,6 +713,55 @@ where
     out
 }
 
+/// What an OS media control event does to the player.
+#[derive(Debug, PartialEq)]
+enum MediaAction {
+    Cmd(&'static [&'static str]),
+    /// Seconds, and whether relative.
+    Seek(f64, bool),
+    Next,
+    Stop,
+}
+
+fn media_action(e: souvlaki::MediaControlEvent) -> Option<MediaAction> {
+    use souvlaki::{MediaControlEvent as E, SeekDirection};
+    let sign = |d| if d == SeekDirection::Forward { 1.0 } else { -1.0 };
+    Some(match e {
+        E::Play => MediaAction::Cmd(&["set", "pause", "no"]),
+        E::Pause => MediaAction::Cmd(&["set", "pause", "yes"]),
+        E::Toggle => MediaAction::Cmd(&["cycle", "pause"]),
+        E::Next => MediaAction::Next,
+        E::Stop => MediaAction::Stop,
+        E::Seek(d) => MediaAction::Seek(10.0 * sign(d), true),
+        E::SeekBy(d, by) => MediaAction::Seek(by.as_secs_f64() * sign(d), true),
+        E::SetPosition(p) => MediaAction::Seek(p.0.as_secs_f64(), false),
+        _ => return None,
+    })
+}
+
+/// OS media controls, sending their events to the UI thread; `None` (logged) where unavailable.
+fn media_controls(cc: &eframe::CreationContext, tx: Sender<Msg>) -> Option<souvlaki::MediaControls> {
+    #[cfg(windows)]
+    let hwnd = match raw_window_handle::HasWindowHandle::window_handle(cc).map(|h| h.as_raw()) {
+        Ok(raw_window_handle::RawWindowHandle::Win32(h)) => Some(h.hwnd.get() as *mut std::ffi::c_void),
+        _ => {
+            eprintln!("media controls: no window handle");
+            return None;
+        }
+    };
+    #[cfg(not(windows))]
+    let hwnd = None;
+    let config = souvlaki::PlatformConfig { display_name: "Stremflix-rs", dbus_name: "stremflix_rs", hwnd };
+    let mut controls = souvlaki::MediaControls::new(config).inspect_err(|e| eprintln!("media controls: {e:?}")).ok()?;
+    let ctx = cc.egui_ctx.clone();
+    // shortcut: without a D-Bus session souvlaki's MPRIS thread panics (logged on stderr) and the app runs on without controls; pre-check the bus if that noise matters.
+    let attached = controls.attach(move |e| {
+        let _ = tx.send(Msg::Media(e));
+        ctx.request_repaint();
+    });
+    attached.inspect_err(|e| eprintln!("media controls: {e:?}")).ok().map(|()| controls)
+}
+
 struct Playing {
     player: Player,
     key: String,
@@ -726,6 +788,10 @@ struct Playing {
     after_hold: bool,
     /// The up-next card was dismissed.
     next_dismissed: bool,
+    /// Per-session picture scaling: aspect override index into `ASPECTS`, fill (crop) instead of fit, zoom in tenths.
+    aspect: usize,
+    fill: bool,
+    zoom: i32,
     /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
     awake: Option<Option<keepawake::KeepAwake>>,
 }
@@ -762,6 +828,9 @@ struct App {
     tab: Tab,
     addons: Vec<(String, Manifest)>,
     addon_url: String,
+    /// Last "Check for updates" result per addon URL.
+    addon_updates: Vec<(String, Result<Manifest, String>)>,
+    checking_updates: bool,
     /// Addon being reconfigured (old transport URL) and the pasted result URL.
     configuring: Option<(String, String)>,
     /// Addon catalog picked in the Addons tab (addon URL, type, catalog id) and its addons (`None` while loading).
@@ -789,6 +858,8 @@ struct App {
     show_streams: bool,
     magnet: String,
     search: String,
+    /// Recent submitted queries, newest first; persisted in settings as `search_history`.
+    search_history: Vec<String>,
     /// Poster bytes by URL; `None` while loading, empty if the fetch failed.
     posters: HashMap<String, Option<Arc<[u8]>>>,
     folder: String,
@@ -827,8 +898,12 @@ struct App {
     autoplay_next: bool,
     /// Playback speed every video starts at.
     default_speed: f64,
+    /// Arrow-key seek in seconds: plain and with Shift.
+    seek_steps: [u32; 2],
     /// Last error, shown in a dismissible red line until cleared.
     error: Option<String>,
+    /// A multi-file torrent waiting for the user to pick a file: key, title, magnet, subtitles, files, selected index.
+    file_pick: Option<(String, String, String, Subs, Vec<MediaFile>, usize)>,
     /// Release page of a newer build, shown until dismissed.
     update: Option<String>,
     /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
@@ -837,8 +912,12 @@ struct App {
     last_poll: Instant,
     /// GL function loader of eframe's context, for libmpv's OpenGL renderer.
     gl_proc: Option<GlProc>,
+    window: Geo,
     /// Video framebuffer, its texture (owned by egui once registered) and pixel size; reused across playbacks.
     video: Option<(glow::Framebuffer, glow::Texture, egui::TextureId, [usize; 2])>,
+    media: Option<souvlaki::MediaControls>,
+    /// Title, paused and duration (s) last published to the media controls.
+    media_shown: Option<(String, bool, u64)>,
 }
 
 fn data_dir() -> PathBuf {
@@ -875,6 +954,7 @@ fn fmt_time(s: f64) -> String {
 impl App {
     fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
         let db = Db::open(&data_dir.join("stremflix-rs.db"))?;
+        let search_history = db.setting("search_history")?.map(|s| db::decode_history(&s)).unwrap_or_default();
         download::clear_partial(&data_dir.join("downloads"));
         let (tx, rx) = channel();
         let mut app = Self {
@@ -902,7 +982,9 @@ impl App {
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
             default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
+            seek_steps: [seek_step(db.setting("seek_step")?, 10), seek_step(db.setting("seek_step_shift")?, 30)],
             error: None,
+            file_pick: None,
             update: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
@@ -914,6 +996,8 @@ impl App {
             rx,
             tab: Tab::Home,
             addon_url: String::new(),
+            addon_updates: Vec::new(),
+            checking_updates: false,
             configuring: None,
             browse: None,
             rows: Vec::new(),
@@ -931,12 +1015,16 @@ impl App {
             show_streams: false,
             magnet: String::new(),
             search: String::new(),
+            search_history,
             posters: HashMap::new(),
             player: None,
             pill: None,
             last_poll: Instant::now(),
             gl_proc: None,
+            window: Geo::default(),
             video: None,
+            media: None,
+            media_shown: None,
         };
         if app.addons.is_empty() {
             app.tab = Tab::Addons;
@@ -968,6 +1056,7 @@ impl App {
 
     /// Resolve `source` (http URL, magnet, or local path) and start playback.
     fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
+        self.clear_file_pick();
         self.nav += 1;
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
@@ -980,7 +1069,14 @@ impl App {
         self.spawn(ctx, async move {
             let (url, id) = match torrent {
                 true => {
-                    let (url, id) = start.await?.stream_url(&source, None, false).await?;
+                    let engine = start.await?;
+                    if source.starts_with("magnet:") {
+                        let files = engine.media_choices(&source).await?;
+                        if !files.is_empty() {
+                            return Ok(Msg::PickFile(key, title, source, subs, files, nav));
+                        }
+                    }
+                    let (url, id) = engine.stream_url(&source, None, false).await?;
                     (url, Some(id))
                 }
                 false => (source.clone(), None),
@@ -1062,6 +1158,13 @@ impl App {
         }
     }
 
+    /// Drop a pending file picker and stop its torrent, which nothing else will play.
+    fn clear_file_pick(&mut self) {
+        if self.file_pick.take().is_some() {
+            self.release_torrents(self.player.as_ref().and_then(|p| p.torrent));
+        }
+    }
+
     fn handle(&mut self, ctx: &egui::Context, msg: Msg) {
         match msg {
             Msg::Error(e) => report(&mut self.error, e),
@@ -1093,6 +1196,10 @@ impl App {
                 }
                 self.build_rows(ctx);
                 self.fetch_recent_posters(ctx);
+            }
+            Msg::UpdateCheck(res) => {
+                self.checking_updates = false;
+                self.addon_updates = res;
             }
             Msg::Catalog(name, items) => {
                 self.search_results = Some((name, items));
@@ -1298,6 +1405,7 @@ impl App {
                 }
             }
             Msg::Update(url) => self.update = url,
+            Msg::Media(e) => self.media_event(ctx, e),
             Msg::Downloaded(d, res) => {
                 self.downloading.retain(|x| x.path != d.path);
                 let res = match res.map_err(anyhow::Error::msg) {
@@ -1326,6 +1434,14 @@ impl App {
             }
             Msg::Poster(url, bytes) => {
                 self.posters.insert(url, Some(bytes.into()));
+            }
+            Msg::PickFile(key, title, source, subs, files, nav) => {
+                if nav == self.nav {
+                    let first = files[0].0;
+                    self.file_pick = Some((key, title, source, subs, files, first));
+                } else {
+                    self.release_torrents(self.player.as_ref().and_then(|p| p.torrent));
+                }
             }
             Msg::Play(key, title, source, url, subs, torrent, nav) => {
                 if nav != self.nav {
@@ -1371,7 +1487,7 @@ impl App {
                         if self.default_speed != 1.0 {
                             let _ = player.command(&["set", "speed", &self.default_speed.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, awake: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, aspect: 0, fill: false, zoom: 0, awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1412,7 +1528,11 @@ impl App {
     }
 
     fn set_watched(&mut self, key: &str, on: bool) {
-        match self.db.set_watched(key, on) {
+        self.set_watched_many(&[key.to_string()], on);
+    }
+
+    fn set_watched_many(&mut self, keys: &[String], on: bool) {
+        match self.db.set_watched_many(keys, on) {
             Ok(()) => {
                 self.watched_keys = self.db.watched_keys().unwrap_or_default();
                 self.watched = self.db.watched(50).unwrap_or_default();
@@ -1425,6 +1545,52 @@ impl App {
     fn stop_player(&mut self) {
         self.save_progress();
         self.player = None;
+    }
+
+    /// A media key or OS overlay button; ignored when nothing plays.
+    fn media_event(&mut self, ctx: &egui::Context, e: souvlaki::MediaControlEvent) {
+        let Some(p) = &mut self.player else { return };
+        let res = match media_action(e) {
+            Some(MediaAction::Cmd(args)) => p.player.command(args),
+            Some(MediaAction::Seek(to, relative)) => p.player.seek(to, relative),
+            Some(MediaAction::Next) => {
+                if self.playing_episode() {
+                    self.play_next(ctx);
+                }
+                return;
+            }
+            Some(MediaAction::Stop) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                self.stop_player();
+                return self.release_torrents(None);
+            }
+            None => return,
+        };
+        if let Err(e) = res {
+            report(&mut self.error, e);
+        }
+    }
+
+    /// Publish the title, duration and play state to the OS media controls when they change.
+    fn publish_media(&mut self) {
+        let Some(mc) = &mut self.media else { return };
+        let shown = self.player.as_ref().map(|p| (p.title.clone(), p.player.state.paused, p.player.state.dur as u64));
+        if shown == self.media_shown {
+            return;
+        }
+        // Errors are ignored: without a D-Bus session every call fails, and the failure was logged at startup.
+        // shortcut: the position is sent only with these changes, so a seek leaves the OS's interpolated position stale until the next pause/play.
+        let _ = match &shown {
+            None => mc.set_playback(souvlaki::MediaPlayback::Stopped),
+            Some((title, paused, dur)) => {
+                let duration = (*dur > 0).then(|| Duration::from_secs(*dur));
+                let _ = mc.set_metadata(souvlaki::MediaMetadata { title: Some(title), duration, ..Default::default() });
+                let pos = self.player.as_ref().map_or(0.0, |p| p.player.state.pos);
+                let progress = Duration::try_from_secs_f64(pos).ok().map(souvlaki::MediaPosition);
+                mc.set_playback(if *paused { souvlaki::MediaPlayback::Paused { progress } } else { souvlaki::MediaPlayback::Playing { progress } })
+            }
+        };
+        self.media_shown = shown;
     }
 
     fn poll_player(&mut self, ctx: &egui::Context) {
@@ -1526,11 +1692,24 @@ impl App {
         }
     }
 
+    fn remember_search(&mut self, query: &str) {
+        db::push_history(&mut self.search_history, query);
+        self.save_search_history();
+    }
+
+    fn save_search_history(&mut self) {
+        let r = if self.search_history.is_empty() { self.db.remove_setting("search_history") } else { self.db.set_setting("search_history", &db::encode_history(&self.search_history)) };
+        if let Err(e) = r {
+            report(&mut self.error, e);
+        }
+    }
+
     fn search(&mut self, ctx: &egui::Context) {
         let query = self.search.trim().to_string();
         if query.is_empty() {
             return;
         }
+        self.remember_search(&query);
         let targets: Vec<(String, String, String)> = self
             .addons
             .iter()
@@ -1698,6 +1877,7 @@ impl App {
         }
         let client = self.client.clone();
         let addons = self.addons_for("meta", &meta.kind, &meta.id);
+        self.clear_file_pick();
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -1737,6 +1917,7 @@ impl App {
         match link {
             DeepLink::Addon(url) => {
                 // Invalidate in-flight play/streams/episodes replies so they can't act over the Addons tab.
+                self.clear_file_pick();
                 (self.pending, self.nav) = (None, self.nav + 1);
                 (self.tab, self.addon_url) = (Tab::Addons, url.into());
             }
@@ -1775,6 +1956,7 @@ impl App {
         let stream_addons = self.addons_for("stream", &meta.kind, &id);
         let names: Vec<String> = stream_addons.iter().map(|u| self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default()).collect();
         let sub_addons = self.addons_for("subtitles", &meta.kind, &id);
+        self.clear_file_pick();
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -1849,6 +2031,7 @@ impl App {
         }
         let mut episode = None;
         let mut toggle: Option<(String, bool)> = None;
+        let mut bulk: Option<(Vec<String>, bool)> = None;
         let mut save = None;
         // Movies show their streams; a series shows them once an episode is picked.
         if let Some((m, streams, subs)) = &self.selected
@@ -1917,6 +2100,13 @@ impl App {
                         ui.selectable_value(&mut self.season, s, season_label(s));
                     }
                 });
+                for (scope, season) in [("season", Some(self.season)), ("series", None)] {
+                    let keys: Vec<String> = self.episodes.iter().filter(|v| season.is_none_or(|s| v.season == s)).map(|v| format!("{}:{}", meta.kind, v.id)).collect();
+                    let all = keys.iter().all(|k| self.watched_keys.contains(k));
+                    if small_button(ui, &format!("Mark {scope} {}", if all { "unwatched" } else { "watched" })).clicked() {
+                        bulk = Some((keys, !all));
+                    }
+                }
             });
             ui.add_space(8.0);
             for v in self.episodes.iter().filter(|v| v.season == self.season) {
@@ -2045,6 +2235,9 @@ impl App {
         }
         if let Some((k, on)) = toggle {
             self.set_watched(&k, on);
+        }
+        if let Some((keys, on)) = bulk {
+            self.set_watched_many(&keys, on);
         }
         if let Some(k) = remove {
             match self.db.remove_progress(&k) {
@@ -2382,7 +2575,8 @@ impl App {
         let [vw, vh] = p.player.state.video;
         if let (true, Some(gl)) = (vw > 0 && vh > 0, frame.gl().cloned()) {
             let fit = (rect.width() / vw as f32).min(rect.height() / vh as f32);
-            let vrect = egui::Rect::from_center_size(rect.center(), vec2(vw as f32, vh as f32) * fit);
+            // Fill renders into the whole window so panscan has something to crop.
+            let vrect = if p.fill { rect } else { egui::Rect::from_center_size(rect.center(), vec2(vw as f32, vh as f32) * fit) };
             let px = vrect.size() * ctx.pixels_per_point();
             let size = [(px.x as usize).max(1), (px.y as usize).max(1)];
             let video = match self.video {
@@ -2472,8 +2666,9 @@ impl App {
             // Space activates a focused popover control, so it must not also toggle pause.
             // A short Space press pauses on release; a hold is 2x speed, like the mouse.
             if (i.key_released(Space) && focused.is_none() && !long) || k(K) { cmd(&["cycle", "pause"]) }
-            if k(ArrowLeft) { seek = Some((-10.0, true)) }
-            if k(ArrowRight) { seek = Some((10.0, true)) }
+            let step = self.seek_steps[i.modifiers.shift as usize] as f64;
+            if k(ArrowLeft) { seek = Some((-step, true)) }
+            if k(ArrowRight) { seek = Some((step, true)) }
             if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]) }
             if k(M) { cmd(&["cycle", "mute"]) }
@@ -2649,6 +2844,12 @@ impl App {
                                     }
                                 }
                             });
+                            if kind == "audio" {
+                                style.audio_delay += stepper(ui, "Audio delay", &format!("{:+.1}s", style.audio_delay)) as f64 * 0.1;
+                                if style.audio_delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(ACCENT)).frame(false)).clicked() {
+                                    style.audio_delay = 0.0;
+                                }
+                            }
                             if kind == "sub" {
                                 menu_heading(ui, "Style");
                                 style.scale = (style.scale * 10.0).round() / 10.0 + stepper(ui, "Size", &format!("{:.1}x", style.scale)) as f64 * 0.1;
@@ -2701,6 +2902,27 @@ impl App {
                                 }
                             });
                             menu_heading(ui, "Video");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                for (i, (name, v)) in ASPECTS.iter().enumerate() {
+                                    if pill(ui, name, p.aspect == i, egui::Role::RadioButton).clicked() {
+                                        p.aspect = i;
+                                        cmd(&["set", "video-aspect-override", v]);
+                                    }
+                                }
+                            });
+                            if switch_row(ui, "Fill screen (crop)", &mut p.fill).changed() {
+                                cmd(&["set", "panscan", if p.fill { "1.0" } else { "0.0" }]);
+                            }
+                            let step = stepper(ui, "Zoom", &if p.zoom == 0 { "0.0".into() } else { format!("{:+.1}", p.zoom as f64 / 10.0) });
+                            if step != 0 {
+                                p.zoom = (p.zoom + step).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
+                                cmd(&["set", "video-zoom", &zoom_value(p.zoom)]);
+                            }
+                            if p.zoom != 0 && ui.add(egui::Button::new(RichText::new("Reset zoom").size(13.0).color(ACCENT)).frame(false)).clicked() {
+                                p.zoom = 0;
+                                cmd(&["set", "video-zoom", "0"]);
+                            }
                             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                                 cmd(&["set", "hwdec", hwdec_value(self.hwdec)]);
                                 if let Err(e) = self.db.set_setting("hwdec", if self.hwdec { "1" } else { "0" }) {
@@ -2832,7 +3054,25 @@ impl App {
                 Ok(Msg::Imported(imp))
             });
         }
+        if ui.add_enabled(!self.checking_updates && !self.addons.is_empty(), egui::Button::new(if self.checking_updates { "Checking..." } else { "Check for updates" })).clicked() {
+            self.checking_updates = true;
+            let (client, urls) = (self.client.clone(), self.addons.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>());
+            self.spawn(&ctx, async move {
+                let mut out = Vec::new();
+                // Four at a time keeps a long addon list from opening dozens of connections.
+                for chunk in urls.chunks(4) {
+                    let res = concurrently(chunk.to_vec(), |u| {
+                        let c = client.clone();
+                        async move { Ok((u.clone(), c.fetch_manifest(&u).await.map_err(|e| e.root_cause().to_string()))) }
+                    })
+                    .await;
+                    out.extend(res.into_iter().flatten());
+                }
+                Ok(Msg::UpdateCheck(out))
+            });
+        }
         ui.separator();
+        let mut update = None;
         let mut remove = None;
         let mut configure = None;
         let mut replace = None;
@@ -2860,6 +3100,23 @@ impl App {
                     remove = Some(url.clone());
                 }
             });
+            match self.addon_updates.iter().find(|(u, _)| u == url).map(|(_, r)| r) {
+                Some(Ok(new)) if !same_addon(m, new) => {
+                    ui.label(RichText::new("Addon id changed; not offered").weak());
+                }
+                Some(Ok(new)) if stremflix_rs::addon::is_newer(&new.version, &m.version) => {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Update available: {} \u{2192} {}", m.version, new.version));
+                        if small_button(ui, "Update").clicked() {
+                            update = Some((url.clone(), new.clone()));
+                        }
+                    });
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(format!("Unreachable: {e}")).weak());
+                }
+                _ => {}
+            }
             if m.behavior_hints.configuration_required {
                 ui.label(RichText::new("Needs configuration before use. Press Configure.").weak());
             }
@@ -2871,6 +3128,12 @@ impl App {
             {
                 replace = Some((old.clone(), pasted.trim().to_string()));
             }
+        }
+        if let Some((url, new)) = update
+            && self.addons.iter().any(|(u, m)| *u == url && same_addon(m, &new))
+        {
+            self.addon_updates.retain(|(u, _)| *u != url);
+            self.handle(&ctx, Msg::Installed(url, new, None));
         }
         if let Some((old, new)) = replace {
             let client = self.client.clone();
@@ -3162,6 +3425,14 @@ impl App {
             self.sub_style = style;
             save.push(("sub_style", style.encode()));
         }
+        ui.horizontal(|ui| {
+            for (i, key, label) in [(0, "seek_step", "Arrow-key seek"), (1, "seek_step_shift", "Shift + arrow seek")] {
+                ui.label(label);
+                if ui.add(egui::DragValue::new(&mut self.seek_steps[i]).range(SEEK_STEP_RANGE).suffix(" s")).changed() {
+                    save.push((key, self.seek_steps[i].to_string()));
+                }
+            }
+        });
         ui.add_space(16.0);
         ui.label(RichText::new("Languages").size(20.0).strong().family(bold()).color(Color32::WHITE));
         for (i, key, label) in [(0, "alang", "Audio:"), (1, "slang", "Subtitles:")] {
@@ -3304,6 +3575,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        ctx.input(|i| self.window.track(i.viewport()));
         // Load libmpv off the UI thread once the first frames are up: loading it earlier delayed them by ~140 ms.
         if ctx.cumulative_frame_nr() == 2 {
             std::thread::spawn(stremflix_rs::player::load_mpv);
@@ -3312,6 +3584,7 @@ impl eframe::App for App {
             self.handle(&ctx, msg);
         }
         self.poll_player(&ctx);
+        self.publish_media();
         ctx.request_repaint_after(Duration::from_millis(500));
         // A dropped .torrent file, or a magnet pasted with no text field focused, plays at once.
         // Window systems deliver dropped files only, not dropped text, so magnets come in by paste.
@@ -3371,8 +3644,69 @@ impl eframe::App for App {
                         self.tab = Tab::Home;
                         self.search(&ctx);
                     }
+                    // Recent searches under the empty, focused box. The popup stays up while the pointer is on it,
+                    // since pressing it takes focus from the field before the click lands.
+                    let id = ui.make_persistent_id("search_history");
+                    let over = ui.ctx().data(|d| d.get_temp::<egui::Rect>(id)).is_some_and(|p| ui.input(|i| i.pointer.hover_pos()).is_some_and(|h| p.contains(h)));
+                    if (r.has_focus() || over) && self.search.is_empty() && !self.search_history.is_empty() {
+                        let (mut pick, mut del, mut clear) = (None, None, false);
+                        let area = egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(pos2(pill.left() - 12.0, pill.bottom() + 12.0)).show(ui.ctx(), |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(220.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Recent searches").small().color(Color32::from_gray(150)));
+                                    if ui.small_button("Clear").clicked() {
+                                        clear = true;
+                                    }
+                                });
+                                for (i, q) in self.search_history.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        if ui.add(egui::Button::new(q).frame(false)).clicked() {
+                                            pick = Some(q.clone());
+                                        }
+                                        if ui.add(egui::Button::new(icons::X).frame(false)).on_hover_text("Remove").clicked() {
+                                            del = Some(i);
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                        ui.ctx().data_mut(|d| d.insert_temp(id, area.response.rect));
+                        if clear || del.is_some() {
+                            match del {
+                                Some(i) => drop(self.search_history.remove(i)),
+                                None => self.search_history.clear(),
+                            }
+                            self.save_search_history();
+                        }
+                        if let Some(q) = pick {
+                            self.search = q;
+                            self.tab = Tab::Home;
+                            self.search(&ctx);
+                        }
+                    } else {
+                        ui.ctx().data_mut(|d| d.remove::<egui::Rect>(id));
+                    }
                 });
             });
+            let mut chosen = None;
+            if let Some((_, title, _, _, files, sel)) = &mut self.file_pick {
+                let mut open = true;
+                egui::Window::new(format!("Choose a file: {}", sanitize_text(title, 80))).open(&mut open).collapsible(false).show(&ctx, |ui| {
+                    for (i, name, len) in files.iter() {
+                        ui.radio_value(sel, *i, format!("{}  ({})", sanitize_text(name, 120), fmt_size(*len)));
+                    }
+                    if ui.button("Play").clicked() {
+                        chosen = Some(*sel);
+                    }
+                });
+                if !open {
+                    self.clear_file_pick();
+                }
+            }
+            if let (Some(idx), Some((key, title, source, subs, _, _))) = (chosen, self.file_pick.take()) {
+                self.play(&ctx, key, title, format!("{source}&so={idx}"), subs);
+            }
             if let Some(e) = self.error.clone() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("Error: {e}")).color(Color32::from_rgb(230, 90, 90)));
@@ -3397,6 +3731,7 @@ impl eframe::App for App {
                     (self.selected, self.details) = (None, None);
                     (self.episodes, self.episode) = (Vec::new(), None);
                     self.scroll_top = true;
+                    self.clear_file_pick();
                     self.nav += 1;
                 }
                 ui.add_space(6.0);
@@ -3412,7 +3747,65 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
+        let _ = self.db.set_setting("window", &self.window.to_string());
         self.stop_player();
+    }
+}
+
+/// Window size/position restored on launch. Default is a maximized 1000x700 window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Geo {
+    size: [f32; 2],
+    pos: Option<[f32; 2]>,
+    maximized: bool,
+}
+
+impl Default for Geo {
+    fn default() -> Self {
+        Self { size: [1000.0, 700.0], pos: None, maximized: true }
+    }
+}
+
+impl std::fmt::Display for Geo {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{},{},{}", self.size[0], self.size[1], u8::from(self.maximized))?;
+        self.pos.map_or(Ok(()), |p| write!(f, ",{},{}", p[0], p[1]))
+    }
+}
+
+impl std::str::FromStr for Geo {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        let n: Vec<f32> = s.split(',').map(|v| v.parse().map_err(|_| ())).collect::<Result<_, _>>()?;
+        if !n.iter().all(|v| v.is_finite()) || !matches!(n.len(), 3 | 5) || !(200.0..=16384.0).contains(&n[0]) || !(150.0..=16384.0).contains(&n[1]) {
+            return Err(());
+        }
+        // Off-screen positions (e.g. Windows' -32000 minimized spot) drop the position, keep the size.
+        let pos = (n.len() == 5 && n[3].abs() <= 10000.0 && n[4].abs() <= 10000.0).then(|| [n[3], n[4]]);
+        Ok(Self { size: [n[0], n[1]], pos, maximized: n[2] != 0.0 })
+    }
+}
+
+impl Geo {
+    /// Fullscreen is transient and a maximized rect is not the restore size, so those keep the last normal rect.
+    fn track(&mut self, vp: &egui::ViewportInfo) {
+        if vp.minimized == Some(true) || vp.fullscreen == Some(true) {
+            return;
+        }
+        // Unknown (None) keeps the last known state.
+        if let Some(m) = vp.maximized {
+            self.maximized = m;
+        }
+        if self.maximized {
+            return;
+        }
+        // Clamp to the ranges from_str accepts, or one bad field would discard the whole record on next launch.
+        if let Some(r) = vp.inner_rect {
+            self.size = [r.width().clamp(200.0, 16384.0), r.height().clamp(150.0, 16384.0)];
+        }
+        // shortcut: Wayland reports no outer position, so only size is restored there.
+        let pos = vp.outer_rect.map(|r| [r.min.x, r.min.y]).filter(|p| p.iter().all(|v| v.abs() <= 10000.0));
+        self.pos = pos.or(self.pos);
     }
 }
 
@@ -3442,10 +3835,13 @@ fn main() -> eframe::Result {
     }
     #[cfg(windows)]
     std::thread::spawn(instance::register_scheme);
+    app.window = app.db.setting("window").ok().flatten().and_then(|s| s.parse().ok()).unwrap_or_default();
+    let mut vp = egui::ViewportBuilder::default().with_inner_size(app.window.size).with_maximized(app.window.maximized);
+    if let Some(p) = app.window.pos {
+        vp = vp.with_position(p);
+    }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 700.0])
-            .with_maximized(true)
+        viewport: vp
             .with_title("Stremflix-rs")
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("bundled icon is a valid PNG")),
         ..Default::default()
@@ -3468,6 +3864,7 @@ fn main() -> eframe::Result {
         cc.egui_ctx.set_visuals_of(egui::Theme::Dark, v);
         cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| s.spacing.button_padding = vec2(14.0, 6.0));
         app.gl_proc = cc.get_proc_address.clone();
+        app.media = media_controls(cc, app.tx.clone());
         app.build_rows(&cc.egui_ctx);
         app.fetch_recent_posters(&cc.egui_ctx);
         app.sync_account(&cc.egui_ctx);
@@ -3549,6 +3946,13 @@ mod mac_links {
     }
 }
 
+const SEEK_STEP_RANGE: std::ops::RangeInclusive<u32> = 1..=600;
+
+/// Saved seek step in seconds; a missing, unparsable or out-of-range value falls back to `default`.
+fn seek_step(v: Option<String>, default: u32) -> u32 {
+    v.and_then(|v| v.parse().ok()).filter(|v| SEEK_STEP_RANGE.contains(v)).unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3559,6 +3963,29 @@ mod tests {
         assert_eq!(buffered_frac(10.0, 0.0, 100.0), 0.1);
         assert_eq!(buffered_frac(10.0, 500.0, 100.0), 1.0);
         assert_eq!(buffered_frac(10.0, 50.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn geo_round_trips_and_rejects_junk() {
+        let g = Geo { size: [800.0, 600.0], pos: Some([-10.0, 20.0]), maximized: false };
+        assert_eq!(g.to_string().parse(), Ok(g));
+        assert_eq!(Geo::default().to_string().parse(), Ok(Geo::default()));
+        assert!("1,2,3".parse::<Geo>().is_err() && "x".parse::<Geo>().is_err() && "800,600,0,1".parse::<Geo>().is_err());
+        assert!("20000,600,0".parse::<Geo>().is_err() && "800,20000,0".parse::<Geo>().is_err());
+        assert_eq!("800,600,0,-32000,-32000".parse(), Ok(Geo { size: [800.0, 600.0], pos: None, maximized: false }));
+    }
+
+    #[test]
+    fn geo_track_keeps_state_and_stays_parseable() {
+        let r = |w, h| egui::Rect::from_min_size(egui::pos2(50_000.0, 5.0), egui::vec2(w, h));
+        let vp = |maximized, fullscreen, w, h| egui::ViewportInfo { maximized, fullscreen, inner_rect: Some(r(w, h)), outer_rect: Some(r(w, h)), ..Default::default() };
+        let mut g = Geo { maximized: true, ..Default::default() };
+        g.track(&vp(None, Some(true), 1920.0, 1080.0));
+        g.track(&vp(None, None, 1920.0, 1080.0));
+        assert!(g.maximized && g.size == [1000.0, 700.0]);
+        g.track(&vp(Some(false), None, 10.0, 99999.0));
+        assert!(!g.maximized && g.size == [200.0, 16384.0] && g.pos.is_none());
+        assert_eq!(g.to_string().parse(), Ok(g));
     }
 
     #[test]
@@ -3579,6 +4006,22 @@ mod tests {
         assert_eq!(keys(saved_view(&items, LibKind::Series, LibSort::Title)), ["series:tt2"]);
         assert!(saved_view(&items, LibKind::Series, LibSort::Added).len() == 1);
         assert_eq!(saved_view(&[], LibKind::All, LibSort::Title).len(), 0);
+    }
+
+    #[test]
+    fn media_events_map_to_player_actions() {
+        use souvlaki::{MediaControlEvent as E, MediaPosition, SeekDirection::*};
+        let s = Duration::from_secs;
+        assert_eq!(media_action(E::Toggle), Some(MediaAction::Cmd(&["cycle", "pause"])));
+        assert_eq!(media_action(E::Play), Some(MediaAction::Cmd(&["set", "pause", "no"])));
+        assert_eq!(media_action(E::Pause), Some(MediaAction::Cmd(&["set", "pause", "yes"])));
+        assert_eq!(media_action(E::Next), Some(MediaAction::Next));
+        assert_eq!(media_action(E::Stop), Some(MediaAction::Stop));
+        assert_eq!(media_action(E::Seek(Backward)), Some(MediaAction::Seek(-10.0, true)));
+        assert_eq!(media_action(E::SeekBy(Forward, s(30))), Some(MediaAction::Seek(30.0, true)));
+        assert_eq!(media_action(E::SetPosition(MediaPosition(s(95)))), Some(MediaAction::Seek(95.0, false)));
+        assert_eq!(media_action(E::Previous), None);
+        assert_eq!(media_action(E::Quit), None);
     }
 
     #[test]
@@ -3736,6 +4179,30 @@ mod tests {
     }
 
     #[test]
+    fn version_compare() {
+        use stremflix_rs::addon::is_newer;
+        assert!(is_newer("1.10.0", "1.9.9"));
+        assert!(is_newer("2", "1.9"));
+        assert!(!is_newer("1.0", "1.0.0"));
+        assert!(!is_newer("1.0.0", "1.0.1"));
+        assert!(is_newer("v1.1.0", "1.0.0"));
+        assert!(!is_newer("1.0.0-beta", "1.0.0"), "same core, suffix only");
+        assert!(is_newer("1.1.0-beta", "1.0.0"));
+        assert!(!is_newer("1.0.0", "1.0.0-beta"));
+        assert!(is_newer("1.0.1+build5", "1.0.0"));
+        assert!(!is_newer("1.0.0-beta", "1.0.0-beta"));
+        assert!(!is_newer("nightly", "1.0.0"), "non-numeric is never offered");
+        assert!(!is_newer("1.0.0", "nightly"));
+    }
+
+    #[test]
+    fn update_keeps_addon_id() {
+        let m = |id: &str| stremflix_rs::addon::parse_manifest(format!(r#"{{"id":"{id}","version":"1","name":"A","resources":["stream"],"types":["movie"]}}"#).as_bytes()).unwrap();
+        assert!(same_addon(&m("a"), &m("a")));
+        assert!(!same_addon(&m("a"), &m("b")));
+    }
+
+    #[test]
     fn reinstall_keeps_addon_priority() {
         let (_dir, mut app) = test_app();
         let ctx = egui::Context::default();
@@ -3799,6 +4266,14 @@ mod tests {
         assert_eq!(command_words("  mpv   --fs "), ["mpv", "--fs"]);
         assert_eq!(command_words(r#"a "" b"#), ["a", "", "b"]);
         assert!(command_words("   ").is_empty());
+    }
+
+    #[test]
+    fn seek_step_validates() {
+        assert_eq!(seek_step(Some("15".into()), 10), 15);
+        for bad in [None, Some("0".into()), Some("601".into()), Some("-5".into()), Some("x".into())] {
+            assert_eq!(seek_step(bad, 10), 10);
+        }
     }
 
     #[test]
