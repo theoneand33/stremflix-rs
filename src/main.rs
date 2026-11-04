@@ -800,6 +800,8 @@ struct App {
     hwdec: bool,
     /// Play the next episode when one ends.
     autoplay_next: bool,
+    /// Playback speed every video starts at.
+    default_speed: f64,
     /// Last error, shown in a dismissible red line until cleared.
     error: Option<String>,
     /// Release page of a newer build, shown until dismissed.
@@ -868,6 +870,7 @@ impl App {
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
+            default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
             error: None,
             update: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
@@ -1230,11 +1233,7 @@ impl App {
                 };
                 let setting = |k| self.db.setting(k).ok().flatten();
                 let lang = |k| setting(k).unwrap_or_default();
-                let subs_off = match setting("sub_off").as_deref() {
-                    Some("0") | Some("") => false, // explicit or legacy "on"
-                    Some(_) => true,
-                    None => lang("slang").is_empty(), // fresh install: off; legacy slang: on
-                };
+                let subs_off = self.subs_off();
                 let headers = self.selected.as_ref().map(|(_, streams, _)| request_headers(streams, &source, &url)).unwrap_or_default();
                 // Remember the episode's series (its key holds only the video id) and the stream's binge group
                 // (empty if none), so the series' play button and Continue Watching can find them later.
@@ -1248,6 +1247,9 @@ impl App {
                 match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], subs_off, &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
+                        if self.default_speed != 1.0 {
+                            let _ = player.command(&["set", "speed", &self.default_speed.to_string()]);
+                        }
                         let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
@@ -2828,6 +2830,16 @@ impl App {
         });
     }
 
+    /// Whether videos start with subtitles off.
+    fn subs_off(&self) -> bool {
+        let setting = |k| self.db.setting(k).ok().flatten();
+        match setting("sub_off").as_deref() {
+            Some("0") | Some("") => false, // explicit or legacy "on"
+            Some(_) => true,
+            None => setting("slang").unwrap_or_default().is_empty(), // fresh install: off; legacy slang: on
+        }
+    }
+
     /// Torrent engine and external player options; each is saved as soon as it changes.
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         let mut save: Vec<(&str, String)> = Vec::new();
@@ -2901,6 +2913,24 @@ impl App {
                 });
             });
             switch_row(ui, "Subtitle background box", &mut style.background);
+            style.delay += stepper(ui, "Subtitle delay", &format!("{:+.1}s", style.delay)) as f64 * 0.1;
+            if style.delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(ACCENT)).frame(false)).clicked() {
+                style.delay = 0.0;
+            }
+            let mut off = self.subs_off();
+            if switch_row(ui, "Subtitles off by default", &mut off).changed() {
+                save.push(("sub_off", if off { "1" } else { "0" }.into()));
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Default speed").size(15.0).color(Color32::from_gray(210)));
+                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                for sp in SPEEDS {
+                    if pill(ui, &format!("{sp}x"), self.default_speed == sp, egui::Role::RadioButton).clicked() {
+                        self.default_speed = sp;
+                        save.push(("default_speed", sp.to_string()));
+                    }
+                }
+            });
         });
         let style = style.clamped();
         if style != self.sub_style {
