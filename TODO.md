@@ -103,7 +103,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | UI translations (i18n) | P3 | M | |
 | Auto-install updates | P3 | M | Release builds already show a download link for a newer build; downloading and replacing the binary is still missing. |
 | Android, iOS, TV clients | P3 | XL | Out of scope for an egui desktop app. |
-| System media controls (MPRIS / SMTC / Now Playing) | P2 | M | Play/pause and now-playing from the OS or keyboard media keys. |
 | Tray icon and minimize-to-tray with background playback | P2 | M | |
 | Dark/light theme and accent customization | P2 | S | Dark only today. |
 | UI scale / zoom | P2 | S | HiDPI and TV-sized screens. |
