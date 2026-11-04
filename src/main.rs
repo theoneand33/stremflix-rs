@@ -1407,7 +1407,11 @@ impl App {
     }
 
     fn set_watched(&mut self, key: &str, on: bool) {
-        match self.db.set_watched(key, on) {
+        self.set_watched_many(&[key.to_string()], on);
+    }
+
+    fn set_watched_many(&mut self, keys: &[String], on: bool) {
+        match self.db.set_watched_many(keys, on) {
             Ok(()) => {
                 self.watched_keys = self.db.watched_keys().unwrap_or_default();
                 self.watched = self.db.watched(50).unwrap_or_default();
@@ -1844,6 +1848,7 @@ impl App {
         }
         let mut episode = None;
         let mut toggle: Option<(String, bool)> = None;
+        let mut bulk: Option<(Vec<String>, bool)> = None;
         let mut save = None;
         // Movies show their streams; a series shows them once an episode is picked.
         if let Some((m, streams, subs)) = &self.selected
@@ -1912,6 +1917,13 @@ impl App {
                         ui.selectable_value(&mut self.season, s, season_label(s));
                     }
                 });
+                for (scope, season) in [("season", Some(self.season)), ("series", None)] {
+                    let keys: Vec<String> = self.episodes.iter().filter(|v| season.is_none_or(|s| v.season == s)).map(|v| format!("{}:{}", meta.kind, v.id)).collect();
+                    let all = keys.iter().all(|k| self.watched_keys.contains(k));
+                    if small_button(ui, &format!("Mark {scope} {}", if all { "unwatched" } else { "watched" })).clicked() {
+                        bulk = Some((keys, !all));
+                    }
+                }
             });
             ui.add_space(8.0);
             for v in self.episodes.iter().filter(|v| v.season == self.season) {
@@ -2040,6 +2052,9 @@ impl App {
         }
         if let Some((k, on)) = toggle {
             self.set_watched(&k, on);
+        }
+        if let Some((keys, on)) = bulk {
+            self.set_watched_many(&keys, on);
         }
         if let Some(k) = remove {
             match self.db.remove_progress(&k) {

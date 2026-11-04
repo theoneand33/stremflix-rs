@@ -326,8 +326,17 @@ impl Db {
     /// Unwatching an episode also drops its imported series (`<series key>:...`) from Watch It Again,
     /// as its imported count no longer holds; watching one of its episodes lets a sync bring it back.
     pub fn set_watched(&self, key: &str, on: bool) -> Result<()> {
+        self.set_watched_many(&[key.to_string()], on)
+    }
+
+    /// [`Db::set_watched`] for many keys (a season or series of episodes), in one transaction.
+    pub fn set_watched_many(&self, keys: &[String], on: bool) -> Result<()> {
+        self.transaction(|| keys.iter().try_for_each(|k| self.set_watched_one(k, on)))
+    }
+
+    fn set_watched_one(&self, key: &str, on: bool) -> Result<()> {
         let k = format!("watched:{key}");
-        self.transaction(|| {
+        {
             if on {
                 self.set_setting(&k, "1")?;
                 self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
@@ -343,7 +352,7 @@ impl Db {
                 self.conn.execute(&format!("DELETE FROM watched WHERE {parent}"), [key])?;
             }
             Ok(())
-        })
+        }
     }
 
     /// Mark episodes `keys` watched, except ones unwatched here, and drop the imported bitfield setting
