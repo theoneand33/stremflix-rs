@@ -181,6 +181,10 @@ pub struct SubStyle {
     pub background: bool,
     /// Seconds; positive shows subtitles later.
     pub delay: f64,
+    /// Index into [`SUB_OUTLINES`].
+    pub outline: usize,
+    /// Percent from the top (mpv `sub-pos`); 100 is the bottom edge.
+    pub pos: f64,
 }
 
 /// Playback speeds offered in the player menu.
@@ -195,9 +199,12 @@ pub fn hwdec_value(on: bool) -> &'static str {
 /// Preset text colors: label and mpv `sub-color` value.
 pub const SUB_COLORS: [(&str, &str); 4] = [("White", "#FFFFFF"), ("Yellow", "#FFFF00"), ("Green", "#00FF00"), ("Cyan", "#00FFFF")];
 
+/// Preset outline colors: label and mpv `sub-border-color` value.
+pub const SUB_OUTLINES: [(&str, &str); 4] = [("Black", "#000000"), ("White", "#FFFFFF"), ("Blue", "#0000FF"), ("Red", "#FF0000")];
+
 impl Default for SubStyle {
     fn default() -> Self {
-        Self { scale: 1.0, color: 0, background: false, delay: 0.0 }
+        Self { scale: 1.0, color: 0, background: false, delay: 0.0, outline: 0, pos: 100.0 }
     }
 }
 
@@ -205,11 +212,11 @@ impl SubStyle {
     /// Forces every field into its valid range (also guards NaN and stale stored values).
     pub fn clamped(self) -> Self {
         let n = |v: f64, lo: f64, hi: f64, d: f64| if v.is_finite() { v.clamp(lo, hi) } else { d };
-        Self { scale: n(self.scale, 0.5, 3.0, 1.0), color: self.color.min(SUB_COLORS.len() - 1), background: self.background, delay: (n(self.delay, -60.0, 60.0, 0.0) * 10.0).round() / 10.0 }
+        Self { scale: n(self.scale, 0.5, 3.0, 1.0), color: self.color.min(SUB_COLORS.len() - 1), background: self.background, delay: (n(self.delay, -60.0, 60.0, 0.0) * 10.0).round() / 10.0, outline: self.outline.min(SUB_OUTLINES.len() - 1), pos: n(self.pos, 0.0, 100.0, 100.0).round() }
     }
 
     /// mpv properties to `set`. `sub-border-style` makes `sub-back-color` show as a box.
-    pub fn props(&self) -> [(&'static str, String); 5] {
+    pub fn props(&self) -> [(&'static str, String); 7] {
         let s = self.clamped();
         [
             ("sub-scale", format!("{:.2}", s.scale)),
@@ -217,18 +224,24 @@ impl SubStyle {
             ("sub-border-style", if s.background { "background-box" } else { "outline-and-shadow" }.into()),
             ("sub-back-color", "#99000000".into()),
             ("sub-delay", format!("{:.1}", s.delay)),
+            ("sub-border-color", SUB_OUTLINES[s.outline].1.into()),
+            ("sub-pos", format!("{}", s.pos)),
         ]
     }
 
     pub fn encode(&self) -> String {
-        format!("{},{},{},{}", self.scale, self.color, self.background as u8, self.delay)
+        format!("{},{},{},{},{},{}", self.scale, self.color, self.background as u8, self.delay, self.outline, self.pos)
     }
 
     /// Parses [`encode`](Self::encode) output; any malformed value falls back to the default.
     pub fn decode(s: &str) -> Self {
         let p: Vec<&str> = s.split(',').collect();
         let (Some(Ok(scale)), Some(Ok(color)), Some(bg), Some(Ok(delay))) = (p.first().map(|v| v.parse()), p.get(1).map(|v| v.parse()), p.get(2), p.get(3).map(|v| v.parse())) else { return Self::default() };
-        Self { scale, color, background: *bg == "1", delay }.clamped()
+        // Values stored before outline/position existed have 4 fields.
+        let d = Self::default();
+        let outline = p.get(4).and_then(|v| v.parse().ok()).unwrap_or(d.outline);
+        let pos = p.get(5).and_then(|v| v.parse().ok()).unwrap_or(d.pos);
+        Self { scale, color, background: *bg == "1", delay, outline, pos }.clamped()
     }
 }
 
@@ -641,9 +654,12 @@ mod tests {
 
     #[test]
     fn sub_style_clamps_and_roundtrips() {
-        let s = SubStyle { scale: 9.0, color: 99, background: true, delay: -500.0 }.clamped();
-        assert_eq!((s.scale, s.color, s.delay), (3.0, SUB_COLORS.len() - 1, -60.0));
+        let s = SubStyle { scale: 9.0, color: 99, background: true, delay: -500.0, outline: 99, pos: -5.0 }.clamped();
+        assert_eq!((s.scale, s.color, s.delay, s.outline, s.pos), (3.0, SUB_COLORS.len() - 1, -60.0, SUB_OUTLINES.len() - 1, 0.0));
         assert_eq!(SubStyle::decode(&s.encode()), s);
+        assert_eq!(SubStyle::decode("1.5,1,0,0.5"), SubStyle { scale: 1.5, color: 1, delay: 0.5, ..Default::default() });
+        let p = SubStyle { outline: 2, pos: 90.0, ..Default::default() }.props();
+        assert_eq!((p[5].1.as_str(), p[6].1.as_str()), ("#0000FF", "90"));
         assert_eq!(SubStyle::decode("junk"), SubStyle::default());
         assert_eq!(SubStyle::decode("NaN,0,0,0").scale, 1.0);
         assert_eq!(SubStyle { background: true, ..Default::default() }.props()[2].1, "background-box");

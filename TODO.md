@@ -40,7 +40,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Audio delay / A-V sync offset | P2 | S | Subtitle delay exists; `audio-delay` is the missing parallel. |
 | Remember volume, speed and audio track across sessions | P2 | S | Other settings persist; these three reset each title. |
 | Configurable seek steps (and Shift step) | P2 | S | Fixed at 10 s; Stremio exposes both. |
-| Subtitle outline color and position | P2 | S | Style has size, color and background only. |
 | Buffered range on the seek bar | P2 | S | Stremio shows buffered progress in grey. |
 | Mouse-wheel volume over the video | P2 | S | |
 | Video scaling / zoom / aspect-ratio override | P2 | S | mpv `video-zoom`, `video-aspect-override`, `panscan`. |
