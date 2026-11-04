@@ -970,6 +970,7 @@ impl App {
 
     /// Resolve `source` (http URL, magnet, or local path) and start playback.
     fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
+        self.clear_file_pick();
         self.nav += 1;
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
@@ -1068,6 +1069,13 @@ impl App {
         if let Some(engine) = self.torrent.get() {
             // shortcut: blocks the UI up to 2 s while librqbit deletes; fine for a few torrents at a time.
             let _ = self.rt.block_on(tokio::time::timeout(Duration::from_secs(2), engine.release_except(keep)));
+        }
+    }
+
+    /// Drop a pending file picker and stop its torrent, which nothing else will play.
+    fn clear_file_pick(&mut self) {
+        if self.file_pick.take().is_some() {
+            self.release_torrents(self.player.as_ref().and_then(|p| p.torrent));
         }
     }
 
@@ -1715,6 +1723,7 @@ impl App {
         }
         let client = self.client.clone();
         let addons = self.addons_for("meta", &meta.kind, &meta.id);
+        self.clear_file_pick();
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -1754,6 +1763,7 @@ impl App {
         match link {
             DeepLink::Addon(url) => {
                 // Invalidate in-flight play/streams/episodes replies so they can't act over the Addons tab.
+                self.clear_file_pick();
                 (self.pending, self.nav) = (None, self.nav + 1);
                 (self.tab, self.addon_url) = (Tab::Addons, url.into());
             }
@@ -1792,6 +1802,7 @@ impl App {
         let stream_addons = self.addons_for("stream", &meta.kind, &id);
         let names: Vec<String> = stream_addons.iter().map(|u| self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default()).collect();
         let sub_addons = self.addons_for("subtitles", &meta.kind, &id);
+        self.clear_file_pick();
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -3400,7 +3411,7 @@ impl eframe::App for App {
                     }
                 });
                 if !open {
-                    self.file_pick = None;
+                    self.clear_file_pick();
                 }
             }
             if let (Some(idx), Some((key, title, source, subs, _, _))) = (chosen, self.file_pick.take()) {
@@ -3430,6 +3441,7 @@ impl eframe::App for App {
                     (self.selected, self.details) = (None, None);
                     (self.episodes, self.episode) = (Vec::new(), None);
                     self.scroll_top = true;
+                    self.clear_file_pick();
                     self.nav += 1;
                 }
                 ui.add_space(6.0);

@@ -134,10 +134,10 @@ impl TorrentEngine {
 
     /// The media files of a torrent with no chosen file, largest first, when there is more than one to pick from.
     pub async fn media_choices(&self, magnet: &str) -> Result<Vec<(usize, String, u64)>> {
-        let (handle, chosen) = self.add(magnet, None).await?;
-        if chosen.is_some() {
+        if magnet_chooses_file(magnet) {
             return Ok(Vec::new());
         }
+        let (handle, _) = self.add(magnet, None).await?;
         let files: Vec<(String, u64)> = handle.with_metadata(|m| m.file_infos.iter().map(|f| (f.relative_filename.to_string_lossy().into_owned(), f.len)).collect())?;
         let media = media_files(&files);
         Ok(if media.len() > 1 { media } else { Vec::new() })
@@ -192,9 +192,22 @@ impl TorrentEngine {
     }
 }
 
+/// A magnet with any `so` key already names its file, so the picker is skipped. Any value counts,
+/// since the picker appends its own `so=` and a BEP 53 range (`so=1-3`) would duplicate it.
+pub fn magnet_chooses_file(magnet: &str) -> bool {
+    url::Url::parse(magnet).is_ok_and(|u| u.query_pairs().any(|(k, _)| k == "so"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn magnet_with_so_skips_picker() {
+        assert!(magnet_chooses_file("magnet:?xt=urn:btih:abc&so=2"));
+        assert!(magnet_chooses_file("magnet:?xt=urn:btih:abc&so=1-3"), "BEP 53 range also counts");
+        assert!(!magnet_chooses_file("magnet:?xt=urn:btih:abc&dn=x"));
+    }
 
     #[test]
     fn media_files_filters_and_sorts_largest_first() {
