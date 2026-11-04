@@ -76,9 +76,15 @@ impl Db {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        // Owner-only: it holds the Stremio account's auth key. SQLite gives `-wal`/`-shm` the same mode.
+        // Owner-only: it holds the Stremio account's auth key. New `-wal`/`-shm` files get the DB's mode;
+        // ones left by an older version are fixed here.
         #[cfg(unix)]
-        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        for ext in ["", "-wal", "-shm"] {
+            let f = PathBuf::from(format!("{}{ext}", path.display()));
+            if f.exists() {
+                std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+            }
+        }
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL; -- safe with WAL; a crash loses at most the last commit, and progress saves every second
@@ -232,6 +238,11 @@ impl Db {
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)", [key, value])?;
+        Ok(())
+    }
+
+    pub fn remove_setting(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
         Ok(())
     }
 

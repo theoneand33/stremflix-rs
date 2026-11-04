@@ -887,7 +887,7 @@ impl App {
             watched_keys: db.watched_keys()?,
             import_path: String::new(),
             login: Default::default(),
-            account: db.setting("stremio_auth")?.filter(|k| !k.is_empty()).map(|_| db.setting("stremio_email").ok().flatten().unwrap_or_default()),
+            account: db.setting("stremio_auth")?.filter(|k| !k.is_empty()).map(|_| db.setting("stremio_email").ok().flatten().filter(|e| !e.is_empty()).unwrap_or_else(|| "a Stremio account".into())),
             account_busy: false,
             addon_details: None,
             torrent_dir: db.setting("torrent_dir")?.unwrap_or_default(),
@@ -3011,7 +3011,7 @@ impl App {
                 }
                 if small_button(ui, "Sign out").clicked() {
                     let key = self.db.setting("stremio_auth").ok().flatten().unwrap_or_default();
-                    let cleared = self.db.transaction(|| ["stremio_auth", "stremio_email"].into_iter().try_for_each(|k| self.db.set_setting(k, "")));
+                    let cleared = self.db.transaction(|| ["stremio_auth", "stremio_email"].into_iter().try_for_each(|k| self.db.remove_setting(k)));
                     match cleared {
                         Ok(()) => {
                             // A running sync for this key is dropped when it ends.
