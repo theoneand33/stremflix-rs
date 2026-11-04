@@ -59,6 +59,25 @@ pub fn evict(torrents: &[(usize, u64)], cache: u64) -> Vec<usize> {
     sorted.into_iter().take_while(|&(_, b)| (cache == 0 || total > cache) && { total -= b; true }).map(|t| t.0).collect()
 }
 
+/// Live numbers for one torrent, for the player's stats overlay.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NetStats {
+    pub peers: u32,
+    /// Bytes per second.
+    pub down: u64,
+    pub up: u64,
+}
+
+/// "1.5 MB/s" from bytes per second.
+pub fn fmt_rate(bytes: u64) -> String {
+    let (mut v, mut u) = (bytes as f64, 0);
+    while v >= 1024.0 && u < 3 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{bytes} B/s") } else { format!("{v:.1} {}/s", ["B", "KB", "MB", "GB"][u]) }
+}
+
 pub struct TorrentEngine {
     session: Arc<Session>,
     http: SocketAddr,
@@ -135,6 +154,12 @@ impl TorrentEngine {
         Ok((format!("http://{}/torrents/{}/stream/{idx}", self.http, handle.id()), handle.id()))
     }
 
+    /// Peers and speeds of torrent `id`; `None` if it is gone or not live yet.
+    pub fn net_stats(&self, id: usize) -> Option<NetStats> {
+        let live = self.session.get(id.into())?.stats().live?;
+        Some(NetStats { peers: live.snapshot.peer_stats.live, down: live.download_speed.as_bytes(), up: live.upload_speed.as_bytes() })
+    }
+
     /// Drop one download's hold on torrent `id` taken by `stream_url(.., pin: true)`.
     pub async fn unpin(&self, id: usize) {
         let mut p = self.pinned.lock().await;
@@ -166,6 +191,14 @@ impl TorrentEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_rates() {
+        assert_eq!(fmt_rate(0), "0 B/s");
+        assert_eq!(fmt_rate(1023), "1023 B/s");
+        assert_eq!(fmt_rate(1536), "1.5 KB/s");
+        assert_eq!(fmt_rate(5 * 1024 * 1024), "5.0 MB/s");
+    }
 
     #[test]
     fn evicts_oldest_until_cache_fits() {
