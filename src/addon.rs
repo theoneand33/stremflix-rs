@@ -148,6 +148,24 @@ fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<
     Ok(ManifestHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired") })
 }
 
+/// Whether `new` is strictly newer than `old`. Compares the numeric dot parts of the core;
+/// a `-` or `+` suffix is ignored, and non-numeric versions are never offered.
+pub fn is_newer(new: &str, old: &str) -> bool {
+    let core = |v: &str| {
+        let v = v.trim().trim_start_matches('v');
+        v.split(['-', '+']).next()?.split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>()
+    };
+    match (core(new), core(old)) {
+        (Some(mut a), Some(mut b)) => {
+            let n = a.len().max(b.len());
+            a.resize(n, 0);
+            b.resize(n, 0);
+            a > b
+        }
+        _ => false,
+    }
+}
+
 impl Manifest {
     pub fn has_resource(&self, name: &str) -> bool {
         self.resources.iter().any(|r| r.name() == name)
@@ -860,7 +878,7 @@ impl AddonClient {
 
     async fn get(&self, url: Url) -> Result<Vec<u8>> {
         let mut resp = self.http()?.get(url.clone()).send().await.with_context(|| format!("GET {url}"))?;
-        ensure!(resp.status().is_success(), "GET {url}: HTTP {}", resp.status());
+        ensure!(resp.status().is_success(), "HTTP {}", resp.status());
         ensure!(resp.content_length().unwrap_or(0) <= MAX_BODY as u64, "response too large");
         let mut body = Vec::new();
         while let Some(chunk) = resp.chunk().await? {
