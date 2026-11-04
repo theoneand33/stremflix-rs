@@ -248,6 +248,11 @@ fn apply_theme(ctx: &egui::Context, light: bool) {
         v.window_fill = v.panel_fill;
         v.extreme_bg_color = if is_light { Color32::WHITE } else { Color32::from_gray(32) };
         v.selection.bg_fill = accent();
+        if !is_light {
+            // Keep the old dark palette: egui's defaults are dimmer than the grays used before theming.
+            v.widgets.noninteractive.fg_stroke.color = Color32::from_gray(200);
+            v.weak_text_color = Some(Color32::from_gray(170));
+        }
         // Netflix-style flat buttons: no outline or grow on hover, gray that dims when hovered.
         let w = &mut v.widgets;
         let grays = if is_light { [215, 200, 185, 200] } else { [82, 56, 45, 56] };
