@@ -1187,12 +1187,14 @@ impl App {
                         }
                     }
                 }
-                self.season = videos.first().and_then(|v| v.season);
+                let key = |v: &Video| format!("{}:{}", meta.kind, v.id);
+                // Open on the season of the episode in progress, else of the next unwatched one.
+                let resume = self.recent.iter().find_map(|p| videos.iter().find(|v| key(v) == p.key));
+                self.season = resume.or_else(|| start_episode(&videos, |v| self.watched_keys.contains(&key(v)))).and_then(|v| v.season);
                 (self.episodes, self.episode) = (videos, None);
                 self.selected = Some((meta.clone(), Vec::new(), Vec::new()));
                 self.scroll_top = true;
                 let Some((_, show)) = self.pending.take().filter(|(id, _)| *id == meta.id) else { return };
-                let key = |v: &Video| format!("{}:{}", meta.kind, v.id);
                 let v = match &show {
                     Some(id) => self.episodes.iter().find(|v| v.id == *id),
                     None => {
