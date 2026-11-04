@@ -15,7 +15,7 @@ use stremflix_rs::db::{Db, Download, Progress, SavedTitle, Watched};
 use stremflix_rs::download;
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{GlProc, Player, SPEEDS, SUB_COLORS, SubStyle, hwdec_value, prefer_lang, valid_langs};
+use stremflix_rs::player::{self, GlProc, Player, SPEEDS, SUB_COLORS, SubStyle, hwdec_value, prefer_lang, valid_langs};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{Profile, TorrentEngine};
 
@@ -968,6 +968,8 @@ impl App {
         let lookup = self.sub_lookup(&key, &source);
         let torrent = source.starts_with("magnet:") || is_torrent_file(&source);
         if !torrent && lookup.is_none() {
+            let mut subs = subs;
+            subs.extend(player::sidecar_subs(std::path::Path::new(&source))); // empty unless `source` is a local file
             let _ = self.tx.send(Msg::Play(key, title, source.clone(), source, subs, None, nav));
             return;
         }
