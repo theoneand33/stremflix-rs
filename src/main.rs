@@ -15,7 +15,7 @@ use stremflix_rs::db::{self, Db, Download, Progress, SavedTitle, Watched};
 use stremflix_rs::download;
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
+use stremflix_rs::player::{GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{Profile, TorrentEngine};
 
@@ -2863,6 +2863,17 @@ impl App {
                                         }
                                     });
                                 });
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Outline").size(15.0).color(Color32::from_gray(210)));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        for (i, (name, hex)) in SUB_OUTLINES.iter().enumerate().rev() {
+                                            if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::BLACK), style.outline == i).clicked() {
+                                                style.outline = i;
+                                            }
+                                        }
+                                    });
+                                });
+                                style.pos += stepper(ui, "Position", &format!("{}%", style.pos)) as f64 * 5.0;
                                 switch_row(ui, "Background box", &mut style.background);
                                 style.delay += stepper(ui, "Delay", &format!("{:+.1}s", style.delay)) as f64 * 0.1;
                                 if style.delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(ACCENT)).frame(false)).clicked() {
@@ -3410,6 +3421,17 @@ impl App {
                     }
                 });
             });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Subtitle outline").size(15.0).color(Color32::from_gray(210)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for (i, (name, hex)) in SUB_OUTLINES.iter().enumerate().rev() {
+                        if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::BLACK), style.outline == i).clicked() {
+                            style.outline = i;
+                        }
+                    }
+                });
+            });
+            style.pos += stepper(ui, "Subtitle position", &format!("{}%", style.pos)) as f64 * 5.0;
             switch_row(ui, "Subtitle background box", &mut style.background);
             style.delay += stepper(ui, "Subtitle delay", &format!("{:+.1}s", style.delay)) as f64 * 0.1;
             if style.delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(ACCENT)).frame(false)).clicked() {
