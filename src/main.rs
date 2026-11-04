@@ -2463,6 +2463,7 @@ impl App {
             p.after_hold = long;
         }
         let focused = ctx.memory(|m| m.focused());
+        let line = ctx.options(|o| o.input_options.line_scroll_speed); // read outside ctx.input to avoid nested locking
         ctx.input(|i| {
             use egui::Key::*;
             let k = |key| i.key_pressed(key);
@@ -2476,7 +2477,7 @@ impl App {
             if k(M) { cmd(&["cycle", "mute"]) }
             // Wheel over the bare video only: `hovered` is false under a popover or a control.
             if bg.hovered() && p.menu.is_none() {
-                let n = wheel_steps(&mut p.wheel, i.smooth_scroll_delta.y);
+                let n = wheel_steps(&mut p.wheel, i.smooth_scroll_delta.y, line);
                 if n != 0 { cmd(&["add", "volume", &(n * 5).to_string()]) }
             } else {
                 p.wheel = 0.0;
@@ -3551,12 +3552,12 @@ mod mac_links {
     }
 }
 
-/// Turn wheel scroll (points) into whole volume steps, keeping the remainder; one 50 pt notch is one step.
-fn wheel_steps(acc: &mut f32, dy: f32) -> i32 {
+/// Turn wheel scroll (points) into whole volume steps, keeping the remainder; one wheel line is one step.
+fn wheel_steps(acc: &mut f32, dy: f32, line: f32) -> i32 {
     if dy * *acc < 0.0 { *acc = 0.0; } // a direction change starts fresh
     *acc += dy;
-    let n = (*acc / 50.0).trunc();
-    *acc -= n * 50.0;
+    let n = (*acc / line).trunc();
+    *acc -= n * line;
     n as i32
 }
 
@@ -3567,13 +3568,15 @@ mod tests {
     #[test]
     fn wheel_accumulates_to_steps() {
         let mut acc = 0.0;
-        assert_eq!(wheel_steps(&mut acc, 50.0), 1);
-        assert_eq!(wheel_steps(&mut acc, -100.0), -2);
-        assert_eq!((0..5).map(|_| wheel_steps(&mut acc, 10.0)).sum::<i32>(), 1);
-        assert_eq!(wheel_steps(&mut acc, 0.0), 0);
-        // A +40 leftover must not cancel a fresh -50 notch.
-        acc = 40.0;
-        assert_eq!(wheel_steps(&mut acc, -50.0), -1);
+        // egui's native line_scroll_speed: one real notch is 40 pt.
+        assert_eq!(wheel_steps(&mut acc, 40.0, 40.0), 1);
+        assert_eq!((0..5).map(|_| wheel_steps(&mut acc, 40.0, 40.0)).sum::<i32>(), 5);
+        assert_eq!(wheel_steps(&mut acc, -80.0, 40.0), -2);
+        assert_eq!((0..4).map(|_| wheel_steps(&mut acc, 10.0, 40.0)).sum::<i32>(), 1);
+        assert_eq!(wheel_steps(&mut acc, 0.0, 40.0), 0);
+        // A +30 leftover must not cancel a fresh -40 notch.
+        acc = 30.0;
+        assert_eq!(wheel_steps(&mut acc, -40.0, 40.0), -1);
     }
 
     #[test]
