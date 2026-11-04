@@ -1268,9 +1268,23 @@ impl App {
                 }
                 None => report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200))),
             },
-            Msg::NewEpisodes(epoch, meta, videos) => {
+            Msg::NewEpisodes(epoch, meta, mut videos) => {
                 if epoch == self.new_eps_gen {
                     self.new_episodes.retain(|(m, _)| m.id != meta.id);
+                    sort_episodes(&mut videos);
+                    // Episodes imported as watched from Stremio, as in `Msg::Episodes`.
+                    let bk = format!("bitfield:{}:{}", meta.kind, meta.id);
+                    if let Ok(Some(field)) = self.db.setting(&bk) {
+                        let keys: Vec<String> = stremio_import::watched_videos(&field, &videos).into_iter().map(|id| format!("{}:{id}", meta.kind)).collect();
+                        if !keys.is_empty() {
+                            match self.db.apply_watched_bitfield(&bk, &keys) {
+                                Ok(marked) => self.watched_keys.extend(marked),
+                                Err(e) => report(&mut self.error, format!("saving watched episodes: {e:#}")),
+                            }
+                        }
+                    }
+                    let today = unix_days();
+                    let videos = recent_episodes(videos, &date_string(today - (NEW_EPISODE_DAYS - 1)), &date_string(today));
                     if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) && !videos.is_empty() {
                         self.new_episodes.push((meta, videos));
                     }
@@ -1578,8 +1592,11 @@ impl App {
             self.rt.spawn(async move {
                 let Ok(_permit) = slots.acquire_owned().await else { return };
                 for u in &addons {
-                    if let Ok(m) = client.meta(u, &meta.kind, &meta.id).await {
-                        let _ = tx.send(Msg::NewEpisodes(epoch, meta, recent_episodes(m.videos, &date_string(unix_days() - NEW_EPISODE_DAYS), &date_string(unix_days()))));
+                    // Like `open_meta`: an addon without episodes doesn't end the search.
+                    if let Ok(m) = client.meta(u, &meta.kind, &meta.id).await
+                        && !m.videos.is_empty()
+                    {
+                        let _ = tx.send(Msg::NewEpisodes(epoch, meta, m.videos));
                         ctx.request_repaint();
                         return;
                     }
@@ -2041,7 +2058,7 @@ impl App {
             .new_episodes
             .iter()
             .filter(|(m, _)| self.saved.iter().any(|t| t.key == format!("series:{}", m.id)))
-            .filter_map(|(m, vs)| vs.iter().rev().find(|v| !self.watched_keys.contains(&format!("{}:{}", m.kind, v.id))).map(|v| (m, v)))
+            .filter_map(|(m, vs)| vs.iter().filter(|v| !self.watched_keys.contains(&format!("{}:{}", m.kind, v.id))).max_by_key(|v| (v.released.as_deref().and_then(|d| d.get(..10)), v.season, v.episode)).map(|v| (m, v)))
             .collect();
         fresh.sort_by(|a, b| b.1.released.cmp(&a.1.released));
         if !fresh.is_empty() {
@@ -3649,6 +3666,10 @@ mod tests {
         ];
         let ids: Vec<_> = recent_episodes(vs, "2024-02-20", "2024-03-06").into_iter().map(|v| v.id).collect();
         assert_eq!(ids, ["new"]);
+        // Both ends of the window are inclusive; a day outside either is not.
+        let edge = vec![v("before", Some(1), Some("2024-02-19")), v("since", Some(1), Some("2024-02-20")), v("today", Some(1), Some("2024-03-06")), v("after", Some(1), Some("2024-03-07"))];
+        let ids: Vec<_> = recent_episodes(edge, "2024-02-20", "2024-03-06").into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, ["since", "today"]);
     }
 
     #[test]
