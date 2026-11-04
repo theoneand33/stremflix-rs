@@ -674,6 +674,11 @@ fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
     paused && dur > 0.0 && pos >= dur - 1.0
 }
 
+/// Fraction of the seek bar the cache covers, never behind the playhead.
+fn buffered_frac(pos: f64, cached_to: f64, dur: f64) -> f32 {
+    if dur > 0.0 { (cached_to.max(pos) / dur).clamp(0.0, 1.0) as f32 } else { 0.0 }
+}
+
 /// The playable source when there is exactly one; `None` when there's a choice (or nothing).
 fn only_source(streams: &[Stream]) -> Option<String> {
     let mut it = streams.iter().filter_map(Stream::source);
@@ -2807,6 +2812,8 @@ impl App {
             let th = ctx.animate_value_with_time(r.id.with("h"), if hot { 6.0 } else { 4.0 }, 0.1);
             let track = egui::Rect::from_center_size(bar.center(), vec2(bar.width(), th));
             paint.rect_filled(track, 2, Color32::from_gray(128).gamma_multiply(a * 0.5));
+            let buf = buffered_frac(pos, st.cached_to, st.dur);
+            paint.rect_filled(egui::Rect::from_min_size(track.min, vec2(track.width() * buf, th)), 2, Color32::from_gray(160).gamma_multiply(a * 0.6));
             paint.rect_filled(egui::Rect::from_min_size(track.min, vec2(track.width() * frac, th)), 2, ACCENT.gamma_multiply(a));
             let knob = pos2(track.left() + track.width() * frac, track.center().y);
             paint.circle_filled(knob, if hot { 9.0 } else { 7.0 }, ACCENT.gamma_multiply(a));
@@ -4131,6 +4138,14 @@ fn seek_step(v: Option<String>, default: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_frac_clamps() {
+        assert_eq!(buffered_frac(10.0, 50.0, 100.0), 0.5);
+        assert_eq!(buffered_frac(10.0, 0.0, 100.0), 0.1);
+        assert_eq!(buffered_frac(10.0, 500.0, 100.0), 1.0);
+        assert_eq!(buffered_frac(10.0, 50.0, 0.0), 0.0);
+    }
 
     #[test]
     fn clamp_scale_bounds_and_rounds() {
