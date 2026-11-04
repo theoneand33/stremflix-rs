@@ -1700,6 +1700,7 @@ impl App {
     fn ui_home(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let (mut want, mut open, mut play, mut quick, mut resume) = (Vec::new(), None, None, None, None);
+        let mut remove: Option<String> = None;
         let featured = match &self.selected {
             Some((m, ..)) => Some(m.clone()),
             None => self.rows.iter().find_map(|r| r.items.as_ref()?.first().cloned()),
@@ -1813,7 +1814,17 @@ impl App {
                             ui.painter().rect_filled(bar, 2, Color32::from_gray(90));
                             ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, bar.height())), 2, RED);
                         }
-                        if card_play(ui, &r, rect, &p.title) {
+                        // Corner X, shown like the play button; registered after the card so it takes the click.
+                        let x = egui::Rect::from_center_size(rect.right_top() + vec2(-18.0, 18.0), vec2(28.0, 28.0));
+                        let xr = ui.interact(x, r.id.with("remove"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                        xr.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Remove {} from Continue Watching", p.title)));
+                        if r.contains_pointer() || xr.has_focus() {
+                            ui.painter().circle_filled(x.center(), 14.0, Color32::from_black_alpha(if xr.hovered() { 210 } else { 140 }));
+                            ui.painter().text(x.center(), egui::Align2::CENTER_CENTER, icons::X, egui::FontId::new(16.0, phosphor()), Color32::WHITE);
+                        }
+                        if xr.clicked() {
+                            remove = Some(p.key.clone());
+                        } else if card_play(ui, &r, rect, &p.title) {
                             play = Some((p.key.clone(), p.title.clone(), p.source.clone(), vec![]));
                         } else if r.clicked() {
                             resume = Some(p.clone());
@@ -1892,6 +1903,12 @@ impl App {
         }
         if let Some((k, on)) = toggle {
             self.set_watched(&k, on);
+        }
+        if let Some(k) = remove {
+            match self.db.remove_progress(&k) {
+                Ok(()) => self.recent = self.db.recent_progress(20).unwrap_or_default(),
+                Err(e) => report(&mut self.error, format!("removing from Continue Watching: {e:#}")),
+            }
         }
         if let Some((m, autoplay)) = open {
             self.open_meta(&ctx, m, autoplay);
