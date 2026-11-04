@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
 use crate::library::MEDIA_EXTS;
@@ -51,36 +51,105 @@ pub fn reserve(dir: &Path, name: &str) -> Result<PathBuf> {
     anyhow::bail!("no free file name for {name}")
 }
 
-/// Delete `.part` files left by downloads cut off when the app quit.
-pub fn clear_partial(dir: &Path) {
+/// At most this many downloads transfer at once; the rest wait queued.
+pub const MAX_ACTIVE: usize = 2;
+
+/// Where a download is in the queue (finished ones leave it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum State {
+    Queued,
+    Active,
+    Paused,
+    Failed,
+}
+
+impl State {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// An `active` row means the app quit mid-transfer, so it comes back paused.
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "queued" => Self::Queued,
+            "failed" => Self::Failed,
+            _ => Self::Paused,
+        }
+    }
+}
+
+/// Indices of the queued downloads to start now: oldest first, up to `max` active in total.
+pub fn to_start(states: &[State], max: usize) -> Vec<usize> {
+    let free = max.saturating_sub(states.iter().filter(|s| **s == State::Active).count());
+    states.iter().enumerate().filter(|(_, s)| **s == State::Queued).map(|(i, _)| i).take(free).collect()
+}
+
+/// Delete `.part` files left by downloads cut off when the app quit, except those of `keep` (queued or paused downloads).
+pub fn clear_partial(dir: &Path, keep: &[PathBuf]) {
+    let keep: Vec<PathBuf> = keep.iter().map(|p| part(p)).collect();
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if e.path().extension().is_some_and(|x| x == "part") {
+        if e.path().extension().is_some_and(|x| x == "part") && !keep.contains(&e.path()) {
             let _ = std::fs::remove_file(e.path());
         }
     }
 }
 
+/// Byte offset to continue from after asking for `bytes=have-`: `have` only if the server answered
+/// 206 with a `Content-Range` starting there, else 0 (it ignored the range, so start over).
+pub fn resume_start(have: u64, status: u16, content_range: Option<&str>) -> u64 {
+    let start = content_range.and_then(|c| c.strip_prefix("bytes ")?.split('-').next()?.parse::<u64>().ok());
+    if status == 206 && start == Some(have) { have } else { 0 }
+}
+
 /// Download `url` (with the addon's request `headers`) into `part(dest)`, then move it to `dest`.
-pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path) -> Result<()> {
+/// Continues a `.part` left by a pause if the server supports ranges. `progress(got, total)` runs about 4 times a second.
+pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path, mut progress: impl FnMut(u64, u64)) -> Result<()> {
     // No total timeout: a movie can take hours. A stalled connection still fails.
     let client = reqwest::Client::builder().user_agent("stremflix-rs").connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(120)).build()?;
-    let mut req = client.get(url);
-    for (k, v) in headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
-    let mut resp = req.send().await.context("download")?.error_for_status()?;
+    let tmp = part(dest);
+    let mut have = tokio::fs::metadata(&tmp).await.map_or(0, |m| m.len());
+    let (mut resp, start) = loop {
+        let mut req = client.get(url);
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if have > 0 {
+            req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
+        }
+        let resp = req.send().await.context("download")?;
+        // 416: the `.part` is not a prefix of the file (or is all of it); start over.
+        if have > 0 && resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            have = 0;
+            continue;
+        }
+        let resp = resp.error_for_status()?;
+        let cr = resp.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok());
+        let start = if have > 0 { resume_start(have, resp.status().as_u16(), cr) } else { 0 };
+        break (resp, start);
+    };
     let kind = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
     ensure!(!["mpegurl", "dash+xml"].iter().any(|t| kind.contains(t)), "{kind} is a streaming playlist, not a video file, so it can't be downloaded");
     ensure!(!kind.starts_with("text/html"), "the server sent a web page, not a video file");
     // A live or endless stream has no length; refusing it keeps a download from filling the disk.
-    let Some(len) = resp.content_length() else { anyhow::bail!("the server gave no file size (likely a live stream), so it can't be downloaded") };
-    ensure!(len > 0, "the server sent an empty file");
-    let tmp = part(dest);
-    let mut f = tokio::fs::File::create(&tmp).await?;
-    let mut got = 0u64;
+    let Some(body) = resp.content_length() else { anyhow::bail!("the server gave no file size (likely a live stream), so it can't be downloaded") };
+    ensure!(body > 0 || start > 0, "the server sent an empty file");
+    let len = start + body;
+    let mut f = tokio::fs::OpenOptions::new().write(true).create(true).append(start > 0).truncate(start == 0).open(&tmp).await?;
+    let mut got = start;
+    let mut last = Instant::now();
+    progress(got, len);
     while let Some(chunk) = resp.chunk().await? {
         f.write_all(&chunk).await?;
         got += chunk.len() as u64;
+        if last.elapsed() >= Duration::from_millis(250) {
+            last = Instant::now();
+            progress(got, len);
+        }
     }
     ensure!(len == got, "download cut off at {got} of {len} bytes");
     f.sync_all().await?;
@@ -127,8 +196,29 @@ mod tests {
         let b = reserve(dir.path(), "A.mkv").unwrap();
         assert_eq!((a.file_name().unwrap(), b.file_name().unwrap()), ("A.mkv".as_ref(), "A (2).mkv".as_ref()));
         assert!(part(&a).exists() && !a.exists());
-        clear_partial(dir.path());
+        clear_partial(dir.path(), std::slice::from_ref(&b));
+        assert!(part(&b).exists() && !part(&a).exists());
+        clear_partial(dir.path(), &[]);
         assert!(!part(&a).exists() && !part(&b).exists());
+    }
+
+    #[test]
+    fn queue_starts_oldest_queued_up_to_the_limit() {
+        use State::*;
+        assert_eq!(to_start(&[Queued, Queued, Queued], 2), [0, 1]);
+        assert_eq!(to_start(&[Active, Paused, Queued, Queued], 2), [2]);
+        assert_eq!(to_start(&[Active, Active, Queued], 2), Vec::<usize>::new());
+        assert_eq!(to_start(&[Failed, Paused], 2), Vec::<usize>::new());
+        assert_eq!(State::from_db("active"), Paused);
+        assert_eq!(State::from_db(State::Queued.as_str()), Queued);
+    }
+
+    #[test]
+    fn resume_needs_a_matching_206() {
+        assert_eq!(resume_start(5, 206, Some("bytes 5-9/10")), 5);
+        assert_eq!(resume_start(5, 200, None), 0, "range ignored");
+        assert_eq!(resume_start(5, 206, Some("bytes 0-9/10")), 0, "wrong offset");
+        assert_eq!(resume_start(5, 206, None), 0);
     }
 
     #[test]
@@ -157,8 +247,28 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let dest = reserve(dir.path(), "a.mp4").unwrap();
-        fetch(&format!("http://{addr}/a.mp4"), &[], &dest).await.unwrap();
+        fetch(&format!("http://{addr}/a.mp4"), &[], &dest, |_, _| {}).await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
         assert!(!part(&dest).exists());
+    }
+
+    #[tokio::test]
+    async fn fetch_resumes_with_a_range() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0; 1024];
+            let n = s.read(&mut buf).unwrap();
+            s.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-4/5\r\nContent-Length: 3\r\nConnection: close\r\n\r\nllo").unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = reserve(dir.path(), "a.mp4").unwrap();
+        std::fs::write(part(&dest), b"he").unwrap();
+        fetch(&format!("http://{addr}/a.mp4"), &[], &dest, |_, _| {}).await.unwrap();
+        assert!(server.join().unwrap().contains("range: bytes=2-"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
     }
 }

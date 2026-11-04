@@ -12,7 +12,7 @@ use anyhow::Context;
 use stremflix_rs::addon::{AddonClient, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
 use stremflix_rs::instance;
 use stremflix_rs::db::{Db, Download, Progress, SavedTitle, Watched};
-use stremflix_rs::download;
+use stremflix_rs::download::{self, State};
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
 use stremflix_rs::player::{GlProc, Player, SPEEDS, SUB_COLORS, SubStyle, hwdec_value, prefer_lang, valid_langs};
@@ -170,8 +170,10 @@ enum Msg {
     Update(Option<String>),
     /// A `stremio://` link from the command line, a later launch, or macOS.
     Link(String),
-    /// A download that finished, or why it failed.
-    Downloaded(Download, Result<(), String>),
+    /// A download's path, run number, bytes got and total, while it transfers.
+    DownloadProgress(PathBuf, u64, u64, u64),
+    /// A download's path and run number, once it finished, failed or was stopped.
+    Downloaded(PathBuf, u64, Result<(), String>),
 }
 
 /// One horizontal catalog row on the home screen.
@@ -792,9 +794,12 @@ struct App {
     library: Vec<LibraryItem>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
-    /// Finished downloads, newest first, and those still running.
+    /// Finished downloads, newest first.
     downloads: Vec<Download>,
-    downloading: Vec<Download>,
+    /// Downloads waiting, running, paused or failed, oldest first.
+    queue: Vec<Job>,
+    /// Counts transfers, so a stopped one's late messages can be told from the current one's.
+    download_runs: u64,
     lib_sort: LibSort,
     lib_kind: LibKind,
     recent: Vec<Progress>,
@@ -867,10 +872,38 @@ fn fmt_time(s: f64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
+/// A download that is waiting, running, paused or failed.
+struct Job {
+    d: Download,
+    /// http URL or magnet.
+    source: String,
+    headers: Vec<(String, String)>,
+    state: State,
+    /// Which transfer this job is on; see `App::download_runs`.
+    run: u64,
+    got: u64,
+    total: u64,
+    /// Bytes per second, smoothed.
+    speed: f64,
+    /// When and at how many bytes the speed was last measured.
+    last: (Instant, u64),
+    /// Dropping or sending on it stops the transfer.
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    err: Option<String>,
+}
+
+impl Job {
+    fn new(d: Download, source: String, headers: Vec<(String, String)>, state: State) -> Self {
+        let got = std::fs::metadata(download::part(&d.path)).map_or(0, |m| m.len());
+        Self { d, source, headers, state, run: 0, got, total: 0, speed: 0.0, last: (Instant::now(), got), cancel: None, err: None }
+    }
+}
+
 impl App {
     fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
         let db = Db::open(&data_dir.join("stremflix-rs.db"))?;
-        download::clear_partial(&data_dir.join("downloads"));
+        let queue: Vec<Job> = db.download_queue()?.into_iter().map(|(d, source, headers, state)| Job::new(d, source, headers, state)).collect();
+        download::clear_partial(&data_dir.join("downloads"), &queue.iter().map(|j| j.d.path.clone()).collect::<Vec<_>>());
         let (tx, rx) = channel();
         let mut app = Self {
             sub_style: db.setting("sub_style")?.map(|s| SubStyle::decode(&s)).unwrap_or_default(),
@@ -879,7 +912,8 @@ impl App {
             library: db.library_items()?,
             saved: db.saved_titles()?,
             downloads: db.downloads()?,
-            downloading: Vec::new(),
+            queue,
+            download_runs: 0,
             lib_sort: LibSort::Added,
             lib_kind: LibKind::All,
             recent: db.recent_progress(20)?,
@@ -1023,29 +1057,98 @@ impl App {
         }
     }
 
-    /// Save stream `source` (http URL or magnet) to the downloads folder as `d`, in the background.
+    /// Queue stream `source` (http URL or magnet) for the downloads folder as `d`; it starts when a slot is free.
     /// `hint` (a file name or URL path) gives the file extension.
     fn download(&mut self, ctx: &egui::Context, mut d: Download, source: String, headers: Vec<(String, String)>, hint: Option<String>) {
         match download::reserve(&self.data_dir.join("downloads"), &download::file_name(&d.title, hint.as_deref())) {
             Ok(p) => d.path = p,
             Err(e) => return report(&mut self.error, format!("download: {e:#}")),
         }
-        self.downloading.push(d.clone());
+        if let Err(e) = self.db.queue_download(&d, &source, &headers, State::Queued) {
+            drop(std::fs::remove_file(download::part(&d.path)));
+            return report(&mut self.error, format!("download: {e:#}"));
+        }
+        self.queue.push(Job::new(d, source, headers, State::Queued));
+        self.pump_downloads(ctx);
+    }
+
+    /// Start queued downloads while fewer than `MAX_ACTIVE` run.
+    fn pump_downloads(&mut self, ctx: &egui::Context) {
+        let states: Vec<State> = self.queue.iter().map(|j| j.state).collect();
+        for i in download::to_start(&states, download::MAX_ACTIVE) {
+            self.start_download(ctx, i);
+        }
+    }
+
+    fn set_job_state(&mut self, i: usize, state: State) {
+        let j = &mut self.queue[i];
+        j.state = state;
+        j.speed = 0.0;
+        if let Err(e) = self.db.set_download_state(&j.d, state) {
+            report(&mut self.error, format!("saving download state: {e:#}"));
+        }
+    }
+
+    /// Run `queue[i]` in the background, continuing its `.part` file if it has one.
+    fn start_download(&mut self, ctx: &egui::Context, i: usize) {
+        self.set_job_state(i, State::Active);
+        self.download_runs += 1;
+        let run = self.download_runs;
+        let (cancel, mut cancelled) = tokio::sync::oneshot::channel::<()>();
+        let j = &mut self.queue[i];
+        (j.run, j.cancel, j.err, j.last) = (run, Some(cancel), None, (Instant::now(), j.got));
+        let (path, source, headers) = (j.d.path.clone(), j.source.clone(), j.headers.clone());
         let engine = source.starts_with("magnet:").then(|| self.engine());
-        self.spawn(ctx, async move {
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        self.rt.spawn(async move {
             let res = async {
-                let Some(engine) = engine else { return download::fetch(&source, &headers, &d.path).await };
-                let engine = engine.await?;
-                // Pinned so playing or stopping another title doesn't pause it mid-download.
-                let (url, id) = engine.stream_url(&source, None, true).await?;
-                let res = download::fetch(&url, &[], &d.path).await;
-                // shortcut: the torrent keeps its cache copy and runs until the next playback releases it; fine for a few downloads.
-                engine.unpin(id).await;
+                let (url, headers, pin) = match engine {
+                    None => (source, headers, None),
+                    Some(engine) => {
+                        let engine = engine.await?;
+                        // Pinned so playing or stopping another title doesn't pause it mid-download.
+                        let (url, id) = engine.stream_url(&source, None, true).await?;
+                        (url, vec![], Some((engine, id)))
+                    }
+                };
+                let progress = |got, total| {
+                    let _ = tx.send(Msg::DownloadProgress(path.clone(), run, got, total));
+                    ctx.request_repaint();
+                };
+                // Pausing or dropping the job sends or drops the sender.
+                let res = tokio::select! { r = download::fetch(&url, &headers, &path, progress) => r, _ = &mut cancelled => Err(anyhow::anyhow!("stopped")) };
+                // shortcut: a paused torrent is unpinned but keeps its cache copy until the next playback releases it; resume re-adds it.
+                if let Some((engine, id)) = pin {
+                    engine.unpin(id).await;
+                }
                 res
             };
             let res = res.await.map_err(|e| format!("{e:#}"));
-            Ok(Msg::Downloaded(d, res))
+            let _ = tx.send(Msg::Downloaded(path, run, res));
+            ctx.request_repaint();
         });
+    }
+
+    /// Stop `queue[i]`'s transfer (it keeps its `.part` file) and mark it `state`.
+    fn stop_download(&mut self, ctx: &egui::Context, i: usize, state: State) {
+        if let Some(c) = self.queue[i].cancel.take() {
+            let _ = c.send(());
+        }
+        self.set_job_state(i, state);
+        self.pump_downloads(ctx);
+    }
+
+    /// Forget `queue[i]`: stop it, delete its `.part` file and its row.
+    fn remove_download(&mut self, ctx: &egui::Context, i: usize) {
+        let j = self.queue.remove(i);
+        if let Some(c) = j.cancel {
+            let _ = c.send(());
+        }
+        drop(std::fs::remove_file(download::part(&j.d.path)));
+        if let Err(e) = self.db.remove_download(&j.d) {
+            report(&mut self.error, format!("removing download {}: {e:#}", j.d.title));
+        }
+        self.pump_downloads(ctx);
     }
 
     /// Stop every torrent but `keep`, so none keeps downloading and seeding. Runs on the UI thread,
@@ -1293,18 +1396,35 @@ impl App {
                 }
             }
             Msg::Update(url) => self.update = url,
-            Msg::Downloaded(d, res) => {
-                self.downloading.retain(|x| x.path != d.path);
-                let res = match res.map_err(anyhow::Error::msg) {
-                    // A failed fetch leaves only our `.part`; `d.path` may be someone else's file.
-                    Err(e) => Err(e).inspect_err(|_| drop(std::fs::remove_file(download::part(&d.path)))),
-                    // A failed DB insert leaves our finished file.
-                    Ok(()) => self.db.add_download(&d).inspect_err(|_| drop(std::fs::remove_file(&d.path))),
-                };
-                match res {
-                    Ok(()) => self.downloads.insert(0, d),
-                    Err(e) => report(&mut self.error, format!("download {}: {e:#}", d.title)),
+            Msg::DownloadProgress(path, run, got, total) => {
+                if let Some(j) = self.queue.iter_mut().find(|j| j.d.path == path && j.run == run) {
+                    let dt = j.last.0.elapsed().as_secs_f64();
+                    if dt > 0.0 {
+                        let rate = got.saturating_sub(j.last.1) as f64 / dt;
+                        j.speed = if j.speed == 0.0 { rate } else { j.speed * 0.5 + rate * 0.5 };
+                    }
+                    (j.got, j.total, j.last) = (got, total, (Instant::now(), got));
                 }
+            }
+            Msg::Downloaded(path, run, res) => {
+                // A paused or removed download's late result is ignored.
+                let Some(i) = self.queue.iter().position(|j| j.d.path == path && j.run == run && j.state == State::Active) else { return };
+                match res {
+                    // The `.part` stays so Resume can continue it.
+                    Err(e) => {
+                        self.queue[i].err = Some(e);
+                        self.set_job_state(i, State::Failed);
+                    }
+                    Ok(()) => {
+                        let d = self.queue.remove(i).d;
+                        // A failed DB update leaves our finished file.
+                        match self.db.add_download(&d).inspect_err(|_| drop(std::fs::remove_file(&d.path))) {
+                            Ok(()) => self.downloads.insert(0, d),
+                            Err(e) => report(&mut self.error, format!("download {}: {e:#}", d.title)),
+                        }
+                    }
+                }
+                self.pump_downloads(ctx);
             }
             Msg::Scanned(dir, res) => {
                 let saved = res.map_err(anyhow::Error::msg).and_then(|items| {
@@ -3222,14 +3342,43 @@ impl App {
         }
         ui.separator();
         ui.label(RichText::new("Downloads").size(20.0).strong().family(bold()).color(Color32::WHITE));
-        if self.downloads.is_empty() && self.downloading.is_empty() {
+        if self.downloads.is_empty() && self.queue.is_empty() {
             ui.label(RichText::new("Nothing downloaded yet. Open a title and choose \"Download\" on a stream.").color(Color32::from_gray(170)));
         }
-        for d in &self.downloading {
+        // (index, 0 pause, 1 resume, 2 remove)
+        let mut act = None;
+        for (i, j) in self.queue.iter().enumerate() {
             ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!("Downloading {}", d.title));
+                ui.label(&j.d.title);
+                let (txt, frac) = match j.state {
+                    State::Queued => ("Queued".to_string(), 0.0),
+                    State::Active if j.total == 0 => ("Starting".to_string(), 0.0),
+                    State::Failed => (format!("Failed: {}", j.err.as_deref().unwrap_or("interrupted")), 0.0),
+                    s => {
+                        let (got, total) = (fmt_size(j.got), fmt_size(j.total));
+                        let speed = if s == State::Active { format!(" - {}/s", fmt_size(j.speed as u64)) } else { " - Paused".into() };
+                        (format!("{got} / {total}{speed}"), j.got as f32 / j.total.max(1) as f32)
+                    }
+                };
+                ui.add(egui::ProgressBar::new(frac).desired_width(160.0).text(txt));
+                match j.state {
+                    State::Active | State::Queued if small_button(ui, "Pause").clicked() => act = Some((i, 0)),
+                    State::Paused | State::Failed if small_button(ui, "Resume").clicked() => act = Some((i, 1)),
+                    _ => {}
+                }
+                if small_button(ui, if j.state == State::Failed { "Remove" } else { "Cancel" }).clicked() {
+                    act = Some((i, 2));
+                }
             });
+        }
+        match act {
+            Some((i, 0)) => self.stop_download(&ctx, i, State::Paused),
+            Some((i, 1)) => {
+                self.set_job_state(i, State::Queued);
+                self.pump_downloads(&ctx);
+            }
+            Some((i, _)) => self.remove_download(&ctx, i),
+            None => {}
         }
         let (mut play, mut delete) = (None, None);
         for d in &self.downloads {
