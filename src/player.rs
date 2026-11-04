@@ -186,8 +186,8 @@ pub struct SubStyle {
 /// Playback speeds offered in the player menu.
 pub const SPEEDS: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 
-/// Aspect-ratio overrides: label and mpv `video-aspect-override` value (`-1` keeps the file's own).
-pub const ASPECTS: [(&str, &str); 5] = [("Auto", "-1"), ("16:9", "16:9"), ("4:3", "4:3"), ("21:9", "21:9"), ("1:1", "1:1")];
+/// Aspect-ratio overrides: label and mpv `video-aspect-override` value (`no` keeps the file's own).
+pub const ASPECTS: [(&str, &str); 5] = [("Auto", "no"), ("16:9", "16:9"), ("4:3", "4:3"), ("21:9", "21:9"), ("1:1", "1:1")];
 
 /// Zoom range in tenths of mpv's log2 `video-zoom` (-1 halves, +1 doubles the picture).
 pub const ZOOM_RANGE: std::ops::RangeInclusive<i32> = -10..=10;
@@ -601,7 +601,7 @@ mod tests {
         assert_eq!(zoom_value(3), "0.3");
         assert_eq!(zoom_value(-99), "-1");
         assert_eq!(zoom_value(99), "1");
-        assert_eq!(ASPECTS[0].1, "-1");
+        assert_eq!(ASPECTS[0].1, "no");
     }
 
     #[test]

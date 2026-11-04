@@ -2381,7 +2381,8 @@ impl App {
         let [vw, vh] = p.player.state.video;
         if let (true, Some(gl)) = (vw > 0 && vh > 0, frame.gl().cloned()) {
             let fit = (rect.width() / vw as f32).min(rect.height() / vh as f32);
-            let vrect = egui::Rect::from_center_size(rect.center(), vec2(vw as f32, vh as f32) * fit);
+            // Fill renders into the whole window so panscan has something to crop.
+            let vrect = if p.fill { rect } else { egui::Rect::from_center_size(rect.center(), vec2(vw as f32, vh as f32) * fit) };
             let px = vrect.size() * ctx.pixels_per_point();
             let size = [(px.x as usize).max(1), (px.y as usize).max(1)];
             let video = match self.video {
@@ -2710,7 +2711,7 @@ impl App {
                             if switch_row(ui, "Fill screen (crop)", &mut p.fill).changed() {
                                 cmd(&["set", "panscan", if p.fill { "1.0" } else { "0.0" }]);
                             }
-                            let step = stepper(ui, "Zoom", &format!("{:+.1}", p.zoom as f64 / 10.0));
+                            let step = stepper(ui, "Zoom", &if p.zoom == 0 { "0.0".into() } else { format!("{:+.1}", p.zoom as f64 / 10.0) });
                             if step != 0 {
                                 p.zoom = (p.zoom + step).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
                                 cmd(&["set", "video-zoom", &zoom_value(p.zoom)]);
