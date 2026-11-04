@@ -160,10 +160,10 @@ enum Msg {
     RecentPoster(String, String),
     /// Stremio storage that was read, and what it holds.
     Imported(Import),
-    /// Stremio account email and auth key after signing in.
-    SignedIn(String, String),
-    /// Account auth key a sync ran with, and what it pulled.
-    Synced(String, Import),
+    /// Stremio account email, and its auth key or the sign-in error.
+    SignedIn(String, Result<String, String>),
+    /// Account auth key a sync ran with, and what it pulled or the error.
+    Synced(String, Result<Import, String>),
     /// Library folder and its scanned media files.
     Scanned(PathBuf, Result<Vec<LibraryItem>, String>),
     /// Release page of a newer build, if any.
@@ -803,9 +803,11 @@ struct App {
     watched_keys: std::collections::HashSet<String>,
     /// Stremio data path to import from; empty = auto-detect.
     import_path: String,
-    /// Stremio account sign-in form, and the signed-in email (`stremio_email` setting).
+    /// Stremio account sign-in form, and the signed-in email (set while a `stremio_auth` key is stored).
     login: (String, String),
     account: Option<String>,
+    /// A sign-in or sync is running.
+    account_busy: bool,
     /// Addon whose details are shown in the Addons tab.
     addon_details: Option<String>,
     /// Torrent download folder as edited (empty = in the data directory); saved when valid.
@@ -885,7 +887,8 @@ impl App {
             watched_keys: db.watched_keys()?,
             import_path: String::new(),
             login: Default::default(),
-            account: db.setting("stremio_email")?.filter(|e| !e.is_empty()),
+            account: db.setting("stremio_auth")?.filter(|k| !k.is_empty()).map(|_| db.setting("stremio_email").ok().flatten().unwrap_or_default()),
+            account_busy: false,
             addon_details: None,
             torrent_dir: db.setting("torrent_dir")?.unwrap_or_default(),
             torrent_cache: db.setting("torrent_cache")?.and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -945,11 +948,15 @@ impl App {
     }
 
     /// Pull the signed-in Stremio account's addons and library into the local DB.
-    fn sync_account(&self, ctx: &egui::Context) {
+    fn sync_account(&mut self, ctx: &egui::Context) {
+        if self.account_busy {
+            return;
+        }
         let Some(key) = self.db.setting("stremio_auth").ok().flatten().filter(|k| !k.is_empty()) else { return };
+        self.account_busy = true;
         let client = self.client.clone();
         self.spawn(ctx, async move {
-            let imp = client.stremio_pull(&key).await.context("Stremio account sync")?;
+            let imp = client.stremio_pull(&key).await.map_err(|e| format!("Stremio account sync: {e:#}"));
             Ok(Msg::Synced(key, imp))
         });
     }
@@ -1242,8 +1249,12 @@ impl App {
             }
             // Dropped if signed out (or into another account) while it ran.
             Msg::Synced(key, imp) => {
+                self.account_busy = false;
                 if self.db.setting("stremio_auth").ok().flatten().as_deref() == Some(key.as_str()) {
-                    self.handle(ctx, Msg::Imported(imp));
+                    match imp {
+                        Ok(imp) => self.handle(ctx, Msg::Imported(imp)),
+                        Err(e) => report(&mut self.error, e),
+                    }
                 }
             }
             Msg::Imported(imp) => {
@@ -1260,6 +1271,11 @@ impl App {
                 self.fetch_recent_posters(ctx);
             }
             Msg::SignedIn(email, key) => {
+                self.account_busy = false;
+                let key = match key {
+                    Ok(k) => k,
+                    Err(e) => return report(&mut self.error, e),
+                };
                 let saved = self.db.transaction(|| {
                     self.db.set_setting("stremio_auth", &key)?;
                     self.db.set_setting("stremio_email", &email)
@@ -2985,18 +3001,25 @@ impl App {
         if let Some(email) = self.account.clone() {
             ui.horizontal(|ui| {
                 ui.label(format!("Signed in as {email}"));
-                if primary_button(ui, "Sync").on_hover_text("Copy the account's addons and library here").clicked() {
+                let busy = self.account_busy;
+                if ui.add_enabled_ui(!busy, |ui| primary_button(ui, "Sync")).inner.on_hover_text("Copy the account's addons and library here").clicked() {
                     self.sync_account(&ctx);
+                }
+                if busy {
+                    ui.spinner();
                 }
                 if small_button(ui, "Sign out").clicked() {
                     let key = self.db.setting("stremio_auth").ok().flatten().unwrap_or_default();
-                    for k in ["stremio_auth", "stremio_email"] {
-                        save.push((k, String::new()));
+                    let cleared = self.db.transaction(|| ["stremio_auth", "stremio_email"].into_iter().try_for_each(|k| self.db.set_setting(k, "")));
+                    match cleared {
+                        Ok(()) => {
+                            self.account = None;
+                            let client = self.client.clone();
+                            // Best effort: the key is already forgotten locally.
+                            self.rt.spawn(async move { client.stremio_logout(&key).await.inspect_err(|e| eprintln!("Stremio sign-out: {e:#}")) });
+                        }
+                        Err(e) => report(&mut self.error, format!("signing out: {e:#}")),
                     }
-                    self.account = None;
-                    let client = self.client.clone();
-                    // Best effort: the key is already forgotten locally.
-                    self.rt.spawn(async move { client.stremio_logout(&key).await.inspect_err(|e| eprintln!("Stremio sign-out: {e:#}")) });
                 }
             });
         } else {
@@ -3007,13 +3030,22 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut self.login.0).desired_width(260.0)).labelled_by(l.id);
                 let l = ui.label("Password:");
                 let r = ui.add(egui::TextEdit::singleline(&mut self.login.1).password(true).desired_width(200.0)).labelled_by(l.id);
-                go = primary_button(ui, "Sign in").clicked() || r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                go = ui.add_enabled_ui(!self.account_busy, |ui| primary_button(ui, "Sign in")).inner.clicked()
+                    || !self.account_busy && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if self.account_busy {
+                    ui.spinner();
+                }
             });
             ui.label(RichText::new("Copies your addons and library from api.strem.io; nothing is uploaded.").size(13.0).color(Color32::from_gray(170)));
-            let (email, password) = (self.login.0.trim().to_string(), if go { std::mem::take(&mut self.login.1) } else { String::new() });
-            if go && !email.is_empty() && !password.is_empty() {
-                let client = self.client.clone();
-                self.spawn(&ctx, async move { Ok(Msg::SignedIn(email.clone(), client.stremio_login(&email, &password).await?)) });
+            let email = self.login.0.trim().to_string();
+            if go && !email.is_empty() && !self.login.1.is_empty() {
+                // Not kept after use, even if signing in fails.
+                let (client, password) = (self.client.clone(), std::mem::take(&mut self.login.1));
+                self.account_busy = true;
+                self.spawn(&ctx, async move {
+                    let key = client.stremio_login(&email, &password).await.map_err(|e| format!("Stremio sign-in: {e:#}"));
+                    Ok(Msg::SignedIn(email, key))
+                });
             }
         }
         ui.add_space(8.0);

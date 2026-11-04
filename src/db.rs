@@ -76,6 +76,9 @@ impl Db {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        // Owner-only: it holds the Stremio account's auth key. SQLite gives `-wal`/`-shm` the same mode.
+        #[cfg(unix)]
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL; -- safe with WAL; a crash loses at most the last commit, and progress saves every second
@@ -163,7 +166,9 @@ impl Db {
     }
 
     /// Re-adding a saved title keeps its original `saved_at`, so the library order is stable.
+    /// It also lets Stremio imports add it again (see [`Db::remove_saved_title`]).
     pub fn add_saved_title(&self, t: &SavedTitle) -> Result<()> {
+        self.conn.execute("DELETE FROM settings WHERE key = ?1", [format!("unsaved:{}", t.key)])?;
         self.conn.execute(
             "INSERT INTO saved_titles (key, title, kind, poster) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster)",
@@ -172,9 +177,12 @@ impl Db {
         Ok(())
     }
 
+    /// Remembered (`unsaved:<key>`), so an account sync or import doesn't bring it back.
     pub fn remove_saved_title(&self, key: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM saved_titles WHERE key = ?1", [key])?;
-        Ok(())
+        self.transaction(|| {
+            self.conn.execute("DELETE FROM saved_titles WHERE key = ?1", [key])?;
+            self.set_setting(&format!("unsaved:{key}"), "1")
+        })
     }
 
     /// Saved titles, newest first; rows with a malformed key or type are skipped.
@@ -284,14 +292,17 @@ impl Db {
 
     /// Mark a movie or episode (`<type>:<id>`) watched or not. Watching also drops its resume point,
     /// so it leaves Continue Watching. Kept in `settings` so the Watch It Again row stays Stremio-only.
+    /// Unwatching is remembered (`unwatched:<key>`), so an account sync or import doesn't undo it.
     pub fn set_watched(&self, key: &str, on: bool) -> Result<()> {
         let k = format!("watched:{key}");
         self.transaction(|| {
             if on {
                 self.set_setting(&k, "1")?;
                 self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
+                self.conn.execute("DELETE FROM settings WHERE key = ?1", [format!("unwatched:{key}")])?;
             } else {
                 self.conn.execute("DELETE FROM settings WHERE key = ?1", [&k])?;
+                self.set_setting(&format!("unwatched:{key}"), "1")?;
                 // Also clears a title imported from Stremio.
                 self.conn.execute("DELETE FROM watched WHERE key = ?1", [key])?;
             }

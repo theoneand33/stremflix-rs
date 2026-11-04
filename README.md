@@ -96,7 +96,7 @@ Only the Linux Flatpak (Stremio 5) is tested against a real install; fixtures co
 
 ### Stremio account
 
-Settings → Stremio account signs in to api.strem.io and copies the account's addons, library (as saved titles), and watched titles, on sign-in, at startup, and with Sync. Sync is one-way: nothing is uploaded, and already installed addons are kept. The auth key is stored in the local DB; Sign out forgets it. Account progress needs the stream that was playing, which the account doesn't hold, so it isn't copied.
+Settings → Stremio account signs in to api.strem.io and copies the account's addons, library (as saved titles), and watched titles, on sign-in, at startup, and with Sync. Sync is one-way: nothing is uploaded, and already installed addons are kept. Titles you remove from the library or mark unwatched here stay that way after a sync. The auth key is stored in the local DB (owner-only on Linux and macOS); Sign out forgets it. Account progress needs the stream that was playing, which the account doesn't hold, so it isn't copied.
 
 ## End-to-end demo
 

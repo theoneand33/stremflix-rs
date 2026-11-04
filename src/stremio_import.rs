@@ -45,18 +45,21 @@ impl Import {
         for (p, at) in &self.progress {
             db.import_progress(p, at)?;
         }
+        // Titles unwatched or removed here stay that way.
+        let kept = |kind: &str, key: &str| db.setting(&format!("{kind}:{key}")).map(|v| v.is_none());
         for (w, at) in &self.watched {
-            db.save_watched(w, at)?;
+            if kept("unwatched", &w.key)? {
+                db.save_watched(w, at)?;
+            }
         }
         for (key, field) in &self.bitfields {
-            db.set_setting(&format!("bitfield:{key}"), field)?;
+            if kept("unwatched", key)? {
+                db.set_setting(&format!("bitfield:{key}"), field)?;
+            }
         }
-        // Only once per title, so one removed here doesn't come back at the next sync.
         for t in &self.saved {
-            let seen = format!("synced:{}", t.key);
-            if db.setting(&seen)?.is_none() {
+            if kept("unsaved", &t.key)? {
                 db.add_saved_title(t)?;
-                db.set_setting(&seen, "1")?;
             }
         }
         Ok(())
@@ -334,7 +337,8 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
         if title.is_empty() {
             continue;
         }
-        if !it.removed && !it.temp {
+        // Like stremio-core's library: `other` items aren't shown.
+        if !it.removed && !it.temp && it.kind != "other" {
             imp.saved.push(SavedTitle { key: key.clone(), title: title.clone(), kind: it.kind.clone(), poster: poster.clone() });
         }
         let video = s.video_id.clone().unwrap_or(it.id.clone());

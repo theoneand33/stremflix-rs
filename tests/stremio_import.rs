@@ -117,10 +117,11 @@ fn account_sync_imports_addons_library_and_saved_titles() {
         item("tt1", serde_json::json!({})),
         item("tt2", serde_json::json!({"removed": true, "state": {"flaggedWatched": 1}})),
         item("tt3", serde_json::json!({"temp": true})),
+        item("tt4", serde_json::json!({"type": "other"})),
         item("bad/id", serde_json::json!({}))]);
     let imp = from_account(&addons, &library).unwrap();
     assert_eq!(imp.addons.len(), 1, "file: transport URL is rejected");
-    assert_eq!(imp.saved.iter().map(|t| t.key.as_str()).collect::<Vec<_>>(), ["movie:tt1"], "removed, temp and invalid items aren't saved");
+    assert_eq!(imp.saved.iter().map(|t| t.key.as_str()).collect::<Vec<_>>(), ["movie:tt1"], "removed, temp, other and invalid items aren't saved");
     assert_eq!(imp.watched.iter().map(|(w, _)| w.key.as_str()).collect::<Vec<_>>(), ["movie:tt2"], "removed items keep their history");
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("a.db")).unwrap();
@@ -129,8 +130,16 @@ fn account_sync_imports_addons_library_and_saved_titles() {
     assert_eq!(db.saved_titles().unwrap().len(), 1);
     assert_eq!(db.addons().unwrap().len(), 1);
     db.remove_saved_title("movie:tt1").unwrap();
+    db.set_watched("movie:tt2", false).unwrap();
     imp.save(&db).unwrap();
     assert!(db.saved_titles().unwrap().is_empty(), "a title removed here stays removed after a re-sync");
+    assert!(db.watched(10).unwrap().is_empty(), "a title unwatched here stays unwatched after a re-sync");
+    // Added back here: later syncs update it again.
+    db.add_saved_title(&imp.saved[0]).unwrap();
+    db.set_watched("movie:tt2", true).unwrap();
+    imp.save(&db).unwrap();
+    assert_eq!(db.saved_titles().unwrap().len(), 1);
+    assert_eq!(db.watched(10).unwrap().len(), 1);
 }
 
 #[test]
