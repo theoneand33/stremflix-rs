@@ -39,7 +39,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Settings: default playback speed, subtitle delay, subtitles off by default | P2 | S | The Settings tab has languages, autoplay, hardware decoding and subtitle style. |
-| Send `videoHash` / `videoSize` to subtitle addons (OpenSubtitles matching) | P2 | M | Needs the OpenSubtitles hash of the file. |
 | Chromecast / DLNA casting | P3 | XL | |
 | Audio delay / A-V sync offset | P2 | S | Subtitle delay exists; `audio-delay` is the missing parallel. |
 | Remember volume, speed and audio track across sessions | P2 | S | Other settings persist; these three reset each title. |
@@ -49,7 +48,7 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Mouse-wheel volume over the video | P2 | S | |
 | Video scaling / zoom / aspect-ratio override | P2 | S | mpv `video-zoom`, `video-aspect-override`, `panscan`. |
 | Auto-load sidecar subtitles next to local files | P2 | S | `.srt`/`.ass`/`.vtt` beside the video; only addon subtitles today. |
-| In-app subtitle search and download | P2 | M | Complements the `videoHash` matching item above. |
+| In-app subtitle search and download | P2 | M | Complements `videoHash` matching. |
 | Skip intro / recap / credits from addon markers | P2 | M | Stremio supporter feature; needs an addon source for the timestamps. |
 | Playback stats overlay (peers, speed, dropped frames) | P2 | S | Stremio has a Network button; useful for torrents. |
 | Sleep timer | P3 | S | |
