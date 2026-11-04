@@ -89,7 +89,7 @@ impl CatalogDef {
     }
 
     /// Required by the `extra` list or the legacy `extraRequired` field.
-    fn is_required(&self, name: &str) -> bool {
+    pub fn is_required(&self, name: &str) -> bool {
         self.extra.iter().any(|e| e.name == name && e.is_required) || self.extra_required.iter().any(|n| n == name)
     }
 

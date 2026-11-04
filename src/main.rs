@@ -2066,7 +2066,7 @@ impl App {
                 let text = at.map_or_else(|| format!("All {}", e.name), |i| d.extras[i].1.clone());
                 egui::ComboBox::from_id_salt(("discover_extra", &e.name)).selected_text(text).show_ui(ui, |ui| {
                     let mut pick = None;
-                    if !e.is_required && ui.selectable_label(at.is_none(), format!("All {}", e.name)).clicked() {
+                    if !cur.2.is_required(&e.name) && ui.selectable_label(at.is_none(), format!("All {}", e.name)).clicked() {
                         pick = Some(None);
                     }
                     for o in &e.options {
