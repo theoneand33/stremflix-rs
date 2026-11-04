@@ -40,7 +40,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Settings: default playback speed, subtitle delay, subtitles off by default | P2 | S | The Settings tab has languages, autoplay, hardware decoding and subtitle style. |
-| Send `videoHash` / `videoSize` to subtitle addons (OpenSubtitles matching) | P2 | M | Needs the OpenSubtitles hash of the file. |
 | Chromecast / DLNA casting | P3 | XL | |
 | Audio delay / A-V sync offset | P2 | S | Subtitle delay exists; `audio-delay` is the missing parallel. |
 | Remember volume, speed and audio track across sessions | P2 | S | Other settings persist; these three reset each title. |
