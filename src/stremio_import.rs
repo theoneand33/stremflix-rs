@@ -28,8 +28,8 @@ pub struct Import {
     pub watched: Vec<(Watched, String)>,
     /// Series key (`<type>:<id>`) and its raw watched-episodes bitfield, mapped to episodes once their list loads.
     pub bitfields: Vec<(String, String)>,
-    /// Library titles (not removed, not history-only), saved with "Add to library".
-    pub saved: Vec<SavedTitle>,
+    /// Library titles (not removed, not history-only), saved with "Add to library", and when they were added (ISO 8601).
+    pub saved: Vec<(SavedTitle, String)>,
 }
 
 impl Import {
@@ -56,14 +56,13 @@ impl Import {
                 db.save_watched(w, at)?;
             }
         }
+        // Episodes unwatched here are skipped when the bitfield is applied (`Db::apply_watched_bitfield`).
         for (key, field) in &self.bitfields {
-            if kept("unwatched", key)? {
-                db.set_setting(&format!("bitfield:{key}"), field)?;
-            }
+            db.set_setting(&format!("bitfield:{key}"), field)?;
         }
-        for t in &self.saved {
+        for (t, at) in &self.saved {
             if kept("unsaved", &t.key)? {
-                db.add_saved_title(t)?;
+                db.import_saved_title(t, at)?;
             }
         }
         Ok(())
@@ -238,6 +237,9 @@ struct Item {
     poster: Option<String>,
     #[serde(rename = "_mtime", default)]
     mtime: String,
+    /// When it was added to the library.
+    #[serde(rename = "_ctime")]
+    ctime: Option<String>,
     state: ItemState,
     #[serde(default)]
     removed: bool,
@@ -344,7 +346,8 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
             continue;
         }
         if !it.removed && !it.temp {
-            imp.saved.push(SavedTitle { key: key.clone(), title: title.clone(), kind: it.kind.clone(), poster: poster.clone() });
+            let added = it.ctime.clone().unwrap_or(it.mtime.clone());
+            imp.saved.push((SavedTitle { key: key.clone(), title: title.clone(), kind: it.kind.clone(), poster: poster.clone() }, added));
         }
         let video = s.video_id.clone().unwrap_or(it.id.clone());
         if s.time_offset > 0
@@ -381,8 +384,11 @@ pub fn from_account(addons: &Value, library: &Value) -> Result<Import> {
     if !addons["addons"].is_array() || !library.is_array() {
         bail!("Stremio API: unexpected addon or library response");
     }
-    let items: serde_json::Map<String, Value> =
-        library.as_array().into_iter().flatten().filter_map(|it| Some((it["_id"].as_str()?.to_string(), it.clone()))).collect();
+    let list = library.as_array().into_iter().flatten();
+    let items: serde_json::Map<String, Value> = list.filter_map(|it| Some((it["_id"].as_str()?.to_string(), it.clone()))).collect();
+    if items.is_empty() && library.as_array().is_some_and(|l| !l.is_empty()) {
+        bail!("Stremio API: unexpected library item shape");
+    }
     let kv = HashMap::from([
         ("profile".to_string(), serde_json::json!({ "addons": addons["addons"] }).to_string()),
         ("library".to_string(), serde_json::json!({ "items": items }).to_string()),

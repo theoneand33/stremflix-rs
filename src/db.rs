@@ -192,6 +192,16 @@ impl Db {
         Ok(())
     }
 
+    /// A title from a Stremio import, dated when it was added there (ISO 8601 `at`) so the "Added" order follows Stremio.
+    pub fn import_saved_title(&self, t: &SavedTitle, at: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO saved_titles (key, title, kind, poster, saved_at) VALUES (?1, ?2, ?3, ?4, coalesce(unixepoch(?5), unixepoch()))
+             ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster)",
+            params![t.key, t.title, t.kind, t.poster, at],
+        )?;
+        Ok(())
+    }
+
     /// Remembered (`unsaved:<key>`), so an account sync or import doesn't bring it back.
     pub fn remove_saved_title(&self, key: &str) -> Result<()> {
         self.transaction(|| {
@@ -313,6 +323,8 @@ impl Db {
     /// Mark a movie or episode (`<type>:<id>`) watched or not. Watching also drops its resume point,
     /// so it leaves Continue Watching. Kept in `settings` so the Watch It Again row stays Stremio-only.
     /// Unwatching is remembered (`unwatched:<key>`), so an account sync or import doesn't undo it.
+    /// Unwatching an episode also drops its imported series (`<series key>:...`) from Watch It Again,
+    /// as its imported count no longer holds; watching one of its episodes lets a sync bring it back.
     pub fn set_watched(&self, key: &str, on: bool) -> Result<()> {
         let k = format!("watched:{key}");
         self.transaction(|| {
@@ -320,19 +332,15 @@ impl Db {
                 self.set_setting(&k, "1")?;
                 self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
                 self.conn.execute("DELETE FROM settings WHERE key = ?1", [format!("unwatched:{key}")])?;
+                // The series' tombstone, `unwatched:<series key>` (10-char prefix).
+                self.conn.execute("DELETE FROM settings WHERE key LIKE 'unwatched:%' AND substr(?1, 1, length(key) - 9) = substr(key, 11) || ':'", [key])?;
             } else {
-                let was = self.conn.execute("DELETE FROM settings WHERE key = ?1", [&k])? > 0;
+                self.conn.execute("DELETE FROM settings WHERE key = ?1", [&k])?;
                 self.set_setting(&format!("unwatched:{key}"), "1")?;
-                // Also clears a title imported from Stremio.
-                self.conn.execute("DELETE FROM watched WHERE key = ?1", [key])?;
-                // An episode of an imported series (`<series key>:...`): one fewer watched; at none the series
-                // leaves Watch It Again and is remembered, so a sync doesn't bring it back.
-                let parent = "substr(?1, 1, length(key) + 1) = key || ':'";
-                if was {
-                    self.conn.execute(&format!("INSERT OR REPLACE INTO settings (key, value) SELECT 'unwatched:' || key, '1' FROM watched WHERE episodes <= 1 AND {parent}"), [key])?;
-                    self.conn.execute(&format!("DELETE FROM watched WHERE episodes <= 1 AND {parent}"), [key])?;
-                    self.conn.execute(&format!("UPDATE watched SET episodes = episodes - 1 WHERE {parent}"), [key])?;
-                }
+                // Also clears a title imported from Stremio, or the series an episode belongs to.
+                let parent = "(key = ?1 OR substr(?1, 1, length(key) + 1) = key || ':')";
+                self.conn.execute(&format!("INSERT OR REPLACE INTO settings (key, value) SELECT 'unwatched:' || key, '1' FROM watched WHERE {parent}"), [key])?;
+                self.conn.execute(&format!("DELETE FROM watched WHERE {parent}"), [key])?;
             }
             Ok(())
         })

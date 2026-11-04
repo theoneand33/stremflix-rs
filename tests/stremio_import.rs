@@ -121,11 +121,11 @@ fn account_sync_imports_addons_library_and_saved_titles() {
         item("tt1", serde_json::json!({})),
         item("tt2", serde_json::json!({"removed": true, "state": {"flaggedWatched": 1}})),
         item("tt3", serde_json::json!({"temp": true})),
-        item("tt4", serde_json::json!({"type": "other"})),
+        item("tt4", serde_json::json!({"type": "other", "state": {"flaggedWatched": 1}})),
         item("bad/id", serde_json::json!({}))]);
     let imp = from_account(&addons, &library).unwrap();
     assert_eq!(imp.addons.len(), 1, "file: transport URL is rejected");
-    assert_eq!(imp.saved.iter().map(|t| t.key.as_str()).collect::<Vec<_>>(), ["movie:tt1"], "removed, temp, other and invalid items aren't saved");
+    assert_eq!(imp.saved.iter().map(|(t, _)| t.key.as_str()).collect::<Vec<_>>(), ["movie:tt1"], "removed, temp, other and invalid items aren't saved");
     assert_eq!(imp.watched.iter().map(|(w, _)| w.key.as_str()).collect::<Vec<_>>(), ["movie:tt2"], "removed items keep their history");
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("a.db")).unwrap();
@@ -139,7 +139,7 @@ fn account_sync_imports_addons_library_and_saved_titles() {
     assert!(db.saved_titles().unwrap().is_empty(), "a title removed here stays removed after a re-sync");
     assert!(db.watched(10).unwrap().is_empty(), "a title unwatched here stays unwatched after a re-sync");
     // Added back here: later syncs update it again.
-    db.add_saved_title(&imp.saved[0]).unwrap();
+    db.add_saved_title(&imp.saved[0].0).unwrap();
     db.set_watched("movie:tt2", true).unwrap();
     imp.save(&db).unwrap();
     assert_eq!(db.saved_titles().unwrap().len(), 1);
@@ -150,6 +150,8 @@ fn account_sync_imports_addons_library_and_saved_titles() {
     assert!(db.addons().unwrap().is_empty());
     assert!(from_account(&serde_json::json!({}), &library).is_err(), "unexpected addon shape");
     assert!(from_account(&addons, &serde_json::json!({"items": []})).is_err(), "unexpected library shape");
+    assert!(from_account(&addons, &serde_json::json!([{"id": "tt1"}])).is_err(), "unexpected library item shape");
+    assert!(from_account(&addons, &serde_json::json!([])).is_ok(), "an empty library is fine");
 }
 
 #[test]
@@ -161,17 +163,30 @@ fn unwatched_episode_survives_bitfield() {
     assert_eq!(db.apply_watched_bitfield("bitfield:series:tt2", &keys).unwrap(), ["series:tt2:1:2"]);
     assert!(!db.watched_keys().unwrap().contains("series:tt2:1:1"));
 
-    // An imported series with 2 watched episodes: unwatching them counts down, then drops it for good.
+    // Unwatching an episode drops its imported series from Watch It Again, also across syncs.
     let imp = Import { watched: vec![(Watched { key: "series:tt2".into(), title: "Show".into(), poster: None, episodes: 2 }, "2026-01-01T00:00:00Z".into())], ..Default::default() };
     imp.save(&db).unwrap();
-    db.set_watched("series:tt2:1:3", true).unwrap();
-    db.set_watched("series:tt2:1:3", false).unwrap();
-    assert_eq!(db.watched(10).unwrap()[0].episodes, 1);
     db.set_watched("series:tt2:1:2", false).unwrap();
     assert!(db.watched(10).unwrap().is_empty());
     imp.save(&db).unwrap();
     assert!(db.watched(10).unwrap().is_empty(), "a sync doesn't bring back a series unwatched here");
-    db.set_watched("series:tt2:1:9", false).unwrap(); // never watched: changes nothing
+    // Watching an episode again lets the next sync restore it; a similar-prefix series isn't affected.
+    db.set_watched("series:tt22:1:1", true).unwrap();
+    imp.save(&db).unwrap();
+    assert!(db.watched(10).unwrap().is_empty());
+    db.set_watched("series:tt2:1:2", true).unwrap();
+    imp.save(&db).unwrap();
+    assert_eq!(db.watched(10).unwrap().len(), 1);
+}
+
+#[test]
+fn imported_saved_titles_keep_stremio_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("a.db")).unwrap();
+    let t = |id: &str| stremflix_rs::db::SavedTitle { key: format!("movie:{id}"), title: id.into(), kind: "movie".into(), poster: None };
+    let imp = Import { saved: vec![(t("old"), "2024-01-01T00:00:00Z".into()), (t("new"), "2025-01-01T00:00:00Z".into())], ..Default::default() };
+    imp.save(&db).unwrap();
+    assert_eq!(db.saved_titles().unwrap().iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["new", "old"]);
 }
 
 #[test]

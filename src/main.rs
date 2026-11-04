@@ -3038,7 +3038,7 @@ impl App {
                     ui.spinner();
                 }
             });
-            ui.label(RichText::new("Copies your addons and library from api.strem.io; nothing is uploaded.").size(13.0).color(Color32::from_gray(170)));
+            ui.label(RichText::new("Copies your addons, library and watched titles from api.strem.io; nothing is uploaded.").size(13.0).color(Color32::from_gray(170)));
             let email = self.login.0.trim().to_string();
             if go && !email.is_empty() && !self.login.1.is_empty() {
                 // Not kept after use, even if signing in fails.
