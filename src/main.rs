@@ -200,8 +200,8 @@ impl Row {
 /// Addon URL, type and id of an addon catalog.
 type AddonCatalogSrc = (String, String, String);
 
-/// Addon URL, type, catalog id, genre.
-type DiscoverSrc = (String, String, String, Option<String>);
+/// Addon URL, type, catalog id, picked extras (name, value).
+type DiscoverSrc = (String, String, String, Vec<(String, String)>);
 
 /// Discover tab pickers and the grid they loaded.
 #[derive(Default)]
@@ -209,7 +209,7 @@ struct Discover {
     kind: String,
     /// Addon URL and catalog id.
     cat: (String, String),
-    genre: Option<String>,
+    extras: Vec<(String, String)>,
     src: Option<DiscoverSrc>,
     /// `None` while loading.
     items: Option<Vec<MetaPreview>>,
@@ -2008,7 +2008,7 @@ impl App {
         }
     }
 
-    /// Pick a type, catalog and genre; the catalog's first page shows as a poster grid.
+    /// Pick a type, catalog and its extras (genre, year, sort, ...); the catalog's first page shows as a poster grid.
     fn ui_discover(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let cats: Vec<(&String, &String, &CatalogDef)> = self
@@ -2029,23 +2029,20 @@ impl App {
                 kinds.push(&c.kind);
             }
         }
-        // Keep the pickers valid as addons change: fall back to the first type, catalog and (if required) genre.
+        // Keep the pickers valid as addons change: fall back to the first type, catalog and required extras.
         if !kinds.contains(&d.kind.as_str()) {
             d.kind = kinds[0].into();
         }
         let in_kind: Vec<_> = cats.iter().filter(|(_, _, c)| c.kind == d.kind).collect();
         let cur = *in_kind.iter().find(|(u, _, c)| **u == d.cat.0 && c.id == d.cat.1).unwrap_or(&in_kind[0]);
         d.cat = (cur.0.clone(), cur.2.id.clone());
-        let genres = cur.2.genres();
-        if !d.genre.as_ref().is_some_and(|g| genres.contains(g)) {
-            d.genre = genres.first().filter(|_| cur.2.requires_genre()).cloned();
-        }
-        let src = (d.cat.0.clone(), d.kind.clone(), d.cat.1.clone(), d.genre.clone());
+        d.extras = cur.2.valid_extras(&d.extras);
+        let src = (d.cat.0.clone(), d.kind.clone(), d.cat.1.clone(), d.extras.clone());
         if d.src.as_ref() != Some(&src) {
             (d.src, d.items) = (Some(src.clone()), None);
             let client = self.client.clone();
             self.spawn(&ctx, async move {
-                let res = client.discover(&src.0, &src.1, &src.2, src.3.as_deref()).await.map_err(|e| format!("{e:#}"));
+                let res = client.discover(&src.0, &src.1, &src.2, &src.3).await.map_err(|e| format!("{e:#}"));
                 Ok(Msg::Discover(src, res))
             });
         }
@@ -2064,13 +2061,22 @@ impl App {
                     ui.selectable_value(&mut d.cat, ((*u).clone(), c.id.clone()), cat_label(addon, c));
                 }
             });
-            if !genres.is_empty() {
-                egui::ComboBox::from_id_salt("discover_genre").selected_text(d.genre.as_deref().unwrap_or("All genres")).show_ui(ui, |ui| {
-                    if !cur.2.requires_genre() {
-                        ui.selectable_value(&mut d.genre, None, "All genres");
+            for e in cur.2.pickers() {
+                let at = d.extras.iter().position(|(n, _)| *n == e.name);
+                let text = at.map_or_else(|| format!("All {}", e.name), |i| d.extras[i].1.clone());
+                egui::ComboBox::from_id_salt(("discover_extra", &e.name)).selected_text(text).show_ui(ui, |ui| {
+                    let mut pick = None;
+                    if !e.is_required && ui.selectable_label(at.is_none(), format!("All {}", e.name)).clicked() {
+                        pick = Some(None);
                     }
-                    for g in genres {
-                        ui.selectable_value(&mut d.genre, Some(g.clone()), g);
+                    for o in &e.options {
+                        if ui.selectable_label(at.is_some_and(|i| d.extras[i].1 == *o), o).clicked() {
+                            pick = Some(Some(o.clone()));
+                        }
+                    }
+                    if let Some(p) = pick {
+                        d.extras.retain(|(n, _)| *n != e.name);
+                        d.extras.extend(p.map(|o| (e.name.clone(), o)));
                     }
                 });
             }

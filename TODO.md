@@ -17,7 +17,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Calendar of upcoming episodes for library series | P2 | M | Depends on the saved library. |
 | New-episode notifications | P2 | M | Depends on the saved library. |
-| Year / sort / other catalog extras | P1 | M | Discover offers only `genre` and `search`; addons commonly declare `year` and `sort`. |
 | "New Episodes" row for library series | P2 | S | Depends on the saved library and addon episode metadata. |
 | Hide / reorder Home catalog rows | P2 | M | Rows follow addon priority only. |
 | Search history | P2 | S | |

@@ -82,20 +82,24 @@ impl CatalogDef {
         self.extra.iter().any(|e| e.is_required) || !self.extra_required.is_empty()
     }
 
-    /// Options of the `genre` extra (empty for legacy `extraSupported` catalogs, which list none).
-    pub fn genres(&self) -> &[String] {
-        self.extra.iter().find(|e| e.name == "genre").map_or(&[], |e| &e.options)
+    /// Extras the user can pick a value for (`genre`, `year`, `sort`, ...): those declaring options.
+    pub fn pickers(&self) -> impl Iterator<Item = &ExtraDef> {
+        self.extra.iter().filter(|e| !e.options.is_empty())
     }
 
-    pub fn requires_genre(&self) -> bool {
-        self.extra.iter().any(|e| e.is_required && e.name == "genre") || self.extra_required.iter().any(|e| e == "genre")
+    /// `current` kept where still a valid option, plus the first option of each required picker.
+    pub fn valid_extras(&self, current: &[(String, String)]) -> Vec<(String, String)> {
+        self.pickers()
+            .filter_map(|e| {
+                let kept = current.iter().find(|(n, v)| *n == e.name && e.options.contains(v));
+                kept.cloned().or_else(|| e.is_required.then(|| (e.name.clone(), e.options[0].clone())))
+            })
+            .collect()
     }
 
-    /// Browsable on Discover: no required extra other than a genre we have options for.
+    /// Browsable on Discover: every required extra has options to pick from.
     pub fn discoverable(&self) -> bool {
-        self.extra.iter().all(|e| !e.is_required || e.name == "genre")
-            && self.extra_required.iter().all(|e| e == "genre")
-            && (!self.requires_genre() || !self.genres().is_empty())
+        self.extra.iter().all(|e| !e.is_required || !e.options.is_empty()) && self.extra_required.is_empty()
     }
 }
 
@@ -743,12 +747,13 @@ pub fn catalog_path(kind: &str, id: &str, skip: usize) -> String {
     }
 }
 
-/// Relative catalog URL, with an optional `genre` extra (`catalog/<type>/<id>/genre=<value>.json`).
-pub fn discover_path(kind: &str, id: &str, genre: Option<&str>) -> String {
-    match genre {
-        None => format!("catalog/{}/{}.json", enc(kind), enc(id)),
-        Some(g) => format!("catalog/{}/{}/genre={}.json", enc(kind), enc(id), enc(g)),
+/// Relative catalog URL with extras (`catalog/<type>/<id>/<name>=<value>&....json`).
+pub fn discover_path(kind: &str, id: &str, extras: &[(String, String)]) -> String {
+    if extras.is_empty() {
+        return format!("catalog/{}/{}.json", enc(kind), enc(id));
     }
+    let extra: Vec<String> = extras.iter().map(|(n, v)| format!("{}={}", enc(n), enc(v))).collect();
+    format!("catalog/{}/{}/{}.json", enc(kind), enc(id), extra.join("&"))
 }
 
 /// Release this binary was built as (`nightly` or `vX.Y.Z`) and its commit; set by release.yml, absent in source builds.
@@ -846,9 +851,9 @@ impl AddonClient {
         parse_catalog(&self.get(addon_base(transport_url)?.join(&catalog_path(kind, id, skip))?).await?)
     }
 
-    /// First page of a catalog, filtered by `genre` if given.
-    pub async fn discover(&self, transport_url: &str, kind: &str, id: &str, genre: Option<&str>) -> Result<Vec<MetaPreview>> {
-        parse_catalog(&self.get(addon_base(transport_url)?.join(&discover_path(kind, id, genre))?).await?)
+    /// First page of a catalog, with the given extras (genre, year, sort, ...).
+    pub async fn discover(&self, transport_url: &str, kind: &str, id: &str, extras: &[(String, String)]) -> Result<Vec<MetaPreview>> {
+        parse_catalog(&self.get(addon_base(transport_url)?.join(&discover_path(kind, id, extras))?).await?)
     }
 
     pub async fn search(&self, transport_url: &str, kind: &str, id: &str, query: &str) -> Result<Vec<MetaPreview>> {
