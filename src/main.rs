@@ -2478,6 +2478,8 @@ impl App {
             if bg.hovered() && p.menu.is_none() {
                 let n = wheel_steps(&mut p.wheel, i.smooth_scroll_delta.y);
                 if n != 0 { cmd(&["add", "volume", &(n * 5).to_string()]) }
+            } else {
+                p.wheel = 0.0;
             }
             toggle_fs |= k(F);
             if k(Escape) {
@@ -3551,6 +3553,7 @@ mod mac_links {
 
 /// Turn wheel scroll (points) into whole volume steps, keeping the remainder; one 50 pt notch is one step.
 fn wheel_steps(acc: &mut f32, dy: f32) -> i32 {
+    if dy * *acc < 0.0 { *acc = 0.0; } // a direction change starts fresh
     *acc += dy;
     let n = (*acc / 50.0).trunc();
     *acc -= n * 50.0;
@@ -3568,6 +3571,9 @@ mod tests {
         assert_eq!(wheel_steps(&mut acc, -100.0), -2);
         assert_eq!((0..5).map(|_| wheel_steps(&mut acc, 10.0)).sum::<i32>(), 1);
         assert_eq!(wheel_steps(&mut acc, 0.0), 0);
+        // A +40 leftover must not cancel a fresh -50 notch.
+        acc = 40.0;
+        assert_eq!(wheel_steps(&mut acc, -50.0), -1);
     }
 
     #[test]
