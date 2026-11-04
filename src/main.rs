@@ -832,6 +832,7 @@ struct App {
     last_poll: Instant,
     /// GL function loader of eframe's context, for libmpv's OpenGL renderer.
     gl_proc: Option<GlProc>,
+    window: Geo,
     /// Video framebuffer, its texture (owned by egui once registered) and pixel size; reused across playbacks.
     video: Option<(glow::Framebuffer, glow::Texture, egui::TextureId, [usize; 2])>,
 }
@@ -931,6 +932,7 @@ impl App {
             pill: None,
             last_poll: Instant::now(),
             gl_proc: None,
+            window: Geo::default(),
             video: None,
         };
         if app.addons.is_empty() {
@@ -3297,6 +3299,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        ctx.input(|i| self.window.track(i.viewport()));
         // Load libmpv off the UI thread once the first frames are up: loading it earlier delayed them by ~140 ms.
         if ctx.cumulative_frame_nr() == 2 {
             std::thread::spawn(stremflix_rs::player::load_mpv);
@@ -3405,7 +3408,55 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
+        let _ = self.db.set_setting("window", &self.window.to_string());
         self.stop_player();
+    }
+}
+
+/// Window size/position restored on launch. Default is a maximized 1000x700 window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Geo {
+    size: [f32; 2],
+    pos: Option<[f32; 2]>,
+    maximized: bool,
+}
+
+impl Default for Geo {
+    fn default() -> Self {
+        Self { size: [1000.0, 700.0], pos: None, maximized: true }
+    }
+}
+
+impl std::fmt::Display for Geo {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{},{},{}", self.size[0], self.size[1], u8::from(self.maximized))?;
+        self.pos.map_or(Ok(()), |p| write!(f, ",{},{}", p[0], p[1]))
+    }
+}
+
+impl std::str::FromStr for Geo {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        let n: Vec<f32> = s.split(',').map(|v| v.parse().map_err(|_| ())).collect::<Result<_, _>>()?;
+        if !n.iter().all(|v| v.is_finite()) || !matches!(n.len(), 3 | 5) || n[0] < 200.0 || n[1] < 150.0 {
+            return Err(());
+        }
+        Ok(Self { size: [n[0], n[1]], pos: (n.len() == 5).then(|| [n[3], n[4]]), maximized: n[2] != 0.0 })
+    }
+}
+
+impl Geo {
+    /// Fullscreen is transient and a maximized rect is not the restore size, so those keep the last normal rect.
+    fn track(&mut self, vp: &egui::ViewportInfo) {
+        self.maximized = vp.maximized.unwrap_or(false);
+        if self.maximized || vp.fullscreen == Some(true) {
+            return;
+        }
+        if let Some(r) = vp.inner_rect {
+            self.size = [r.width(), r.height()];
+        }
+        // shortcut: Wayland reports no outer position, so only size is restored there.
+        self.pos = vp.outer_rect.map(|r| [r.min.x, r.min.y]).or(self.pos);
     }
 }
 
@@ -3435,10 +3486,13 @@ fn main() -> eframe::Result {
     }
     #[cfg(windows)]
     std::thread::spawn(instance::register_scheme);
+    app.window = app.db.setting("window").ok().flatten().and_then(|s| s.parse().ok()).unwrap_or_default();
+    let mut vp = egui::ViewportBuilder::default().with_inner_size(app.window.size).with_maximized(app.window.maximized);
+    if let Some(p) = app.window.pos {
+        vp = vp.with_position(p);
+    }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 700.0])
-            .with_maximized(true)
+        viewport: vp
             .with_title("Stremflix-rs")
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("bundled icon is a valid PNG")),
         ..Default::default()
@@ -3545,6 +3599,14 @@ mod mac_links {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geo_round_trips_and_rejects_junk() {
+        let g = Geo { size: [800.0, 600.0], pos: Some([-10.0, 20.0]), maximized: false };
+        assert_eq!(g.to_string().parse(), Ok(g));
+        assert_eq!(Geo::default().to_string().parse(), Ok(Geo::default()));
+        assert!("1,2,3".parse::<Geo>().is_err() && "x".parse::<Geo>().is_err() && "800,600,0,1".parse::<Geo>().is_err());
+    }
 
     #[test]
     fn saved_view_filters_and_sorts() {

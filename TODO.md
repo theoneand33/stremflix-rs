@@ -73,7 +73,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Transcoding for formats the player can't handle | P3 | L | mpv already plays almost everything, so this is mostly irrelevant. |
 | HTTP/SOCKS proxy for addon and stream requests | P2 | M | Also routes torrents; relevant for VPN users. |
-| Remember window size and position | P2 | S | |
 | Configurable User-Agent | P3 | S | Some addons and streams reject the default. |
 | Pause playback when the window is minimized | P3 | S | Stremio setting. |
 | Launch playback in a separate window | P3 | M | Stremio setting; egui multi-viewport. |
