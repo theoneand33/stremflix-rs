@@ -3239,10 +3239,15 @@ impl App {
                 ui.label(if hidden { RichText::new(title).weak() } else { RichText::new(title) });
             });
         }
+        if self.home_all.is_empty() {
+            ui.label(RichText::new("No catalog rows yet.").weak());
+        }
         if small_button(ui, "Reset").on_hover_text("Addon order, nothing hidden").clicked() {
             reset = true;
         }
         if swap.is_some() || toggle.is_some() || reset {
+            // Show and Reset need a fetch, so they rebuild. Up, Down and Hide reorder or filter the loaded rows.
+            let rebuild = reset || toggle.as_ref().is_some_and(|k| self.home_hidden.contains(k));
             if let Some(i) = swap {
                 self.home_all.swap(i, i + 1);
                 self.home_order = self.home_all.iter().map(|(k, _)| k.clone()).collect();
@@ -3258,7 +3263,13 @@ impl App {
             }
             save.push(("home_order", encode_keys(&self.home_order)));
             save.push(("home_hidden", encode_keys(&self.home_hidden)));
-            self.build_rows(&ctx);
+            if rebuild {
+                self.build_rows(&ctx);
+            } else {
+                let order = &self.home_all;
+                self.rows.sort_by_key(|r| order.iter().position(|(k, _)| *k == row_key(&r.src)));
+                self.rows.retain(|r| !self.home_hidden.contains(&row_key(&r.src)));
+            }
         }
         for (k, v) in save {
             if let Err(e) = self.db.set_setting(k, &v) {
