@@ -75,6 +75,30 @@ type Subs = Vec<(String, String)>;
 /// Media file `(index, name, size)` of a torrent.
 type MediaFile = (usize, String, u64);
 
+/// A subtitle an addon offers for the playing item, listed in the player's search panel.
+#[derive(Clone)]
+struct SubFound {
+    addon: String,
+    lang: String,
+    url: String,
+}
+
+/// State of the player's subtitle search panel.
+#[derive(Default)]
+struct SubSearch {
+    open: bool,
+    busy: bool,
+    filter: String,
+    results: Vec<SubFound>,
+    status: String,
+}
+
+/// Results whose language or addon name contains `q` (case-insensitive, blank matches all).
+fn filter_subs<'a>(found: &'a [SubFound], q: &str) -> Vec<&'a SubFound> {
+    let q = q.trim().to_lowercase();
+    found.iter().filter(|f| f.lang.to_lowercase().contains(&q) || f.addon.to_lowercase().contains(&q)).collect()
+}
+
 /// Order of the saved-titles list in the Library tab.
 #[derive(PartialEq, Clone, Copy)]
 enum LibSort {
@@ -117,9 +141,14 @@ impl LibKind {
     }
 }
 
-/// Saved titles of `kind`, newest first unless sorted by title (case-insensitive).
-fn saved_view(items: &[SavedTitle], kind: LibKind, sort: LibSort) -> Vec<&SavedTitle> {
-    let mut v: Vec<&SavedTitle> = items.iter().filter(|t| kind.matches(&t.kind)).collect();
+/// Case-insensitive substring match; a blank query matches everything.
+fn title_matches(title: &str, query: &str) -> bool {
+    title.to_lowercase().contains(&query.trim().to_lowercase())
+}
+
+/// Saved titles of `kind` matching `query`, newest first unless sorted by title (case-insensitive).
+fn saved_view<'a>(items: &'a [SavedTitle], kind: LibKind, sort: LibSort, query: &str) -> Vec<&'a SavedTitle> {
+    let mut v: Vec<&SavedTitle> = items.iter().filter(|t| kind.matches(&t.kind) && title_matches(&t.title, query)).collect();
     if sort == LibSort::Title {
         v.sort_by_key(|t| t.title.to_lowercase());
     }
@@ -156,6 +185,8 @@ enum Msg {
     Episodes(MetaPreview, Meta, u64),
     /// Full meta of a movie (genres, cast, ...) for the detail page.
     Details(Meta),
+    /// `new_eps_gen`, a saved series and its recently released episodes.
+    NewEpisodes(u64, MetaPreview, Vec<Video>),
     /// poster URL, image bytes (empty on failure)
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs, torrent id, the `nav` it was requested at
@@ -178,6 +209,10 @@ enum Msg {
     Link(String),
     /// A download that finished, or why it failed.
     Downloaded(Download, Result<(), String>),
+    /// Progress key and the subtitles every addon offered for it.
+    SubSearch(String, Vec<SubFound>),
+    /// A saved subtitle's path, or why saving failed.
+    SubSaved(Result<PathBuf, String>),
     /// A media key or OS media overlay button.
     Media(souvlaki::MediaControlEvent),
 }
@@ -195,6 +230,33 @@ struct Row {
     loading_more: bool,
     /// Last page was empty, had nothing new, or failed.
     exhausted: bool,
+}
+
+/// How far back an episode's release date still counts as new.
+const NEW_EPISODE_DAYS: i64 = 14;
+
+/// Days since 1970-01-01 (UTC) today.
+fn unix_days() -> i64 {
+    (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) / 86400) as i64
+}
+
+/// `YYYY-MM-DD` of a day count since 1970-01-01 (civil-from-days).
+fn date_string(days: i64) -> String {
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + i64::from(m <= 2))
+}
+
+/// Numbered episodes released on `since..=today` (`YYYY-MM-DD`), in list order.
+fn recent_episodes(videos: Vec<Video>, since: &str, today: &str) -> Vec<Video> {
+    let day = |v: &Video| v.released.as_deref().and_then(|d| d.get(..10)).map(str::to_owned);
+    videos.into_iter().filter(|v| v.episode.is_some() && v.season != Some(0) && day(v).is_some_and(|d| d.as_str() >= since && d.as_str() <= today)).collect()
 }
 
 /// Max items kept per catalog row.
@@ -687,6 +749,11 @@ fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
     paused && dur > 0.0 && pos >= dur - 1.0
 }
 
+/// Fraction of the seek bar the cache covers, never behind the playhead.
+fn buffered_frac(pos: f64, cached_to: f64, dur: f64) -> f32 {
+    if dur > 0.0 { (cached_to.max(pos) / dur).clamp(0.0, 1.0) as f32 } else { 0.0 }
+}
+
 /// The playable source when there is exactly one; `None` when there's a choice (or nothing).
 fn only_source(streams: &[Stream]) -> Option<String> {
     let mut it = streams.iter().filter_map(Stream::source);
@@ -834,6 +901,7 @@ struct Playing {
     after_hold: bool,
     /// The up-next card was dismissed.
     next_dismissed: bool,
+    search: SubSearch,
     /// Per-session picture scaling: aspect override index into `ASPECTS`, fill (crop) instead of fit, zoom in tenths.
     aspect: usize,
     fill: bool,
@@ -914,11 +982,17 @@ struct App {
     library: Vec<LibraryItem>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
+    /// Saved series with episodes released in the last `NEW_EPISODE_DAYS` days (watched ones are hidden when drawn).
+    new_episodes: Vec<(MetaPreview, Vec<Video>)>,
+    /// Bumped on each `build_rows`; stale `Msg::NewEpisodes` replies are dropped.
+    new_eps_gen: u64,
     /// Finished downloads, newest first, and those still running.
     downloads: Vec<Download>,
     downloading: Vec<Download>,
     lib_sort: LibSort,
     lib_kind: LibKind,
+    /// Title filter of the Library tab.
+    lib_query: String,
     recent: Vec<Progress>,
     watched: Vec<Watched>,
     /// Keys (`<type>:<id>`) of movies and episodes marked watched.
@@ -1012,10 +1086,13 @@ impl App {
             addons: db.addons()?,
             library: db.library_items()?,
             saved: db.saved_titles()?,
+            new_episodes: Vec::new(),
+            new_eps_gen: 0,
             downloads: db.downloads()?,
             downloading: Vec::new(),
             lib_sort: LibSort::Added,
             lib_kind: LibKind::All,
+            lib_query: String::new(),
             recent: db.recent_progress(20)?,
             watched: db.watched(50)?,
             watched_keys: db.watched_keys()?,
@@ -1396,6 +1473,28 @@ impl App {
                 }
                 None => report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200))),
             },
+            Msg::NewEpisodes(epoch, meta, mut videos) => {
+                if epoch == self.new_eps_gen {
+                    self.new_episodes.retain(|(m, _)| m.id != meta.id);
+                    sort_episodes(&mut videos);
+                    // Episodes imported as watched from Stremio, as in `Msg::Episodes`.
+                    let bk = format!("bitfield:{}:{}", meta.kind, meta.id);
+                    if let Ok(Some(field)) = self.db.setting(&bk) {
+                        let keys: Vec<String> = stremio_import::watched_videos(&field, &videos).into_iter().map(|id| format!("{}:{id}", meta.kind)).collect();
+                        if !keys.is_empty() {
+                            match self.db.apply_watched_bitfield(&bk, &keys) {
+                                Ok(marked) => self.watched_keys.extend(marked),
+                                Err(e) => report(&mut self.error, format!("saving watched episodes: {e:#}")),
+                            }
+                        }
+                    }
+                    let today = unix_days();
+                    let videos = recent_episodes(videos, &date_string(today - (NEW_EPISODE_DAYS - 1)), &date_string(today));
+                    if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) && !videos.is_empty() {
+                        self.new_episodes.push((meta, videos));
+                    }
+                }
+            }
             Msg::Details(m) => {
                 if self.details_want == (m.kind.clone(), m.id.clone()) {
                     if let Some((sel, ..)) = self.selected.as_mut() {
@@ -1456,6 +1555,20 @@ impl App {
                 }
             }
             Msg::Update(url) => self.update = url,
+            Msg::SubSearch(key, found) => {
+                if let Some(p) = self.player.as_mut().filter(|p| p.key == key) {
+                    p.search.busy = false;
+                    p.search.results = found;
+                }
+            }
+            Msg::SubSaved(res) => {
+                if let Some(p) = &mut self.player {
+                    p.search.status = match res {
+                        Ok(path) => format!("Saved {}", path.display()),
+                        Err(e) => format!("Save failed: {e}"),
+                    };
+                }
+            }
             Msg::Media(e) => self.media_event(ctx, e),
             Msg::Downloaded(d, res) => {
                 self.downloading.retain(|x| x.path != d.path);
@@ -1538,7 +1651,7 @@ impl App {
                         if self.default_speed != 1.0 {
                             let _ = player.command(&["set", "speed", &self.default_speed.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, aspect: 0, fill: false, zoom: 0, awake: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1699,6 +1812,8 @@ impl App {
 
     /// Rebuild home rows from installed catalogs: generic Trending/Popular rows first, then the rest.
     fn build_rows(&mut self, ctx: &egui::Context) {
+        self.new_eps_gen += 1;
+        self.new_episodes.clear();
         let cats: Vec<(&String, &String, &CatalogDef)> = self
             .addons
             .iter()
@@ -1739,6 +1854,31 @@ impl App {
             self.spawn(ctx, async move {
                 let res = client.catalog(&src.0, &src.1, &src.2, 0).await.map_err(|e| format!("{e:#}"));
                 Ok(Msg::Row(src, res))
+            });
+        }
+        self.fetch_new_episodes(ctx);
+    }
+
+    /// Ask a meta addon for the episodes of each saved series and keep those released recently.
+    fn fetch_new_episodes(&self, ctx: &egui::Context) {
+        // At most 4 meta requests in flight, so a long library doesn't flood the addons.
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
+        for meta in self.saved.iter().filter(|t| t.kind == "series").filter_map(SavedTitle::preview) {
+            let addons = self.addons_for("meta", &meta.kind, &meta.id);
+            let (client, tx, ctx, epoch, slots) = (self.client.clone(), self.tx.clone(), ctx.clone(), self.new_eps_gen, slots.clone());
+            // Not `spawn`: a series whose meta fails to load just has no row entry.
+            self.rt.spawn(async move {
+                let Ok(_permit) = slots.acquire_owned().await else { return };
+                for u in &addons {
+                    // Like `open_meta`: an addon without episodes doesn't end the search.
+                    if let Ok(m) = client.meta(u, &meta.kind, &meta.id).await
+                        && !m.videos.is_empty()
+                    {
+                        let _ = tx.send(Msg::NewEpisodes(epoch, meta, m.videos));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
             });
         }
     }
@@ -2081,6 +2221,7 @@ impl App {
             let _ = self.tx.send(Msg::Play(key, format!("{} - {}", d.name, t.title.as_deref().unwrap_or("Trailer")), src.clone(), src, vec![], None, self.nav));
         }
         let mut episode = None;
+        let mut fresh_click: Option<(MetaPreview, String)> = None;
         let mut toggle: Option<(String, bool)> = None;
         let mut bulk: Option<(Vec<String>, bool)> = None;
         let mut save = None;
@@ -2216,6 +2357,28 @@ impl App {
                 });
             });
         }
+        let mut fresh: Vec<(&MetaPreview, &Video)> = self
+            .new_episodes
+            .iter()
+            .filter(|(m, _)| self.saved.iter().any(|t| t.key == format!("series:{}", m.id)))
+            .filter_map(|(m, vs)| vs.iter().filter(|v| !self.watched_keys.contains(&format!("{}:{}", m.kind, v.id))).max_by_key(|v| (v.released.as_deref().and_then(|d| d.get(..10)), v.season, v.episode)).map(|v| (m, v)))
+            .collect();
+        fresh.sort_by(|a, b| b.1.released.cmp(&a.1.released));
+        if !fresh.is_empty() {
+            Self::row_title(ui, "New Episodes");
+            egui::ScrollArea::horizontal().id_salt("new_episodes").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (m, v) in fresh {
+                        let label = format!("{} S{}E{}", m.name, v.season.unwrap_or(0), v.episode.unwrap_or(0));
+                        let (r, rect) = card(ui, CARD, &label);
+                        self.paint_poster(ui, &r, rect, &m.poster, &m.name, &mut want);
+                        if r.on_hover_text(label).clicked() {
+                            fresh_click = Some((m.clone(), v.id.clone()));
+                        }
+                    }
+                });
+            });
+        }
         if !self.watched.is_empty() {
             Self::row_title(ui, "Watch It Again");
             egui::ScrollArea::horizontal().id_salt("watched").show(ui, |ui| {
@@ -2304,6 +2467,12 @@ impl App {
         }
         if let Some((m, v)) = episode {
             self.open_streams(&ctx, m, Some(v), Autoplay::Only, None);
+        }
+        // Load the series page first, so no other series' episode list stays under it.
+        if let Some((m, id)) = fresh_click {
+            let sid = m.id.clone();
+            self.open_meta(&ctx, m, false);
+            self.pending = Some((sid, Some(id)));
         }
         if let Some((k, t, s, subs)) = play {
             self.play(&ctx, k, t, s, subs);
@@ -2619,6 +2788,7 @@ impl App {
         let mut cmd = |a: &[&str]| cmds.push(a.iter().map(|s| s.to_string()).collect());
         let (mut back, mut toggle_fs, mut external) = (false, false, false);
         let mut seek: Option<(f64, bool)> = None;
+        let (mut search_req, mut sub_act): (bool, Option<(bool, SubFound)>) = (false, None);
         let mut style = self.sub_style;
         ui.painter().rect_filled(rect, 0, Color32::BLACK);
 
@@ -2723,6 +2893,9 @@ impl App {
             if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]) }
             if k(M) { cmd(&["cycle", "mute"]) }
+            // mpv pauses on its own after a frame step.
+            if k(Period) { cmd(&["frame-step"]) }
+            if k(Comma) { cmd(&["frame-back-step"]) }
             toggle_fs |= k(F);
             if k(Escape) {
                 if fs { toggle_fs = true } else { back = true }
@@ -2801,6 +2974,8 @@ impl App {
             let th = ctx.animate_value_with_time(r.id.with("h"), if hot { 6.0 } else { 4.0 }, 0.1);
             let track = egui::Rect::from_center_size(bar.center(), vec2(bar.width(), th));
             paint.rect_filled(track, 2, Color32::from_gray(128).gamma_multiply(a * 0.5));
+            let buf = buffered_frac(pos, st.cached_to, st.dur);
+            paint.rect_filled(egui::Rect::from_min_size(track.min, vec2(track.width() * buf, th)), 2, Color32::from_gray(160).gamma_multiply(a * 0.6));
             paint.rect_filled(egui::Rect::from_min_size(track.min, vec2(track.width() * frac, th)), 2, accent().gamma_multiply(a));
             let knob = pos2(track.left() + track.width() * frac, track.center().y);
             paint.circle_filled(knob, if hot { 9.0 } else { 7.0 }, accent().gamma_multiply(a));
@@ -2901,6 +3076,36 @@ impl App {
                                 }
                             }
                             if kind == "sub" {
+                                menu_heading(ui, "Search");
+                                let s = &mut p.search;
+                                if ui.add(egui::Button::new(RichText::new(if s.open { "Hide search" } else { "Search subtitles" }).size(14.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(16)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0))).clicked() {
+                                    s.open = !s.open;
+                                    search_req = s.open && s.results.is_empty() && !s.busy;
+                                }
+                                if s.open {
+                                    ui.add(egui::TextEdit::singleline(&mut s.filter).hint_text("Filter by language or addon").desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
+                                    let hits = filter_subs(&s.results, &s.filter);
+                                    let note = if s.busy { "Searching..." } else if hits.is_empty() { "No subtitles found" } else { "" };
+                                    if !note.is_empty() {
+                                        ui.label(RichText::new(note).size(14.0).color(Color32::from_gray(150)));
+                                    }
+                                    egui::ScrollArea::vertical().id_salt("sub_search").max_height(200.0).show(ui, |ui| {
+                                        // shortcut: first 100 matches only; type a filter to narrow.
+                                        for f in hits.into_iter().take(100) {
+                                            ui.horizontal(|ui| {
+                                                if ui.small_button("Save").on_hover_text("Save next to the video or in downloads").clicked() {
+                                                    sub_act = Some((true, f.clone()));
+                                                }
+                                                if menu_row(ui, &format!("{} · {}", f.lang, f.addon), false).clicked() {
+                                                    sub_act = Some((false, f.clone()));
+                                                }
+                                            });
+                                        }
+                                    });
+                                    if !s.status.is_empty() {
+                                        ui.label(RichText::new(&s.status).size(13.0).color(Color32::from_gray(170)));
+                                    }
+                                }
                                 menu_heading(ui, "Style");
                                 style.scale = (style.scale * 10.0).round() / 10.0 + stepper(ui, "Size", &format!("{:.1}x", style.scale)) as f64 * 0.1;
                                 ui.horizontal(|ui| {
@@ -3082,6 +3287,48 @@ impl App {
             }
             if let Err(e) = p.player.command(&args) {
                 report(&mut self.error, e);
+            }
+        }
+        let (key, source, title) = (p.key.clone(), p.source.clone(), p.title.clone());
+        if let Some((save, f)) = sub_act {
+            if save {
+                // Beside a local or downloaded video, else in the downloads folder.
+                let src = std::path::Path::new(&source);
+                let dir = src.is_file().then(|| src.parent().map(PathBuf::from)).flatten().unwrap_or_else(|| self.data_dir.join("downloads"));
+                let client = self.client.clone();
+                p.search.status = "Saving...".into();
+                self.spawn(&ctx, async move {
+                    let res = async { download::save_subtitle(&dir, &title, &f.lang, &client.subtitle_file(&f.url).await?).await }.await;
+                    Ok(Msg::SubSaved(res.map_err(|e| format!("{e:#}"))))
+                });
+            } else if let Err(e) = p.player.add_sub(&f.url, &f.lang) {
+                report(&mut self.error, e);
+            }
+        }
+        if search_req {
+            let lookup = self.sub_lookup(&key, &source);
+            let names: Vec<(String, String)> = lookup.iter().flat_map(|l| &l.addons).map(|u| (u.clone(), self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default())).collect();
+            if let Some(p) = &mut self.player {
+                p.search.busy = lookup.is_some();
+                p.search.status = if lookup.is_some() { String::new() } else { "No subtitle addons for this item".into() };
+            }
+            if let Some(l) = lookup {
+                let client = self.client.clone();
+                // Like `hashed_subs`: the stream's hash and file name let OpenSubtitles-style addons match the exact file.
+                let extra: Vec<(&str, String)> = [("videoHash", l.hints.video_hash.clone()), ("videoSize", l.hints.video_size.map(|n| n.to_string())), ("filename", l.hints.filename.clone())]
+                    .into_iter()
+                    .filter_map(|(k, v)| Some((k, v?)))
+                    .collect();
+                self.spawn(&ctx, async move {
+                    let ask = |(u, name): (String, String)| {
+                        let (c, k, i, e) = (client.clone(), l.kind.clone(), l.id.clone(), extra.clone());
+                        async move { Ok(c.subtitles(&u, &k, &i, &e).await?.into_iter().map(|s| SubFound { addon: name.clone(), lang: s.lang, url: s.url }).collect::<Vec<_>>()) }
+                    };
+                    let mut found: Vec<SubFound> = concurrently(names, ask).await.into_iter().flatten().flatten().collect();
+                    let mut seen = std::collections::HashSet::new();
+                    found.retain(|f| seen.insert(f.url.clone()));
+                    Ok(Msg::SubSearch(key, found))
+                });
             }
         }
         if toggle_fs {
@@ -3366,7 +3613,7 @@ impl App {
             }
         });
         ui.label(RichText::new("Also Ctrl and +, Ctrl and −, Ctrl and 0.").size(13.0).color(ui.visuals().weak_text_color()));
-                if !save.is_empty() {
+        if !save.is_empty() {
             apply_theme(ui.ctx(), self.light);
         }
         ui.add_space(16.0);
@@ -3493,7 +3740,7 @@ impl App {
                 });
             });
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Subtitle outline").size(15.0).color(Color32::from_gray(210)));
+                ui.label(RichText::new("Subtitle outline").size(15.0).color(ui.visuals().weak_text_color()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     for (i, (name, hex)) in SUB_OUTLINES.iter().enumerate().rev() {
                         if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::BLACK), style.outline == i).clicked() {
@@ -3581,13 +3828,17 @@ impl App {
                     ui.selectable_value(&mut self.lib_kind, k, k.label());
                 }
             });
+            let edit = ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Filter by title").desired_width(180.0));
+            if (edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape))) || (!self.lib_query.is_empty() && small_button(ui, "x").on_hover_text("Clear filter").clicked()) {
+                self.lib_query.clear();
+            }
         });
         ui.add_space(4.0);
-        let items: Vec<MetaPreview> = saved_view(&self.saved, self.lib_kind, self.lib_sort).into_iter().filter_map(SavedTitle::preview).collect();
+        let items: Vec<MetaPreview> = saved_view(&self.saved, self.lib_kind, self.lib_sort, &self.lib_query).into_iter().filter_map(SavedTitle::preview).collect();
         if self.saved.is_empty() {
             ui.label(RichText::new("Nothing saved yet. Open a title and choose \"Add to library\".").color(ui.visuals().weak_text_color()));
         } else if items.is_empty() {
-            ui.label(RichText::new("No saved titles of this type.").color(ui.visuals().weak_text_color()));
+            ui.label(RichText::new("No saved titles match.").color(ui.visuals().weak_text_color()));
         }
         self.ui_cards(ui, "saved", &items, &mut want, &mut open, &mut quick);
         for u in want {
@@ -3660,7 +3911,7 @@ impl App {
         }
         ui.separator();
         let mut play = None;
-        for it in &self.library {
+        for it in self.library.iter().filter(|it| title_matches(&it.title, &self.lib_query)) {
             ui.horizontal(|ui| {
                 if primary_button(ui, &format!("Play {}", it.title)).clicked() {
                     play = Some(it.clone());
@@ -3768,7 +4019,7 @@ impl eframe::App for App {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.set_min_width(220.0);
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new("Recent searches").small().color(Color32::from_gray(150)));
+                                    ui.label(RichText::new("Recent searches").small().color(ui.visuals().weak_text_color()));
                                     if ui.small_button("Clear").clicked() {
                                         clear = true;
                                     }
@@ -4067,6 +4318,34 @@ mod tests {
     }
 
     #[test]
+    fn new_episodes_window() {
+        assert_eq!(date_string(0), "1970-01-01");
+        assert_eq!(date_string(19782), "2024-02-29");
+        let v = |id: &str, season, rel: Option<&str>| Video { id: id.into(), title: None, season, episode: Some(1), released: rel.map(Into::into), thumbnail: None };
+        let vs = vec![
+            v("old", Some(1), Some("2024-01-01T00:00:00.000Z")),
+            v("new", Some(1), Some("2024-03-05T00:00:00.000Z")),
+            v("future", Some(1), Some("2024-04-01")),
+            v("special", Some(0), Some("2024-03-05")),
+            v("undated", Some(1), None),
+        ];
+        let ids: Vec<_> = recent_episodes(vs, "2024-02-20", "2024-03-06").into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, ["new"]);
+        // Both ends of the window are inclusive; a day outside either is not.
+        let edge = vec![v("before", Some(1), Some("2024-02-19")), v("since", Some(1), Some("2024-02-20")), v("today", Some(1), Some("2024-03-06")), v("after", Some(1), Some("2024-03-07"))];
+        let ids: Vec<_> = recent_episodes(edge, "2024-02-20", "2024-03-06").into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, ["since", "today"]);
+    }
+
+    #[test]
+    fn buffered_frac_clamps() {
+        assert_eq!(buffered_frac(10.0, 50.0, 100.0), 0.5);
+        assert_eq!(buffered_frac(10.0, 0.0, 100.0), 0.1);
+        assert_eq!(buffered_frac(10.0, 500.0, 100.0), 1.0);
+        assert_eq!(buffered_frac(10.0, 50.0, 0.0), 0.0);
+    }
+
+    #[test]
     fn clamp_scale_bounds_and_rounds() {
         assert_eq!(clamp_scale(0.1), 0.75);
         assert_eq!(clamp_scale(9.0), 2.0);
@@ -4108,13 +4387,24 @@ mod tests {
         // Newest first, as stored.
         let items = [t("series:tt2", "beta"), t("movie:tt3", "Alpha"), t("movie:tt1", "gamma")];
         let keys = |v: Vec<&SavedTitle>| v.into_iter().map(|t| t.key.clone()).collect::<Vec<_>>();
-        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Added)), ["series:tt2", "movie:tt3", "movie:tt1"]);
-        assert_eq!(keys(saved_view(&items, LibKind::Movie, LibSort::Added)), ["movie:tt3", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Added, "")), ["series:tt2", "movie:tt3", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::Movie, LibSort::Added, "")), ["movie:tt3", "movie:tt1"]);
         // Case-insensitive title order, and the filter holds while sorting.
-        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Title)), ["movie:tt3", "series:tt2", "movie:tt1"]);
-        assert_eq!(keys(saved_view(&items, LibKind::Series, LibSort::Title)), ["series:tt2"]);
-        assert!(saved_view(&items, LibKind::Series, LibSort::Added).len() == 1);
-        assert_eq!(saved_view(&[], LibKind::All, LibSort::Title).len(), 0);
+        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Title, "")), ["movie:tt3", "series:tt2", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::Series, LibSort::Title, "")), ["series:tt2"]);
+        assert!(saved_view(&items, LibKind::Series, LibSort::Added, "").len() == 1);
+        assert_eq!(saved_view(&[], LibKind::All, LibSort::Title, "").len(), 0);
+        // Query combines with kind and sort.
+        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Title, " A ")), ["movie:tt3", "series:tt2", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::Movie, LibSort::Added, "ALPH")), ["movie:tt3"]);
+    }
+
+    #[test]
+    fn title_match_folds_case() {
+        assert!(title_matches("Amélie", "AMÉL"));
+        assert!(title_matches("Straße", "straße"));
+        assert!(title_matches("anything", "  "));
+        assert!(!title_matches("Alpha", "beta"));
     }
 
     #[test]
@@ -4255,6 +4545,16 @@ mod tests {
         assert_eq!(app.recent.len(), 1, "a rewatch keeps a resume point");
         app.record_progress(p(95.0));
         assert!(app.recent.is_empty() && app.db.progress("movie:tt1").unwrap().is_none());
+    }
+
+    #[test]
+    fn filter_subs_matches_lang_or_addon() {
+        let f = |addon: &str, lang: &str| SubFound { addon: addon.into(), lang: lang.into(), url: String::new() };
+        let all = [f("OpenSubtitles", "eng"), f("Other", "por-BR"), f("Other", "fre")];
+        assert_eq!(filter_subs(&all, " ENG ").len(), 1);
+        assert_eq!(filter_subs(&all, "other").len(), 2);
+        assert_eq!(filter_subs(&all, "").len(), 3);
+        assert!(filter_subs(&all, "xx").is_empty());
     }
 
     #[tokio::test]

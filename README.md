@@ -60,6 +60,7 @@ For series, pick a season and episode. ⏭ in the player opens the next episode.
 | Space, K, click | Pause |
 | ←/→, Shift+←/→ | Skip 10 s / 30 s (Settings) |
 | ↑/↓, M | Volume, mute |
+| ,/. | Step one frame back / forward (pauses) |
 | F, double-click | Full screen |
 | Esc | Leave full screen / back |
 
