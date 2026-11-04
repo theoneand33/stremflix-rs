@@ -1816,7 +1816,7 @@ impl App {
                         }
                         // Corner X, shown like the play button; registered after the card so it takes the click.
                         let x = egui::Rect::from_center_size(rect.right_top() + vec2(-18.0, 18.0), vec2(28.0, 28.0));
-                        let xr = ui.interact(x, r.id.with("remove"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                        let xr = ui.interact(x, r.id.with("remove"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Remove from Continue Watching");
                         xr.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Remove {} from Continue Watching", p.title)));
                         if r.contains_pointer() || xr.has_focus() {
                             ui.painter().circle_filled(x.center(), 14.0, Color32::from_black_alpha(if xr.hovered() { 210 } else { 140 }));
