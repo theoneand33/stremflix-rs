@@ -84,7 +84,7 @@ Scheme registration: the Linux AppImage declares it (installed by AppImageLaunch
 
 ### Import from Stremio
 
-Addons → Import from Stremio copies addons, watched titles (Watch It Again), and progress (Continue Watching) from a local Stremio install. It reads a temp copy and never changes Stremio's files. Re-importing keeps newer local progress. Leave the path empty to auto-detect:
+Addons → Import from Stremio copies addons, library titles (saved titles), watched titles (Watch It Again), and progress (Continue Watching) from a local Stremio install. It reads a temp copy and never changes Stremio's files. Re-importing keeps newer local progress. Leave the path empty to auto-detect:
 
 | OS | Location (format) |
 |---|---|
@@ -93,6 +93,10 @@ Addons → Import from Stremio copies addons, watched titles (Watch It Again), a
 | Windows | `*stremio*` folders in `%APPDATA%`, `%LOCALAPPDATA%`, `%LOCALAPPDATA%\Programs` (Chromium LevelDB) |
 
 Only the Linux Flatpak (Stremio 5) is tested against a real install; fixtures cover the rest. `cargo test --test stremio_import -- --ignored --nocapture` reads this machine's Stremio into a temp DB.
+
+### Stremio account
+
+Settings → Stremio account signs in to api.strem.io and copies the account's addons, library (as saved titles), and watched titles, on sign-in, at startup, and with Sync. Sync is one-way: nothing is uploaded, already installed addons are kept, and deletions on the account aren't removed here. Addons and library titles you remove here, and titles or episodes you mark unwatched, stay that way after a sync or import. The auth key is stored in the local DB (owner-only on Linux and macOS); Sign out clears it there and tries to sign the key out on the server. Account progress needs the stream that was playing, which the account doesn't hold, so it isn't copied.
 
 ## End-to-end demo
 

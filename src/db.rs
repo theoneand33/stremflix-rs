@@ -76,6 +76,19 @@ impl Db {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        // Owner-only: it holds the Stremio account's auth key. New `-wal`/`-shm` files get the DB's mode;
+        // ones left by an older version are fixed here.
+        #[cfg(unix)]
+        for ext in ["", "-wal", "-shm"] {
+            let mut f = path.as_os_str().to_os_string();
+            f.push(ext);
+            // Some filesystems (FAT, network shares) have no Unix modes: not a reason to refuse to start.
+            if let Err(e) = std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("making {} owner-only: {e}", PathBuf::from(f).display());
+            }
+        }
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL; -- safe with WAL; a crash loses at most the last commit, and progress saves every second
@@ -107,7 +120,9 @@ impl Db {
         Ok(())
     }
 
+    /// Also lets Stremio imports add it again (see [`Db::remove_addon`]).
     pub fn add_addon(&self, transport_url: &str, manifest: &Manifest) -> Result<()> {
+        self.conn.execute("DELETE FROM settings WHERE key = ?1", [format!("unaddon:{transport_url}")])?;
         self.conn.execute(
             // A reinstall keeps its priority; a new addon goes last.
             "INSERT INTO addons (transport_url, manifest, position) VALUES (?1, ?2, (SELECT coalesce(max(position), 0) + 1 FROM addons))
@@ -117,9 +132,12 @@ impl Db {
         Ok(())
     }
 
+    /// Remembered (`unaddon:<url>`), so an account sync or import doesn't reinstall it.
     pub fn remove_addon(&self, transport_url: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM addons WHERE transport_url = ?1", [transport_url])?;
-        Ok(())
+        self.transaction(|| {
+            self.conn.execute("DELETE FROM addons WHERE transport_url = ?1", [transport_url])?;
+            self.set_setting(&format!("unaddon:{transport_url}"), "1")
+        })
     }
 
     /// Store `urls` (installed addon transport URLs) as the addon priority order, first = highest.
@@ -163,7 +181,9 @@ impl Db {
     }
 
     /// Re-adding a saved title keeps its original `saved_at`, so the library order is stable.
+    /// It also lets Stremio imports add it again (see [`Db::remove_saved_title`]).
     pub fn add_saved_title(&self, t: &SavedTitle) -> Result<()> {
+        self.conn.execute("DELETE FROM settings WHERE key = ?1", [format!("unsaved:{}", t.key)])?;
         self.conn.execute(
             "INSERT INTO saved_titles (key, title, kind, poster) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster)",
@@ -172,9 +192,22 @@ impl Db {
         Ok(())
     }
 
-    pub fn remove_saved_title(&self, key: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM saved_titles WHERE key = ?1", [key])?;
+    /// A title from a Stremio import, dated when it was added there (ISO 8601 `at`) so the "Added" order follows Stremio.
+    pub fn import_saved_title(&self, t: &SavedTitle, at: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO saved_titles (key, title, kind, poster, saved_at) VALUES (?1, ?2, ?3, ?4, coalesce(unixepoch(?5), unixepoch()))
+             ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster)",
+            params![t.key, t.title, t.kind, t.poster, at],
+        )?;
         Ok(())
+    }
+
+    /// Remembered (`unsaved:<key>`), so an account sync or import doesn't bring it back.
+    pub fn remove_saved_title(&self, key: &str) -> Result<()> {
+        self.transaction(|| {
+            self.conn.execute("DELETE FROM saved_titles WHERE key = ?1", [key])?;
+            self.set_setting(&format!("unsaved:{key}"), "1")
+        })
     }
 
     /// Saved titles, newest first; rows with a malformed key or type are skipped.
@@ -219,6 +252,11 @@ impl Db {
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)", [key, value])?;
+        Ok(())
+    }
+
+    pub fn remove_setting(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
         Ok(())
     }
 
@@ -284,30 +322,45 @@ impl Db {
 
     /// Mark a movie or episode (`<type>:<id>`) watched or not. Watching also drops its resume point,
     /// so it leaves Continue Watching. Kept in `settings` so the Watch It Again row stays Stremio-only.
+    /// Unwatching is remembered (`unwatched:<key>`), so an account sync or import doesn't undo it.
+    /// Unwatching an episode also drops its imported series (`<series key>:...`) from Watch It Again,
+    /// as its imported count no longer holds; watching one of its episodes lets a sync bring it back.
     pub fn set_watched(&self, key: &str, on: bool) -> Result<()> {
         let k = format!("watched:{key}");
         self.transaction(|| {
             if on {
                 self.set_setting(&k, "1")?;
                 self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
+                self.conn.execute("DELETE FROM settings WHERE key = ?1", [format!("unwatched:{key}")])?;
+                // The series' tombstone, `unwatched:<series key>` (10-char prefix).
+                self.conn.execute("DELETE FROM settings WHERE key LIKE 'unwatched:%' AND substr(?1, 1, length(key) - 9) = substr(key, 11) || ':'", [key])?;
             } else {
                 self.conn.execute("DELETE FROM settings WHERE key = ?1", [&k])?;
-                // Also clears a title imported from Stremio.
-                self.conn.execute("DELETE FROM watched WHERE key = ?1", [key])?;
+                self.set_setting(&format!("unwatched:{key}"), "1")?;
+                // Also clears a title imported from Stremio, or the series an episode belongs to.
+                let parent = "(key = ?1 OR substr(?1, 1, length(key) + 1) = key || ':')";
+                self.conn.execute(&format!("INSERT OR REPLACE INTO settings (key, value) SELECT 'unwatched:' || key, '1' FROM watched WHERE {parent}"), [key])?;
+                self.conn.execute(&format!("DELETE FROM watched WHERE {parent}"), [key])?;
             }
             Ok(())
         })
     }
 
-    /// Mark episodes `keys` watched and drop the imported bitfield setting they came from, in one transaction.
-    pub fn apply_watched_bitfield(&self, bitfield_key: &str, keys: &[String]) -> Result<()> {
+    /// Mark episodes `keys` watched, except ones unwatched here, and drop the imported bitfield setting
+    /// they came from, in one transaction. Returns the keys marked.
+    pub fn apply_watched_bitfield(&self, bitfield_key: &str, keys: &[String]) -> Result<Vec<String>> {
+        let mut marked = Vec::new();
         self.transaction(|| {
             for k in keys {
-                self.set_setting(&format!("watched:{k}"), "1")?;
+                if self.setting(&format!("unwatched:{k}"))?.is_none() {
+                    self.set_setting(&format!("watched:{k}"), "1")?;
+                    marked.push(k.clone());
+                }
             }
             self.conn.execute("DELETE FROM settings WHERE key = ?1", [bitfield_key])?;
             Ok(())
-        })
+        })?;
+        Ok(marked)
     }
 
     /// Keys marked watched here or imported from Stremio (a movie imported as watched counts).

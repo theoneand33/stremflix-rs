@@ -1,4 +1,5 @@
-//! Import addons, watch progress and watched titles from a local Stremio installation.
+//! Import addons, library titles, watch progress and watched titles from a local Stremio installation
+//! or (via [`from_account`]) a Stremio account.
 //!
 //! Stremio 5 (stremio-web + stremio-core) keeps its state as JSON in the webview's localStorage
 //! under the keys `profile` (addons), `library`/`library_recent` (titles + progress) and `streams`
@@ -17,7 +18,7 @@ use std::time::SystemTime;
 use walkdir::WalkDir;
 
 use crate::addon::{Manifest, Stream, Video, addon_base, parse_manifest, safe_http_url, sanitize_text, valid_id};
-use crate::db::{Db, Progress, Watched};
+use crate::db::{Db, Progress, SavedTitle, Watched};
 
 #[derive(Debug, Default)]
 pub struct Import {
@@ -27,6 +28,8 @@ pub struct Import {
     pub watched: Vec<(Watched, String)>,
     /// Series key (`<type>:<id>`) and its raw watched-episodes bitfield, mapped to episodes once their list loads.
     pub bitfields: Vec<(String, String)>,
+    /// Library titles (not removed, not history-only), saved with "Add to library", and when they were added (ISO 8601).
+    pub saved: Vec<(SavedTitle, String)>,
 }
 
 impl Import {
@@ -38,16 +41,29 @@ impl Import {
     fn save_rows(&self, db: &Db) -> Result<()> {
         let have: Vec<String> = db.addons()?.into_iter().map(|(u, _)| u).collect();
         for (u, m) in self.addons.iter().filter(|(u, _)| !have.contains(u)) {
-            db.add_addon(u, m)?;
+            // Not one removed here.
+            if db.setting(&format!("unaddon:{u}"))?.is_none() {
+                db.add_addon(u, m)?;
+            }
         }
         for (p, at) in &self.progress {
             db.import_progress(p, at)?;
         }
+        // Titles unwatched or removed here stay that way.
+        let kept = |kind: &str, key: &str| db.setting(&format!("{kind}:{key}")).map(|v| v.is_none());
         for (w, at) in &self.watched {
-            db.save_watched(w, at)?;
+            if kept("unwatched", &w.key)? {
+                db.save_watched(w, at)?;
+            }
         }
+        // Episodes unwatched here are skipped when the bitfield is applied (`Db::apply_watched_bitfield`).
         for (key, field) in &self.bitfields {
             db.set_setting(&format!("bitfield:{key}"), field)?;
+        }
+        for (t, at) in &self.saved {
+            if kept("unsaved", &t.key)? {
+                db.import_saved_title(t, at)?;
+            }
         }
         Ok(())
     }
@@ -221,7 +237,15 @@ struct Item {
     poster: Option<String>,
     #[serde(rename = "_mtime", default)]
     mtime: String,
+    /// When it was added to the library.
+    #[serde(rename = "_ctime")]
+    ctime: Option<String>,
     state: ItemState,
+    #[serde(default)]
+    removed: bool,
+    /// Only watched, never added to the library.
+    #[serde(default)]
+    temp: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -305,6 +329,8 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
             if let Ok(it) = serde_json::from_value::<Item>(v.clone())
                 && valid_id(&it.id)
                 && valid_id(&it.kind)
+                // Like stremio-core's library and Continue Watching: `other` items are skipped.
+                && it.kind != "other"
                 && items.get(&it.id).is_none_or(|old| old.mtime <= it.mtime)
             {
                 items.insert(it.id.clone(), it);
@@ -318,6 +344,10 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
         let at = s.last_watched.clone().unwrap_or(it.mtime.clone());
         if title.is_empty() {
             continue;
+        }
+        if !it.removed && !it.temp {
+            let added = it.ctime.clone().unwrap_or(it.mtime.clone());
+            imp.saved.push((SavedTitle { key: key.clone(), title: title.clone(), kind: it.kind.clone(), poster: poster.clone() }, added));
         }
         let video = s.video_id.clone().unwrap_or(it.id.clone());
         if s.time_offset > 0
@@ -345,4 +375,23 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
         }
     }
     Ok(imp)
+}
+
+/// Build an import from Stremio account API results: `addonCollectionGet` and `datastoreGet` of `libraryItem`.
+/// Shaped like localStorage and parsed by [`parse`], so it gets the same validation.
+pub fn from_account(addons: &Value, library: &Value) -> Result<Import> {
+    // An unexpected shape must fail, not sync as empty.
+    if !addons["addons"].is_array() || !library.is_array() {
+        bail!("Stremio API: unexpected addon or library response");
+    }
+    let list = library.as_array().into_iter().flatten();
+    let items: serde_json::Map<String, Value> = list.filter_map(|it| Some((it["_id"].as_str()?.to_string(), it.clone()))).collect();
+    if items.is_empty() && library.as_array().is_some_and(|l| !l.is_empty()) {
+        bail!("Stremio API: unexpected library item shape");
+    }
+    let kv = HashMap::from([
+        ("profile".to_string(), serde_json::json!({ "addons": addons["addons"] }).to_string()),
+        ("library".to_string(), serde_json::json!({ "items": items }).to_string()),
+    ]);
+    parse(&kv)
 }

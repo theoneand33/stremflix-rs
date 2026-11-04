@@ -96,7 +96,7 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| Stremio account login, with addon and library sync (api.strem.io) | P2 | L | Today there's only a one-way import from a local install. |
+| Upload to the Stremio account (addons, library, progress) | P2 | M | Sign-in pulls addons, library and watched titles; nothing is pushed back. |
 | Trakt integration (scrobbling, watched sync) | P3 | L | |
 | Export / import all data (addons, library, progress) | P2 | S | Stremio offers a data export; good for backup and migration. |
 | Simkl / MyAnimeList / Letterboxd sync | P3 | L | After Trakt. |

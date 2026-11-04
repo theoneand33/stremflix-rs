@@ -8,6 +8,9 @@ use url::Url;
 
 /// Upper bound on any addon response body.
 pub const MAX_BODY: usize = 4 * 1024 * 1024;
+/// Stremio account API. A whole library can be far larger than an addon response.
+const STREMIO_API: &str = "https://api.strem.io/api/";
+const MAX_API_BODY: usize = 64 * 1024 * 1024;
 const MAX_TEXT: usize = 300;
 const MAX_LONG_TEXT: usize = 4000;
 const MAX_ITEMS: usize = 500;
@@ -483,6 +486,15 @@ fn from_json<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
 
 // ---------- parsers ----------
 
+/// `result` of a Stremio API response body, or an error with its (sanitized) message.
+pub fn api_result(body: &[u8]) -> Result<serde_json::Value> {
+    let mut v: serde_json::Value = serde_json::from_slice(body).context("Stremio API: invalid response")?;
+    if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
+        bail!("Stremio API: {}", sanitize_text(e["message"].as_str().unwrap_or("request failed"), 200));
+    }
+    v.get_mut("result").map(serde_json::Value::take).filter(|r| !r.is_null()).context("Stremio API: no result")
+}
+
 pub fn parse_manifest(body: &[u8]) -> Result<Manifest> {
     let mut m: Manifest = from_json(body)?;
     ensure!(valid_id(&m.id), "manifest: invalid id");
@@ -830,6 +842,39 @@ impl AddonClient {
         let (Some(release), Some(commit)) = (RELEASE, COMMIT) else { return Ok(None) };
         let url = Url::parse(&format!("https://api.github.com/repos/{REPO}/releases/"))?.join(if release == "nightly" { "tags/nightly" } else { "latest" })?;
         newer_release(release, commit, &self.get(url).await?)
+    }
+
+    /// POST `body` to Stremio API `method`; its `result`, or its `error` message.
+    async fn stremio_api(&self, method: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+        let url = format!("{STREMIO_API}{method}");
+        // A whole library takes longer than the client's 15 s default.
+        let req = self.http()?.post(&url).json(&body).timeout(std::time::Duration::from_secs(120));
+        let mut resp = req.send().await.with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        // Errors come back as JSON `{"error": ...}`, so the body is read whatever the status.
+        let mut out = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            out.extend_from_slice(&chunk);
+            ensure!(out.len() <= MAX_API_BODY, "Stremio API: response too large");
+        }
+        api_result(&out).with_context(|| format!("HTTP {status}"))
+    }
+
+    /// Sign in to a Stremio account; returns its auth key.
+    pub async fn stremio_login(&self, email: &str, password: &str) -> Result<String> {
+        let r = self.stremio_api("login", serde_json::json!({"type": "Login", "email": email, "password": password, "facebook": false})).await?;
+        r["authKey"].as_str().filter(|k| !k.is_empty()).map(String::from).context("Stremio API: no auth key")
+    }
+
+    pub async fn stremio_logout(&self, auth_key: &str) -> Result<()> {
+        self.stremio_api("logout", serde_json::json!({"type": "Logout", "authKey": auth_key})).await.map(drop)
+    }
+
+    /// The account's addons and library, validated like a local Stremio import.
+    pub async fn stremio_pull(&self, auth_key: &str) -> Result<crate::stremio_import::Import> {
+        let addons = self.stremio_api("addonCollectionGet", serde_json::json!({"type": "AddonCollectionGet", "authKey": auth_key, "update": true})).await?;
+        let library = self.stremio_api("datastoreGet", serde_json::json!({"authKey": auth_key, "collection": "libraryItem", "ids": [], "all": true})).await?;
+        crate::stremio_import::from_account(&addons, &library)
     }
 
     pub async fn fetch_manifest(&self, transport_url: &str) -> Result<Manifest> {

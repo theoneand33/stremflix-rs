@@ -166,3 +166,20 @@ fn downloads_round_trip() {
     assert_eq!(db.progress(&movie.key()).unwrap(), None, "resume point on the deleted file is dropped");
     assert!(db.progress(&ep.key()).unwrap().is_some(), "a streamed resume point is kept");
 }
+
+#[cfg(unix)]
+#[test]
+fn db_files_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.db");
+    drop(Db::open(&path).unwrap());
+    // A journal left world-readable by an older version is fixed on open.
+    let wal = dir.path().join("a.db-wal");
+    std::fs::write(&wal, b"").unwrap();
+    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _db = Db::open(&path).unwrap(); // kept open: SQLite deletes the WAL on the last close
+    for f in [&path, &wal] {
+        assert_eq!(std::fs::metadata(f).unwrap().permissions().mode() & 0o777, 0o600, "{}", f.display());
+    }
+}
