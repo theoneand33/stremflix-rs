@@ -2433,9 +2433,11 @@ impl App {
         // Press and hold the video for 2x speed; the release halves it back and is not a click.
         let was_fast = p.fast;
         // Primary button only; losing focus or the pointer ends the hold in case the release went elsewhere.
-        let down = ctx.input(|i| i.pointer.primary_down() && i.focused && i.pointer.has_pointer());
+        // Space holds the same way; a focused popover control keeps Space for itself.
+        let space = ctx.memory(|m| m.focused()).is_none() && ctx.input(|i| i.focused && i.key_down(egui::Key::Space));
+        let down = ctx.input(|i| i.pointer.primary_down() && i.focused && i.pointer.has_pointer()) || space;
         // Record the start on the press frame: egui drops the press from `bg` after 0.8 s or 6 px.
-        let hold = p.hold.or_else(|| bg.is_pointer_button_down_on().then(|| ctx.input(|i| i.pointer.press_start_time())).flatten());
+        let hold = p.hold.or_else(|| bg.is_pointer_button_down_on().then(|| ctx.input(|i| i.pointer.press_start_time())).flatten()).or(space.then_some(now));
         let long = hold.is_some_and(|t| now - t >= 0.5);
         p.hold = hold.filter(|_| down);
         p.fast = down && long;
@@ -2463,7 +2465,8 @@ impl App {
             use egui::Key::*;
             let k = |key| i.key_pressed(key);
             // Space activates a focused popover control, so it must not also toggle pause.
-            if (k(Space) && focused.is_none()) || k(K) { cmd(&["cycle", "pause"]) }
+            // A short Space press pauses on release; a hold is 2x speed, like the mouse.
+            if (i.key_released(Space) && focused.is_none() && !long) || k(K) { cmd(&["cycle", "pause"]) }
             if k(ArrowLeft) { seek = Some((-10.0, true)) }
             if k(ArrowRight) { seek = Some((10.0, true)) }
             if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
