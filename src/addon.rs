@@ -958,6 +958,11 @@ impl AddonClient {
         parse_subtitles(&self.get(addon_base(transport_url)?.join(&subtitles_path(kind, id, extra))?).await?)
     }
 
+    /// Body of a subtitle file: an http(s) URL, capped at `MAX_BODY`.
+    pub async fn subtitle_file(&self, url: &str) -> Result<Vec<u8>> {
+        self.get(safe_http_url(url).context("not an http(s) URL")?).await
+    }
+
     /// Up to `HASH_CHUNK` bytes of `url` from `start`, and the file size from `Content-Range` (or a 200's length).
     async fn chunk_at(&self, url: &Url, headers: &[(String, String)], start: u64) -> Result<(Vec<u8>, u64)> {
         let mut req = self.http()?.get(url.clone()).header("Range", format!("bytes={start}-{}", start + HASH_CHUNK as u64 - 1));

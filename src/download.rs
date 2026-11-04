@@ -26,6 +26,26 @@ pub fn file_name(title: &str, hint: Option<&str>) -> String {
     format!("{stem}.{ext}")
 }
 
+/// `<sanitized title> <lang>.srt`; addon text never reaches the path. mpv sniffs the format, so `.srt` fits any text subtitle.
+pub fn subtitle_name(title: &str, lang: &str) -> String {
+    let n = file_name(&format!("{title} {lang}"), None);
+    format!("{}.srt", n.strip_suffix(".mkv").unwrap_or(&n))
+}
+
+/// Write `data` to a free `subtitle_name` in `dir`; the path it landed at.
+pub async fn save_subtitle(dir: &Path, title: &str, lang: &str, data: &[u8]) -> Result<PathBuf> {
+    let path = reserve(dir, &subtitle_name(title, lang))?;
+    let res = match tokio::fs::write(part(&path), data).await {
+        Ok(()) => tokio::fs::rename(part(&path), &path).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(part(&path));
+        return Err(e.into());
+    }
+    Ok(path)
+}
+
 /// Where a download is written until it completes.
 pub fn part(path: &Path) -> PathBuf {
     let mut p = path.as_os_str().to_owned();
@@ -118,6 +138,7 @@ mod tests {
         assert_eq!(file_name(&"x".repeat(500), None).len(), 124);
         assert!(file_name(&"é".repeat(500), None).len() <= 124, "capped by bytes");
         assert_eq!(file_name("nul", None), "_nul.mkv");
+        assert_eq!(subtitle_name("../x/Film: 2", "eng"), ".._x_Film_ 2 eng.srt");
     }
 
     #[test]
