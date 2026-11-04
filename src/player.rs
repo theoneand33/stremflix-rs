@@ -188,6 +188,17 @@ pub struct SubStyle {
 /// Playback speeds offered in the player menu.
 pub const SPEEDS: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 
+/// Aspect-ratio overrides: label and mpv `video-aspect-override` value (`no` keeps the file's own).
+pub const ASPECTS: [(&str, &str); 5] = [("Auto", "no"), ("16:9", "16:9"), ("4:3", "4:3"), ("21:9", "21:9"), ("1:1", "1:1")];
+
+/// Zoom range in tenths of mpv's log2 `video-zoom` (-1 halves, +1 doubles the picture).
+pub const ZOOM_RANGE: std::ops::RangeInclusive<i32> = -10..=10;
+
+/// mpv `video-zoom` value for a zoom in tenths.
+pub fn zoom_value(tenths: i32) -> String {
+    (tenths.clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end()) as f64 / 10.0).to_string()
+}
+
 /// mpv `hwdec` value: GPU decoders with zero-copy OpenGL interop only, or software decoding.
 /// Copy-back decoders (e.g. vulkan-copy) corrupted frames in testing.
 pub fn hwdec_value(on: bool) -> &'static str {
@@ -589,6 +600,15 @@ impl Drop for Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_scaling_values() {
+        assert_eq!(zoom_value(0), "0");
+        assert_eq!(zoom_value(3), "0.3");
+        assert_eq!(zoom_value(-99), "-1");
+        assert_eq!(zoom_value(99), "1");
+        assert_eq!(ASPECTS[0].1, "no");
+    }
 
     #[test]
     fn libmpv_loads_with_every_symbol() {
