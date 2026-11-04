@@ -63,7 +63,7 @@ pub fn clear_partial(dir: &Path) {
 /// Download `url` (with the addon's request `headers`) into `part(dest)`, then move it to `dest`.
 pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path) -> Result<()> {
     // No total timeout: a movie can take hours. A stalled connection still fails.
-    let client = reqwest::Client::builder().user_agent("stremflix-rs").connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(120)).build()?;
+    let client = crate::addon::with_proxy(reqwest::Client::builder().user_agent("stremflix-rs").connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(120)))?.build()?;
     let mut req = client.get(url);
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());

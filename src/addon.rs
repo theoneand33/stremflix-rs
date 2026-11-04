@@ -694,6 +694,64 @@ pub fn check_poster(body: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Proxy from Settings, set once at startup: changes apply on restart. Never log it: it can hold credentials.
+pub static PROXY: std::sync::OnceLock<Url> = std::sync::OnceLock::new();
+
+/// Proxy URL for `kind` ("" = off, "http", "socks5") and `addr` (`host:port`), with credentials percent-encoded.
+/// Errors never echo the input, which may hold a password.
+pub fn proxy_url(kind: &str, addr: &str, user: &str, pass: &str) -> std::result::Result<Option<Url>, &'static str> {
+    // socks5h: DNS goes through the proxy too, so lookups don't leak around a VPN.
+    let scheme = match kind {
+        "" => return Ok(None),
+        "http" => "http",
+        "socks5" => "socks5h",
+        _ => return Err("unknown proxy type"),
+    };
+    let (host, port) = addr.trim().rsplit_once(':').ok_or("use host:port")?;
+    if host.is_empty() || host.chars().any(|c| c.is_whitespace() || c.is_control() || "/?#@\\".contains(c)) {
+        return Err("invalid proxy host");
+    }
+    let port: u16 = port.parse().ok().filter(|&p| p != 0).ok_or("proxy port must be 1-65535")?;
+    let mut url = Url::parse(&format!("{scheme}://{host}:{port}")).map_err(|_| "invalid proxy host")?;
+    if !user.is_empty() || !pass.is_empty() {
+        // Pre-encoded: `Url` leaves a literal `%` alone, so a password like `%41` would decode to `A`.
+        let enc = |s: &str| percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string();
+        url.set_username(&enc(user)).map_err(|_| "invalid proxy username")?;
+        url.set_password((!pass.is_empty()).then(|| enc(pass)).as_deref()).map_err(|_| "invalid proxy password")?;
+    }
+    Ok(Some(url))
+}
+
+/// `b` routed through [`PROXY`], except loopback (the local torrent stream, local addons).
+pub fn with_proxy(b: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder> {
+    let Some(url) = PROXY.get() else { return Ok(b) };
+    let p = reqwest::Proxy::all(url.as_str()).map_err(|_| anyhow::anyhow!("invalid proxy setting"))?;
+    Ok(b.proxy(p.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1"))))
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn builds_and_validates() {
+        assert_eq!(proxy_url("", "junk", "", ""), Ok(None));
+        let u = |k, a, us, p| proxy_url(k, a, us, p).unwrap().unwrap().to_string();
+        assert_eq!(u("http", "proxy.lan:3128", "", ""), "http://proxy.lan:3128/");
+        assert_eq!(u("socks5", " 10.0.0.1:1080 ", "", ""), "socks5h://10.0.0.1:1080");
+        assert_eq!(u("socks5", "[::1]:1080", "", ""), "socks5h://[::1]:1080");
+        let url = proxy_url("http", "p:8080", "us er@x", "p:@/#%41?é").unwrap().unwrap();
+        assert_eq!(url.as_str(), "http://us%20er%40x:p%3A%40%2F%23%2541%3F%C3%A9@p:8080/");
+        let dec = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8().unwrap().into_owned();
+        assert_eq!((dec(url.username()), dec(url.password().unwrap())), ("us er@x".into(), "p:@/#%41?é".into()));
+        assert_eq!(u("socks5", "h:1", "", "pw"), "socks5h://:pw@h:1");
+        for (k, a) in [("ftp", "h:1"), ("http", "h"), ("http", ":80"), ("http", "h:0"), ("http", "h:65536"), ("http", "h:x"), ("http", "a b:80"), ("http", "h\n:80"), ("http", "u@h:80"), ("http", "h/x:80"), ("http", "a:b:80")] {
+            assert!(proxy_url(k, a, "", "").is_err(), "{k} {a}");
+        }
+        assert!(with_proxy(reqwest::Client::builder()).is_ok());
+    }
+}
+
 #[cfg(test)]
 mod configure_tests {
     use super::*;
@@ -848,12 +906,11 @@ impl AddonClient {
 
     fn http(&self) -> Result<&reqwest::Client> {
         let http = self.http.get_or_init(|| {
-            reqwest::Client::builder()
+            let b = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::limited(3))
-                .user_agent("stremflix-rs") // GitHub's API rejects requests without one
-                .build()
-                .map_err(|e| format!("HTTP client: {e}"))
+                .user_agent("stremflix-rs"); // GitHub's API rejects requests without one
+            with_proxy(b).map_err(|e| format!("{e}"))?.build().map_err(|e| format!("HTTP client: {e}"))
         });
         http.as_ref().map_err(|e| anyhow::anyhow!("{e}"))
     }

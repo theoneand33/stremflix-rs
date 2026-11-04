@@ -814,6 +814,8 @@ struct App {
     torrent_dir: String,
     torrent_cache: u64,
     torrent_profile: Profile,
+    /// Proxy type ("", "http", "socks5"), host:port, username, password as saved; applied at startup.
+    proxy: [String; 4],
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
     /// mpv hardware decoding.
@@ -893,6 +895,7 @@ impl App {
             torrent_dir: db.setting("torrent_dir")?.unwrap_or_default(),
             torrent_cache: db.setting("torrent_cache")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             torrent_profile: Profile::from_label(&db.setting("torrent_profile")?.unwrap_or_default()),
+            proxy: [db.setting("proxy_kind")?.unwrap_or_default(), db.setting("proxy_addr")?.unwrap_or_default(), db.setting("proxy_user")?.unwrap_or_default(), db.setting("proxy_pass")?.unwrap_or_default()],
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
@@ -935,6 +938,14 @@ impl App {
         };
         if app.addons.is_empty() {
             app.tab = Tab::Addons;
+        }
+        let [kind, addr, user, pass] = &app.proxy;
+        match stremflix_rs::addon::proxy_url(kind, addr, user, pass) {
+            Ok(Some(p)) => {
+                let _ = stremflix_rs::addon::PROXY.set(p);
+            }
+            Ok(None) => {}
+            Err(e) => report(&mut app.error, format!("proxy setting ignored: {e}")),
         }
         Ok(app)
     }
@@ -3101,6 +3112,50 @@ impl App {
         if self.torrent.get().is_some() {
             ui.label(RichText::new("A torrent has already played: restart the app to apply changes.").size(13.0).color(Color32::from_gray(170)));
         }
+        ui.add_space(16.0);
+        ui.label(RichText::new("Proxy").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        let kinds = [("", "Off"), ("http", "HTTP"), ("socks5", "SOCKS5")];
+        ui.horizontal(|ui| {
+            let l = ui.label("Type:");
+            ui.add_space((150.0 - l.rect.width()).max(0.0));
+            let shown = kinds.iter().find(|k| k.0 == self.proxy[0]).map_or("Off", |k| k.1);
+            egui::ComboBox::from_id_salt("proxy_kind").selected_text(shown).show_ui(ui, |ui| {
+                for (k, name) in kinds {
+                    ui.selectable_value(&mut self.proxy[0], k.to_string(), name);
+                }
+            });
+        });
+        let mut apply = false;
+        if !self.proxy[0].is_empty() {
+            ui.horizontal(|ui| {
+                let l = ui.label("Address:");
+                ui.add_space((150.0 - l.rect.width()).max(0.0));
+                ui.add(egui::TextEdit::singleline(&mut self.proxy[1]).hint_text("host:port").desired_width(260.0)).labelled_by(l.id);
+            });
+            ui.horizontal(|ui| {
+                let l = ui.label("Username:");
+                ui.add_space((150.0 - l.rect.width()).max(0.0));
+                ui.add(egui::TextEdit::singleline(&mut self.proxy[2]).hint_text("optional").desired_width(160.0)).labelled_by(l.id);
+                let l = ui.label("Password:");
+                ui.add(egui::TextEdit::singleline(&mut self.proxy[3]).password(true).desired_width(160.0)).labelled_by(l.id);
+            });
+        }
+        let [kind, addr, user, pass] = &self.proxy;
+        match stremflix_rs::addon::proxy_url(kind, addr, user, pass) {
+            Ok(_) => apply = primary_button(ui, "Save proxy").clicked(),
+            Err(e) => {
+                ui.label(RichText::new(e).size(13.0).color(Color32::from_rgb(230, 90, 90)));
+            }
+        }
+        if apply {
+            for (k, v) in ["proxy_kind", "proxy_addr", "proxy_user", "proxy_pass"].into_iter().zip(&self.proxy) {
+                save.push((k, v.clone()));
+            }
+        }
+        let note = "Applies after a restart. HTTP covers addons, downloads, the update check and mpv streams, but not torrents. \
+            SOCKS5 covers addons, downloads, the update check and torrent peers and HTTP trackers, but not mpv's direct HTTP streams \
+            (mpv has no SOCKS support) or DHT. The password is stored unencrypted in the app's database.";
+        ui.label(RichText::new(note).size(13.0).color(Color32::from_gray(170)));
         ui.add_space(16.0);
         ui.label(RichText::new("Player").size(20.0).strong().family(bold()).color(Color32::WHITE));
         if form_row(ui, "External player:", &mut self.external_player, "vlc", "Save", Some("Command run with the stream URL; no shell"), true) {
