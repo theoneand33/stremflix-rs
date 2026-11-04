@@ -59,7 +59,7 @@ For series, pick a season and episode. ⏭ in the player opens the next episode.
 |---|---|
 | Space, K, click | Pause |
 | ←/→ | Skip 10 s |
-| ↑/↓, M | Volume, mute |
+| ↑/↓, wheel, M | Volume, mute |
 | F, double-click | Full screen |
 | Esc | Leave full screen / back |
 

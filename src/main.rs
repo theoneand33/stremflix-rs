@@ -719,6 +719,8 @@ struct Playing {
     hold: Option<f64>,
     /// The last click on the video was a hold release, so the next one must not pair with it into a double-click.
     after_hold: bool,
+    /// Wheel scroll not yet turned into volume steps (points).
+    wheel: f32,
     /// The up-next card was dismissed.
     next_dismissed: bool,
     /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
@@ -1366,7 +1368,7 @@ impl App {
                         if self.default_speed != 1.0 {
                             let _ = player.command(&["set", "speed", &self.default_speed.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, awake: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -2472,6 +2474,11 @@ impl App {
             if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]) }
             if k(M) { cmd(&["cycle", "mute"]) }
+            // Wheel over the bare video only: `hovered` is false under a popover or a control.
+            if bg.hovered() && p.menu.is_none() {
+                let n = wheel_steps(&mut p.wheel, i.smooth_scroll_delta.y);
+                if n != 0 { cmd(&["add", "volume", &(n * 5).to_string()]) }
+            }
             toggle_fs |= k(F);
             if k(Escape) {
                 if fs { toggle_fs = true } else { back = true }
@@ -3542,9 +3549,26 @@ mod mac_links {
     }
 }
 
+/// Turn wheel scroll (points) into whole volume steps, keeping the remainder; one 50 pt notch is one step.
+fn wheel_steps(acc: &mut f32, dy: f32) -> i32 {
+    *acc += dy;
+    let n = (*acc / 50.0).trunc();
+    *acc -= n * 50.0;
+    n as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_accumulates_to_steps() {
+        let mut acc = 0.0;
+        assert_eq!(wheel_steps(&mut acc, 50.0), 1);
+        assert_eq!(wheel_steps(&mut acc, -100.0), -2);
+        assert_eq!((0..5).map(|_| wheel_steps(&mut acc, 10.0)).sum::<i32>(), 1);
+        assert_eq!(wheel_steps(&mut acc, 0.0), 0);
+    }
 
     #[test]
     fn saved_view_filters_and_sorts() {
