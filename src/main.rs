@@ -11,7 +11,7 @@ use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use anyhow::Context;
 use stremflix_rs::addon::{AddonClient, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
 use stremflix_rs::instance;
-use stremflix_rs::db::{Db, Download, Progress, SavedTitle, Watched};
+use stremflix_rs::db::{self, Db, Download, Progress, SavedTitle, Watched};
 use stremflix_rs::download;
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
@@ -839,6 +839,8 @@ struct App {
     show_streams: bool,
     magnet: String,
     search: String,
+    /// Recent submitted queries, newest first; persisted in settings as `search_history`.
+    search_history: Vec<String>,
     /// Poster bytes by URL; `None` while loading, empty if the fetch failed.
     posters: HashMap<String, Option<Arc<[u8]>>>,
     folder: String,
@@ -931,6 +933,7 @@ fn fmt_time(s: f64) -> String {
 impl App {
     fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
         let db = Db::open(&data_dir.join("stremflix-rs.db"))?;
+        let search_history = db.setting("search_history")?.map(|s| db::decode_history(&s)).unwrap_or_default();
         download::clear_partial(&data_dir.join("downloads"));
         let (tx, rx) = channel();
         let mut app = Self {
@@ -988,6 +991,7 @@ impl App {
             show_streams: false,
             magnet: String::new(),
             search: String::new(),
+            search_history,
             posters: HashMap::new(),
             player: None,
             pill: None,
@@ -1633,11 +1637,24 @@ impl App {
         }
     }
 
+    fn remember_search(&mut self, query: &str) {
+        db::push_history(&mut self.search_history, query);
+        self.save_search_history();
+    }
+
+    fn save_search_history(&mut self) {
+        let r = if self.search_history.is_empty() { self.db.remove_setting("search_history") } else { self.db.set_setting("search_history", &db::encode_history(&self.search_history)) };
+        if let Err(e) = r {
+            report(&mut self.error, e);
+        }
+    }
+
     fn search(&mut self, ctx: &egui::Context) {
         let query = self.search.trim().to_string();
         if query.is_empty() {
             return;
         }
+        self.remember_search(&query);
         let targets: Vec<(String, String, String)> = self
             .addons
             .iter()
@@ -3514,6 +3531,49 @@ impl eframe::App for App {
                     if b.clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                         self.tab = Tab::Home;
                         self.search(&ctx);
+                    }
+                    // Recent searches under the empty, focused box. The popup stays up while the pointer is on it,
+                    // since pressing it takes focus from the field before the click lands.
+                    let id = ui.make_persistent_id("search_history");
+                    let over = ui.ctx().data(|d| d.get_temp::<egui::Rect>(id)).is_some_and(|p| ui.input(|i| i.pointer.hover_pos()).is_some_and(|h| p.contains(h)));
+                    if (r.has_focus() || over) && self.search.is_empty() && !self.search_history.is_empty() {
+                        let (mut pick, mut del, mut clear) = (None, None, false);
+                        let area = egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(pos2(pill.left() - 12.0, pill.bottom() + 12.0)).show(ui.ctx(), |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(220.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Recent searches").small().color(Color32::from_gray(150)));
+                                    if ui.small_button("Clear").clicked() {
+                                        clear = true;
+                                    }
+                                });
+                                for (i, q) in self.search_history.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        if ui.add(egui::Button::new(q).frame(false)).clicked() {
+                                            pick = Some(q.clone());
+                                        }
+                                        if ui.add(egui::Button::new(icons::X).frame(false)).on_hover_text("Remove").clicked() {
+                                            del = Some(i);
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                        ui.ctx().data_mut(|d| d.insert_temp(id, area.response.rect));
+                        if clear || del.is_some() {
+                            match del {
+                                Some(i) => drop(self.search_history.remove(i)),
+                                None => self.search_history.clear(),
+                            }
+                            self.save_search_history();
+                        }
+                        if let Some(q) = pick {
+                            self.search = q;
+                            self.tab = Tab::Home;
+                            self.search(&ctx);
+                        }
+                    } else {
+                        ui.ctx().data_mut(|d| d.remove::<egui::Rect>(id));
                     }
                 });
             });
