@@ -347,7 +347,7 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
         }
         if !it.removed && !it.temp {
             let added = it.ctime.clone().unwrap_or(it.mtime.clone());
-            imp.saved.push((SavedTitle { key: key.clone(), title: title.clone(), kind: it.kind.clone(), poster: poster.clone() }, added));
+            imp.saved.push((SavedTitle { key: key.clone(), title: title.clone(), kind: it.kind.clone(), poster: poster.clone(), year: None, rating: None, last_watched: None }, added));
         }
         let video = s.video_id.clone().unwrap_or(it.id.clone());
         if s.time_offset > 0

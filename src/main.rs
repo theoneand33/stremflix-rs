@@ -104,6 +104,9 @@ fn filter_subs<'a>(found: &'a [SubFound], q: &str) -> Vec<&'a SubFound> {
 enum LibSort {
     Added,
     Title,
+    Watched,
+    Rating,
+    Year,
 }
 
 /// Type filter of the saved-titles list in the Library tab.
@@ -119,6 +122,9 @@ impl LibSort {
         match self {
             Self::Added => "Recently added",
             Self::Title => "Title A–Z",
+            Self::Watched => "Recently watched",
+            Self::Rating => "Rating",
+            Self::Year => "Year",
         }
     }
 }
@@ -141,16 +147,32 @@ impl LibKind {
     }
 }
 
+/// Release year from free text like "2010" or "2010–2015".
+fn parse_year(s: &str) -> Option<i32> {
+    let d: String = s.chars().skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
+    d.parse().ok().filter(|y| (1800..=2200).contains(y))
+}
+
+/// Year and IMDb rating of a title's details.
+fn saved_facts(d: &Meta) -> (Option<i32>, Option<f64>) {
+    (d.release_info.as_deref().and_then(parse_year), d.imdb_rating.as_deref().and_then(|r| r.trim().parse::<f64>().ok()).filter(|r| (0.0..=10.0).contains(r)))
+}
+
 /// Case-insensitive substring match; a blank query matches everything.
 fn title_matches(title: &str, query: &str) -> bool {
     title.to_lowercase().contains(&query.trim().to_lowercase())
 }
 
-/// Saved titles of `kind` matching `query`, newest first unless sorted by title (case-insensitive).
+/// Saved titles of `kind` matching `query`, newest first unless sorted: by title (case-insensitive), or best first with missing values last.
 fn saved_view<'a>(items: &'a [SavedTitle], kind: LibKind, sort: LibSort, query: &str) -> Vec<&'a SavedTitle> {
     let mut v: Vec<&SavedTitle> = items.iter().filter(|t| kind.matches(&t.kind) && title_matches(&t.title, query)).collect();
-    if sort == LibSort::Title {
-        v.sort_by_key(|t| t.title.to_lowercase());
+    // Stable sorts keep the "Recently added" order among ties; `None` is the smallest, so it ends up last when reversed.
+    match sort {
+        LibSort::Added => {}
+        LibSort::Title => v.sort_by_key(|t| t.title.to_lowercase()),
+        LibSort::Watched => v.sort_by_key(|t| std::cmp::Reverse(t.last_watched)),
+        LibSort::Year => v.sort_by_key(|t| std::cmp::Reverse(t.year)),
+        LibSort::Rating => v.sort_by(|a, b| b.rating.unwrap_or(f64::NEG_INFINITY).total_cmp(&a.rating.unwrap_or(f64::NEG_INFINITY))),
     }
     v
 }
@@ -1364,6 +1386,7 @@ impl App {
                 let mut videos = std::mem::take(&mut m.videos);
                 // A Continue Watching entry only knows the episode title.
                 let meta = MetaPreview { name: m.name.clone(), poster: meta.poster.or(m.poster.clone()), ..meta };
+                self.backfill_saved_facts(&m);
                 self.details = Some(m);
                 sort_episodes(&mut videos);
                 // Episodes imported as watched from Stremio: saved once as local marks, so they can be unmarked.
@@ -1451,6 +1474,7 @@ impl App {
                     if let Some((sel, ..)) = self.selected.as_mut() {
                         fill_deep_linked(sel, &m);
                     }
+                    self.backfill_saved_facts(&m);
                     self.details = Some(m);
                 }
             }
@@ -1955,6 +1979,18 @@ impl App {
         }
     }
 
+    /// Store year and rating on a saved title once its details are known (imports and older rows lack them).
+    fn backfill_saved_facts(&mut self, d: &Meta) {
+        let key = format!("{}:{}", d.kind, d.id);
+        let (year, rating) = saved_facts(d);
+        if let Some(t) = self.saved.iter_mut().find(|t| t.key == key && (year.is_some_and(|y| t.year != Some(y)) || rating.is_some_and(|r| t.rating != Some(r)))) {
+            (t.year, t.rating) = (year.or(t.year), rating.or(t.rating));
+            if let Err(e) = self.db.set_saved_facts(&key, year, rating) {
+                report(&mut self.error, format!("saving library: {e:#}"));
+            }
+        }
+    }
+
     /// Add the selected title to the library, or remove it.
     fn toggle_saved(&mut self, meta: &MetaPreview) {
         let key = format!("{}:{}", meta.kind, meta.id);
@@ -1962,7 +1998,11 @@ impl App {
             self.saved.retain(|t| t.key != key);
             self.db.remove_saved_title(&key)
         } else {
-            let t = SavedTitle { key, title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone() };
+            let t = SavedTitle { key, title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone(), year: None, rating: None, last_watched: None };
+            let t = match self.details.as_ref().filter(|d| d.kind == meta.kind && d.id == meta.id).map(saved_facts) {
+                Some((year, rating)) => SavedTitle { year, rating, ..t },
+                None => t,
+            };
             self.saved.insert(0, t.clone());
             self.db.add_saved_title(&t)
         };
@@ -3747,11 +3787,16 @@ impl App {
         let (mut want, mut open, mut quick) = (Vec::new(), None, None);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Saved titles").size(20.0).strong().family(bold()).color(Color32::WHITE));
+            let before = self.lib_sort;
             egui::ComboBox::from_id_salt("lib_sort").selected_text(self.lib_sort.label()).show_ui(ui, |ui| {
-                for s in [LibSort::Added, LibSort::Title] {
+                for s in [LibSort::Added, LibSort::Title, LibSort::Watched, LibSort::Rating, LibSort::Year] {
                     ui.selectable_value(&mut self.lib_sort, s, s.label());
                 }
             });
+            // Watch times are read when loaded, so refresh them when the order is picked.
+            if self.lib_sort != before {
+                self.saved = self.db.saved_titles().unwrap_or_default();
+            }
             egui::ComboBox::from_id_salt("lib_kind").selected_text(self.lib_kind.label()).show_ui(ui, |ui| {
                 for k in [LibKind::All, LibKind::Movie, LibKind::Series] {
                     ui.selectable_value(&mut self.lib_kind, k, k.label());
@@ -4318,6 +4363,9 @@ mod tests {
             title: title.into(),
             kind: key.split_once(':').unwrap().0.into(),
             poster: None,
+            year: None,
+            rating: None,
+            last_watched: None,
         };
         // Newest first, as stored.
         let items = [t("series:tt2", "beta"), t("movie:tt3", "Alpha"), t("movie:tt1", "gamma")];
@@ -4328,6 +4376,18 @@ mod tests {
         assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Title, "")), ["movie:tt3", "series:tt2", "movie:tt1"]);
         assert_eq!(keys(saved_view(&items, LibKind::Series, LibSort::Title, "")), ["series:tt2"]);
         assert!(saved_view(&items, LibKind::Series, LibSort::Added, "").len() == 1);
+        // Watched, rating and year: best first, missing last, ties keep the added order.
+        let items = [
+            SavedTitle { last_watched: Some(5), year: Some(1999), rating: Some(6.0), ..items[0].clone() },
+            items[1].clone(),
+            SavedTitle { last_watched: Some(9), year: Some(2020), rating: Some(8.5), ..items[2].clone() },
+        ];
+        let best_first = ["movie:tt1", "series:tt2", "movie:tt3"];
+        for sort in [LibSort::Watched, LibSort::Rating, LibSort::Year] {
+            assert_eq!(keys(saved_view(&items, LibKind::All, sort, "")), best_first);
+        }
+        assert_eq!(parse_year("2010–2015"), Some(2010));
+        assert_eq!(parse_year("n/a"), None);
         assert_eq!(saved_view(&[], LibKind::All, LibSort::Title, "").len(), 0);
         // Query combines with kind and sort.
         assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Title, " A ")), ["movie:tt3", "series:tt2", "movie:tt1"]);
@@ -4356,6 +4416,16 @@ mod tests {
         assert_eq!(media_action(E::SetPosition(MediaPosition(s(95)))), Some(MediaAction::Seek(95.0, false)));
         assert_eq!(media_action(E::Previous), None);
         assert_eq!(media_action(E::Quit), None);
+    }
+
+    #[test]
+    fn saved_facts_rejects_non_finite_ratings() {
+        let rated = |r: &str| serde_json::from_value::<Meta>(serde_json::json!({"id": "tt1", "type": "movie", "name": "x", "imdbRating": r})).unwrap();
+        assert_eq!(saved_facts(&rated("NaN")).1, None);
+        assert_eq!(saved_facts(&rated("inf")).1, None);
+        assert_eq!(saved_facts(&rated("infinity")).1, None);
+        assert_eq!(saved_facts(&rated("11")).1, None);
+        assert_eq!(saved_facts(&rated("8.5")).1, Some(8.5));
     }
 
     #[test]
