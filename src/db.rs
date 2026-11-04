@@ -110,7 +110,9 @@ impl Db {
         Ok(())
     }
 
+    /// Also lets Stremio imports add it again (see [`Db::remove_addon`]).
     pub fn add_addon(&self, transport_url: &str, manifest: &Manifest) -> Result<()> {
+        self.conn.execute("DELETE FROM settings WHERE key = ?1", [format!("unaddon:{transport_url}")])?;
         self.conn.execute(
             // A reinstall keeps its priority; a new addon goes last.
             "INSERT INTO addons (transport_url, manifest, position) VALUES (?1, ?2, (SELECT coalesce(max(position), 0) + 1 FROM addons))
@@ -120,9 +122,12 @@ impl Db {
         Ok(())
     }
 
+    /// Remembered (`unaddon:<url>`), so an account sync or import doesn't reinstall it.
     pub fn remove_addon(&self, transport_url: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM addons WHERE transport_url = ?1", [transport_url])?;
-        Ok(())
+        self.transaction(|| {
+            self.conn.execute("DELETE FROM addons WHERE transport_url = ?1", [transport_url])?;
+            self.set_setting(&format!("unaddon:{transport_url}"), "1")
+        })
     }
 
     /// Store `urls` (installed addon transport URLs) as the addon priority order, first = highest.
@@ -310,15 +315,21 @@ impl Db {
         })
     }
 
-    /// Mark episodes `keys` watched and drop the imported bitfield setting they came from, in one transaction.
-    pub fn apply_watched_bitfield(&self, bitfield_key: &str, keys: &[String]) -> Result<()> {
+    /// Mark episodes `keys` watched, except ones unwatched here, and drop the imported bitfield setting
+    /// they came from, in one transaction. Returns the keys marked.
+    pub fn apply_watched_bitfield(&self, bitfield_key: &str, keys: &[String]) -> Result<Vec<String>> {
+        let mut marked = Vec::new();
         self.transaction(|| {
             for k in keys {
-                self.set_setting(&format!("watched:{k}"), "1")?;
+                if self.setting(&format!("unwatched:{k}"))?.is_none() {
+                    self.set_setting(&format!("watched:{k}"), "1")?;
+                    marked.push(k.clone());
+                }
             }
             self.conn.execute("DELETE FROM settings WHERE key = ?1", [bitfield_key])?;
             Ok(())
-        })
+        })?;
+        Ok(marked)
     }
 
     /// Keys marked watched here or imported from Stremio (a movie imported as watched counts).

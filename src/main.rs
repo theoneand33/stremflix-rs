@@ -1182,7 +1182,7 @@ impl App {
                     // An anchor missing from this addon's list marks nothing; keep the field for another source.
                     if !keys.is_empty() {
                         match self.db.apply_watched_bitfield(&bk, &keys) {
-                            Ok(()) => self.watched_keys.extend(keys),
+                            Ok(marked) => self.watched_keys.extend(marked),
                             Err(e) => report(&mut self.error, format!("saving watched episodes: {e:#}")),
                         }
                     }
@@ -1249,8 +1249,9 @@ impl App {
             }
             // Dropped if signed out (or into another account) while it ran.
             Msg::Synced(key, imp) => {
-                self.account_busy = false;
                 if self.db.setting("stremio_auth").ok().flatten().as_deref() == Some(key.as_str()) {
+                    // Only for the current key: a stale sync mustn't clear a newer sign-in's flag.
+                    self.account_busy = false;
                     match imp {
                         Ok(imp) => self.handle(ctx, Msg::Imported(imp)),
                         Err(e) => report(&mut self.error, e),
@@ -3013,7 +3014,8 @@ impl App {
                     let cleared = self.db.transaction(|| ["stremio_auth", "stremio_email"].into_iter().try_for_each(|k| self.db.set_setting(k, "")));
                     match cleared {
                         Ok(()) => {
-                            self.account = None;
+                            // A running sync for this key is dropped when it ends.
+                            (self.account, self.account_busy) = (None, false);
                             let client = self.client.clone();
                             // Best effort: the key is already forgotten locally.
                             self.rt.spawn(async move { client.stremio_logout(&key).await.inspect_err(|e| eprintln!("Stremio sign-out: {e:#}")) });

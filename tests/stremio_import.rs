@@ -140,6 +140,22 @@ fn account_sync_imports_addons_library_and_saved_titles() {
     imp.save(&db).unwrap();
     assert_eq!(db.saved_titles().unwrap().len(), 1);
     assert_eq!(db.watched(10).unwrap().len(), 1);
+    // An addon removed here isn't reinstalled.
+    db.remove_addon("https://a.example/manifest.json").unwrap();
+    imp.save(&db).unwrap();
+    assert!(db.addons().unwrap().is_empty());
+    assert!(from_account(&serde_json::json!({}), &library).is_err(), "unexpected addon shape");
+    assert!(from_account(&addons, &serde_json::json!({"items": []})).is_err(), "unexpected library shape");
+}
+
+#[test]
+fn unwatched_episode_survives_bitfield() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("a.db")).unwrap();
+    db.set_watched("series:tt2:1:1", false).unwrap();
+    let keys = ["series:tt2:1:1".to_string(), "series:tt2:1:2".to_string()];
+    assert_eq!(db.apply_watched_bitfield("bitfield:series:tt2", &keys).unwrap(), ["series:tt2:1:2"]);
+    assert!(!db.watched_keys().unwrap().contains("series:tt2:1:1"));
 }
 
 #[test]

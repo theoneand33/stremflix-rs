@@ -40,7 +40,10 @@ impl Import {
     fn save_rows(&self, db: &Db) -> Result<()> {
         let have: Vec<String> = db.addons()?.into_iter().map(|(u, _)| u).collect();
         for (u, m) in self.addons.iter().filter(|(u, _)| !have.contains(u)) {
-            db.add_addon(u, m)?;
+            // Not one removed here.
+            if db.setting(&format!("unaddon:{u}"))?.is_none() {
+                db.add_addon(u, m)?;
+            }
         }
         for (p, at) in &self.progress {
             db.import_progress(p, at)?;
@@ -372,6 +375,10 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
 /// Build an import from Stremio account API results: `addonCollectionGet` and `datastoreGet` of `libraryItem`.
 /// Shaped like localStorage and parsed by [`parse`], so it gets the same validation.
 pub fn from_account(addons: &Value, library: &Value) -> Result<Import> {
+    // An unexpected shape must fail, not sync as empty.
+    if !addons["addons"].is_array() || !library.is_array() {
+        bail!("Stremio API: unexpected addon or library response");
+    }
     let items: serde_json::Map<String, Value> =
         library.as_array().into_iter().flatten().filter_map(|it| Some((it["_id"].as_str()?.to_string(), it.clone()))).collect();
     let kv = HashMap::from([
