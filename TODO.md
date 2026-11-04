@@ -37,7 +37,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
-| Audio delay / A-V sync offset | P2 | S | Subtitle delay exists; `audio-delay` is the missing parallel. |
 | Remember volume, speed and audio track across sessions | P2 | S | Other settings persist; these three reset each title. |
 | Configurable seek steps (and Shift step) | P2 | S | Fixed at 10 s; Stremio exposes both. |
 | Subtitle outline color and position | P2 | S | Style has size, color and background only. |
