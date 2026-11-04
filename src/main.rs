@@ -3438,16 +3438,21 @@ impl std::str::FromStr for Geo {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, ()> {
         let n: Vec<f32> = s.split(',').map(|v| v.parse().map_err(|_| ())).collect::<Result<_, _>>()?;
-        if !n.iter().all(|v| v.is_finite()) || !matches!(n.len(), 3 | 5) || n[0] < 200.0 || n[1] < 150.0 {
+        if !n.iter().all(|v| v.is_finite()) || !matches!(n.len(), 3 | 5) || !(200.0..=16384.0).contains(&n[0]) || !(150.0..=16384.0).contains(&n[1]) {
             return Err(());
         }
-        Ok(Self { size: [n[0], n[1]], pos: (n.len() == 5).then(|| [n[3], n[4]]), maximized: n[2] != 0.0 })
+        // Off-screen positions (e.g. Windows' -32000 minimized spot) drop the position, keep the size.
+        let pos = (n.len() == 5 && n[3].abs() <= 10000.0 && n[4].abs() <= 10000.0).then(|| [n[3], n[4]]);
+        Ok(Self { size: [n[0], n[1]], pos, maximized: n[2] != 0.0 })
     }
 }
 
 impl Geo {
     /// Fullscreen is transient and a maximized rect is not the restore size, so those keep the last normal rect.
     fn track(&mut self, vp: &egui::ViewportInfo) {
+        if vp.minimized == Some(true) {
+            return;
+        }
         self.maximized = vp.maximized.unwrap_or(false);
         if self.maximized || vp.fullscreen == Some(true) {
             return;
@@ -3606,6 +3611,8 @@ mod tests {
         assert_eq!(g.to_string().parse(), Ok(g));
         assert_eq!(Geo::default().to_string().parse(), Ok(Geo::default()));
         assert!("1,2,3".parse::<Geo>().is_err() && "x".parse::<Geo>().is_err() && "800,600,0,1".parse::<Geo>().is_err());
+        assert!("20000,600,0".parse::<Geo>().is_err() && "800,20000,0".parse::<Geo>().is_err());
+        assert_eq!("800,600,0,-32000,-32000".parse(), Ok(Geo { size: [800.0, 600.0], pos: None, maximized: false }));
     }
 
     #[test]
