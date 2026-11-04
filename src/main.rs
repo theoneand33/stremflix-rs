@@ -557,10 +557,11 @@ const EPISODE_BUTTON: egui::Vec2 = egui::Vec2::new(150.0, 32.0);
 fn list_row(ui: &mut egui::Ui, n: usize, head: String, details: String, reserve: f32) -> egui::Response {
     let (w, text_x, pad) = (ui.available_width().min(960.0), 84.0, 18.0);
     let wrap = (w - text_x - 96.0 - reserve).max(40.0);
+    let (strong, weak, panel) = (ui.visuals().strong_text_color(), ui.visuals().weak_text_color(), ui.visuals().panel_fill);
     let p = ui.painter();
-    let hg = p.layout(head.clone(), egui::FontId::new(17.0, bold()), Color32::WHITE, wrap);
+    let hg = p.layout(head.clone(), egui::FontId::new(17.0, bold()), strong, wrap);
     let has_details = !details.is_empty();
-    let mut job = egui::text::LayoutJob::simple(details, egui::FontId::proportional(14.0), Color32::from_gray(170), wrap);
+    let mut job = egui::text::LayoutJob::simple(details, egui::FontId::proportional(14.0), weak, wrap);
     job.sections[0].format.line_height = Some(20.0);
     let dg = p.layout_job(job);
     let block = hg.size().y + if has_details { 8.0 + dg.size().y } else { 0.0 };
@@ -568,19 +569,20 @@ fn list_row(ui: &mut egui::Ui, n: usize, head: String, details: String, reserve:
     let (rect, r) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Play {head}")));
     let t = ui.ctx().animate_bool(r.id, r.hovered() || r.has_focus());
+    // Hover wash: strong text at alpha 34 is the old gray 51 on the dark panel.
+    let hover = tint(ui, 34);
     let p = ui.painter();
     // Inset so neighbouring rows' highlights never touch.
-    p.rect_filled(rect.shrink2(vec2(4.0, 4.0)), 8, Color32::from_gray(51).gamma_multiply(t));
-    let num = p.layout_no_wrap(n.to_string(), egui::FontId::proportional(24.0), Color32::from_gray(210));
-    p.galley(pos2(rect.left() + text_x / 2.0 - num.size().x / 2.0, rect.center().y - num.size().y / 2.0), num, Color32::WHITE);
+    p.rect_filled(rect.shrink2(vec2(4.0, 4.0)), 8, hover.gamma_multiply(t));
+    let num = p.layout_no_wrap(n.to_string(), egui::FontId::proportional(24.0), strong);
+    p.galley(pos2(rect.left() + text_x / 2.0 - num.size().x / 2.0, rect.center().y - num.size().y / 2.0), num, strong);
     let top = rect.center().y - block / 2.0;
-    p.galley(pos2(rect.left() + text_x, top), hg.clone(), Color32::WHITE);
-    p.galley(pos2(rect.left() + text_x, top + hg.size().y + 8.0), dg, Color32::WHITE);
-    // Play button: outlined circle that fills white on hover.
+    p.galley(pos2(rect.left() + text_x, top), hg.clone(), strong);
+    p.galley(pos2(rect.left() + text_x, top + hg.size().y + 8.0), dg, weak);
+    // Play button: outlined circle that fills with strong text on hover.
     let c = pos2(rect.right() - 48.0, rect.center().y);
-    let fg = Color32::from_gray(160).lerp_to_gamma(Color32::WHITE, t);
-    p.circle(c, 20.0, Color32::WHITE.gamma_multiply(t), (2.0, fg));
-    let tri = Color32::WHITE.lerp_to_gamma(Color32::BLACK, t);
+    p.circle(c, 20.0, strong.gamma_multiply(t), (2.0, strong));
+    let tri = strong.lerp_to_gamma(panel, t);
     p.add(egui::Shape::convex_polygon(vec![c + vec2(-6.0, -9.0), c + vec2(10.0, 0.0), c + vec2(-6.0, 9.0)], tri, egui::Stroke::NONE));
     r
 }
@@ -2344,14 +2346,14 @@ impl App {
     /// Returns the trailer the user clicked.
     fn ui_details<'a>(ui: &mut egui::Ui, d: &'a Meta) -> Option<&'a Stream> {
         ui.add_space(14.0);
-        let gray = Color32::from_gray(170);
+        let gray = ui.visuals().weak_text_color();
         let facts: Vec<String> = [d.release_info.clone(), d.runtime.clone(), d.imdb_rating.as_ref().map(|r| format!("IMDb {r}"))]
             .into_iter()
             .flatten()
             .chain((!d.genres.is_empty()).then(|| d.genres.join(", ")))
             .collect();
         if !facts.is_empty() {
-            ui.label(RichText::new(facts.join("  ·  ")).size(16.0).color(Color32::WHITE));
+            ui.label(RichText::new(facts.join("  ·  ")).size(16.0).color(ui.visuals().strong_text_color()));
         }
         for (name, list) in [("Cast", &d.cast), ("Director", &d.director)] {
             if !list.is_empty() {
@@ -3411,7 +3413,7 @@ impl eframe::App for App {
                 }
                 if let Some(target) = sel_rect {
                     let rect = self.pill_rect(&ctx, target);
-                    ui.painter().set(pill_slot, egui::epaint::RectShape::filled(rect, 17, Color32::from_gray(51)));
+                    ui.painter().set(pill_slot, egui::epaint::RectShape::filled(rect, 17, tint(ui, 34)));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // Search in the same dark gray pill; Enter or the icon runs it.
@@ -3421,10 +3423,10 @@ impl eframe::App for App {
                     let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Titles, people, genres").frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 2, ..Default::default() })).desired_width(170.0)); // top margin: optically center the text; width leaves room for five tabs at the 1000 px default size
                     let (icon, b) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
                     b.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Search"));
-                    ui.painter().text(icon.center(), egui::Align2::CENTER_CENTER, icons::MAGNIFYING_GLASS, egui::FontId::proportional(18.0), Color32::from_gray(180));
+                    ui.painter().text(icon.center(), egui::Align2::CENTER_CENTER, icons::MAGNIFYING_GLASS, egui::FontId::proportional(18.0), ui.visuals().weak_text_color());
                     let b = b.on_hover_text("Search").on_hover_cursor(egui::CursorIcon::PointingHand);
                     let pill = r.rect.union(b.rect);
-                    ui.painter().set(bg, egui::epaint::RectShape::filled(egui::Rect::from_center_size(pos2(pill.center().x, icon.center().y), vec2(pill.width() + 24.0, 34.0)), 17, Color32::from_gray(51)));
+                    ui.painter().set(bg, egui::epaint::RectShape::filled(egui::Rect::from_center_size(pos2(pill.center().x, icon.center().y), vec2(pill.width() + 24.0, 34.0)), 17, tint(ui, 34)));
                     let r = r.labelled_by(b.id);
                     if b.clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                         self.tab = Tab::Home;
