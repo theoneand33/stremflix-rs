@@ -382,3 +382,53 @@ impl Db {
 fn row_progress(r: &rusqlite::Row) -> rusqlite::Result<Progress> {
     Ok(Progress { key: r.get(0)?, title: r.get(1)?, source: r.get(2)?, position: r.get(3)?, duration: r.get(4)?, poster: r.get(5)? })
 }
+
+const HISTORY_MAX: usize = 10;
+const HISTORY_QUERY_MAX: usize = 100;
+
+/// Puts `q` first in `h`: trimmed, capped in length, deduped case-insensitively, list capped.
+pub fn push_history(h: &mut Vec<String>, q: &str) {
+    let q: String = q.trim().chars().take(HISTORY_QUERY_MAX).collect();
+    if q.is_empty() {
+        return;
+    }
+    h.retain(|x| !x.eq_ignore_ascii_case(&q) && x.to_lowercase() != q.to_lowercase());
+    h.insert(0, q);
+    h.truncate(HISTORY_MAX);
+}
+
+pub fn encode_history(h: &[String]) -> String {
+    h.join("\n")
+}
+
+pub fn decode_history(s: &str) -> Vec<String> {
+    let mut h = Vec::new();
+    for l in s.lines().rev() {
+        push_history(&mut h, l);
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_push_dedupe_cap_roundtrip() {
+        let mut h = Vec::new();
+        push_history(&mut h, "  Matrix ");
+        push_history(&mut h, "   ");
+        push_history(&mut h, "dune");
+        push_history(&mut h, "MATRIX");
+        assert_eq!(h, ["MATRIX", "dune"]);
+        for i in 0..20 {
+            push_history(&mut h, &format!("q{i}"));
+        }
+        assert_eq!(h.len(), HISTORY_MAX);
+        assert_eq!(h[0], "q19");
+        push_history(&mut h, &"x".repeat(500));
+        assert_eq!(h[0].len(), HISTORY_QUERY_MAX);
+        assert_eq!(decode_history(&encode_history(&h)), h);
+        assert!(decode_history("").is_empty());
+    }
+}
