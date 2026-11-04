@@ -2642,6 +2642,12 @@ impl App {
                                     }
                                 }
                             });
+                            if kind == "audio" {
+                                style.audio_delay += stepper(ui, "Audio delay", &format!("{:+.1}s", style.audio_delay)) as f64 * 0.1;
+                                if style.audio_delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(ACCENT)).frame(false)).clicked() {
+                                    style.audio_delay = 0.0;
+                                }
+                            }
                             if kind == "sub" {
                                 menu_heading(ui, "Style");
                                 style.scale = (style.scale * 10.0).round() / 10.0 + stepper(ui, "Size", &format!("{:.1}x", style.scale)) as f64 * 0.1;
