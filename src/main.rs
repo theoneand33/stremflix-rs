@@ -517,7 +517,7 @@ fn card_text(ui: &egui::Ui, rect: egui::Rect, text: &str) {
     // Clipped: a very long title would otherwise spill past the card.
     let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     p.rect_filled(rect, 6, Color32::from_gray(40));
-    let mut job = egui::text::LayoutJob::simple(text.to_owned(), egui::FontId::proportional(15.0), ui.visuals().text_color(), rect.width() - 16.0);
+    let mut job = egui::text::LayoutJob::simple(text.to_owned(), egui::FontId::proportional(15.0), Color32::WHITE, rect.width() - 16.0);
     job.halign = Align::Center; // each line centered around x = 0
     let g = p.layout_job(job);
     p.galley(pos2(rect.center().x, rect.center().y - g.size().y / 2.0), g, Color32::WHITE);
