@@ -13,7 +13,7 @@ const MAX_LONG_TEXT: usize = 4000;
 const MAX_ITEMS: usize = 500;
 /// Long-running series have well over `MAX_ITEMS` episodes.
 const MAX_VIDEOS: usize = 5000;
-/// Cap on genres, cast, directors and links of a meta.
+/// Cap on genres, cast, directors, links and trailers of a meta.
 const MAX_TAGS: usize = 30;
 /// Max options kept per catalog extra (e.g. genres).
 const MAX_OPTIONS: usize = 200;
@@ -193,6 +193,19 @@ pub struct Meta {
     /// Episodes of a series; malformed entries are dropped.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub videos: Vec<Video>,
+    /// YouTube trailers (`trailerStreams`, else legacy `trailers`); each has a valid `ytId` and nothing else to play.
+    #[serde(default, rename = "trailerStreams", deserialize_with = "lenient_vec")]
+    pub trailers: Vec<Stream>,
+    #[serde(default, rename = "trailers", deserialize_with = "lenient_vec", skip_serializing)]
+    legacy_trailers: Vec<LegacyTrailer>,
+}
+
+/// Legacy `trailers` entry: `{"source": "<ytId>", "type": "Trailer"}`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct LegacyTrailer {
+    source: String,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -276,6 +289,8 @@ pub struct BehaviorHints {
     pub filename: Option<String>,
     /// `videoSize` in bytes.
     pub video_size: Option<u64>,
+    /// `videoHash`: OpenSubtitles hash of the file (16 hex digits).
+    pub video_hash: Option<String>,
 }
 
 const MAX_HEADERS: usize = 32;
@@ -306,6 +321,7 @@ fn behavior_hints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BehaviorHint
             .collect(),
         filename: text("filename"),
         video_size: v.get("videoSize").and_then(|x| x.as_u64()),
+        video_hash: text("videoHash").filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit())).map(|h| h.to_ascii_lowercase()),
     })
 }
 
@@ -585,6 +601,19 @@ pub fn parse_meta(body: &[u8]) -> Result<Meta> {
         opt_text(&mut v.released, 64);
         opt_url(&mut v.thumbnail);
     }
+    // Only the YouTube id is kept, so a trailer can never play an arbitrary URL or torrent.
+    let keep = |list: Vec<Stream>| -> Vec<Stream> {
+        list.into_iter()
+            .filter(|t| t.yt_id.as_deref().and_then(youtube_url).is_some())
+            .map(|t| Stream { title: t.title.map(|x| sanitize_text(&x, MAX_TEXT)).filter(|x| !x.is_empty()), yt_id: t.yt_id, ..Default::default() })
+            .take(MAX_TAGS)
+            .collect()
+    };
+    m.trailers = keep(std::mem::take(&mut m.trailers));
+    if m.trailers.is_empty() {
+        m.trailers = keep(m.legacy_trailers.drain(..).map(|t| Stream { yt_id: Some(t.source), title: t.kind, ..Default::default() }).collect());
+    }
+    m.legacy_trailers.clear();
     Ok(m)
 }
 
@@ -685,6 +714,25 @@ pub fn configure_url(transport_url: &str) -> Result<Url> {
 
 fn enc(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>().replace('+', "%20")
+}
+
+/// Bytes the OpenSubtitles hash reads from each end of the file.
+pub const HASH_CHUNK: usize = 64 * 1024;
+
+/// OpenSubtitles hash: file size plus the little-endian u64 words of its first and last 64 KiB, wrapping.
+/// For files under 128 KiB the two chunks overlap, as in the reference algorithm; files under 64 KiB get no hash.
+pub fn opensubtitles_hash(size: u64, head: &[u8], tail: &[u8]) -> String {
+    let sum = |b: &[u8]| b.as_chunks::<8>().0.iter().fold(0u64, |a, w| a.wrapping_add(u64::from_le_bytes(*w)));
+    format!("{:016x}", size.wrapping_add(sum(head)).wrapping_add(sum(tail)))
+}
+
+/// Subtitles path with Stremio extras (`subtitles/<type>/<id>/videoHash=..&videoSize=...json`).
+pub fn subtitles_path(kind: &str, id: &str, extra: &[(&str, String)]) -> String {
+    let extra: Vec<String> = extra.iter().map(|(k, v)| format!("{k}={}", enc(v))).collect();
+    match extra.is_empty() {
+        true => format!("subtitles/{}/{}.json", enc(kind), enc(id)),
+        false => format!("subtitles/{}/{}/{}.json", enc(kind), enc(id), extra.join("&")),
+    }
 }
 
 /// Relative catalog URL; `skip > 0` adds the Stremio `skip` extra.
@@ -827,7 +875,47 @@ impl AddonClient {
         parse_streams(&self.get(Self::resource_url(transport_url, "stream", kind, id)?).await?)
     }
 
-    pub async fn subtitles(&self, transport_url: &str, kind: &str, id: &str) -> Result<Vec<Subtitle>> {
-        parse_subtitles(&self.get(Self::resource_url(transport_url, "subtitles", kind, id)?).await?)
+    /// `extra`: Stremio subtitle extras such as `videoHash`, `videoSize` and `filename`.
+    pub async fn subtitles(&self, transport_url: &str, kind: &str, id: &str, extra: &[(&str, String)]) -> Result<Vec<Subtitle>> {
+        parse_subtitles(&self.get(addon_base(transport_url)?.join(&subtitles_path(kind, id, extra))?).await?)
+    }
+
+    /// Up to `HASH_CHUNK` bytes of `url` from `start`, and the file size from `Content-Range` (or a 200's length).
+    async fn chunk_at(&self, url: &Url, headers: &[(String, String)], start: u64) -> Result<(Vec<u8>, u64)> {
+        let mut req = self.http()?.get(url.clone()).header("Range", format!("bytes={start}-{}", start + HASH_CHUNK as u64 - 1));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let mut resp = req.send().await?;
+        ensure!(resp.status().is_success(), "HTTP {}", resp.status());
+        // `bytes <first>-<last>/<total>`; a slice from elsewhere would hash wrong.
+        let range = resp.headers().get("content-range").and_then(|v| v.to_str().ok()?.strip_prefix("bytes ").map(String::from));
+        let range = range.and_then(|r| {
+            let (span, total) = r.split_once('/')?;
+            Some((span.split('-').next()?.parse::<u64>().ok()?, total.parse::<u64>().ok()?))
+        });
+        let size = match (resp.status().as_u16(), range) {
+            (206, Some((first, t))) if first == start => t,
+            // No range support: the head still reads, but the tail request then lands in `bail!` below.
+            (200, _) if start == 0 => resp.content_length().context("no length")?,
+            _ => bail!("no range support"),
+        };
+        let mut body = Vec::new();
+        while body.len() < HASH_CHUNK
+            && let Some(c) = resp.chunk().await?
+        {
+            body.extend_from_slice(&c[..c.len().min(HASH_CHUNK - body.len())]);
+        }
+        Ok((body, size))
+    }
+
+    /// OpenSubtitles hash and size of the video at `url`, read with two range requests.
+    pub async fn video_hash(&self, url: &str, headers: &[(String, String)]) -> Result<(String, u64)> {
+        let url = safe_http_url(url).context("not an http(s) URL")?;
+        let (head, size) = self.chunk_at(&url, headers, 0).await?;
+        ensure!(size >= HASH_CHUNK as u64 && head.len() == HASH_CHUNK, "file too small to hash");
+        let (tail, _) = self.chunk_at(&url, headers, size - HASH_CHUNK as u64).await?;
+        ensure!(tail.len() == HASH_CHUNK, "short read");
+        Ok((opensubtitles_hash(size, &head, &tail), size))
     }
 }

@@ -1,5 +1,5 @@
 //! Starts the bundled test addon and exercises the real addon client against it.
-use stremflix_rs::addon::{AddonClient, PlayTarget};
+use stremflix_rs::addon::{AddonClient, HASH_CHUNK, PlayTarget, opensubtitles_hash};
 
 #[tokio::test]
 async fn client_against_test_addon() {
@@ -32,9 +32,20 @@ async fn client_against_test_addon() {
     assert!(matches!(streams[0].target(), Some(PlayTarget::Http(u)) if u.as_str() == format!("{base}/media/test-pattern.mp4")));
     assert!(matches!(streams[1].target(), Some(PlayTarget::Magnet(m, Some(0))) if m.contains("x.pe=127.0.0.1:6881")));
 
-    let subs = c.subtitles(&url, "movie", &meta.id).await.unwrap();
+    let subs = c.subtitles(&url, "movie", &meta.id, &[]).await.unwrap();
     assert_eq!(subs.len(), 1);
     assert_eq!(subs[0].url, format!("{base}/subs/test-en.vtt"));
+
+    // Hash over range requests; the test addon ignores the range end, so the client must cap each read.
+    let dir = tempfile::tempdir().unwrap();
+    let video: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    std::fs::write(dir.path().join(test_addon::VIDEO_FILE), &video).unwrap();
+    let media = test_addon::spawn(test_addon::Config { media_dir: Some(dir.path().into()), torrent: None }).unwrap();
+    let want = opensubtitles_hash(200_000, &video[..HASH_CHUNK], &video[200_000 - HASH_CHUNK..]);
+    assert_eq!(c.video_hash(&format!("{media}/media/{}", test_addon::VIDEO_FILE), &[]).await.unwrap(), (want, 200_000));
+    assert!(c.video_hash(&format!("{media}/missing.mp4"), &[]).await.is_err());
+    let extra = [("videoHash", "8e245d9679d31e12".to_string()), ("videoSize", "200000".to_string())];
+    assert_eq!(c.subtitles(&url, "movie", &meta.id, &extra).await.unwrap().len(), 1, "extras path reaches the addon");
 
     // Malformed and missing resources are errors, not panics.
     assert!(c.fetch_manifest(&format!("{base}/malformed/manifest.json")).await.is_err());

@@ -156,6 +156,23 @@ fn meta_detail_fields() {
 }
 
 #[test]
+fn meta_trailers() {
+    let m = parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": "One", "trailerStreams": [
+        {"title": "Official", "ytId": "dQw4w9WgXcQ", "url": "https://evil.example/x"},
+        {"title": "Bad", "ytId": "../../etc"}, {"title": "Torrent", "infoHash": "0123456789abcdef0123456789abcdef01234567"}, 3
+    ], "trailers": [{"source": "aaaaaaaaaaa", "type": "Trailer"}]}}"#)
+    .unwrap();
+    assert_eq!(m.trailers.len(), 1, "invalid ids, non-YouTube and malformed entries dropped; legacy ignored");
+    assert_eq!(m.trailers[0].source().as_deref(), Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "url stripped");
+    assert_eq!(m.trailers[0].title.as_deref(), Some("Official"));
+    let m = parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": "One", "trailers": [{"source": "aaaaaaaaaaa", "type": "Trailer"}, {"source": 5}]}}"#).unwrap();
+    assert_eq!((m.trailers.len(), m.trailers[0].yt_id.as_deref()), (1, Some("aaaaaaaaaaa")), "legacy fallback");
+    assert!(parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": "One", "trailers": "x"}}"#).unwrap().trailers.is_empty());
+    let m = parse_meta(br#"{"meta": {"id": "tt1", "type": "movie", "name": "One", "trailerStreams": [{"ytId": "bad"}], "trailers": [{"source": "aaaaaaaaaaa"}]}}"#).unwrap();
+    assert_eq!(m.trailers.len(), 1, "legacy used when every trailerStreams entry is invalid");
+}
+
+#[test]
 fn meta_videos_parsing() {
     let m = parse_meta(br#"{"meta": {"id": "tt9", "type": "series", "name": "Show", "videos": [
         {"id": "tt9:1:2", "name": "Pilot\u0007 ", "season": 1, "episode": 2, "released": "2020-01-01T00:00:00.000Z", "thumbnail": "https://img.example/e.jpg"},
@@ -258,12 +275,12 @@ fn stream_behavior_hints() {
     let many: Vec<String> = (0..40).map(|i| format!(r#""X-H{i:02}": "v""#)).collect();
     let body = format!(
         r#"{{"streams": [
-        {{"url": "https://a.example/1", "behaviorHints": {{"filename": " Movie.2024\n.1080p.mkv\u0007", "videoSize": 2345000000,
+        {{"url": "https://a.example/1", "behaviorHints": {{"filename": " Movie.2024\n.1080p.mkv\u0007", "videoSize": 2345000000, "videoHash": "8E245D9679D31E12",
             "proxyHeaders": {{"request": {{"User-Agent": " Moz (KHTML, like Gecko) ", "Referer": "https://a.example/",
                 "X-Inject": "a\r\nX-Evil: 1", "X-Nul": "a\u0000b", "Bad Name": "v", "Bad:Name": "v", "": "v", "Host": "evil.example",
                 "Content-Length": "0", "X-Num": 7, "X-Uni": "café", "X-Long": "{long}"}}}}}}}},
-        {{"url": "https://a.example/2", "behaviorHints": {{"videoSize": -1, "filename": 3, "proxyHeaders": {{"request": "junk"}}}}}},
-        {{"url": "https://a.example/3", "behaviorHints": {{"proxyHeaders": {{"request": {{{many}}}}}}}}}
+        {{"url": "https://a.example/2", "behaviorHints": {{"videoSize": -1, "filename": 3, "videoHash": "../../x.json", "proxyHeaders": {{"request": "junk"}}}}}},
+        {{"url": "https://a.example/3", "behaviorHints": {{"videoHash": "8e245d9679d31e1g", "proxyHeaders": {{"request": {{{many}}}}}}}}}
     ]}}"#,
         long = "x".repeat(5000),
         many = many.join(",")
@@ -272,11 +289,13 @@ fn stream_behavior_hints() {
     let h = &s[0].hints;
     assert_eq!(h.filename.as_deref(), Some("Movie.2024 .1080p.mkv"));
     assert_eq!(h.video_size, Some(2_345_000_000));
+    assert_eq!((h.video_hash.as_deref(), &s[1].hints.video_hash), (Some("8e245d9679d31e12"), &None));
     let names: Vec<_> = h.request_headers.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(names, ["Referer", "User-Agent"]);
     assert_eq!(h.request_headers[1].1, "Moz (KHTML, like Gecko)");
     assert_eq!((s[1].hints.video_size, &s[1].hints.filename, s[1].hints.request_headers.len()), (None, &None, 0));
     assert_eq!(s[2].hints.request_headers.len(), 32);
+    assert_eq!(s[2].hints.video_hash, None, "16 chars but not hex");
     assert!(valid_header("X-Debrid-Token", "abc, def;q=1") && !valid_header("X-A", "a\nb") && !valid_header("TE", "trailers"));
 }
 
@@ -394,4 +413,16 @@ fn deep_links() {
     for bad in ["stremio:///detail/movie", "stremio:///detail/movie/a%2Fb", "stremio:///detail/movie/x%00", "stremio:///detail/movie/a%E2%80%AEb", "stremio:///search?q=x", "stremio:///detail/movie/tt1/v/extra"] {
         assert_eq!(parse_deep_link(bad), None, "{bad}");
     }
+}
+
+#[test]
+fn opensubtitles_hash_and_subtitle_extras() {
+    let zero = vec![0u8; HASH_CHUNK];
+    assert_eq!(opensubtitles_hash(131_072, &zero, &zero), "0000000000020000");
+    let mut max = zero.clone();
+    max[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert_eq!(opensubtitles_hash(131_072, &max, &zero), "000000000001ffff", "wraps");
+    assert_eq!(subtitles_path("movie", "tt1", &[]), "subtitles/movie/tt1.json");
+    let extra = [("videoHash", "8e245d9679d31e12".to_string()), ("videoSize", "12".to_string()), ("filename", "a b&c=/../d.mkv".to_string())];
+    assert_eq!(subtitles_path("series", "tt1:1:2", &extra), "subtitles/series/tt1%3A1%3A2/videoHash=8e245d9679d31e12&videoSize=12&filename=a%20b%26c%3D%2F..%2Fd.mkv.json");
 }

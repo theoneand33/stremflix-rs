@@ -572,6 +572,9 @@ fn binge_source(streams: &[Stream], group: &str) -> Option<String> {
     streams.iter().filter(|s| s.hints.binge_group.as_deref() == Some(group)).find_map(Stream::source)
 }
 
+/// Progress-key prefix of trailers, which are never saved to history; `/` keeps it off any `<kind>:<id>` key.
+const TRAILER: &str = "trailer/";
+
 /// The addon's `proxyHeaders` for playing `url`, only when it is that addon's own http(s) stream:
 /// never for torrents (`url` is then the local torrent server, not `source`) or local files.
 fn request_headers(streams: &[Stream], source: &str, url: &str) -> Vec<(String, String)> {
@@ -618,6 +621,52 @@ fn only_source(streams: &[Stream]) -> Option<String> {
     let mut it = streams.iter().filter_map(Stream::source);
     let first = it.next();
     if it.next().is_some() { None } else { first }
+}
+
+/// Inputs of [`hashed_subs`].
+struct SubLookup {
+    addons: Vec<String>,
+    kind: String,
+    id: String,
+    hints: stremflix_rs::addon::BehaviorHints,
+    headers: Vec<(String, String)>,
+}
+
+/// Re-ask subtitle addons with the stream's `videoHash`/`videoSize`/`filename` (the hash from the stream's hints,
+/// else read from `url`), so OpenSubtitles can match the exact file. Matches come first, then the earlier `subs`;
+/// on timeout or without a hash, `subs` unchanged.
+async fn hashed_subs(client: AddonClient, l: SubLookup, url: &str, subs: Subs) -> Subs {
+    // Playback waits on this; one shared deadline, so a slow hash or addon cannot hold it up for long
+    // and a slow addon does not discard the fast ones' matches.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let ask = async {
+        // Without a hash the addons would only repeat the earlier lookup.
+        let (hash, size) = match l.hints.video_hash.clone() {
+            Some(h) => (h, l.hints.video_size),
+            // Playlists and YouTube pages are not the video file, so they have no hash.
+            None if stremflix_rs::addon::is_youtube(url) || url::Url::parse(url).is_ok_and(|u| [".m3u8", ".mpd"].iter().any(|x| u.path().to_ascii_lowercase().ends_with(x))) => return Vec::new(),
+            None => match tokio::time::timeout_at(deadline, client.video_hash(url, &l.headers)).await {
+                Ok(Ok((h, n))) => (h, Some(n)),
+                _ => return Vec::new(),
+            },
+        };
+        let extra: Vec<(&str, String)> = [("videoHash", Some(hash)), ("videoSize", size.map(|n| n.to_string())), ("filename", l.hints.filename.clone())]
+            .into_iter()
+            .filter_map(|(k, v)| Some((k, v?)))
+            .collect();
+        let ask = |u: String| {
+            let (c, k, i, e) = (client.clone(), l.kind.clone(), l.id.clone(), extra.clone());
+            async move { tokio::time::timeout_at(deadline, c.subtitles(&u, &k, &i, &e)).await? }
+        };
+        concurrently(l.addons.clone(), ask).await.into_iter().flatten().flatten().map(|s| (s.url, s.lang)).collect::<Subs>()
+    };
+    let mut out = ask.await;
+    for s in subs {
+        if !out.iter().any(|(u, _)| *u == s.0) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// Run `f` for every item at once; results come back in item order (e.g. addon priority).
@@ -876,7 +925,9 @@ impl App {
     fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
         self.nav += 1;
         let nav = self.nav;
-        if !source.starts_with("magnet:") && !is_torrent_file(&source) {
+        let lookup = self.sub_lookup(&key, &source);
+        let torrent = source.starts_with("magnet:") || is_torrent_file(&source);
+        if !torrent && lookup.is_none() {
             let _ = self.tx.send(Msg::Play(key, title, source.clone(), source, subs, None, nav));
             return;
         }
@@ -885,13 +936,33 @@ impl App {
             Some(d) => PathBuf::from(d).join("stremflix-rs-torrents"),
             None => self.data_dir.join("torrents"),
         };
-        let (cell, cache, profile) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile);
+        let (cell, cache, profile, client) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile, self.client.clone());
         let dht = std::env::var_os("STREMFLIX_RS_NO_DHT").is_none();
         self.spawn(ctx, async move {
-            let engine = cell.get_or_try_init(|| TorrentEngine::start(dir, dht, cache, profile)).await?;
-            let (url, id) = engine.stream_url(&source, None).await?;
-            Ok(Msg::Play(key, title, source, url, subs, Some(id), nav))
+            let (url, id) = match torrent {
+                true => {
+                    let engine = cell.get_or_try_init(|| TorrentEngine::start(dir, dht, cache, profile)).await?;
+                    let (url, id) = engine.stream_url(&source, None).await?;
+                    (url, Some(id))
+                }
+                false => (source.clone(), None),
+            };
+            let subs = match lookup {
+                Some(l) => hashed_subs(client, l, &url, subs).await,
+                None => subs,
+            };
+            Ok(Msg::Play(key, title, source, url, subs, id, nav))
         });
+    }
+
+    /// What a hash-matched subtitle query needs for the selected title's stream `source`;
+    /// `None` without subtitle addons or outside the selected title's streams.
+    fn sub_lookup(&self, key: &str, source: &str) -> Option<SubLookup> {
+        let (m, streams, _) = self.selected.as_ref().filter(|_| self.play_key().is_some_and(|(k, _)| k == key))?;
+        let s = streams.iter().find(|s| s.source().as_deref() == Some(source))?;
+        let id = self.episode.as_ref().map_or(m.id.clone(), |v| v.id.clone());
+        let addons = self.addons_for("subtitles", &m.kind, &id);
+        (!addons.is_empty()).then(|| SubLookup { addons, kind: m.kind.clone(), id, hints: s.hints.clone(), headers: request_headers(streams, source, source) })
     }
 
     /// Play a magnet link or a local `.torrent` file (typed, pasted or dropped).
@@ -1197,7 +1268,8 @@ impl App {
     }
 
     fn save_progress(&mut self) {
-        if let Some(p) = &self.player {
+        // Trailers never enter Continue Watching or the watched list.
+        if let Some(p) = self.player.as_ref().filter(|p| !p.key.starts_with(TRAILER)) {
             let prog = Progress { key: p.key.clone(), title: p.title.clone(), source: p.source.clone(), position: p.pos, duration: p.dur, poster: p.poster.clone() };
             self.record_progress(prog);
         }
@@ -1593,7 +1665,7 @@ impl App {
             };
             let ask_subs = |u: String| {
                 let (c, k, i) = (client.clone(), kind.clone(), vid.clone());
-                async move { c.subtitles(&u, &k, &i).await }
+                async move { c.subtitles(&u, &k, &i, &[]).await }
             };
             let (stream_res, sub_res) = tokio::join!(concurrently(stream_addons, ask_streams), concurrently(sub_addons, ask_subs));
             // Addon priority order, so the picker groups streams by addon.
@@ -1645,8 +1717,13 @@ impl App {
                 ui.spinner();
             }
         }
-        if let Some(d) = self.selected_details() {
-            Self::ui_details(ui, d);
+        if let Some(d) = self.selected_details()
+            && let Some(t) = Self::ui_details(ui, d)
+            && let Some(src) = t.source()
+        {
+            // Not `play`: its `nav` bump would drop the title's still-loading streams and episodes.
+            let key = format!("{TRAILER}{}", t.yt_id.clone().unwrap_or_default());
+            let _ = self.tx.send(Msg::Play(key, format!("{} - {}", d.name, t.title.as_deref().unwrap_or("Trailer")), src.clone(), src, vec![], None, self.nav));
         }
         let mut episode = None;
         let mut toggle: Option<(String, bool)> = None;
@@ -2060,8 +2137,9 @@ impl App {
         });
     }
 
-    /// Detail facts under the banner: year, runtime, rating, genres, cast, director, links.
-    fn ui_details(ui: &mut egui::Ui, d: &Meta) {
+    /// Detail facts under the banner: year, runtime, rating, genres, cast, director, links, trailers.
+    /// Returns the trailer the user clicked.
+    fn ui_details<'a>(ui: &mut egui::Ui, d: &'a Meta) -> Option<&'a Stream> {
         ui.add_space(14.0);
         let gray = Color32::from_gray(170);
         let facts: Vec<String> = [d.release_info.clone(), d.runtime.clone(), d.imdb_rating.as_ref().map(|r| format!("IMDb {r}"))]
@@ -2085,6 +2163,17 @@ impl App {
                 }
             });
         }
+        let mut clicked = None;
+        if !d.trailers.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for t in &d.trailers {
+                    if ui.button(format!("▶ {}", t.title.as_deref().unwrap_or("Trailer"))).clicked() {
+                        clicked = Some(t);
+                    }
+                }
+            });
+        }
+        clicked
     }
 
     /// Full-window Netflix-style player: letterboxed video, controls that fade out after
@@ -3342,6 +3431,26 @@ mod tests {
         app.record_progress(p(95.0));
         assert!(app.recent.is_empty() && app.db.progress("movie:tt1").unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn hashed_subs_put_matches_first() {
+        let base = test_addon::spawn(test_addon::Config { media_dir: None, torrent: None }).unwrap();
+        let hints = stremflix_rs::addon::BehaviorHints { video_hash: Some("8e245d9679d31e12".into()), ..Default::default() };
+        let l = |hints| SubLookup { addons: vec![format!("{base}/manifest.json")], kind: "movie".into(), id: test_addon::META_ID.into(), hints, headers: vec![] };
+        let test_en = (format!("{base}/subs/test-en.vtt"), "eng".to_string());
+        let old = vec![("https://x.example/a.srt".to_string(), "fre".to_string()), test_en.clone()];
+        let out = hashed_subs(AddonClient::new(), l(hints.clone()), "/local/file.mkv", old.clone()).await;
+        assert_eq!(out, [test_en, old[0].clone()], "match first, deduped by URL");
+        let out = hashed_subs(AddonClient::new(), l(Default::default()), "/local/file.mkv", old.clone()).await;
+        assert_eq!(out, old, "no hash: unchanged");
+        // An addon that never answers times out alone; the fast one's match is kept.
+        let hang = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut slow = l(hints);
+        slow.addons.insert(0, format!("http://{}/manifest.json", hang.local_addr().unwrap()));
+        let out = hashed_subs(AddonClient::new(), slow, "/local/file.mkv", vec![]).await;
+        assert_eq!(out, [(format!("{base}/subs/test-en.vtt"), "eng".to_string())]);
+    }
+
 
     #[tokio::test]
     async fn concurrently_keeps_item_order() {
