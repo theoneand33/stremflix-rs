@@ -969,7 +969,7 @@ impl App {
         let torrent = source.starts_with("magnet:") || is_torrent_file(&source);
         if !torrent && lookup.is_none() {
             let mut subs = subs;
-            subs.extend(player::sidecar_subs(std::path::Path::new(&source))); // empty unless `source` is a local file
+            subs.extend(player::sidecar_subs(std::path::Path::new(&source))); // empty for URLs and missing paths
             let _ = self.tx.send(Msg::Play(key, title, source.clone(), source, subs, None, nav));
             return;
         }

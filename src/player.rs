@@ -366,7 +366,11 @@ fn pick_sub(subs: &[(String, String)], slang: &str) -> Option<usize> {
 
 /// Subtitle files beside a local video as `(path, lang)`: `<stem>.<ext>` or `<stem>.<lang>.<ext>`, case-insensitive.
 /// Reads one directory listing, no recursion. `lang` is empty unless the tag is 2-3 letters.
+/// Returns nothing for URLs and paths that are not existing files.
 pub fn sidecar_subs(video: &Path) -> Vec<(String, String)> {
+    if video.to_string_lossy().contains("://") || !video.is_file() {
+        return vec![];
+    }
     let (Some(dir), Some(stem)) = (video.parent(), video.file_stem().and_then(|s| s.to_str())) else { return vec![] };
     let stem = stem.to_lowercase();
     let mut out: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| {
@@ -605,14 +609,13 @@ mod tests {
 
     #[test]
     fn sidecar_matching() {
-        let dir = std::env::temp_dir().join(format!("sidecar-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         for f in ["Movie.mkv", "movie.SRT", "Movie.en.ass", "Movie.pt-BR.vtt", "Movie2.srt", "Other.srt", "Movie.txt"] {
-            std::fs::write(dir.join(f), "").unwrap();
+            std::fs::write(dir.path().join(f), "").unwrap();
         }
-        let got: Vec<_> = sidecar_subs(&dir.join("Movie.mkv")).into_iter().map(|(p, l)| (p.rsplit('/').next().unwrap().to_string(), l)).collect();
-        std::fs::remove_dir_all(&dir).unwrap();
+        let got: Vec<_> = sidecar_subs(&dir.path().join("Movie.mkv")).into_iter().map(|(p, l)| (p.rsplit('/').next().unwrap().to_string(), l)).collect();
         assert_eq!(got, [("Movie.en.ass", "en"), ("Movie.pt-BR.vtt", ""), ("movie.SRT", "")].map(|(p, l)| (p.to_string(), l.to_string())));
+        assert!(sidecar_subs(Path::new("https://x/Movie.mkv")).is_empty());
     }
 
     #[test]
