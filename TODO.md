@@ -17,7 +17,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Calendar of upcoming episodes for library series | P2 | M | Depends on the saved library. |
 | New-episode notifications | P2 | M | Depends on the saved library. |
-| "New Episodes" row for library series | P2 | S | Depends on the saved library and addon episode metadata. |
 | Hide / reorder Home catalog rows | P2 | M | Rows follow addon priority only. |
 | Search history | P2 | S | |
 | Search within the saved library | P2 | S | |

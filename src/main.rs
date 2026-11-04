@@ -152,6 +152,8 @@ enum Msg {
     Episodes(MetaPreview, Meta, u64),
     /// Full meta of a movie (genres, cast, ...) for the detail page.
     Details(Meta),
+    /// A saved series and its recently released episodes.
+    NewEpisodes(MetaPreview, Vec<Video>),
     /// poster URL, image bytes (empty on failure)
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs, torrent id, the `nav` it was requested at
@@ -187,6 +189,33 @@ struct Row {
     loading_more: bool,
     /// Last page was empty, had nothing new, or failed.
     exhausted: bool,
+}
+
+/// How far back an episode's release date still counts as new.
+const NEW_EPISODE_DAYS: i64 = 14;
+
+/// Days since 1970-01-01 (UTC) today.
+fn unix_days() -> i64 {
+    (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) / 86400) as i64
+}
+
+/// `YYYY-MM-DD` of a day count since 1970-01-01 (civil-from-days).
+fn date_string(days: i64) -> String {
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + i64::from(m <= 2))
+}
+
+/// Numbered episodes released on `since..=today` (`YYYY-MM-DD`), in list order.
+fn recent_episodes(videos: Vec<Video>, since: &str, today: &str) -> Vec<Video> {
+    let day = |v: &Video| v.released.as_deref().and_then(|d| d.get(..10)).map(str::to_owned);
+    videos.into_iter().filter(|v| v.episode.is_some() && v.season != Some(0) && day(v).is_some_and(|d| d.as_str() >= since && d.as_str() <= today)).collect()
 }
 
 /// Max items kept per catalog row.
@@ -792,6 +821,8 @@ struct App {
     library: Vec<LibraryItem>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
+/// Saved series with episodes released in the last `NEW_EPISODE_DAYS` days (watched ones are hidden when drawn).
+new_episodes: Vec<(MetaPreview, Vec<Video>)>,
     /// Finished downloads, newest first, and those still running.
     downloads: Vec<Download>,
     downloading: Vec<Download>,
@@ -878,6 +909,7 @@ impl App {
             addons: db.addons()?,
             library: db.library_items()?,
             saved: db.saved_titles()?,
+new_episodes: Vec::new(),
             downloads: db.downloads()?,
             downloading: Vec::new(),
             lib_sort: LibSort::Added,
@@ -1233,6 +1265,12 @@ impl App {
                 }
                 None => report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200))),
             },
+            Msg::NewEpisodes(meta, videos) => {
+                self.new_episodes.retain(|(m, _)| m.id != meta.id);
+                if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) && !videos.is_empty() {
+                    self.new_episodes.push((meta, videos));
+                }
+            }
             Msg::Details(m) => {
                 if self.details_want == (m.kind.clone(), m.id.clone()) {
                     if let Some((sel, ..)) = self.selected.as_mut() {
@@ -1517,6 +1555,25 @@ impl App {
             self.spawn(ctx, async move {
                 let res = client.catalog(&src.0, &src.1, &src.2, 0).await.map_err(|e| format!("{e:#}"));
                 Ok(Msg::Row(src, res))
+            });
+        }
+        self.fetch_new_episodes(ctx);
+    }
+
+    /// Ask a meta addon for the episodes of each saved series and keep those released recently.
+    fn fetch_new_episodes(&self, ctx: &egui::Context) {
+        for meta in self.saved.iter().filter(|t| t.kind == "series").filter_map(SavedTitle::preview) {
+            let addons = self.addons_for("meta", &meta.kind, &meta.id);
+            let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), ctx.clone());
+            // Not `spawn`: a series whose meta fails to load just has no row entry.
+            self.rt.spawn(async move {
+                for u in &addons {
+                    if let Ok(m) = client.meta(u, &meta.kind, &meta.id).await {
+                        let _ = tx.send(Msg::NewEpisodes(meta, recent_episodes(m.videos, &date_string(unix_days() - NEW_EPISODE_DAYS), &date_string(unix_days()))));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
             });
         }
     }
@@ -1965,6 +2022,27 @@ impl App {
                             play = Some((p.key.clone(), p.title.clone(), p.source.clone(), vec![]));
                         } else if r.clicked() {
                             resume = Some(p.clone());
+                        }
+                    }
+                });
+            });
+        }
+        let mut fresh: Vec<(&MetaPreview, &Video)> = self
+            .new_episodes
+            .iter()
+            .filter_map(|(m, vs)| vs.iter().rev().find(|v| !self.watched_keys.contains(&format!("{}:{}", m.kind, v.id))).map(|v| (m, v)))
+            .collect();
+        fresh.sort_by(|a, b| b.1.released.cmp(&a.1.released));
+        if !fresh.is_empty() {
+            Self::row_title(ui, "New Episodes");
+            egui::ScrollArea::horizontal().id_salt("new_episodes").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (m, v) in fresh {
+                        let label = format!("{} S{}E{}", m.name, v.season.unwrap_or(0), v.episode.unwrap_or(0));
+                        let (r, rect) = card(ui, CARD, &label);
+                        self.paint_poster(ui, &r, rect, &m.poster, &m.name, &mut want);
+                        if r.on_hover_text(label).clicked() {
+                            episode = Some((m.clone(), v.clone()));
                         }
                     }
                 });
@@ -3545,6 +3623,22 @@ mod mac_links {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_episodes_window() {
+        assert_eq!(date_string(0), "1970-01-01");
+        assert_eq!(date_string(19782), "2024-02-29");
+        let v = |id: &str, season, rel: Option<&str>| Video { id: id.into(), title: None, season, episode: Some(1), released: rel.map(Into::into), thumbnail: None };
+        let vs = vec![
+            v("old", Some(1), Some("2024-01-01T00:00:00.000Z")),
+            v("new", Some(1), Some("2024-03-05T00:00:00.000Z")),
+            v("future", Some(1), Some("2024-04-01")),
+            v("special", Some(0), Some("2024-03-05")),
+            v("undated", Some(1), None),
+        ];
+        let ids: Vec<_> = recent_episodes(vs, "2024-02-20", "2024-03-06").into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, ["new"]);
+    }
 
     #[test]
     fn saved_view_filters_and_sorts() {
