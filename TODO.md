@@ -84,7 +84,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Check installed addons for updates | P2 | S | Manifests store a version but nothing compares it. |
-| Support `notWebReady` and `proxyHeaders.response` hints | P2 | M | `proxyHeaders.request` is handled; these are not. |
 | Remote/LAN streaming server | P2 | L | Stremio serves the library to other devices; casting is a separate item. |
 | Addon health indicator (unreachable / timeout) | P3 | S | |
 | Install from `stremio://` addon links pasted in Addons | P3 | S | Deep links only cover detail pages today. |

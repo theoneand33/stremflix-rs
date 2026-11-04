@@ -493,7 +493,8 @@ fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream, reserve: f32) -> egui::Re
     let described = stem.is_some_and(|f| parts.iter().any(|p| p.contains(f)));
     let file = if described { String::new() } else { [s.hints.filename.clone(), s.hints.video_size.map(fmt_size)].into_iter().flatten().collect::<Vec<_>>().join("  ·  ") };
     let external = (s.target().is_none()).then_some("Opens in your browser");
-    let details: Vec<&str> = parts.into_iter().chain(Some(file.as_str()).filter(|f| !f.is_empty())).chain(external).collect();
+    let not_web_ready = s.hints.not_web_ready.then_some("Not web-ready (plays directly here)");
+    let details: Vec<&str> = parts.into_iter().chain(Some(file.as_str()).filter(|f| !f.is_empty())).chain(not_web_ready).chain(external).collect();
     list_row(ui, n, head, details.join("\n"), reserve)
 }
 
@@ -585,8 +586,13 @@ const TRAILER: &str = "trailer/";
 /// The addon's `proxyHeaders` for playing `url`, only when it is that addon's own http(s) stream:
 /// never for torrents (`url` is then the local torrent server, not `source`) or local files.
 fn request_headers(streams: &[Stream], source: &str, url: &str) -> Vec<(String, String)> {
+    own_stream(streams, source, url).map(|s| s.hints.request_headers.clone()).unwrap_or_default()
+}
+
+/// The stream whose own http(s) URL is `url`, when `url` is also the `source` being played.
+fn own_stream<'a>(streams: &'a [Stream], source: &str, url: &str) -> Option<&'a Stream> {
     let own = |s: &&Stream| matches!(s.target(), Some(PlayTarget::Http(u)) if u.as_str() == url);
-    (source == url).then(|| streams.iter().find(own)).flatten().map(|s| s.hints.request_headers.clone()).unwrap_or_default()
+    (source == url).then(|| streams.iter().find(own)).flatten()
 }
 
 /// Series id of a local episode progress key's video id, for history saved before the series id was stored:
@@ -1351,6 +1357,7 @@ impl App {
                 let lang = |k| setting(k).unwrap_or_default();
                 let subs_off = self.subs_off();
                 let headers = self.selected.as_ref().map(|(_, streams, _)| request_headers(streams, &source, &url)).unwrap_or_default();
+                let demuxer = self.selected.as_ref().and_then(|(_, streams, _)| own_stream(streams, &source, &url)).and_then(|s| s.hints.demuxer);
                 // Remember the episode's series (its key holds only the video id) and the stream's binge group
                 // (empty if none), so the series' play button and Continue Watching can find them later.
                 if let (Some((m, streams, _)), Some(_)) = (&self.selected, &self.episode)
@@ -1360,7 +1367,7 @@ impl App {
                     let _ = self.db.set_setting(&format!("series:{key}"), &m.id);
                     let _ = self.db.set_setting(&format!("binge:{}:{}", m.kind, m.id), &group.unwrap_or_default());
                 }
-                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], subs_off, &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
+                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], subs_off, &headers, demuxer, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
                         if self.default_speed != 1.0 {
