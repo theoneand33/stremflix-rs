@@ -18,7 +18,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Calendar of upcoming episodes for library series | P2 | M | Depends on the saved library. |
 | New-episode notifications | P2 | M | Depends on the saved library. |
 | Hide / reorder Home catalog rows | P2 | M | Rows follow addon priority only. |
-| Search within the saved library | P2 | S | |
 
 ### Library and organization
 
@@ -35,7 +34,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
 | Remember volume, speed and audio track across sessions | P2 | S | Other settings persist; these three reset each title. |
-| Buffered range on the seek bar | P2 | S | Stremio shows buffered progress in grey. |
 | Mouse-wheel volume over the video | P2 | S | |
 | Auto-load sidecar subtitles next to local files | P2 | S | `.srt`/`.ass`/`.vtt` beside the video; only addon subtitles today. |
 | Skip intro / recap / credits from addon markers | P2 | M | Stremio supporter feature; needs an addon source for the timestamps. |
