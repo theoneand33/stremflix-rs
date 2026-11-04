@@ -75,6 +75,30 @@ type Subs = Vec<(String, String)>;
 /// Media file `(index, name, size)` of a torrent.
 type MediaFile = (usize, String, u64);
 
+/// A subtitle an addon offers for the playing item, listed in the player's search panel.
+#[derive(Clone)]
+struct SubFound {
+    addon: String,
+    lang: String,
+    url: String,
+}
+
+/// State of the player's subtitle search panel.
+#[derive(Default)]
+struct SubSearch {
+    open: bool,
+    busy: bool,
+    filter: String,
+    results: Vec<SubFound>,
+    status: String,
+}
+
+/// Results whose language or addon name contains `q` (case-insensitive, blank matches all).
+fn filter_subs<'a>(found: &'a [SubFound], q: &str) -> Vec<&'a SubFound> {
+    let q = q.trim().to_lowercase();
+    found.iter().filter(|f| f.lang.to_lowercase().contains(&q) || f.addon.to_lowercase().contains(&q)).collect()
+}
+
 /// Order of the saved-titles list in the Library tab.
 #[derive(PartialEq, Clone, Copy)]
 enum LibSort {
@@ -178,6 +202,10 @@ enum Msg {
     Link(String),
     /// A download that finished, or why it failed.
     Downloaded(Download, Result<(), String>),
+    /// Progress key and the subtitles every addon offered for it.
+    SubSearch(String, Vec<SubFound>),
+    /// A saved subtitle's path, or why saving failed.
+    SubSaved(Result<PathBuf, String>),
     /// A media key or OS media overlay button.
     Media(souvlaki::MediaControlEvent),
 }
@@ -793,6 +821,7 @@ struct Playing {
     after_hold: bool,
     /// The up-next card was dismissed.
     next_dismissed: bool,
+    search: SubSearch,
     /// Per-session picture scaling: aspect override index into `ASPECTS`, fill (crop) instead of fit, zoom in tenths.
     aspect: usize,
     fill: bool,
@@ -1412,6 +1441,20 @@ impl App {
                 }
             }
             Msg::Update(url) => self.update = url,
+            Msg::SubSearch(key, found) => {
+                if let Some(p) = self.player.as_mut().filter(|p| p.key == key) {
+                    p.search.busy = false;
+                    p.search.results = found;
+                }
+            }
+            Msg::SubSaved(res) => {
+                if let Some(p) = &mut self.player {
+                    p.search.status = match res {
+                        Ok(path) => format!("Saved {}", path.display()),
+                        Err(e) => format!("Save failed: {e}"),
+                    };
+                }
+            }
             Msg::Media(e) => self.media_event(ctx, e),
             Msg::Downloaded(d, res) => {
                 self.downloading.retain(|x| x.path != d.path);
@@ -1494,7 +1537,7 @@ impl App {
                         if self.default_speed != 1.0 {
                             let _ = player.command(&["set", "speed", &self.default_speed.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, aspect: 0, fill: false, zoom: 0, awake: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -2575,6 +2618,7 @@ impl App {
         let mut cmd = |a: &[&str]| cmds.push(a.iter().map(|s| s.to_string()).collect());
         let (mut back, mut toggle_fs, mut external) = (false, false, false);
         let mut seek: Option<(f64, bool)> = None;
+        let (mut search_req, mut sub_act): (bool, Option<(bool, SubFound)>) = (false, None);
         let mut style = self.sub_style;
         ui.painter().rect_filled(rect, 0, Color32::BLACK);
 
@@ -2858,6 +2902,36 @@ impl App {
                                 }
                             }
                             if kind == "sub" {
+                                menu_heading(ui, "Search");
+                                let s = &mut p.search;
+                                if ui.add(egui::Button::new(RichText::new(if s.open { "Hide search" } else { "Search subtitles" }).size(14.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(16)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0))).clicked() {
+                                    s.open = !s.open;
+                                    search_req = s.open && s.results.is_empty() && !s.busy;
+                                }
+                                if s.open {
+                                    ui.add(egui::TextEdit::singleline(&mut s.filter).hint_text("Filter by language or addon").desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
+                                    let hits = filter_subs(&s.results, &s.filter);
+                                    let note = if s.busy { "Searching..." } else if hits.is_empty() { "No subtitles found" } else { "" };
+                                    if !note.is_empty() {
+                                        ui.label(RichText::new(note).size(14.0).color(Color32::from_gray(150)));
+                                    }
+                                    egui::ScrollArea::vertical().id_salt("sub_search").max_height(200.0).show(ui, |ui| {
+                                        // shortcut: first 100 matches only; type a filter to narrow.
+                                        for f in hits.into_iter().take(100) {
+                                            ui.horizontal(|ui| {
+                                                if ui.small_button("Save").on_hover_text("Save next to the video or in downloads").clicked() {
+                                                    sub_act = Some((true, f.clone()));
+                                                }
+                                                if menu_row(ui, &format!("{} · {}", f.lang, f.addon), false).clicked() {
+                                                    sub_act = Some((false, f.clone()));
+                                                }
+                                            });
+                                        }
+                                    });
+                                    if !s.status.is_empty() {
+                                        ui.label(RichText::new(&s.status).size(13.0).color(Color32::from_gray(170)));
+                                    }
+                                }
                                 menu_heading(ui, "Style");
                                 style.scale = (style.scale * 10.0).round() / 10.0 + stepper(ui, "Size", &format!("{:.1}x", style.scale)) as f64 * 0.1;
                                 ui.horizontal(|ui| {
@@ -3039,6 +3113,48 @@ impl App {
             }
             if let Err(e) = p.player.command(&args) {
                 report(&mut self.error, e);
+            }
+        }
+        let (key, source, title) = (p.key.clone(), p.source.clone(), p.title.clone());
+        if let Some((save, f)) = sub_act {
+            if save {
+                // Beside a local or downloaded video, else in the downloads folder.
+                let src = std::path::Path::new(&source);
+                let dir = src.is_file().then(|| src.parent().map(PathBuf::from)).flatten().unwrap_or_else(|| self.data_dir.join("downloads"));
+                let client = self.client.clone();
+                p.search.status = "Saving...".into();
+                self.spawn(&ctx, async move {
+                    let res = async { download::save_subtitle(&dir, &title, &f.lang, &client.subtitle_file(&f.url).await?).await }.await;
+                    Ok(Msg::SubSaved(res.map_err(|e| format!("{e:#}"))))
+                });
+            } else if let Err(e) = p.player.add_sub(&f.url, &f.lang) {
+                report(&mut self.error, e);
+            }
+        }
+        if search_req {
+            let lookup = self.sub_lookup(&key, &source);
+            let names: Vec<(String, String)> = lookup.iter().flat_map(|l| &l.addons).map(|u| (u.clone(), self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default())).collect();
+            if let Some(p) = &mut self.player {
+                p.search.busy = lookup.is_some();
+                p.search.status = if lookup.is_some() { String::new() } else { "No subtitle addons for this item".into() };
+            }
+            if let Some(l) = lookup {
+                let client = self.client.clone();
+                // Like `hashed_subs`: the stream's hash and file name let OpenSubtitles-style addons match the exact file.
+                let extra: Vec<(&str, String)> = [("videoHash", l.hints.video_hash.clone()), ("videoSize", l.hints.video_size.map(|n| n.to_string())), ("filename", l.hints.filename.clone())]
+                    .into_iter()
+                    .filter_map(|(k, v)| Some((k, v?)))
+                    .collect();
+                self.spawn(&ctx, async move {
+                    let ask = |(u, name): (String, String)| {
+                        let (c, k, i, e) = (client.clone(), l.kind.clone(), l.id.clone(), extra.clone());
+                        async move { Ok(c.subtitles(&u, &k, &i, &e).await?.into_iter().map(|s| SubFound { addon: name.clone(), lang: s.lang, url: s.url }).collect::<Vec<_>>()) }
+                    };
+                    let mut found: Vec<SubFound> = concurrently(names, ask).await.into_iter().flatten().flatten().collect();
+                    let mut seen = std::collections::HashSet::new();
+                    found.retain(|f| seen.insert(f.url.clone()));
+                    Ok(Msg::SubSearch(key, found))
+                });
             }
         }
         if toggle_fs {
@@ -4205,6 +4321,16 @@ mod tests {
         assert_eq!(app.recent.len(), 1, "a rewatch keeps a resume point");
         app.record_progress(p(95.0));
         assert!(app.recent.is_empty() && app.db.progress("movie:tt1").unwrap().is_none());
+    }
+
+    #[test]
+    fn filter_subs_matches_lang_or_addon() {
+        let f = |addon: &str, lang: &str| SubFound { addon: addon.into(), lang: lang.into(), url: String::new() };
+        let all = [f("OpenSubtitles", "eng"), f("Other", "por-BR"), f("Other", "fre")];
+        assert_eq!(filter_subs(&all, " ENG ").len(), 1);
+        assert_eq!(filter_subs(&all, "other").len(), 2);
+        assert_eq!(filter_subs(&all, "").len(), 3);
+        assert!(filter_subs(&all, "xx").is_empty());
     }
 
     #[tokio::test]

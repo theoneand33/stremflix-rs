@@ -38,7 +38,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Remember volume, speed and audio track across sessions | P2 | S | Other settings persist; these three reset each title. |
 | Mouse-wheel volume over the video | P2 | S | |
 | Auto-load sidecar subtitles next to local files | P2 | S | `.srt`/`.ass`/`.vtt` beside the video; only addon subtitles today. |
-| In-app subtitle search and download | P2 | M | Complements `videoHash` matching. |
 | Skip intro / recap / credits from addon markers | P2 | M | Stremio supporter feature; needs an addon source for the timestamps. |
 | Playback stats overlay (peers, speed, dropped frames) | P2 | S | Stremio has a Network button; useful for torrents. |
 | Sleep timer | P3 | S | |
