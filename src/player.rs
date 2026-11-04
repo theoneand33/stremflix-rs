@@ -183,6 +183,10 @@ pub struct SubStyle {
     pub delay: f64,
     /// Seconds; positive plays audio later (mpv `audio-delay`).
     pub audio_delay: f64,
+    /// Index into [`SUB_OUTLINES`].
+    pub outline: usize,
+    /// Percent from the top (mpv `sub-pos`); 100 is the bottom edge.
+    pub pos: f64,
 }
 
 /// Playback speeds offered in the player menu.
@@ -208,9 +212,12 @@ pub fn hwdec_value(on: bool) -> &'static str {
 /// Preset text colors: label and mpv `sub-color` value.
 pub const SUB_COLORS: [(&str, &str); 4] = [("White", "#FFFFFF"), ("Yellow", "#FFFF00"), ("Green", "#00FF00"), ("Cyan", "#00FFFF")];
 
+/// Preset outline colors: label and mpv `sub-border-color` value.
+pub const SUB_OUTLINES: [(&str, &str); 4] = [("Black", "#000000"), ("White", "#FFFFFF"), ("Blue", "#0000FF"), ("Red", "#FF0000")];
+
 impl Default for SubStyle {
     fn default() -> Self {
-        Self { scale: 1.0, color: 0, background: false, delay: 0.0, audio_delay: 0.0 }
+        Self { scale: 1.0, color: 0, background: false, delay: 0.0, audio_delay: 0.0, outline: 0, pos: 100.0 }
     }
 }
 
@@ -219,11 +226,11 @@ impl SubStyle {
     pub fn clamped(self) -> Self {
         let n = |v: f64, lo: f64, hi: f64, d: f64| if v.is_finite() { v.clamp(lo, hi) } else { d };
         let t = |v: f64| (n(v, -60.0, 60.0, 0.0) * 10.0).round() / 10.0;
-        Self { scale: n(self.scale, 0.5, 3.0, 1.0), color: self.color.min(SUB_COLORS.len() - 1), background: self.background, delay: t(self.delay), audio_delay: t(self.audio_delay) }
+        Self { scale: n(self.scale, 0.5, 3.0, 1.0), color: self.color.min(SUB_COLORS.len() - 1), background: self.background, delay: t(self.delay), audio_delay: t(self.audio_delay), outline: self.outline.min(SUB_OUTLINES.len() - 1), pos: n(self.pos, 0.0, 100.0, 100.0).round() }
     }
 
     /// mpv properties to `set`. `sub-border-style` makes `sub-back-color` show as a box.
-    pub fn props(&self) -> [(&'static str, String); 6] {
+    pub fn props(&self) -> [(&'static str, String); 8] {
         let s = self.clamped();
         [
             ("sub-scale", format!("{:.2}", s.scale)),
@@ -232,20 +239,25 @@ impl SubStyle {
             ("sub-back-color", "#99000000".into()),
             ("sub-delay", format!("{:.1}", s.delay)),
             ("audio-delay", format!("{:.1}", s.audio_delay)),
+            ("sub-border-color", SUB_OUTLINES[s.outline].1.into()),
+            ("sub-pos", format!("{}", s.pos)),
         ]
     }
 
     pub fn encode(&self) -> String {
-        format!("{},{},{},{},{}", self.scale, self.color, self.background as u8, self.delay, self.audio_delay)
+        format!("{},{},{},{},{},{},{}", self.scale, self.color, self.background as u8, self.delay, self.audio_delay, self.outline, self.pos)
     }
 
     /// Parses [`encode`](Self::encode) output; any malformed value falls back to the default.
     pub fn decode(s: &str) -> Self {
         let p: Vec<&str> = s.split(',').collect();
         let (Some(Ok(scale)), Some(Ok(color)), Some(bg), Some(Ok(delay))) = (p.first().map(|v| v.parse()), p.get(1).map(|v| v.parse()), p.get(2), p.get(3).map(|v| v.parse())) else { return Self::default() };
-        // Older values have no 5th field.
-        let audio_delay = p.get(4).and_then(|v| v.parse().ok()).unwrap_or(0.0);
-        Self { scale, color, background: *bg == "1", delay, audio_delay }.clamped()
+        // Values stored before audio delay/outline/position existed have fewer fields.
+        let d = Self::default();
+        let audio_delay = p.get(4).and_then(|v| v.parse().ok()).unwrap_or(d.audio_delay);
+        let outline = p.get(5).and_then(|v| v.parse().ok()).unwrap_or(d.outline);
+        let pos = p.get(6).and_then(|v| v.parse().ok()).unwrap_or(d.pos);
+        Self { scale, color, background: *bg == "1", delay, audio_delay, outline, pos }.clamped()
     }
 }
 
@@ -667,12 +679,17 @@ mod tests {
 
     #[test]
     fn sub_style_clamps_and_roundtrips() {
-        let s = SubStyle { scale: 9.0, color: 99, background: true, delay: -500.0, audio_delay: 500.0 }.clamped();
-        assert_eq!((s.scale, s.color, s.delay, s.audio_delay), (3.0, SUB_COLORS.len() - 1, -60.0, 60.0));
+        let s = SubStyle { scale: 9.0, color: 99, background: true, delay: -500.0, audio_delay: 500.0, outline: 99, pos: -5.0 }.clamped();
+        assert_eq!((s.scale, s.color, s.delay, s.audio_delay, s.outline, s.pos), (3.0, SUB_COLORS.len() - 1, -60.0, 60.0, SUB_OUTLINES.len() - 1, 0.0));
         assert_eq!(SubStyle::decode("1,0,0,0.5,-0.3").audio_delay, -0.3);
         assert_eq!(SubStyle::decode("1,0,0,0.5").audio_delay, 0.0);
+        assert_eq!(SubStyle::decode("1,0,0,0.5,0.2").outline, 0);
+        assert_eq!(SubStyle::decode("1,0,0,0.5,0.2").pos, 100.0);
         assert_eq!(SubStyle { audio_delay: 0.3, ..Default::default() }.props()[5], ("audio-delay", "0.3".into()));
         assert_eq!(SubStyle::decode(&s.encode()), s);
+        assert_eq!(SubStyle::decode("1.5,1,0,0.5"), SubStyle { scale: 1.5, color: 1, delay: 0.5, ..Default::default() });
+        let p = SubStyle { outline: 2, pos: 90.0, ..Default::default() }.props();
+        assert_eq!((p[6].1.as_str(), p[7].1.as_str()), ("#0000FF", "90"));
         assert_eq!(SubStyle::decode("junk"), SubStyle::default());
         assert_eq!(SubStyle::decode("NaN,0,0,0").scale, 1.0);
         assert_eq!(SubStyle { background: true, ..Default::default() }.props()[2].1, "background-box");

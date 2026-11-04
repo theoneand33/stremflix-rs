@@ -36,7 +36,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
 | Remember volume, speed and audio track across sessions | P2 | S | Other settings persist; these three reset each title. |
-| Subtitle outline color and position | P2 | S | Style has size, color and background only. |
 | Buffered range on the seek bar | P2 | S | Stremio shows buffered progress in grey. |
 | Mouse-wheel volume over the video | P2 | S | |
 | Auto-load sidecar subtitles next to local files | P2 | S | `.srt`/`.ass`/`.vtt` beside the video; only addon subtitles today. |
@@ -100,7 +99,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Auto-install updates | P3 | M | Release builds already show a download link for a newer build; downloading and replacing the binary is still missing. |
 | Android, iOS, TV clients | P3 | XL | Out of scope for an egui desktop app. |
 | Tray icon and minimize-to-tray with background playback | P2 | M | |
-| UI scale / zoom | P2 | S | HiDPI and TV-sized screens. |
 | Remember last tab and window state on launch | P3 | S | |
 | Command-line flags for play/open | P3 | S | Only `stremio://` links are parsed now. |
 | Screen-reader labels and focus-order polish | P3 | M | AccessKit is enabled; coverage is partial. |
