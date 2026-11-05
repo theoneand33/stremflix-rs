@@ -65,7 +65,7 @@ For series, pick a season and episode. ⏭ in the player opens the next episode.
 | F, double-click | Full screen |
 | Esc | Leave full screen / back |
 
-The bottom-right buttons open the Audio, Subtitles, and Playback panels. Playback sets speed, hardware decoding, and can hand the stream to an external player (command set in Settings; quote paths with spaces). For torrents, stay on the player screen while the external player streams: going back stops the torrent.
+The bottom-right buttons open the Audio, Subtitles, and Playback panels. Playback sets speed, repeat file, an A-B loop (set A and B at the current position), hardware decoding, and can hand the stream to an external player (command set in Settings; quote paths with spaces). For torrents, stay on the player screen while the external player streams: going back stops the torrent.
 
 ### Torrents
 

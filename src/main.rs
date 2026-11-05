@@ -843,6 +843,21 @@ fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
     paused && dur > 0.0 && pos >= dur - 1.0
 }
 
+/// Sets loop point `i` (0 = A, 1 = B) to `t`, keeping A before B; true if the points were swapped.
+fn set_ab(ab: &mut [Option<f64>; 2], i: usize, t: f64) -> bool {
+    ab[i] = Some(t);
+    let swap = matches!(*ab, [Some(a), Some(b)] if a > b);
+    if swap {
+        ab.swap(0, 1);
+    }
+    swap
+}
+
+/// mpv loops only with Repeat on or both A-B points set.
+fn looping(repeat: bool, ab: [Option<f64>; 2]) -> bool {
+    repeat || (ab[0].is_some() && ab[1].is_some())
+}
+
 /// Fraction of the seek bar the cache covers, never behind the playhead.
 fn buffered_frac(pos: f64, cached_to: f64, dur: f64) -> f32 {
     if dur > 0.0 { (cached_to.max(pos) / dur).clamp(0.0, 1.0) as f32 } else { 0.0 }
@@ -2144,7 +2159,7 @@ impl App {
             return;
         }
         let st = &p.player.state;
-        if self.autoplay_next && at_end(st.pos, st.dur, st.paused) && self.playing_episode() {
+        if self.autoplay_next && !looping(p.repeat, p.ab) && at_end(st.pos, st.dur, st.paused) && self.playing_episode() {
             return self.play_next(ctx);
         }
         let Some(p) = &mut self.player else { return };
@@ -3666,13 +3681,11 @@ impl App {
                                 for (i, (name, prop)) in [("A", "ab-loop-a"), ("B", "ab-loop-b")].into_iter().enumerate() {
                                     let label = p.ab[i].map_or(format!("Set {name}"), |t| format!("{name} {t:.0}s"));
                                     if pill(ui, &label, p.ab[i].is_some(), egui::Role::Button).clicked() {
-                                        p.ab[i] = Some(st.pos);
                                         cmd(&["set", prop, &st.pos.to_string()]);
                                         // Keep A before B so the labels match the loop mpv plays.
-                                        if let [Some(a), Some(b)] = p.ab && a > b {
-                                            p.ab.swap(0, 1);
-                                            cmd(&["set", "ab-loop-a", &b.to_string()]);
-                                            cmd(&["set", "ab-loop-b", &a.to_string()]);
+                                        if set_ab(&mut p.ab, i, st.pos) {
+                                            cmd(&["set", "ab-loop-a", &p.ab[0].unwrap_or_default().to_string()]);
+                                            cmd(&["set", "ab-loop-b", &p.ab[1].unwrap_or_default().to_string()]);
                                         }
                                     }
                                 }
@@ -3732,7 +3745,7 @@ impl App {
         // Up next: in an episode's last 30 s, a card slides in from the right to play the next one.
         if let Some((series, label, img)) = up_next {
             // Needs a duration over 60 s so a short or still-loading stream doesn't show the card at once.
-            let open = !p.next_dismissed && !p.repeat && p.ab.iter().all(Option::is_none) &&rect.width() >= 362.0 && st.dur > 60.0 && st.dur - st.pos <= 30.0;
+            let open = !p.next_dismissed && !looping(p.repeat, p.ab) && rect.width() >= 362.0 && st.dur > 60.0 && st.dur - st.pos <= 30.0;
             let t = ctx.animate_bool_with_time(ui.scope_id().with("up_next"), open, 0.4);
             if t > 0.0 {
                 let ease = 1.0 - (1.0 - t).powi(3);
@@ -5375,6 +5388,10 @@ mod tests {
         assert_eq!(binge_source(&streams, "hd").as_deref(), Some("https://a/3"), "skips unplayable");
         assert_eq!(binge_source(&streams, "4k"), None);
         assert!(at_end(99.5, 100.0, true) && !at_end(99.5, 100.0, false) && !at_end(50.0, 100.0, true) && !at_end(0.0, 0.0, true));
+        let mut ab = [None; 2];
+        assert!(!set_ab(&mut ab, 1, 10.0) && ab == [None, Some(10.0)]);
+        assert!(set_ab(&mut ab, 0, 20.0) && ab == [Some(10.0), Some(20.0)], "A after B swaps");
+        assert!(!looping(false, [None, Some(1.0)]) && looping(false, ab) && looping(true, [None; 2]));
     }
 
     #[test]
