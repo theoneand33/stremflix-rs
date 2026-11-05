@@ -22,7 +22,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| Custom lists / collections | P2 | M | Stremio "My List" style folders; today only one saved-titles list. |
 | Bulk selection in the library | P3 | M | |
 | User profiles (household, child-safe) | P3 | L | Stremio supporter feature. |
 
