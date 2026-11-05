@@ -946,6 +946,8 @@ struct Playing {
     scrub: Option<f64>,
     /// Video held down: playing at 2x until release.
     fast: bool,
+    /// Pause playback at this time (sleep timer).
+    sleep_at: Option<Instant>,
     /// Press start (egui clock) of a press that began on the video, while the button stays down.
     hold: Option<f64>,
     /// The last click on the video was a hold release, so the next one must not pair with it into a double-click.
@@ -1720,7 +1722,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, sleep_at: None, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1845,6 +1847,10 @@ impl App {
             return;
         }
         self.last_poll = Instant::now();
+        if p.sleep_at.is_some_and(|t| Instant::now() >= t) {
+            p.sleep_at = None;
+            let _ = p.player.command(&["set", "pause", "yes"]);
+        }
         let paused = p.player.state.paused;
         if paused {
             if p.awake.is_some() {
@@ -3278,6 +3284,18 @@ impl App {
                                         if let Err(e) = self.db.set_setting("default_speed", &sp.to_string()) {
                                             report(&mut self.error, format!("saving default_speed: {e:#}"));
                                         }
+                                    }
+                                }
+                            });
+                            menu_heading(ui, "Sleep timer");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                if pill(ui, "Off", p.sleep_at.is_none(), egui::Role::RadioButton).clicked() {
+                                    p.sleep_at = None;
+                                }
+                                for m in [15u64, 30, 60, 90] {
+                                    if pill(ui, &format!("{m} min"), false, egui::Role::RadioButton).clicked() {
+                                        p.sleep_at = Some(Instant::now() + Duration::from_secs(m * 60));
                                     }
                                 }
                             });

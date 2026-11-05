@@ -34,7 +34,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Auto-load sidecar subtitles next to local files | P2 | S | `.srt`/`.ass`/`.vtt` beside the video; only addon subtitles today. |
 | Skip intro / recap / credits from addon markers | P2 | M | Stremio supporter feature; needs an addon source for the timestamps. |
 | Playback stats overlay (peers, speed, dropped frames) | P2 | S | Stremio has a Network button; useful for torrents. |
-| Sleep timer | P3 | S | |
 | Screenshot capture | P3 | S | mpv `screenshot-to-file`. |
 | A-B loop / repeat | P3 | S | |
 | Frame-by-frame stepping | P3 | S | |
