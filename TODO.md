@@ -15,7 +15,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| New-episode notifications | P2 | M | Depends on the saved library. |
 
 ### Library and organization
 
