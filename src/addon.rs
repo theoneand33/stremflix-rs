@@ -328,6 +328,57 @@ pub struct BehaviorHints {
     pub video_size: Option<u64>,
     /// `videoHash`: OpenSubtitles hash of the file (16 hex digits).
     pub video_hash: Option<String>,
+    /// `skip`: local extension, validated by [`parse_skips`].
+    pub skip: Vec<Skip>,
+}
+
+/// Which part of an episode a [`Skip`] covers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SkipKind {
+    Intro,
+    Recap,
+    Credits,
+}
+
+impl SkipKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Intro => "Skip intro",
+            Self::Recap => "Skip recap",
+            Self::Credits => "Skip credits",
+        }
+    }
+}
+
+/// A span (seconds) the viewer can jump over.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Skip {
+    pub kind: SkipKind,
+    pub start: f64,
+    pub end: f64,
+}
+
+const MAX_SKIPS: usize = 10;
+const MAX_SKIP_SECS: f64 = 15.0 * 60.0;
+
+/// `[{type: "intro"|"recap"|"credits", start, end}]` in seconds. Invalid entries (unknown type, non-finite,
+/// `start < 0`, `end <= start`, longer than 15 min) are dropped; at most 10 are kept.
+pub fn parse_skips(v: &serde_json::Value) -> Vec<Skip> {
+    let items = v.as_array().map(|a| a.as_slice()).unwrap_or_default();
+    items
+        .iter()
+        .filter_map(|x| {
+            let kind = match x.get("type")?.as_str()? {
+                "intro" => SkipKind::Intro,
+                "recap" => SkipKind::Recap,
+                "credits" => SkipKind::Credits,
+                _ => return None,
+            };
+            let (start, end) = (x.get("start")?.as_f64()?, x.get("end")?.as_f64()?);
+            (start.is_finite() && end.is_finite() && start >= 0.0 && start < end && end - start <= MAX_SKIP_SECS).then_some(Skip { kind, start, end })
+        })
+        .take(MAX_SKIPS)
+        .collect()
 }
 
 const MAX_HEADERS: usize = 32;
@@ -370,6 +421,7 @@ fn behavior_hints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BehaviorHint
         filename: text("filename"),
         video_size: v.get("videoSize").and_then(|x| x.as_u64()),
         video_hash: text("videoHash").filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit())).map(|h| h.to_ascii_lowercase()),
+        skip: v.get("skip").map(parse_skips).unwrap_or_default(),
     })
 }
 
@@ -792,6 +844,29 @@ mod proxy_tests {
 #[cfg(test)]
 mod configure_tests {
     use super::*;
+
+    #[test]
+    fn skip_markers_are_validated() {
+        let s = |j: &str| parse_skips(&serde_json::from_str(j).unwrap());
+        let ok = s(r#"[{"type":"intro","start":5,"end":65.5},{"type":"recap","start":0,"end":900},{"type":"credits","start":1200,"end":1300}]"#);
+        assert_eq!(ok, [Skip { kind: SkipKind::Intro, start: 5.0, end: 65.5 }, Skip { kind: SkipKind::Recap, start: 0.0, end: 900.0 }, Skip { kind: SkipKind::Credits, start: 1200.0, end: 1300.0 }]);
+        for bad in [
+            r#"[{"type":"intro","start":-1,"end":5}]"#,
+            r#"[{"type":"intro","start":5,"end":5}]"#,
+            r#"[{"type":"intro","start":9,"end":5}]"#,
+            r#"[{"type":"intro","start":0,"end":901}]"#,
+            r#"[{"type":"outro","start":0,"end":5}]"#,
+            r#"[{"type":"intro","start":"0","end":5}]"#,
+            r#"{"type":"intro","start":0,"end":5}"#,
+            r#""junk""#,
+        ] {
+            assert!(s(bad).is_empty(), "{bad}");
+        }
+        let many = format!("[{}]", vec![r#"{"type":"intro","start":0,"end":5}"#; 25].join(","));
+        assert_eq!(s(&many).len(), MAX_SKIPS);
+        let st: Stream = serde_json::from_str(r#"{"url":"https://x.example/v","behaviorHints":{"skip":[{"type":"intro","start":1,"end":2},{"type":"bad"}]}}"#).unwrap();
+        assert_eq!(st.hints.skip.len(), 1);
+    }
 
     #[test]
     fn configure_url_derivation() {
