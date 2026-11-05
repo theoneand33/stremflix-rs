@@ -37,7 +37,12 @@ const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000),
 
 /// A local `.torrent` file path (not a URL or magnet).
 fn is_torrent_file(s: &str) -> bool {
-    !s.contains("://") && !s.starts_with("magnet:") && std::path::Path::new(s).extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+    !s.contains("://") && parse_magnet_hash(s).is_none() && std::path::Path::new(s).extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+}
+
+/// Played through the torrent engine: a valid magnet (any scheme case, padding trimmed like `Url::parse`) or a `.torrent` file.
+fn is_torrent_source(s: &str) -> bool {
+    parse_magnet_hash(s).is_some() || is_torrent_file(s)
 }
 
 /// What to play or open from a magnet, `stremio://` link or local file: valid magnet, or an existing file.
@@ -54,7 +59,7 @@ enum Cli {
     Bad(String),
 }
 
-/// Parse the command line (without argv[0]). Pure: only checks that a file exists.
+/// Parse the command line (without argv[0]). Reads the filesystem only to check that a file exists.
 fn parse_cli(args: &[String]) -> Cli {
     // macOS Finder adds `-psn_…`.
     let mut args = args.iter().filter(|a| !a.starts_with("-psn_"));
@@ -62,10 +67,13 @@ fn parse_cli(args: &[String]) -> Cli {
     if matches!(a.as_str(), "-h" | "--help") {
         return Cli::Help;
     }
+    // `--` ends the flags so a file named `-movie.mkv` can be opened.
+    let end_of_flags = a == "--";
+    let Some(a) = (if end_of_flags { args.next() } else { Some(a) }) else { return Cli::Open(None) };
     if args.next().is_some() {
         return Cli::Bad("only one argument is accepted".into());
     }
-    if a.starts_with('-') {
+    if a.starts_with('-') && !end_of_flags {
         return Cli::Bad(format!("unknown flag: {}", sanitize_text(a, 100)));
     }
     if a.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("stremio://")) {
@@ -74,7 +82,7 @@ fn parse_cli(args: &[String]) -> Cli {
     if parse_magnet_hash(a).is_some() {
         return Cli::Open(Some(a.clone()));
     }
-    if a.contains("://") || a.starts_with("magnet:") {
+    if a.contains("://") || a.trim_start().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("magnet:")) {
         return Cli::Bad(format!("unsupported link: {}", sanitize_text(a, 100)));
     }
     match std::path::absolute(a) {
@@ -1457,7 +1465,7 @@ impl App {
         self.nav += 1;
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
-        let torrent = source.starts_with("magnet:") || is_torrent_file(&source);
+        let torrent = is_torrent_source(&source);
         let mut subs = subs;
         if !torrent {
             subs.extend(player::sidecar_subs(std::path::Path::new(&source))); // empty for URLs and missing paths
@@ -1471,7 +1479,7 @@ impl App {
             let (url, id) = match torrent {
                 true => {
                     let engine = start.await?;
-                    if source.starts_with("magnet:") {
+                    if parse_magnet_hash(&source).is_some() {
                         let files = engine.media_choices(&source).await?;
                         if !files.is_empty() {
                             return Ok(Msg::PickFile(key, title, source, subs, files, nav));
@@ -1825,7 +1833,7 @@ impl App {
                     }
                     match link {
                         Some(link) => self.open_link(ctx, link),
-                        None if is_torrent_file(&s) || parse_magnet_hash(&s).is_some() => self.play_torrent(ctx, &s),
+                        None if is_torrent_source(&s) => self.play_torrent(ctx, &s),
                         None => {
                             let name = std::path::Path::new(&s).file_stem().map_or("Video".into(), |n| n.to_string_lossy().into_owned());
                             self.play(ctx, format!("file:{s}"), name, s, vec![]);
@@ -5608,6 +5616,10 @@ mod tests {
         assert!(matches!(cli(&[]), Cli::Open(None)) && matches!(cli(&["-psn_0_1"]), Cli::Open(None)));
         assert!(matches!(cli(&["--help"]), Cli::Help));
         assert!(matches!(cli(&["stremio:///detail/movie/tt1"]), Cli::Open(Some(_))));
+        assert!(matches!(cli(&["-h"]), Cli::Help));
+        assert!(matches!(cli(&["--", &magnet]), Cli::Open(Some(m)) if m == magnet));
+        assert!(matches!(cli(&["--"]), Cli::Open(None)) && matches!(cli(&["--", "-no-such.mkv"]), Cli::Bad(m) if m.starts_with("no such file")));
+        assert!(matches!(cli(&["MAGNET:?xt=bad"]), Cli::Bad(m) if m.starts_with("unsupported link")));
         assert!(matches!(cli(&[&magnet]), Cli::Open(Some(m)) if m == magnet));
         assert!(matches!(cli(&[file]), Cli::Open(Some(p)) if p == file));
         // Url::parse accepts an upper-case scheme; Msg::Link routing uses the same predicate.
@@ -5615,6 +5627,17 @@ mod tests {
         assert!(matches!(cli(&[&upper]), Cli::Open(Some(_))) && parse_magnet_hash(&upper).is_some());
         for bad in [&["--nope"][..], &["magnet:?xt=bad"], &["https://x.example/a.torrent"], &["/no/such.mkv"], &[file, file]] {
             assert!(matches!(cli(bad), Cli::Bad(_)), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn torrent_source_routing() {
+        let m = format!("magnet:?xt=urn:btih:{}", "a".repeat(40));
+        for yes in [m.clone(), m.replacen("magnet", "MAGNET", 1), format!("  {m}"), "/m/a.torrent".into()] {
+            assert!(is_torrent_source(&yes), "{yes}");
+        }
+        for no in ["magnet:?xt=bad", "/m/a.mkv", "https://x.example/a.torrent"] {
+            assert!(!is_torrent_source(no), "{no}");
         }
     }
 
