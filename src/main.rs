@@ -619,6 +619,11 @@ fn same_addon(installed: &Manifest, fetched: &Manifest) -> bool {
     installed.id == fetched.id
 }
 
+/// Health text for a failed addon check; reqwest reports a deadline as "operation timed out".
+fn health_error(e: &str) -> String {
+    if e.to_lowercase().contains("timed out") { "Timed out".into() } else { format!("Unreachable: {e}") }
+}
+
 /// Small secondary pill for toolbar actions (Uninstall, Clear, Stop …).
 fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     pill_button(ui, text, 14.0, vec2(0.0, 32.0), gray_fill(), Color32::WHITE)
@@ -3541,9 +3546,12 @@ impl App {
                     });
                 }
                 Some(Err(e)) => {
-                    ui.label(RichText::new(format!("Unreachable: {e}")).weak());
+                    ui.label(RichText::new(health_error(e)).weak());
                 }
-                _ => {}
+                Some(Ok(_)) => {
+                    ui.label(RichText::new("Reachable").weak());
+                }
+                None => {}
             }
             if m.behavior_hints.configuration_required {
                 ui.label(RichText::new("Needs configuration before use. Press Configure.").weak());
@@ -4495,6 +4503,12 @@ fn seek_step(v: Option<String>, default: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn health_error_distinguishes_timeout() {
+        assert_eq!(health_error("operation timed out"), "Timed out");
+        assert_eq!(health_error("connection refused"), "Unreachable: connection refused");
+    }
+
     use super::*;
 
     #[test]
