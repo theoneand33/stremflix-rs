@@ -154,11 +154,16 @@ impl TorrentEngine {
         };
         for (id, h, elapsed) in due {
             let st = h.stats();
-            if h.is_paused() || self.seed.reached(st.uploaded_bytes, st.total_bytes, elapsed) {
-                self.seeding.lock().unwrap().remove(&id);
-                if !h.is_paused() && let Err(e) = self.session.pause(&h).await {
-                    eprintln!("pause torrent {id}: {e:#}");
-                }
+            if !(h.is_paused() || self.seed.reached(st.uploaded_bytes, st.total_bytes, elapsed)) {
+                continue;
+            }
+            // Held through the pause so stream_url can't unpause and pin this torrent in between.
+            let pinned = self.pinned.lock().await;
+            if pinned.contains(&id) || self.seeding.lock().unwrap().remove(&id).is_none() {
+                continue;
+            }
+            if !h.is_paused() && let Err(e) = self.session.pause(&h).await {
+                eprintln!("pause torrent {id}: {e:#}");
             }
         }
     }
@@ -254,8 +259,7 @@ impl TorrentEngine {
     /// while they fit in the cache; the oldest are deleted with their files first.
     pub async fn release_except(&self, keep: Option<usize>) {
         let pinned = self.pinned.lock().await;
-        let mut seeding = self.seeding.lock().unwrap().clone();
-        let stopped: Vec<_> = self.session.with_torrents(|it| it.filter(|(id, _)| Some(*id) != keep && !pinned.contains(id)).map(|(id, h)| (id, h.clone())).collect());
+        let candidates: Vec<_> = self.session.with_torrents(|it| it.filter(|(id, _)| Some(*id) != keep && !pinned.contains(id)).map(|(id, h)| (id, h.clone())).collect());
         // A finished torrent keeps seeding under the limit; its files stay, so it is not evicted.
         let keep_seeding = |id: usize, h: &Arc<librqbit::ManagedTorrent>, seeding: &mut std::collections::HashMap<usize, Instant>| {
             let st = h.stats();
@@ -264,9 +268,13 @@ impl TorrentEngine {
             }
             !self.seed.reached(st.uploaded_bytes, st.total_bytes, seeding.entry(id).or_insert_with(Instant::now).elapsed())
         };
-        let stopped: Vec<_> = stopped.into_iter().filter(|(id, h)| !keep_seeding(*id, h, &mut seeding)).collect();
-        seeding.retain(|id, _| !stopped.iter().any(|(s, _)| s == id));
-        *self.seeding.lock().unwrap() = seeding;
+        // Sync guard, dropped before the first await: edits the shared map in place so concurrent `remove` isn't lost.
+        let stopped: Vec<_> = {
+            let mut seeding = self.seeding.lock().unwrap();
+            let stopped: Vec<_> = candidates.into_iter().filter(|(id, h)| !keep_seeding(*id, h, &mut seeding)).collect();
+            seeding.retain(|id, _| !stopped.iter().any(|(s, _)| s == id));
+            stopped
+        };
         for (_, h) in stopped.iter().filter(|(_, h)| !h.is_paused()) {
             if let Err(e) = self.session.pause(h).await {
                 eprintln!("pause torrent {}: {e:#}", h.id());
