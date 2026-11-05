@@ -4,6 +4,7 @@
 //! `STREMFLIX_RS_MPV_ARGS` adds mpv options (e.g. `--ao=null` for headless CI).
 //! mpv's JSON IPC server stays on at [`ipc_socket_path`] so tools can query player state.
 
+use crate::addon::{Skip, SkipKind};
 use anyhow::{Result, bail};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -130,7 +131,7 @@ const FORMAT_INT64: c_int = 4;
 const FORMAT_DOUBLE: c_int = 5;
 
 /// Observed properties, in `reply_userdata` order.
-const PROPS: [(&str, c_int); 12] = [
+const PROPS: [(&str, c_int); 19] = [
     ("time-pos", FORMAT_DOUBLE),
     ("duration", FORMAT_DOUBLE),
     ("pause", FORMAT_FLAG),
@@ -143,6 +144,13 @@ const PROPS: [(&str, c_int); 12] = [
     ("speed", FORMAT_DOUBLE),
     ("seeking", FORMAT_FLAG),
     ("demuxer-cache-time", FORMAT_DOUBLE),
+    ("video-codec", FORMAT_STRING),
+    ("container-fps", FORMAT_DOUBLE),
+    ("hwdec-current", FORMAT_STRING),
+    ("frame-drop-count", FORMAT_INT64),
+    ("decoder-frame-drop-count", FORMAT_INT64),
+    ("demuxer-cache-duration", FORMAT_DOUBLE),
+    ("chapter-list", FORMAT_STRING),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -171,6 +179,14 @@ pub struct State {
     pub tracks: Vec<Track>,
     /// Playback speed multiplier; 0 until mpv reports it.
     pub speed: f64,
+    /// Chapters of the file as (start seconds, title).
+    pub chapters: Vec<(f64, String)>,
+    /// Stats overlay: video codec, container fps, active hwdec ("no" in software), output / decoder dropped frames, seconds buffered ahead.
+    pub codec: String,
+    pub fps: f64,
+    pub hwdec: String,
+    pub dropped: [usize; 2],
+    pub cache: f64,
     /// Set when the file failed to open/play.
     pub error: Option<String>,
 }
@@ -329,6 +345,11 @@ pub fn parse_args(s: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Not a remote URL: a file path, or the loopback torrent stream (never proxied).
+fn is_local(source: &str) -> bool {
+    url::Url::parse(source).ok().and_then(|u| u.host_str().map(|h| matches!(h, "localhost" | "127.0.0.1" | "[::1]"))).unwrap_or(true)
+}
+
 /// HTTP request headers as mpv options: User-Agent as the plain-string `user-agent`, the rest as the
 /// comma-separated `http-header-fields` list. mpv reads `\,` as a literal comma, but a value's own
 /// backslash would make that ambiguous, so such headers are dropped.
@@ -362,6 +383,38 @@ pub fn parse_tracks(json: &str) -> Vec<Track> {
                 (None, None) => format!("Track {id}"),
             };
             Some(Track { id, kind, label, lang: lang.map(str::to_owned), selected: t["selected"].as_bool().unwrap_or(false) })
+        })
+        .collect()
+}
+
+/// mpv's `chapter-list` JSON as (start, title); unknown shapes yield an empty list.
+pub fn parse_chapters(json: &str) -> Vec<(f64, String)> {
+    let Ok(serde_json::Value::Array(list)) = serde_json::from_str(json) else { return Vec::new() };
+    list.iter().filter_map(|c| Some((c["time"].as_f64().filter(|t| t.is_finite())?, c["title"].as_str().unwrap_or_default().to_owned()))).collect()
+}
+
+/// Skip kind a chapter title names: whole words (a trailing number is ignored), so "OP1" and "Opening" are
+/// intros but "Hope" is not.
+pub fn chapter_kind(title: &str) -> Option<SkipKind> {
+    let words: Vec<String> = title.split(|c: char| !c.is_alphanumeric()).map(|w| w.trim_end_matches(|c: char| c.is_ascii_digit()).to_lowercase()).collect();
+    let has = |names: &[&str]| words.iter().any(|w| names.contains(&w.as_str()));
+    if has(&["recap", "previously"]) {
+        Some(SkipKind::Recap)
+    } else if has(&["intro", "introduction", "opening", "op"]) {
+        Some(SkipKind::Intro)
+    } else if has(&["credits", "ending", "outro", "ed"]) {
+        Some(SkipKind::Credits)
+    } else {
+        None
+    }
+}
+
+/// Skip spans from chapters: each matching chapter runs to the next chapter (the last, to `dur`).
+pub fn chapter_skips(chapters: &[(f64, String)], dur: f64) -> Vec<Skip> {
+    (0..chapters.len())
+        .filter_map(|i| {
+            let (start, end) = (chapters[i].0, chapters.get(i + 1).map_or(dur, |c| c.0));
+            (end > start).then_some(Skip { kind: chapter_kind(&chapters[i].1)?, start, end })
         })
         .collect()
 }
@@ -460,12 +513,16 @@ impl Player {
             opts.push(("sid".into(), "no".into()));
         }
         opts.extend(header_options(headers));
+        // ffmpeg has no SOCKS support, so only an HTTP proxy reaches mpv; the local torrent stream stays direct.
+        if let Some(p) = crate::addon::PROXY.get().filter(|p| p.scheme() == "http" && !is_local(source)) {
+            opts.push(("http-proxy".into(), p.to_string()));
+        }
         opts.extend(demuxer.map(|f| ("demuxer-lavf-format".to_string(), f.to_string())));
         opts.extend(parse_args(&std::env::var("STREMFLIX_RS_MPV_ARGS").unwrap_or_default()));
         for (k, v) in &opts {
             let rc = unsafe { mpv_set_option_string(mpv, cstr(k).as_ptr(), cstr(v).as_ptr()) };
             if rc < 0 {
-                bail!("mpv option {k}={v}: {}", err_text(rc));
+                bail!("mpv option {k}={}: {}", if k == "http-proxy" { "<proxy>" } else { v }, err_text(rc));
             }
         }
         let rc = unsafe { mpv_initialize(mpv) };
@@ -576,6 +633,7 @@ impl Player {
             match idx {
                 8 => s.tracks.clear(),
                 11 => s.cached_to = 0.0,
+                18 => s.chapters.clear(),
                 _ => {}
             }
             return;
@@ -597,6 +655,13 @@ impl Player {
                 9 => s.speed = f(),
                 10 => s.seeking = flag(),
                 11 => s.cached_to = f(),
+                12 => s.codec = CStr::from_ptr(*(p.data as *const *const c_char)).to_string_lossy().into_owned(),
+                13 => s.fps = f(),
+                14 => s.hwdec = CStr::from_ptr(*(p.data as *const *const c_char)).to_string_lossy().into_owned(),
+                15 => s.dropped[0] = int(),
+                16 => s.dropped[1] = int(),
+                17 => s.cache = f(),
+                18 => s.chapters = parse_chapters(&CStr::from_ptr(*(p.data as *const *const c_char)).to_string_lossy()),
                 _ => {}
             }
         }
@@ -650,6 +715,33 @@ impl Drop for Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_sources_skip_the_proxy() {
+        for s in ["/home/a.mkv", "C:\\a.mkv", "http://127.0.0.1:4000/torrents/0/stream/1", "http://localhost/x", "http://[::1]:9/x"] {
+            assert!(is_local(s), "{s}");
+        }
+        assert!(!is_local("https://cdn.example/a.mp4"));
+    }
+
+    #[test]
+    fn chapter_titles_classify_by_word() {
+        for (t, k) in [("Intro", SkipKind::Intro), ("Opening", SkipKind::Intro), ("OP1", SkipKind::Intro), ("Anime op", SkipKind::Intro), ("Recap", SkipKind::Recap), ("Previously on...", SkipKind::Recap), ("End Credits", SkipKind::Credits), ("ENDING", SkipKind::Credits), ("ED 2", SkipKind::Credits)] {
+            assert_eq!(chapter_kind(t), Some(k), "{t}");
+        }
+        for t in ["", "Chapter 1", "Hope", "Operation", "Opera", "Edward", "Introspection"] {
+            assert_eq!(chapter_kind(t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn chapters_become_skip_spans() {
+        let ch = parse_chapters(r#"[{"title":"Recap","time":0.0},{"title":"Opening","time":30.5},{"title":"Part A","time":120.0},{"title":"Credits","time":1300.0}]"#);
+        let sk = chapter_skips(&ch, 1400.0);
+        assert_eq!(sk, [Skip { kind: SkipKind::Recap, start: 0.0, end: 30.5 }, Skip { kind: SkipKind::Intro, start: 30.5, end: 120.0 }, Skip { kind: SkipKind::Credits, start: 1300.0, end: 1400.0 }]);
+        assert!(chapter_skips(&ch, 0.0).len() == 2, "last chapter needs a duration");
+        assert!(parse_chapters("junk").is_empty());
+    }
 
     #[test]
     fn sidecar_matching() {
