@@ -17,7 +17,7 @@ use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
 use stremflix_rs::player::{GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
-use stremflix_rs::torrent::{Profile, TorrentEngine};
+use stremflix_rs::torrent::{Profile, SeedLimit, TorrentEngine};
 use stremflix_rs::tray::{self, Tray};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -31,6 +31,10 @@ enum Tab {
 
 /// Torrent cache size choices: label and bytes kept (0 = delete a torrent when its playback stops).
 const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000), ("5 GB", 5_000_000_000), ("10 GB", 10_000_000_000), ("Unlimited", u64::MAX)];
+
+/// Seeding limit choices (0 = no limit of that kind): upload ratio, and seconds.
+const SEED_RATIOS: [(&str, f64); 4] = [("Off", 0.0), ("1.0", 1.0), ("2.0", 2.0), ("5.0", 5.0)];
+const SEED_TIMES: [(&str, f64); 4] = [("Off", 0.0), ("1 hour", 3600.0), ("6 hours", 21600.0), ("24 hours", 86400.0)];
 
 /// A local `.torrent` file path (not a URL or magnet).
 fn is_torrent_file(s: &str) -> bool {
@@ -1068,6 +1072,7 @@ struct App {
     torrent_dir: String,
     torrent_cache: u64,
     torrent_profile: Profile,
+    torrent_seed: SeedLimit,
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
     /// mpv hardware decoding.
@@ -1180,6 +1185,10 @@ impl App {
             torrent_dir: db.setting("torrent_dir")?.unwrap_or_default(),
             torrent_cache: db.setting("torrent_cache")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             torrent_profile: Profile::from_label(&db.setting("torrent_profile")?.unwrap_or_default()),
+            torrent_seed: SeedLimit {
+                ratio: db.setting("seed_ratio")?.and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                secs: db.setting("seed_secs")?.and_then(|v| v.parse().ok()).unwrap_or(0),
+            },
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
@@ -1308,9 +1317,9 @@ impl App {
             Some(d) => PathBuf::from(d).join("stremflix-rs-torrents"),
             None => self.data_dir.join("torrents"),
         };
-        let (cell, cache, profile) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile);
+        let (cell, cache, profile, seed) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile, self.torrent_seed);
         let dht = std::env::var_os("STREMFLIX_RS_NO_DHT").is_none();
-        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile).await.map(Arc::new) }).await.cloned() }
+        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile, seed).await }).await.cloned() }
     }
 
     /// What a hash-matched subtitle query needs for the selected title's stream `source`;
@@ -3865,10 +3874,39 @@ impl App {
                 }
             });
         });
-        let note = "Stopped torrents stay on disk up to the cache size, and are cleared when the app starts.";
+        for (label, id, choices) in [("Seed to ratio:", "seed_ratio", &SEED_RATIOS), ("Seed for:", "seed_secs", &SEED_TIMES)] {
+            ui.horizontal(|ui| {
+                let l = ui.label(label);
+                ui.add_space((150.0 - l.rect.width()).max(0.0));
+                let cur = if id == "seed_ratio" { self.torrent_seed.ratio } else { self.torrent_seed.secs as f64 };
+                egui::ComboBox::from_id_salt(id).selected_text(choices.iter().find(|c| c.1 == cur).map_or("Custom", |c| c.0)).show_ui(ui, |ui| {
+                    for &(name, v) in choices {
+                        if ui.selectable_label(cur == v, name).clicked() {
+                            if id == "seed_ratio" { self.torrent_seed.ratio = v } else { self.torrent_seed.secs = v as u64 }
+                            save.push((id, v.to_string()));
+                        }
+                    }
+                });
+            });
+        }
+        let note = "Finished torrents keep seeding after playback until a seeding limit is reached (both Off: stop at once). Stopped torrents stay on disk up to the cache size, and are cleared when the app starts.";
         ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
         if self.torrent.get().is_some() {
             ui.label(RichText::new("A torrent has already played: restart the app to apply changes.").size(13.0).color(ui.visuals().weak_text_color()));
+        }
+        if let Some(engine) = self.torrent.get() {
+            ui.ctx().request_repaint_after(Duration::from_secs(2));
+            for t in engine.list() {
+                ui.horizontal(|ui| {
+                    if ui.small_button("Delete").on_hover_text("Stop and delete its files").clicked() {
+                        let e = engine.clone();
+                        self.rt.spawn(async move { e.remove(t.id).await });
+                    }
+                    let state = if t.paused { "stopped" } else { "running" };
+                    let (done, total) = t.progress;
+                    ui.label(format!("{} - {state}, {}% of {}, uploaded {}", t.name, done * 100 / total.max(1), fmt_size(total), fmt_size(t.uploaded)));
+                });
+            }
         }
         ui.add_space(16.0);
         ui.label(RichText::new("Player").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
