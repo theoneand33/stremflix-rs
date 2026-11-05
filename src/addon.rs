@@ -712,6 +712,40 @@ pub fn check_poster(body: &[u8]) -> Result<()> {
     Ok(())
 }
 
+const DEFAULT_UA: &str = "stremflix-rs";
+pub const MAX_UA_LEN: usize = 200;
+static USER_AGENT: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+/// Trimmed custom User-Agent if header-safe (printable ASCII, at most `MAX_UA_LEN`); empty means the default.
+pub fn valid_user_agent(s: &str) -> Option<String> {
+    let s = s.trim();
+    (s.len() <= MAX_UA_LEN && s.bytes().all(|b| (0x20..0x7f).contains(&b))).then(|| s.to_string())
+}
+
+/// Use `ua` (already validated) for addon and download requests made from now on; addon clients built earlier keep theirs.
+pub fn set_user_agent(ua: &str) {
+    *USER_AGENT.write().unwrap_or_else(|e| e.into_inner()) = ua.to_string();
+}
+
+pub fn user_agent() -> String {
+    let ua = USER_AGENT.read().unwrap_or_else(|e| e.into_inner());
+    if ua.is_empty() { DEFAULT_UA.to_string() } else { ua.clone() }
+}
+
+#[cfg(test)]
+mod user_agent_tests {
+    use super::*;
+
+    #[test]
+    fn user_agent_validation() {
+        assert_eq!(valid_user_agent("  Mozilla/5.0 (X11) ").as_deref(), Some("Mozilla/5.0 (X11)"));
+        assert_eq!(valid_user_agent("").as_deref(), Some(""));
+        assert!(valid_user_agent("a\r\nX-Evil: 1").is_none());
+        assert!(valid_user_agent("caf\u{e9}").is_none());
+        assert!(valid_user_agent(&"a".repeat(MAX_UA_LEN + 1)).is_none());
+    }
+}
+
 #[cfg(test)]
 mod configure_tests {
     use super::*;
@@ -869,7 +903,7 @@ impl AddonClient {
             reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::limited(3))
-                .user_agent("stremflix-rs") // GitHub's API rejects requests without one
+                .user_agent(user_agent()) // GitHub's API rejects requests without one
                 .build()
                 .map_err(|e| format!("HTTP client: {e}"))
         });
