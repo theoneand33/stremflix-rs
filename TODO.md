@@ -28,7 +28,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
-| Sleep timer | P3 | S | |
 | A-B loop / repeat | P3 | S | |
 | Frame-by-frame stepping | P3 | S | |
 | Picture-in-picture / mini player | P3 | M | egui viewport or a second native window. |
@@ -51,14 +50,12 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Configurable User-Agent | P3 | S | Some addons and streams reject the default. |
 | Pause playback when the window is minimized | P3 | S | Stremio setting. |
 | Launch playback in a separate window | P3 | M | Stremio setting; egui multi-viewport. |
-| Log file and diagnostics export | P3 | S | |
 
 ### Addons
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Remote/LAN streaming server | P2 | L | Stremio serves the library to other devices; casting is a separate item. |
-| Addon health indicator (unreachable / timeout) | P3 | S | |
 
 ### Accounts and sync
 
