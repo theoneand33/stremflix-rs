@@ -1114,6 +1114,12 @@ struct App {
     media_shown: Option<(String, bool, u64)>,
 }
 
+/// `<data>/screenshots/<title>-<unix secs>.png`, with the title reduced to filename-safe characters.
+fn screenshot_path(dir: &std::path::Path, title: &str, secs: u64) -> PathBuf {
+    let t: String = title.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).take(60).collect();
+    dir.join("screenshots").join(format!("{t}-{secs}.png"))
+}
+
 fn data_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("STREMFLIX_RS_DATA") {
         return d.into();
@@ -3025,6 +3031,12 @@ impl App {
             if k(ArrowUp) { cmd(&["add", "volume", "5"]); new_vol = Some(st.volume + 5.0) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]); new_vol = Some(st.volume - 5.0) }
             if k(M) { cmd(&["cycle", "mute"]) }
+            if k(S) && focused.is_none() {
+                let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                let path = screenshot_path(&data_dir(), &p.title, secs);
+                let _ = path.parent().map(std::fs::create_dir_all);
+                cmd(&["screenshot-to-file", &path.to_string_lossy(), "video"]);
+            }
             // mpv pauses on its own after a frame step.
             if k(Period) { cmd(&["frame-step"]) }
             if k(Comma) { cmd(&["frame-back-step"]) }
@@ -4974,6 +4986,12 @@ mod tests {
         for not in ["https://x.example/a.torrent", "magnet:?xt=urn:btih:a.torrent", "/m/a.mkv", "/m/torrent"] {
             assert!(!is_torrent_file(not), "{not}");
         }
+    }
+
+    #[test]
+    fn screenshot_path_is_filename_safe() {
+        let p = screenshot_path(std::path::Path::new("/d"), "A/B: c", 7);
+        assert_eq!(p, std::path::Path::new("/d/screenshots/A_B__c-7.png"));
     }
 
     #[test]
