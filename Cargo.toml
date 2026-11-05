@@ -36,6 +36,13 @@ raw-window-handle = "0.6"
 objc2 = "0.6"
 winit = { version = "0.30.13", default-features = false }
 
+# Tray: StatusNotifierItem over D-Bus, on the async-io zbus accesskit already uses (no GTK, unlike tray-icon there).
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.7", default-features = false, features = ["async-io"] }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false }
+
 [dev-dependencies]
 tempfile = "3.27.0"
 test-addon = { path = "test-addon" }

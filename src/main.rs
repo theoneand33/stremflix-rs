@@ -11,13 +11,14 @@ use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use anyhow::Context;
 use stremflix_rs::addon::{AddonClient, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
 use stremflix_rs::instance;
-use stremflix_rs::db::{self, Db, Download, Progress, SavedTitle, Watched};
+use stremflix_rs::db::{self, Db, Download, List, Progress, SavedTitle, Watched};
 use stremflix_rs::download;
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
+use stremflix_rs::player::{self, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{Profile, TorrentEngine};
+use stremflix_rs::tray::{self, Tray};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -27,6 +28,9 @@ enum Tab {
     Library,
     Settings,
 }
+
+/// Speed limit choices in bytes/s; 0 is unlimited.
+const SPEED_LIMITS: [(&str, u32); 6] = [("Unlimited", 0), ("500 KB/s", 500_000), ("1 MB/s", 1_000_000), ("2 MB/s", 2_000_000), ("5 MB/s", 5_000_000), ("10 MB/s", 10_000_000)];
 
 /// Torrent cache size choices: label and bytes kept (0 = delete a torrent when its playback stops).
 const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000), ("5 GB", 5_000_000_000), ("10 GB", 10_000_000_000), ("Unlimited", u64::MAX)];
@@ -231,6 +235,8 @@ enum Msg {
     Link(String),
     /// A download that finished, or why it failed.
     Downloaded(Download, Result<(), String>),
+    /// A tray menu item or icon click.
+    Tray(tray::Action),
     /// Progress key and the subtitles every addon offered for it.
     SubSearch(String, Vec<SubFound>),
     /// A saved subtitle's path, or why saving failed.
@@ -971,6 +977,8 @@ struct Playing {
     zoom: i32,
     /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
     awake: Option<Option<keepawake::KeepAwake>>,
+    /// Video track to restore once the window is shown again; video is off while hidden.
+    hidden_vid: Option<String>,
 }
 
 impl Drop for Playing {
@@ -1045,6 +1053,11 @@ struct App {
     library: Vec<LibraryItem>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
+    /// User lists of saved titles; `lib_list` is the one shown in Library (`None` = all saved).
+    lists: Vec<List>,
+    lib_list: Option<i64>,
+    /// Name typed for a new or renamed list.
+    list_name: String,
     /// Saved series with episodes released in the last `NEW_EPISODE_DAYS` days (watched ones are hidden when drawn).
     new_episodes: Vec<(MetaPreview, Vec<Video>)>,
     /// Bumped on each `build_rows`; stale `Msg::NewEpisodes` replies are dropped.
@@ -1073,6 +1086,8 @@ struct App {
     torrent_dir: String,
     torrent_cache: u64,
     torrent_profile: Profile,
+    /// (download, upload) in bytes/s; 0 is unlimited.
+    torrent_limits: (u32, u32),
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
     /// mpv hardware decoding.
@@ -1085,6 +1100,13 @@ struct App {
     light: bool,
     /// Play the next episode when one ends.
     autoplay_next: bool,
+    /// Closing the window hides it to the tray instead of quitting.
+    tray_on_close: bool,
+    tray: Option<Tray>,
+    /// Window hidden to the tray.
+    hidden: bool,
+    /// Quit was picked in the tray: let the close through.
+    quit: bool,
     ui_scale: f32,
     /// Playback speed every video starts at.
     default_speed: f64,
@@ -1124,6 +1146,10 @@ fn data_dir() -> PathBuf {
     base.join("stremflix-rs")
 }
 
+fn wayland() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
 /// Show `e` in the UI and on stderr (headless runs, CI).
 fn report(slot: &mut Option<String>, e: impl std::fmt::Display) {
     eprintln!("error: {e:#}");
@@ -1156,6 +1182,9 @@ impl App {
             addons: db.addons()?,
             library: db.library_items()?,
             saved: db.saved_titles()?,
+            lists: db.lists()?,
+            lib_list: None,
+            list_name: String::new(),
             new_episodes: Vec::new(),
             new_eps_gen: 0,
             downloads: db.downloads()?,
@@ -1174,6 +1203,10 @@ impl App {
             torrent_dir: db.setting("torrent_dir")?.unwrap_or_default(),
             torrent_cache: db.setting("torrent_cache")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             torrent_profile: Profile::from_label(&db.setting("torrent_profile")?.unwrap_or_default()),
+            torrent_limits: (
+                db.setting("torrent_down_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
+                db.setting("torrent_up_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
+            ),
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
@@ -1181,6 +1214,10 @@ impl App {
             home_all: Vec::new(),
             light: db.setting("theme")?.as_deref() == Some("light"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
+            tray_on_close: db.setting("tray_on_close")?.as_deref() == Some("1"),
+            tray: None,
+            hidden: false,
+            quit: false,
             volume: db.setting("volume")?.and_then(|v| v.parse().ok()).filter(|v| (0.0..=130.0).contains(v)).unwrap_or(100.0),
             ui_scale: clamp_scale(db.setting("ui_scale")?.and_then(|v| v.parse().ok()).unwrap_or(1.0)),
             default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
@@ -1263,6 +1300,10 @@ impl App {
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
         let torrent = source.starts_with("magnet:") || is_torrent_file(&source);
+        let mut subs = subs;
+        if !torrent {
+            subs.extend(player::sidecar_subs(std::path::Path::new(&source))); // empty for URLs and missing paths
+        }
         if !torrent && lookup.is_none() {
             let _ = self.tx.send(Msg::Play(key, title, source.clone(), source, subs, None, nav));
             return;
@@ -1298,9 +1339,9 @@ impl App {
             Some(d) => PathBuf::from(d).join("stremflix-rs-torrents"),
             None => self.data_dir.join("torrents"),
         };
-        let (cell, cache, profile) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile);
+        let (cell, cache, profile, limits) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile, self.torrent_limits);
         let dht = std::env::var_os("STREMFLIX_RS_NO_DHT").is_none();
-        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile).await.map(Arc::new) }).await.cloned() }
+        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile, limits).await.map(Arc::new) }).await.cloned() }
     }
 
     /// What a hash-matched subtitle query needs for the selected title's stream `source`;
@@ -1530,10 +1571,19 @@ impl App {
                 let autoplay = if show.is_some() { Autoplay::Off } else { Autoplay::Top };
                 self.open_streams(ctx, meta, Some(v), autoplay, binge);
             }
+            Msg::Tray(tray::Action::Toggle) => self.show_window(ctx, self.hidden),
+            Msg::Tray(tray::Action::PlayPause) => {
+                if let Some(Err(e)) = self.player.as_ref().map(|p| p.player.command(&["cycle", "pause"])) {
+                    report(&mut self.error, e);
+                }
+            }
+            Msg::Tray(tray::Action::Quit) => {
+                self.quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             Msg::Link(s) => match stremflix_rs::addon::parse_deep_link(&s) {
                 Some(link) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.show_window(ctx, true);
                     // Leave the player like its Back button does, or the link opens behind it.
                     if self.player.is_some() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -1542,10 +1592,7 @@ impl App {
                     }
                     self.open_link(ctx, link);
                 }
-                None if s.is_empty() => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
+                None if s.is_empty() => self.show_window(ctx, true),
                 None => report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200))),
             },
             Msg::NewEpisodes(epoch, meta, mut videos) => {
@@ -1730,7 +1777,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None, hidden_vid: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1782,6 +1829,20 @@ impl App {
                 self.recent = self.db.recent_progress(20).unwrap_or_default();
             }
             Err(e) => report(&mut self.error, format!("saving watched state: {e:#}")),
+        }
+    }
+
+    /// Shows and focuses the window, or hides it to the tray.
+    fn show_window(&mut self, ctx: &egui::Context, show: bool) {
+        self.hidden = !show;
+        // shortcut: Wayland can't hide a window (winit ignores Visible), so it minimizes there instead.
+        if !show && wayland() {
+            return ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show));
+        if show {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
     }
 
@@ -2105,6 +2166,7 @@ impl App {
         let key = format!("{}:{}", meta.kind, meta.id);
         let res = if self.saved.iter().any(|t| t.key == key) {
             self.saved.retain(|t| t.key != key);
+            self.lists.iter_mut().for_each(|l| _ = l.keys.remove(&key));
             self.db.remove_saved_title(&key)
         } else {
             let t = SavedTitle { key, title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone(), year: None, rating: None, last_watched: None };
@@ -2118,6 +2180,49 @@ impl App {
         if let Err(e) = res {
             report(&mut self.error, format!("saving library: {e:#}"));
         }
+    }
+
+    /// Re-read lists (and saved titles, which joining a list can add) after a list change; `res` errors are shown.
+    fn lists_changed(&mut self, res: anyhow::Result<()>) {
+        if let Err(e) = res {
+            report(&mut self.error, format!("saving list: {e:#}"));
+        }
+        self.saved = self.db.saved_titles().unwrap_or_default();
+        self.lists = self.db.lists().unwrap_or_default();
+        if !self.lists.iter().any(|l| Some(l.id) == self.lib_list) {
+            self.lib_list = None;
+        }
+    }
+
+    /// "Add to list" menu: a checkbox per list, plus a new list that gets `meta`.
+    fn list_menu(&mut self, ui: &mut egui::Ui, meta: &MetaPreview) {
+        let t = SavedTitle { key: format!("{}:{}", meta.kind, meta.id), title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone(), year: None, rating: None, last_watched: None };
+        ui.menu_button(format!("{}  Add to list", icons::PLUS), |ui| {
+            let mut change = None;
+            for l in &self.lists {
+                let mut on = l.keys.contains(&t.key);
+                if ui.checkbox(&mut on, &l.name).changed() {
+                    change = Some((l.id, on));
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.list_name).hint_text("New list…").char_limit(60).desired_width(140.0));
+                if ui.button("Create").clicked() {
+                    match self.db.create_list(&self.list_name) {
+                        Ok(id) => {
+                            self.list_name.clear();
+                            change = Some((id, true));
+                        }
+                        Err(e) => report(&mut self.error, format!("creating list: {e:#}")),
+                    }
+                }
+            });
+            if let Some((id, on)) = change {
+                let res = self.db.set_in_list(id, &t, on);
+                self.lists_changed(res);
+            }
+        });
     }
 
     /// Progress key and player title of the selected movie or episode.
@@ -2795,6 +2900,7 @@ impl App {
                 if hero_button(ui, &label, [gray(179), gray(102)], Color32::WHITE).clicked() {
                     self.toggle_saved(meta);
                 }
+                self.list_menu(ui, meta);
             });
             ui.add_space(12.0);
             if let Some(d) = &meta.description {
@@ -3478,6 +3584,10 @@ impl App {
     fn ui_addons(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if form_row(ui, "Manifest URL:", &mut self.addon_url, "http://127.0.0.1:7070/manifest.json", "Install", None, false) {
+            // A pasted stremio:// link becomes its manifest URL (http for loopback).
+            if let Some(stremflix_rs::addon::DeepLink::Addon(u)) = stremflix_rs::addon::parse_deep_link(&self.addon_url) {
+                self.addon_url = u.into();
+            }
             let (client, url) = (self.client.clone(), self.addon_url.trim().to_string());
             self.spawn(&ctx, async move {
                 let m = client.fetch_manifest(&url).await?;
@@ -3838,6 +3948,20 @@ impl App {
                 }
             });
         });
+        for (title, key, val) in [("Download limit:", "torrent_down_limit", &mut self.torrent_limits.0), ("Upload limit:", "torrent_up_limit", &mut self.torrent_limits.1)] {
+            ui.horizontal(|ui| {
+                let l = ui.label(title);
+                ui.add_space((150.0 - l.rect.width()).max(0.0));
+                let label = SPEED_LIMITS.iter().find(|c| c.1 == *val).map_or("Custom", |c| c.0);
+                egui::ComboBox::from_id_salt(key).selected_text(label).show_ui(ui, |ui| {
+                    for (name, bps) in SPEED_LIMITS {
+                        if ui.selectable_value(val, bps, name).changed() {
+                            save.push((key, bps.to_string()));
+                        }
+                    }
+                });
+            });
+        }
         let note = "Stopped torrents stay on disk up to the cache size, and are cleared when the app starts.";
         ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
         if self.torrent.get().is_some() {
@@ -3857,6 +3981,9 @@ impl App {
             }
             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                 save.push(("hwdec", on(self.hwdec)));
+            }
+            if switch_row(ui, "Minimize to tray on close", &mut self.tray_on_close).changed() {
+                save.push(("tray_on_close", on(self.tray_on_close)));
             }
             let step = stepper(ui, "Subtitle size", &format!("{:.1}x", style.scale));
             if step != 0 {
@@ -4019,17 +4146,48 @@ impl App {
                     ui.selectable_value(&mut self.lib_kind, k, k.label());
                 }
             });
+            let list = self.lists.iter().find(|l| Some(l.id) == self.lib_list);
+            egui::ComboBox::from_id_salt("lib_list").selected_text(list.map_or("All saved", |l| l.name.as_str())).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.lib_list, None, "All saved");
+                for l in &self.lists {
+                    ui.selectable_value(&mut self.lib_list, Some(l.id), &l.name);
+                }
+            });
+            ui.add(egui::TextEdit::singleline(&mut self.list_name).hint_text("List name").char_limit(60).desired_width(140.0));
+            let mut res = None;
+            if ui.button("New list").clicked() {
+                res = Some(self.db.create_list(&self.list_name).map(|id| self.lib_list = Some(id)));
+            }
+            if let Some(id) = self.lib_list {
+                if ui.button("Rename").clicked() {
+                    res = Some(self.db.rename_list(id, &self.list_name));
+                }
+                if ui.button("Delete list").on_hover_text("Its titles stay saved").clicked() {
+                    res = Some(self.db.delete_list(id));
+                }
+            }
+            if let Some(res) = res {
+                if res.is_ok() {
+                    self.list_name.clear();
+                }
+                self.lists_changed(res);
+            }
             let edit = ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Filter by title").desired_width(180.0));
             if (edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape))) || (!self.lib_query.is_empty() && small_button(ui, "x").on_hover_text("Clear filter").clicked()) {
                 self.lib_query.clear();
             }
         });
         ui.add_space(4.0);
-        let items: Vec<MetaPreview> = saved_view(&self.saved, self.lib_kind, self.lib_sort, &self.lib_query).into_iter().filter_map(SavedTitle::preview).collect();
+        let list = self.lists.iter().find(|l| Some(l.id) == self.lib_list);
+        let items: Vec<MetaPreview> = saved_view(&self.saved, self.lib_kind, self.lib_sort, &self.lib_query)
+            .into_iter()
+            .filter(|t| list.is_none_or(|l| l.keys.contains(&t.key)))
+            .filter_map(SavedTitle::preview)
+            .collect();
         if self.saved.is_empty() {
             ui.label(RichText::new("Nothing saved yet. Open a title and choose \"Add to library\".").color(ui.visuals().weak_text_color()));
         } else if items.is_empty() {
-            ui.label(RichText::new("No saved titles match.").color(ui.visuals().weak_text_color()));
+            ui.label(RichText::new(if list.is_some() { "No titles match in this list." } else { "No saved titles match." }).color(ui.visuals().weak_text_color()));
         }
         self.ui_cards(ui, "saved", &items, &mut want, &mut open, &mut quick);
         for u in want {
@@ -4118,6 +4276,33 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Runs before each `ui`, and alone while the window is hidden, so messages, tray clicks and playback keep going.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.handle(ctx, msg);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.tray_on_close && !self.quit && self.tray.as_ref().is_some_and(Tray::is_up) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.show_window(ctx, false);
+        }
+        self.poll_player(ctx);
+        self.publish_media();
+        // Hidden, `ui` doesn't run and mpv's frames aren't rendered, which stalls its core: play audio only meanwhile.
+        // A minimized Wayland window is no different from one minimized by hand, so it keeps its video.
+        if let Some(p) = &mut self.player
+            && (self.hidden && !wayland()) != p.hidden_vid.is_some()
+        {
+            let v = p.hidden_vid.take().unwrap_or_else(|| {
+                p.hidden_vid = Some(p.player.state.tracks.iter().find(|t| t.kind == "video" && t.selected).map_or("auto".into(), |t| t.id.to_string()));
+                "no".into()
+            });
+            if let Err(e) = p.player.command(&["set", "vid", &v]) {
+                report(&mut self.error, e);
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // egui's built-in zoom keys change the factor too: bound it, then persist any change.
@@ -4136,12 +4321,6 @@ impl eframe::App for App {
         if ctx.cumulative_frame_nr() == 2 {
             std::thread::spawn(stremflix_rs::player::load_mpv);
         }
-        while let Ok(msg) = self.rx.try_recv() {
-            self.handle(&ctx, msg);
-        }
-        self.poll_player(&ctx);
-        self.publish_media();
-        ctx.request_repaint_after(Duration::from_millis(500));
         // A dropped .torrent file, or a magnet pasted with no text field focused, plays at once.
         // Window systems deliver dropped files only, not dropped text, so magnets come in by paste.
         let (dropped, pasted) = ctx.input(|i| {
@@ -4419,6 +4598,11 @@ fn main() -> eframe::Result {
                 eprintln!("update check: {e:#}");
                 None
             })))
+        });
+        let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
+        app.tray = tray::spawn(&app.rt, include_bytes!("../assets/icon.png"), move |a| {
+            let _ = tx.send(Msg::Tray(a));
+            ctx.request_repaint();
         });
         let _ = ctx_cell.set(cc.egui_ctx.clone());
         Ok(Box::new(app))
