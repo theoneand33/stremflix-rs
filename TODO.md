@@ -41,7 +41,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| Download queue with progress and pause/resume | P2 | M | Builds on the download manager. |
 | Custom listen port / UPnP / NAT-PMP | P3 | M | |
 
 ### Settings and streaming server
