@@ -3033,7 +3033,7 @@ impl App {
             if k(M) { cmd(&["cycle", "mute"]) }
             if k(S) && focused.is_none() {
                 let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                let path = screenshot_path(&data_dir(), &p.title, secs);
+                let path = screenshot_path(&self.data_dir, &p.title, secs);
                 let _ = path.parent().map(std::fs::create_dir_all);
                 cmd(&["screenshot-to-file", &path.to_string_lossy(), "video"]);
             }
