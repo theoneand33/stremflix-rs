@@ -29,6 +29,17 @@ enum Tab {
     Settings,
 }
 
+impl Tab {
+    fn name(self) -> &'static str {
+        match self { Tab::Home => "home", Tab::Discover => "discover", Tab::Addons => "addons", Tab::Library => "library", Tab::Settings => "settings" }
+    }
+
+    /// Stored value to tab; missing or unknown falls back to Home.
+    fn from_name(s: Option<&str>) -> Tab {
+        [Tab::Home, Tab::Discover, Tab::Addons, Tab::Library, Tab::Settings].into_iter().find(|t| Some(t.name()) == s).unwrap_or(Tab::Home)
+    }
+}
+
 /// Torrent cache size choices: label and bytes kept (0 = delete a torrent when its playback stops).
 const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000), ("5 GB", 5_000_000_000), ("10 GB", 10_000_000_000), ("Unlimited", u64::MAX)];
 
@@ -1158,6 +1169,7 @@ impl App {
     fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
         let db = Db::open(&data_dir.join("stremflix-rs.db"))?;
         let search_history = db.setting("search_history")?.map(|s| db::decode_history(&s)).unwrap_or_default();
+        let tab = db.setting("tab")?;
         download::clear_partial(&data_dir.join("downloads"));
         let (tx, rx) = channel();
         ACCENT_IDX.store(accent_index(db.setting("accent")?.as_deref()), std::sync::atomic::Ordering::Relaxed);
@@ -1214,7 +1226,7 @@ impl App {
             torrent: Default::default(),
             tx,
             rx,
-            tab: Tab::Home,
+            tab: Tab::from_name(tab.as_deref()),
             addon_url: String::new(),
             addon_updates: Vec::new(),
             checking_updates: false,
@@ -4439,6 +4451,7 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
         let _ = self.db.set_setting("window", &self.window.to_string());
+        let _ = self.db.set_setting("tab", self.tab.name());
         self.stop_player();
     }
 }
@@ -4649,6 +4662,14 @@ fn seek_step(v: Option<String>, default: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_name_round_trip() {
+        for t in [Tab::Home, Tab::Discover, Tab::Addons, Tab::Library, Tab::Settings] {
+            assert!(Tab::from_name(Some(t.name())) == t);
+        }
+        assert!(Tab::from_name(Some("bogus")) == Tab::Home && Tab::from_name(None) == Tab::Home);
+    }
 
     #[test]
     fn wheel_accumulates_to_steps() {
