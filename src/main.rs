@@ -325,10 +325,12 @@ fn fresh_episodes(seen: &mut Vec<String>, series: &str, eps: &[&str]) -> Vec<Str
     fresh
 }
 
-/// Adds `entry`, replacing any earlier one for the same series, so refetches don't duplicate rows.
+/// Replaces any earlier row for the series, so refetches don't duplicate rows; an empty `videos` only removes it.
 fn upsert_by_id(list: &mut Vec<(MetaPreview, Vec<Video>)>, meta: MetaPreview, videos: Vec<Video>) {
     list.retain(|(m, _)| m.id != meta.id);
-    list.push((meta, videos));
+    if !videos.is_empty() {
+        list.push((meta, videos));
+    }
 }
 
 /// Desktop notification; never blocks the UI and a missing notification service only logs.
@@ -1836,9 +1838,7 @@ impl App {
                             self.notice = Some(format!("{}: {}", meta.name, body));
                             os_notify(meta.name.clone(), body);
                         }
-                        if !videos.is_empty() {
-                            upsert_by_id(&mut self.new_episodes, meta, videos);
-                        }
+                        upsert_by_id(&mut self.new_episodes, meta, videos);
                     }
                 }
             }
@@ -5170,11 +5170,16 @@ mod tests {
     #[test]
     fn refetch_does_not_duplicate_rows() {
         let meta = |id: &str| MetaPreview { id: id.into(), kind: "series".into(), name: id.into(), poster: None, background: None, description: None };
+        let video = |id: &str| Video { id: id.into(), title: None, released: None, season: Some(1), episode: Some(1), thumbnail: None };
         let mut list = Vec::new();
-        upsert_by_id(&mut list, meta("a"), vec![]);
-        upsert_by_id(&mut list, meta("b"), vec![]);
-        upsert_by_id(&mut list, meta("a"), vec![]);
+        upsert_by_id(&mut list, meta("a"), vec![video("a1")]);
+        upsert_by_id(&mut list, meta("b"), vec![video("b1")]);
+        upsert_by_id(&mut list, meta("a"), vec![video("a2")]);
         assert_eq!(list.iter().map(|(m, _)| m.id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        assert_eq!(list[1].1[0].id, "a2");
+        // An empty refetch (episodes aged out of the window) removes the old row.
+        upsert_by_id(&mut list, meta("a"), vec![]);
+        assert_eq!(list.iter().map(|(m, _)| m.id.as_str()).collect::<Vec<_>>(), ["b"]);
     }
 
     #[test]
