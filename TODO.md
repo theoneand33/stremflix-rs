@@ -17,7 +17,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Calendar of upcoming episodes for library series | P2 | M | Depends on the saved library. |
 | New-episode notifications | P2 | M | Depends on the saved library. |
-| Hide / reorder Home catalog rows | P2 | M | Rows follow addon priority only. |
 
 ### Library and organization
 
@@ -32,7 +31,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
-| Mouse-wheel volume over the video | P2 | S | |
 | Auto-load sidecar subtitles next to local files | P2 | S | `.srt`/`.ass`/`.vtt` beside the video; only addon subtitles today. |
 | Playback stats overlay (peers, speed, dropped frames) | P2 | S | Stremio has a Network button; useful for torrents. |
 | Sleep timer | P3 | S | |
