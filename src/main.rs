@@ -29,6 +29,9 @@ enum Tab {
     Settings,
 }
 
+/// Speed limit choices in bytes/s; 0 is unlimited.
+const SPEED_LIMITS: [(&str, u32); 6] = [("Unlimited", 0), ("500 KB/s", 500_000), ("1 MB/s", 1_000_000), ("2 MB/s", 2_000_000), ("5 MB/s", 5_000_000), ("10 MB/s", 10_000_000)];
+
 /// Torrent cache size choices: label and bytes kept (0 = delete a torrent when its playback stops).
 const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000), ("5 GB", 5_000_000_000), ("10 GB", 10_000_000_000), ("Unlimited", u64::MAX)];
 
@@ -1073,6 +1076,8 @@ struct App {
     torrent_dir: String,
     torrent_cache: u64,
     torrent_profile: Profile,
+    /// (download, upload) in bytes/s; 0 is unlimited.
+    torrent_limits: (u32, u32),
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
     /// mpv hardware decoding.
@@ -1188,6 +1193,10 @@ impl App {
             torrent_dir: db.setting("torrent_dir")?.unwrap_or_default(),
             torrent_cache: db.setting("torrent_cache")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             torrent_profile: Profile::from_label(&db.setting("torrent_profile")?.unwrap_or_default()),
+            torrent_limits: (
+                db.setting("torrent_down_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
+                db.setting("torrent_up_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
+            ),
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
@@ -1320,9 +1329,9 @@ impl App {
             Some(d) => PathBuf::from(d).join("stremflix-rs-torrents"),
             None => self.data_dir.join("torrents"),
         };
-        let (cell, cache, profile) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile);
+        let (cell, cache, profile, limits) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile, self.torrent_limits);
         let dht = std::env::var_os("STREMFLIX_RS_NO_DHT").is_none();
-        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile).await.map(Arc::new) }).await.cloned() }
+        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile, limits).await.map(Arc::new) }).await.cloned() }
     }
 
     /// What a hash-matched subtitle query needs for the selected title's stream `source`;
@@ -3922,6 +3931,20 @@ impl App {
                 }
             });
         });
+        for (title, key, val) in [("Download limit:", "torrent_down_limit", &mut self.torrent_limits.0), ("Upload limit:", "torrent_up_limit", &mut self.torrent_limits.1)] {
+            ui.horizontal(|ui| {
+                let l = ui.label(title);
+                ui.add_space((150.0 - l.rect.width()).max(0.0));
+                let label = SPEED_LIMITS.iter().find(|c| c.1 == *val).map_or("Custom", |c| c.0);
+                egui::ComboBox::from_id_salt(key).selected_text(label).show_ui(ui, |ui| {
+                    for (name, bps) in SPEED_LIMITS {
+                        if ui.selectable_value(val, bps, name).changed() {
+                            save.push((key, bps.to_string()));
+                        }
+                    }
+                });
+            });
+        }
         let note = "Stopped torrents stay on disk up to the cache size, and are cleared when the app starts.";
         ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
         if self.torrent.get().is_some() {
