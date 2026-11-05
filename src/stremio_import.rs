@@ -418,7 +418,7 @@ impl Upload {
 
 /// `addons` for `addonCollectionSet`: local addons in local order as `{transportUrl, transportName, manifest, flags}`,
 /// then the account's addons missing here, unchanged (they are never deleted). A local addon keeps the
-/// account's flags and the manifest fields this app doesn't store (logo, ...).
+/// account's flags and manifest as is; local fields only fill keys the account lacks (new addons).
 pub fn addon_collection(local: &[(String, Manifest)], remote: &Value) -> Result<Vec<Value>> {
     let remote = remote["addons"].as_array().context("Stremio API: unexpected addon response")?;
     let find = |u: &str| remote.iter().find(|a| a["transportUrl"] == u);
@@ -426,8 +426,11 @@ pub fn addon_collection(local: &[(String, Manifest)], remote: &Value) -> Result<
     for (url, m) in local {
         let old = find(url);
         let mut manifest = old.map(|a| a["manifest"].clone()).filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+        // The account's manifest wins: the local one is lossy, so it only fills keys the account lacks.
         if let (Some(o), Value::Object(l)) = (manifest.as_object_mut(), serde_json::to_value(m)?) {
-            o.extend(l);
+            for (k, v) in l.into_iter().filter(|(_, v)| !v.is_null()) {
+                o.entry(k).or_insert(v);
+            }
         }
         let flags = old.map(|a| a["flags"].clone()).filter(Value::is_object);
         out.push(serde_json::json!({
@@ -453,7 +456,7 @@ fn new_item(kind: &str, id: &str, name: &str, poster: &Option<String>, now: &str
 
 /// `changes` for `datastorePut` on `libraryItem`: only items that differ from the account's `remote` items,
 /// each with `_mtime` = `now`. Account-only items aren't sent, so nothing is deleted there.
-/// Progress newer than the account's `lastWatched` wins; saved titles are un-removed; movies watched here are flagged.
+/// Progress newer than the account's `lastWatched` wins; saved titles missing on the account are added (ones already there, even removed, are left alone); movies watched here are flagged.
 /// shortcut: episodes watched here aren't written to the series' `watched` bitfield; upgrade when one is built locally.
 pub fn library_changes(up: &Upload, remote: &Value) -> Vec<Value> {
     let mut items: std::collections::BTreeMap<String, Value> = remote
@@ -466,11 +469,13 @@ pub fn library_changes(up: &Upload, remote: &Value) -> Vec<Value> {
     let mut changed = std::collections::BTreeSet::new();
     for t in &up.saved {
         let Some(id) = t.key.strip_prefix(&format!("{}:", t.kind)) else { continue };
-        let it = items.entry(t.key.clone()).or_insert_with(|| new_item(&t.kind, id, &t.title, &t.poster, &up.now));
-        if it["removed"] != false || it["temp"] != false {
-            (it["removed"], it["temp"]) = (false.into(), false.into());
-            changed.insert(t.key.clone());
+        if items.contains_key(&t.key) {
+            continue;
         }
+        let mut it = new_item(&t.kind, id, &t.title, &t.poster, &up.now);
+        (it["removed"], it["temp"]) = (false.into(), false.into());
+        items.insert(t.key.clone(), it);
+        changed.insert(t.key.clone());
     }
     for (p, at) in &up.progress {
         // The title it belongs to: an episode's key is `<series key>:<season>:<episode>`.

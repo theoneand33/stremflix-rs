@@ -211,14 +211,18 @@ fn upload_builds_addon_collection_and_library_changes() {
 
     let remote = serde_json::json!({"addons": [
         {"transportUrl": "https://a.example/manifest.json", "transportName": "", "flags": {"official": true, "protected": true},
-         "manifest": {"id": "a", "version": "1", "name": "A", "resources": ["stream"], "types": ["movie"], "logo": "https://l.example/a.png"}},
+         "manifest": {"id": "a", "version": "1", "name": "A", "resources": ["stream"], "types": ["movie"], "logo": "https://l.example/a.png",
+                      "description": "Official A", "catalogs": [{"type": "movie", "id": "top", "extra": [{"name": "genre", "options": ["x ", "y"]}]}], "behaviorHints": {"adult": true}}},
         {"transportUrl": "https://r.example/manifest.json", "manifest": {"id": "r"}, "flags": {"official": false, "protected": false}}]});
     let addons = addon_collection(&up.addons, &remote).unwrap();
     let urls: Vec<_> = addons.iter().map(|a| a["transportUrl"].as_str().unwrap()).collect();
     assert_eq!(urls, ["https://b.example/manifest.json", "https://a.example/manifest.json", "https://r.example/manifest.json"], "local order, account-only addons kept last");
     assert_eq!(addons[0]["flags"], serde_json::json!({"official": false, "protected": false}));
     assert_eq!(addons[0]["transportName"], "");
-    assert_eq!((addons[1]["flags"]["protected"].as_bool(), addons[1]["manifest"]["version"].as_str()), (Some(true), Some("2")), "account flags kept, local manifest wins");
+    assert_eq!((addons[1]["flags"]["protected"].as_bool(), addons[1]["manifest"]["version"].as_str()), (Some(true), Some("1")), "account flags and manifest kept");
+    let am = &remote["addons"][0]["manifest"];
+    assert_eq!((&addons[1]["manifest"]["catalogs"], &addons[1]["manifest"]["behaviorHints"]["adult"], &addons[1]["manifest"]["description"]), (&am["catalogs"], &am["behaviorHints"]["adult"], &am["description"]), "account manifest wins");
+    assert_eq!((addons[1]["manifest"]["version"].as_str(), addons[0]["manifest"]["version"].as_str()), (Some("1"), Some("2")), "account version kept, local fills new addons");
     assert_eq!(addons[1]["manifest"]["logo"], "https://l.example/a.png", "fields not stored here are kept");
     assert_eq!(addons[2], remote["addons"][1]);
     assert!(addon_collection(&up.addons, &serde_json::json!({})).is_err());
@@ -241,7 +245,7 @@ fn upload_builds_addon_collection_and_library_changes() {
     let tt1 = by_id("tt1").unwrap();
     assert_eq!((tt1["removed"].as_bool(), tt1["state"]["flaggedWatched"].as_u64(), tt1["posterShape"].as_str()), (Some(false), Some(1), Some("poster")));
     let tt2 = by_id("tt2").unwrap();
-    assert_eq!((tt2["removed"].as_bool(), tt2["name"].as_str()), (Some(false), Some("R tt2")), "account item un-removed, its fields kept");
+    assert_eq!((tt2["removed"].as_bool(), tt2["name"].as_str()), (Some(true), Some("R tt2")), "account-removed title stays removed, its fields kept");
     assert_eq!((tt2["state"]["video_id"].as_str(), tt2["state"]["timeOffset"].as_u64(), tt2["state"]["duration"].as_u64()), (Some("tt2:1:3"), Some(12500), Some(100000)));
     let tt5 = by_id("tt5").unwrap();
     assert_eq!((tt5["temp"].as_bool(), tt5["removed"].as_bool()), (Some(true), Some(true)), "progress-only movie is history, not library");

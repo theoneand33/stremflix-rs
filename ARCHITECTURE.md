@@ -33,7 +33,7 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 - `fileIdx` is carried through saved progress as BEP 53 `&so=<idx>`.
 - Series: `meta.videos` gives the episode list and streams are requested with the episode id (`tt…:S:E`), so each episode resumes on its own. `behaviorHints.bingeGroup` marks streams from the same source, and the player autoplays the next episode from the same group.
 - Search uses the catalog `search` extra (`<base>/catalog/<type>/<id>/search=<query>.json`) and only targets catalogs whose required extras are satisfied.
-- Stremio account (`api.strem.io`): sync pulls `addonCollectionGet` and `datastoreGet` of `libraryItem`. Upload (Settings) sends `addonCollectionSet` with the local addon order as `{transportUrl, transportName, manifest, flags}` (account-only addons kept last, account flags kept) and `datastorePut` of only the changed `libraryItem`s with `_mtime` set to now. Account-only items are never deleted; progress replaces the account's only when newer than its `lastWatched`.
+- Stremio account (`api.strem.io`): sync pulls `addonCollectionGet` and `datastoreGet` of `libraryItem`. Upload (Settings) sends `addonCollectionSet` with the local addon order as `{transportUrl, transportName, manifest, flags}` (account-only addons kept last, account flags kept) and `datastorePut` of only the changed `libraryItem`s with `_mtime` set to now. Account-only items are never deleted, and saved titles already on the account (even removed) are not touched; progress replaces the account's only when newer than its `lastWatched`.
 
 ## Untrusted addon output
 

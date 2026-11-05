@@ -3076,7 +3076,7 @@ impl App {
             });
             if self.confirm_upload {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Overwrites the account's addon list with this order (addons only on the account are kept, last). Library titles and progress are added or updated, never deleted.").size(13.0).color(Color32::from_gray(170)));
+                    ui.label(RichText::new("Overwrites the account's addon list with this order (addons only on the account are kept, last). Saved titles missing on the account are added (ones it has, even removed, stay as they are), and progress is updated only where it is newer there. Nothing is deleted.").size(13.0).color(Color32::from_gray(170)));
                     if primary_button(ui, "Upload").clicked() {
                         self.confirm_upload = false;
                         self.upload_account(&ctx);
