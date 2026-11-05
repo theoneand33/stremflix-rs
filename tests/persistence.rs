@@ -1,5 +1,6 @@
 use stremflix_rs::addon::parse_manifest;
-use stremflix_rs::db::{Db, Download, Progress, SavedTitle, Watched};
+use stremflix_rs::download::State;
+use stremflix_rs::db::{Db, Download, QueuedDownload, Progress, SavedTitle, Watched};
 use stremflix_rs::library::LibraryItem;
 
 #[test]
@@ -223,6 +224,17 @@ fn downloads_round_trip() {
     let prog = |key: String, source: &str| Progress { key, title: "t".into(), source: source.into(), position: 1.0, duration: 2.0, poster: None };
     db.save_progress(&prog(movie.key(), "/d/One.mp4")).unwrap();
     db.save_progress(&prog(ep.key(), "https://x/ep.mkv")).unwrap();
+    let q = Download { path: "/d/Q.mkv".into(), ..movie.clone() };
+    let h = vec![("Cookie".to_string(), "a=b".to_string())];
+    db.queue_download(&q, "https://x/q.mkv", &h, State::Active).unwrap();
+    assert_eq!(db.downloads().unwrap().len(), 2, "the queue is not in finished downloads");
+    let want = QueuedDownload { d: q.clone(), source: "https://x/q.mkv".into(), headers: h, state: State::Paused, validator: "\"v1\"".into(), total: 99 };
+    db.set_download_meta(&q, &want.validator, want.total).unwrap();
+    assert_eq!(db.download_queue().unwrap(), [want], "active comes back paused, with its validator");
+    db.set_download_state(&q, State::Failed).unwrap();
+    assert_eq!(db.download_queue().unwrap()[0].state, State::Failed);
+    db.remove_download(&q).unwrap();
+    assert!(db.download_queue().unwrap().is_empty());
     db.remove_download(&movie).unwrap();
     db.remove_download(&ep).unwrap();
     assert_eq!(db.downloads().unwrap(), []);
@@ -245,4 +257,74 @@ fn db_files_are_owner_only() {
     for f in [&path, &wal] {
         assert_eq!(std::fs::metadata(f).unwrap().permissions().mode() & 0o777, 0o600, "{}", f.display());
     }
+}
+
+#[test]
+fn export_import_round_trip_and_rejects() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Db::open(&dir.path().join("a.db")).unwrap();
+    let manifest = parse_manifest(br#"{"id":"a","version":"1","name":"A","resources":["stream"],"types":["movie"]}"#).unwrap();
+    a.add_addon("https://x.example/manifest.json", &manifest).unwrap();
+    a.add_saved_title(&SavedTitle { key: "movie:tt1".into(), title: "One".into(), kind: "movie".into(), poster: None, year: None, rating: None, last_watched: None }).unwrap();
+    a.save_progress(&Progress { key: "movie:tt1".into(), title: "One".into(), source: "https://x.example/v.mp4".into(), position: 5.0, duration: 9.0, poster: None }).unwrap();
+    // Download resume points, the auth key and the external player command stay out of the file.
+    a.add_download(&Download { path: "/d/two.mp4".into(), kind: "movie".into(), meta_id: "tt2".into(), video_id: "tt2".into(), title: "Two".into() }).unwrap();
+    a.save_progress(&Progress { key: "movie:tt2".into(), title: "Two".into(), source: "/d/two.mp4".into(), position: 1.0, duration: 9.0, poster: None }).unwrap();
+    a.save_progress(&Progress { key: "file:/d/three.mp4".into(), title: "Three".into(), source: "/d/three.mp4".into(), position: 1.0, duration: 9.0, poster: None }).unwrap();
+    a.save_watched(&Watched { key: "movie:tt3".into(), title: "Three".into(), poster: None, episodes: 0 }, "2024-01-01T00:00:00Z").unwrap();
+    a.set_watched("movie:tt4", true).unwrap();
+    a.set_setting("hwdec", "0").unwrap();
+    a.set_setting("stremio_auth", "SECRET").unwrap();
+    a.set_setting("external_player", "rm -rf").unwrap();
+    let json = a.export_json().unwrap();
+    assert!(!json.contains("SECRET") && !json.contains("/d/two.mp4") && !json.contains("/d/three.mp4") && !json.contains("rm -rf"));
+
+    let b = Db::open(&dir.path().join("b.db")).unwrap();
+    b.import_json(&json).unwrap();
+    assert_eq!(b.addons().unwrap(), a.addons().unwrap());
+    assert_eq!(b.saved_titles().unwrap(), a.saved_titles().unwrap());
+    assert_eq!(b.progress("movie:tt1").unwrap(), a.progress("movie:tt1").unwrap());
+    assert_eq!(b.progress("movie:tt2").unwrap(), None);
+    assert_eq!(b.watched(10).unwrap(), a.watched(10).unwrap());
+    assert!(b.watched_keys().unwrap().contains("movie:tt4"));
+    assert_eq!(b.setting("hwdec").unwrap().as_deref(), Some("0"));
+    assert_eq!(b.setting("stremio_auth").unwrap(), None);
+    // Newer local progress survives a re-import; existing data is kept.
+    b.save_progress(&Progress { key: "movie:tt1".into(), title: "One".into(), source: "https://x.example/v.mp4".into(), position: 7.0, duration: 9.0, poster: None }).unwrap();
+    b.import_json(&json).unwrap();
+    assert_eq!(b.progress("movie:tt1").unwrap().unwrap().position, 7.0);
+
+    let bad = |s: String| Db::open(&dir.path().join("c.db")).unwrap().import_json(&s).unwrap_err().to_string();
+    assert!(bad(r#"{"format":"other","version":1}"#.into()).contains("not a stremflix-rs export"));
+    assert!(bad(r#"{"format":"stremflix-rs-export","version":2}"#.into()).contains("version"));
+    assert!(bad("x".repeat(17 << 20)).contains("16 MiB"));
+    // A bad addon URL is dropped, not imported.
+    let c = Db::open(&dir.path().join("d.db")).unwrap();
+    let doc = json.replace("https://x.example/manifest.json", "file:///etc/manifest.json");
+    c.import_json(&doc).unwrap();
+    assert!(c.addons().unwrap().is_empty());
+    // The size cap applies to files too.
+    let big = dir.path().join("big.json");
+    std::fs::write(&big, vec![b' '; (16 << 20) + 1]).unwrap();
+    assert!(c.import_file(&big).unwrap_err().to_string().contains("16 MiB"));
+}
+
+#[test]
+fn import_rejects_local_and_bad_magnet_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let row = |key: &str, source: &str| format!(r#"{{"key":"{key}","title":"T","source":"{source}","position":1,"duration":9,"updated_at":1}}"#);
+    let hash = "a".repeat(40);
+    let doc = format!(
+        r#"{{"format":"stremflix-rs-export","version":1,"progress":[{},{},{},{}]}}"#,
+        row("file:/etc/passwd", "/etc/passwd"),
+        row("movie:tt5", "magnet:?xt=urn:btih:nothex"),
+        row("movie:tt6", &format!("magnet:?xt=urn:btih:{hash}")),
+        row("movie:tt7", "https://x.example/v.mp4"),
+    );
+    let db = Db::open(&dir.path().join("e.db")).unwrap();
+    db.import_json(&doc).unwrap();
+    assert_eq!(db.progress("file:/etc/passwd").unwrap(), None);
+    assert_eq!(db.progress("movie:tt5").unwrap(), None);
+    assert!(db.progress("movie:tt6").unwrap().is_some());
+    assert!(db.progress("movie:tt7").unwrap().is_some());
 }
