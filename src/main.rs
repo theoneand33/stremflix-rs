@@ -1706,7 +1706,13 @@ impl App {
                 // `Only` autoplays when there's no choice to make; otherwise show the stream picker.
                 if autoplay != Autoplay::Off {
                     match (src, self.play_key()) {
-                        (Some(src), Some((key, title))) => self.play(ctx, key, title, src, subs),
+                        (Some(src), Some((key, title))) => {
+                            self.play(ctx, key, title, src, subs);
+                            // `play` advanced nav; the carry must match the nav Msg::Play arrives with.
+                            if let Some((_, n)) = &mut self.sleep_carry {
+                                *n = self.nav;
+                            }
+                        }
                         _ => {
                             self.show_streams = true;
                             self.sleep_carry = None;
@@ -2154,6 +2160,14 @@ impl App {
             self.release_torrents(None);
             return;
         }
+        // Before the autoplay check: an expired timer must not roll into the next episode.
+        if self.sleep.is_some_and(|(t, _)| Instant::now() >= t) {
+            self.sleep = None;
+            if let Err(e) = p.player.command(&["set", "pause", "yes"]) {
+                report(&mut self.error, e);
+            }
+            return;
+        }
         let st = &p.player.state;
         if self.autoplay_next && at_end(st.pos, st.dur, st.paused) && self.playing_episode() {
             return self.play_next(ctx);
@@ -2163,12 +2177,6 @@ impl App {
             return;
         }
         self.last_poll = Instant::now();
-        if self.sleep.is_some_and(|(t, _)| Instant::now() >= t) {
-            self.sleep = None;
-            if let Err(e) = p.player.command(&["set", "pause", "yes"]) {
-                report(&mut self.error, e);
-            }
-        }
         let paused = p.player.state.paused;
         if paused {
             if p.awake.is_some() {
@@ -5433,6 +5441,19 @@ mod tests {
         app.sleep_carry = Some(((Instant::now(), 30), 3));
         app.handle(&ctx, Msg::Streams(m, None, vec![], vec![], Autoplay::Only, None, 3));
         assert!(app.sleep_carry.is_none() && app.show_streams);
+    }
+
+    #[test]
+    fn sleep_carry_follows_nav_after_autoplay() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
+        let one = Stream { url: Some("https://x.example/a".into()), ..Default::default() };
+        app.nav = 3;
+        app.sleep_carry = Some(((Instant::now(), 30), 3));
+        app.handle(&ctx, Msg::Streams(m, None, vec![one], vec![], Autoplay::Only, None, 3));
+        assert_eq!(app.nav, 4, "play advanced nav");
+        assert_eq!(app.sleep_carry.map(|(_, n)| n), Some(4), "carry matches the Msg::Play nav");
     }
 
     #[test]
