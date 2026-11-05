@@ -22,7 +22,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| Custom lists / collections | P2 | M | Stremio "My List" style folders; today only one saved-titles list. |
 | Bulk selection in the library | P3 | M | |
 | User profiles (household, child-safe) | P3 | L | Stremio supporter feature. |
 
@@ -31,8 +30,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
-| Auto-load sidecar subtitles next to local files | P2 | S | `.srt`/`.ass`/`.vtt` beside the video; only addon subtitles today. |
-| Playback stats overlay (peers, speed, dropped frames) | P2 | S | Stremio has a Network button; useful for torrents. |
 | Sleep timer | P3 | S | |
 | Screenshot capture | P3 | S | mpv `screenshot-to-file`. |
 | A-B loop / repeat | P3 | S | |
@@ -47,7 +44,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Download queue with progress and pause/resume | P2 | M | Builds on the download manager. |
-| Download / upload speed limits | P3 | S | librqbit supports rate limits. |
 | Seeding limits (ratio/time) and a torrent manager UI | P3 | S | Torrents are stopped and deleted automatically now. |
 | Custom listen port / UPnP / NAT-PMP | P3 | M | |
 
@@ -66,10 +62,8 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| Support `notWebReady` and `proxyHeaders.response` hints | P2 | M | `proxyHeaders.request` is handled; these are not. |
 | Remote/LAN streaming server | P2 | L | Stremio serves the library to other devices; casting is a separate item. |
 | Addon health indicator (unreachable / timeout) | P3 | S | |
-| Install from `stremio://` addon links pasted in Addons | P3 | S | Deep links only cover detail pages today. |
 | QR code to install an addon | P3 | S | |
 | Per-type addon ordering | P3 | S | One global priority list today. |
 
@@ -79,7 +73,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Upload to the Stremio account (addons, library, progress) | P2 | M | Sign-in pulls addons, library and watched titles; nothing is pushed back. |
 | Trakt integration (scrobbling, watched sync) | P3 | L | |
-| Export / import all data (addons, library, progress) | P2 | S | Stremio offers a data export; good for backup and migration. |
 | Simkl / MyAnimeList / Letterboxd sync | P3 | L | After Trakt. |
 
 ### Platform and app
@@ -89,7 +82,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | UI translations (i18n) | P3 | M | |
 | Auto-install updates | P3 | M | Release builds already show a download link for a newer build; downloading and replacing the binary is still missing. |
 | Android, iOS, TV clients | P3 | XL | Out of scope for an egui desktop app. |
-| Tray icon and minimize-to-tray with background playback | P2 | M | |
 | Remember last tab and window state on launch | P3 | S | |
 | Command-line flags for play/open | P3 | S | Only `stremio://` links are parsed now. |
 | Screen-reader labels and focus-order polish | P3 | M | AccessKit is enabled; coverage is partial. |

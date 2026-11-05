@@ -7,6 +7,7 @@ src/library.rs  Recursive media-file scan (walkdir)
 src/download.rs Offline downloads: safe file names, streaming a URL (or the local torrent stream) to a file
 src/player.rs   libmpv (FFI) in-process: OpenGL-rendered frames, observed properties, IPC server
 src/torrent.rs  librqbit session + its HTTP streaming API on 127.0.0.1
+src/tray.rs     Tray icon (Show/Hide, Play/Pause, Quit): ksni StatusNotifierItem over D-Bus on Linux (no GTK), tray-icon on Windows/macOS
 src/stremio_import.rs  Reads a local Stremio's localStorage (WebKit SQLite or Chromium LevelDB via rusty-leveldb)
 src/main.rs     egui/eframe GUI; tokio runtime for network/torrent work, results via mpsc
 test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed via librqbit.
@@ -24,6 +25,7 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 
 - **egui + video surface.** egui renders through its own GL/wgpu painter and has no native video widget. The options are (a) libmpv's render API into an egui texture or GL callback, which needs unsafe FFI, libmpv at runtime, and GL context sharing with eframe's glow backend, or (b) mpv's `--wid` embedding, which only works on X11 and breaks on Wayland/macOS. eframe runs on its glow (OpenGL) backend instead of the default wgpu, so libmpv can render into eframe's own GL context. eframe exposes that context's `get_proc_address`, and libmpv uses it to load GL functions. mpv renders during `App::ui` into an app-owned framebuffer at on-screen pixel size. The app then resets the GL state that mpv changes and egui's painter relies on: framebuffer, active texture, program, VAO, unpack alignment, scissor and blend. This works on X11, Wayland, macOS and Xvfb (Mesa llvmpipe).
 - **librqbit + tokio vs. egui's synchronous loop.** The app owns a tokio runtime. UI events spawn async tasks, and results return over `std::sync::mpsc` with `ctx.request_repaint()`. The UI thread never blocks.
+- **Minimize to tray vs. egui's loop.** A hidden window gets no `App::ui`, only `App::logic`, so messages, tray clicks and player polling run in `logic`. mpv's frames aren't rendered meanwhile, which would stall its core, so the video track is off (`vid=no`) while hidden and restored when shown. Without a tray host (no D-Bus, no StatusNotifierWatcher) closing quits as before. Wayland can't hide windows, so the window minimizes there.
 - **OS media controls: souvlaki** (MPRIS on Linux, SMTC on Windows via the window's HWND, MPNowPlaying on macOS). Its `use_zbus` feature talks D-Bus in pure Rust, so there is no libdbus build dependency. Media-key events come back over the same `mpsc` channel with `ctx.request_repaint()`. Without a D-Bus session (CI, Xvfb) its MPRIS thread fails, logs, and the app runs on without controls.
 - **librqbit's HTTP API** needs the `http-api` feature and also `tracing-subscriber-utils` (librqbit 9.1 fails to compile without it). It also needs `librqbit-dualstack-sockets` for its listener type.
 
@@ -31,6 +33,7 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 
 - An addon is identified by its transport URL ending in `/manifest.json`. Resources are fetched from `<base>/<resource>/<type>/<id>.json`, with type and id percent-encoded.
 - Streams: `url` (http/https or `magnet:`) or `infoHash` + `fileIdx` + `sources`. `tracker:<url>` sources become `&tr=` in the magnet. `peer:<host:port>` is a **local extension** (becomes `x.pe=`) that the test addon uses to point at its seeder without a tracker or DHT. An http(s) `externalUrl` opens in the browser. A `ytId` (11 characters of `[A-Za-z0-9_-]`) becomes `https://www.youtube.com/watch?v=<id>`. `behaviorHints.skip` is a **local extension**: `[{"type":"intro"|"recap"|"credits","start":<s>,"end":<s>}]` in seconds, shown as a "Skip …" button while playing. Entries need finite `0 <= start < end`, at most 15 min long; invalid ones are dropped, at most 10 kept. Chapters titled intro/opening/OP, recap/previously, or credits/ending/ED in the media itself do the same.
+- `behaviorHints.notWebReady` only means Stremio-web needs the streaming server's proxy. mpv plays the stream directly, so the hint just adds a "Not web-ready" note to the stream row. `proxyHeaders.response` is ignored except a `Content-Type` of HLS (`application/vnd.apple.mpegurl`, `application/x-mpegurl`, `audio/(x-)mpegurl`) or DASH (`application/dash+xml`), which sets mpv's `demuxer-lavf-format` (`hls`/`dash`) for that stream. mpv sniffs content and ignores other response headers.
 - `fileIdx` is carried through saved progress as BEP 53 `&so=<idx>`.
 - Series: `meta.videos` gives the episode list and streams are requested with the episode id (`tt…:S:E`), so each episode resumes on its own. `behaviorHints.bingeGroup` marks streams from the same source, and the player autoplays the next episode from the same group.
 - Search uses the catalog `search` extra (`<base>/catalog/<type>/<id>/search=<query>.json`) and only targets catalogs whose required extras are satisfied.
@@ -46,5 +49,9 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 ## Persistence
 
 SQLite in WAL mode at `$STREMFLIX_RS_DATA/stremflix-rs.db`. Progress keys are `<type>:<id>` for addon items, `file:<path>` for local files, and `btih:<hash>` for raw magnets. Each row stores a resumable source: URL, magnet, or path.
+
+Settings > Data exports addons, saved titles, progress, watched marks and safe settings to `exports/stremflix-rs-<time>.json` (`{"format":"stremflix-rs-export","version":1}`; no auth key, no local paths). Import treats the file as untrusted (16 MiB cap, validated entries) and merges it in one transaction, keeping newer progress.
+
+Saved titles (`saved_titles`) are the default library. User lists live in `lists` (name unique ignoring case) and `list_items` (`list_id`, saved-title key; cascades when a list is deleted); adding to a list saves the title, and unsaving removes it from every list.
 
 Downloads go to `$STREMFLIX_RS_DATA/downloads/`, named from the sanitized title (never from addon or torrent file paths), written to `<name>.part` and renamed when complete. The `downloads` table keeps path, type, meta id, video id and title; playing one uses the streaming progress key `<type>:<video id>`. A downloading torrent is pinned so other playback doesn't stop it.

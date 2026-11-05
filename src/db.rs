@@ -1,11 +1,22 @@
-//! SQLite persistence: addons, library folders/items, saved titles, settings, watch progress.
+//! SQLite persistence: addons, library folders/items, saved titles and lists, settings, watch progress.
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
-use crate::addon::{Manifest, MetaPreview, parse_manifest, valid_id};
+use crate::addon::{Manifest, MetaPreview, addon_base, parse_manifest, parse_magnet_hash, safe_http_url, valid_id};
+use serde_json::{Value, json};
 use crate::library::LibraryItem;
+
+/// Settings an export carries. Not secrets (`stremio_auth`), local paths, or `external_player` (a command to run).
+const EXPORT_SETTINGS: [&str; 9] = ["autoplay_next", "hwdec", "sub_style", "sub_off", "torrent_cache", "torrent_profile", "default_speed", "alang", "slang"];
+const EXPORT_FORMAT: &str = "stremflix-rs-export";
+pub const MAX_IMPORT_BYTES: u64 = 16 << 20;
+
+/// A progress row is kept only if it resumes a web URL or a magnet with a real info hash, never a local path.
+fn resumable_source(key: &str, source: &str) -> bool {
+    !key.starts_with("file:") && (safe_http_url(source).is_some() || parse_magnet_hash(source).is_some())
+}
 
 pub struct Db {
     conn: Connection,
@@ -47,6 +58,22 @@ pub struct SavedTitle {
     pub rating: Option<f64>,
     /// Unix time of the latest progress or watched mark on the title or any of its episodes; read-only, set by `saved_titles`.
     pub last_watched: Option<i64>,
+}
+
+/// A user list ("collection") of saved titles.
+#[derive(Debug, Clone, PartialEq)]
+pub struct List {
+    pub id: i64,
+    pub name: String,
+    /// Saved-title keys in the list.
+    pub keys: std::collections::HashSet<String>,
+}
+
+/// Trimmed list name, or an error unless it is 1–60 characters.
+fn list_name(name: &str) -> Result<&str> {
+    let n = name.trim();
+    anyhow::ensure!((1..=60).contains(&n.chars().count()), "list names are 1–60 characters");
+    Ok(n)
 }
 
 /// A stream saved for offline playback.
@@ -97,6 +124,7 @@ impl Db {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL; -- safe with WAL; a crash loses at most the last commit, and progress saves every second
+             PRAGMA foreign_keys=ON;
              CREATE TABLE IF NOT EXISTS addons (transport_url TEXT PRIMARY KEY, manifest TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS library_folders (path TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS library_items (path TEXT PRIMARY KEY, folder TEXT NOT NULL, title TEXT NOT NULL);
@@ -108,7 +136,11 @@ impl Db {
              CREATE TABLE IF NOT EXISTS saved_titles (key TEXT PRIMARY KEY, title TEXT NOT NULL, kind TEXT NOT NULL,
                  poster TEXT, saved_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS downloads (path TEXT PRIMARY KEY, kind TEXT NOT NULL, meta_id TEXT NOT NULL,
-                 video_id TEXT NOT NULL, title TEXT NOT NULL, added_at INTEGER NOT NULL DEFAULT (unixepoch()));",
+                 video_id TEXT NOT NULL, title TEXT NOT NULL, added_at INTEGER NOT NULL DEFAULT (unixepoch()));
+             CREATE TABLE IF NOT EXISTS lists (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                 created INTEGER NOT NULL DEFAULT (unixepoch()));
+             CREATE TABLE IF NOT EXISTS list_items (list_id INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+                 title_key TEXT NOT NULL, added INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (list_id, title_key));",
         )?;
         // Migrate databases created before posters were stored; fails harmlessly if the column exists.
         let _ = conn.execute("ALTER TABLE progress ADD COLUMN poster TEXT", []);
@@ -224,6 +256,7 @@ impl Db {
     pub fn remove_saved_title(&self, key: &str) -> Result<()> {
         self.transaction(|| {
             self.conn.execute("DELETE FROM saved_titles WHERE key = ?1", [key])?;
+            self.conn.execute("DELETE FROM list_items WHERE title_key = ?1", [key])?;
             self.set_setting(&format!("unsaved:{key}"), "1")
         })
     }
@@ -255,6 +288,51 @@ impl Db {
             .collect())
     }
 
+    /// New list; the name is trimmed, 1–60 characters, and unique ignoring case.
+    pub fn create_list(&self, name: &str) -> Result<i64> {
+        self.conn.execute("INSERT INTO lists (name) VALUES (?1)", [list_name(name)?])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn rename_list(&self, id: i64, name: &str) -> Result<()> {
+        self.conn.execute("UPDATE lists SET name = ?2 WHERE id = ?1", params![id, list_name(name)?])?;
+        Ok(())
+    }
+
+    /// Its items go with it (cascade); the titles stay saved.
+    pub fn delete_list(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM lists WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Add `t` to list `id` (saving it too if needed), or take it out of the list.
+    pub fn set_in_list(&self, id: i64, t: &SavedTitle, on: bool) -> Result<()> {
+        if !on {
+            self.conn.execute("DELETE FROM list_items WHERE list_id = ?1 AND title_key = ?2", params![id, t.key])?;
+            return Ok(());
+        }
+        self.transaction(|| {
+            self.add_saved_title(t)?;
+            self.conn.execute("INSERT OR IGNORE INTO list_items (list_id, title_key) VALUES (?1, ?2)", params![id, t.key])?;
+            Ok(())
+        })
+    }
+
+    /// Lists by name (case-insensitive), with their title keys.
+    pub fn lists(&self) -> Result<Vec<List>> {
+        let mut st = self.conn.prepare("SELECT id, name FROM lists ORDER BY name")?;
+        let mut lists: Vec<List> =
+            st.query_map([], |r| Ok(List { id: r.get(0)?, name: r.get(1)?, keys: Default::default() }))?.collect::<rusqlite::Result<_>>()?;
+        let mut st = self.conn.prepare("SELECT list_id, title_key FROM list_items")?;
+        for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, key) = r?;
+            if let Some(l) = lists.iter_mut().find(|l| l.id == id) {
+                l.keys.insert(key);
+            }
+        }
+        Ok(lists)
+    }
+
     pub fn add_download(&self, d: &Download) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO downloads (path, kind, meta_id, video_id, title) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -280,6 +358,127 @@ impl Db {
             Ok(Download { path: PathBuf::from(r.get::<_, String>(0)?), kind: r.get(1)?, meta_id: r.get(2)?, video_id: r.get(3)?, title: r.get(4)? })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// All user data as one versioned JSON document: addons (in priority order), saved titles, progress,
+    /// watched marks and settings. No account key, no download or other local file paths.
+    pub fn export_json(&self) -> Result<String> {
+        let rows = |sql: &str, f: fn(&rusqlite::Row) -> rusqlite::Result<Value>| -> Result<Vec<Value>> {
+            Ok(self.conn.prepare(sql)?.query_map([], f)?.collect::<rusqlite::Result<_>>()?)
+        };
+        let addons: Vec<Value> = self.addons()?.into_iter().map(|(url, m)| json!({"url": url, "manifest": m})).collect();
+        let saved = rows("SELECT key, title, kind, poster, saved_at FROM saved_titles ORDER BY saved_at, rowid", |r| {
+            Ok(json!({"key": r.get::<_, String>(0)?, "title": r.get::<_, String>(1)?, "kind": r.get::<_, String>(2)?, "poster": r.get::<_, Option<String>>(3)?, "saved_at": r.get::<_, i64>(4)?}))
+        })?;
+        // Same rule as import: local-file rows (download resume points, `file:` keys) are left out.
+        let mut progress = rows("SELECT key, title, source, position, duration, poster, updated_at FROM progress WHERE source NOT IN (SELECT path FROM downloads) ORDER BY updated_at", |r| {
+            Ok(json!({"key": r.get::<_, String>(0)?, "title": r.get::<_, String>(1)?, "source": r.get::<_, String>(2)?, "position": r.get::<_, f64>(3)?,
+                "duration": r.get::<_, f64>(4)?, "poster": r.get::<_, Option<String>>(5)?, "updated_at": r.get::<_, i64>(6)?}))
+        })?;
+        progress.retain(|p| resumable_source(p["key"].as_str().unwrap_or_default(), p["source"].as_str().unwrap_or_default()));
+        let watched = rows("SELECT key, title, poster, episodes, watched_at FROM watched ORDER BY watched_at", |r| {
+            Ok(json!({"key": r.get::<_, String>(0)?, "title": r.get::<_, String>(1)?, "poster": r.get::<_, Option<String>>(2)?, "episodes": r.get::<_, u32>(3)?, "watched_at": r.get::<_, i64>(4)?}))
+        })?;
+        let marks = rows("SELECT substr(key, 9) FROM settings WHERE key LIKE 'watched:%' ORDER BY key", |r| Ok(Value::String(r.get(0)?)))?;
+        let mut settings = serde_json::Map::new();
+        for k in EXPORT_SETTINGS {
+            if let Some(v) = self.setting(k)? {
+                settings.insert(k.into(), v.into());
+            }
+        }
+        Ok(serde_json::to_string_pretty(&json!({"format": EXPORT_FORMAT, "version": 1, "addons": addons, "saved": saved, "progress": progress,
+            "watched": watched, "watched_marks": marks, "settings": settings}))?)
+    }
+
+    /// Merge an export into this database in one transaction; nothing is deleted and older progress never
+    /// replaces newer. The file is untrusted: invalid entries are dropped. Returns a summary of what was merged.
+    pub fn import_json(&self, text: &str) -> Result<String> {
+        anyhow::ensure!(text.len() as u64 <= MAX_IMPORT_BYTES, "file is over 16 MiB");
+        let doc: Value = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("not valid JSON: {e}"))?;
+        anyhow::ensure!(doc["format"] == EXPORT_FORMAT, "not a stremflix-rs export");
+        anyhow::ensure!(doc["version"] == 1, "unsupported export version {}", doc["version"]);
+        let list = |k: &str| doc[k].as_array().map(Vec::as_slice).unwrap_or_default();
+        let text = |v: &Value, k: &str| v[k].as_str().map(str::to_owned);
+        let poster = |v: &Value| text(v, "poster").filter(|p| safe_http_url(p).is_some());
+        let int = |v: &Value, k: &str| v[k].as_i64().unwrap_or(0).max(0);
+        let (mut addons, mut saved, mut progress, mut watched, mut settings) = (0, 0, 0, 0, 0);
+        let total = list("addons").len() + list("saved").len() + list("progress").len() + list("watched").len() + list("watched_marks").len();
+        self.transaction(|| {
+            for a in list("addons") {
+                let (Some(url), Ok(m)) = (text(a, "url"), parse_manifest(&serde_json::to_vec(&a["manifest"])?)) else { continue };
+                if addon_base(&url).is_ok() {
+                    self.add_addon(&url, &m)?;
+                    addons += 1;
+                }
+            }
+            for t in list("saved") {
+                let (Some(key), Some(title), Some(kind)) = (text(t, "key"), text(t, "title"), text(t, "kind")) else { continue };
+                if valid_id(&key) && valid_id(&kind) && !title.trim().is_empty() {
+                    self.conn.execute(
+                        "INSERT INTO saved_titles (key, title, kind, poster, saved_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster)",
+                        params![key, title, kind, poster(t), int(t, "saved_at")],
+                    )?;
+                    saved += 1;
+                }
+            }
+            for p in list("progress") {
+                let (Some(key), Some(title), Some(source)) = (text(p, "key"), text(p, "title"), text(p, "source")) else { continue };
+                let (pos, dur) = (p["position"].as_f64().unwrap_or(-1.0), p["duration"].as_f64().unwrap_or(-1.0));
+                if valid_id(&key) && resumable_source(&key, &source) && pos.is_finite() && dur.is_finite() && pos >= 0.0 && dur >= 0.0 {
+                    self.conn.execute(
+                        "INSERT INTO progress (key, title, source, position, duration, poster, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                         ON CONFLICT(key) DO UPDATE SET title = excluded.title, source = excluded.source, position = excluded.position,
+                             duration = excluded.duration, poster = coalesce(excluded.poster, poster), updated_at = excluded.updated_at
+                         WHERE excluded.updated_at > progress.updated_at",
+                        params![key, title, source, pos, dur, poster(p), int(p, "updated_at")],
+                    )?;
+                    progress += 1;
+                }
+            }
+            for w in list("watched") {
+                let (Some(key), Some(title)) = (text(w, "key"), text(w, "title")) else { continue };
+                if valid_id(&key) && !title.trim().is_empty() {
+                    self.conn.execute(
+                        "INSERT INTO watched (key, title, poster, episodes, watched_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster),
+                             episodes = excluded.episodes, watched_at = excluded.watched_at WHERE excluded.watched_at > watched.watched_at",
+                        params![key, title, poster(w), int(w, "episodes").min(u32::MAX as i64), int(w, "watched_at")],
+                    )?;
+                    watched += 1;
+                }
+            }
+            for k in list("watched_marks").iter().filter_map(Value::as_str).filter(|k| valid_id(k)) {
+                self.set_setting(&format!("watched:{k}"), "1")?;
+                watched += 1;
+            }
+            for k in EXPORT_SETTINGS {
+                if let Some(v) = doc["settings"][k].as_str().filter(|v| v.len() <= 256) {
+                    self.set_setting(k, v)?;
+                    settings += 1;
+                }
+            }
+            Ok(())
+        })?;
+        let merged = addons + saved + progress + watched;
+        Ok(format!("Imported {addons} addons, {saved} saved titles, {progress} progress, {watched} watched, {settings} settings; skipped {} invalid", total - merged.min(total)))
+    }
+
+    /// Write [`Db::export_json`] to `dir/stremflix-rs-<unix time>.json` and return the path.
+    pub fn export_file(&self, dir: &Path) -> Result<PathBuf> {
+        std::fs::create_dir_all(dir)?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+        let path = dir.join(format!("stremflix-rs-{now}.json"));
+        std::fs::write(&path, self.export_json()?)?;
+        Ok(path)
+    }
+
+    /// Read an export file (at most 16 MiB) and merge it with [`Db::import_json`].
+    pub fn import_file(&self, path: &Path) -> Result<String> {
+        use std::io::Read;
+        let mut text = String::new();
+        std::fs::File::open(path)?.take(MAX_IMPORT_BYTES + 1).read_to_string(&mut text)?;
+        self.import_json(&text)
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {

@@ -318,6 +318,11 @@ pub struct BehaviorHints {
     pub binge_group: Option<String>,
     /// `proxyHeaders.request`: headers the stream URL needs (e.g. a debrid User-Agent), each passing [`valid_header`].
     pub request_headers: Vec<(String, String)>,
+    /// `proxyHeaders.response` `Content-Type` naming a streaming manifest: the mpv demuxer to force (`hls`/`dash`).
+    /// Other response headers are ignored: mpv sniffs content and has no use for them.
+    pub demuxer: Option<&'static str>,
+    /// `notWebReady`: Stremio-web needs the streaming server's proxy for it; mpv plays it directly.
+    pub not_web_ready: bool,
     pub filename: Option<String>,
     /// `videoSize` in bytes.
     pub video_size: Option<u64>,
@@ -395,7 +400,18 @@ fn behavior_hints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BehaviorHint
     let v = serde_json::Value::deserialize(d)?;
     let text = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
     let headers = v.pointer("/proxyHeaders/request").and_then(|h| h.as_object()).into_iter().flatten();
+    let content_type = v
+        .pointer("/proxyHeaders/response")
+        .and_then(|h| h.as_object())
+        .and_then(|h| h.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")))
+        .and_then(|(k, x)| Some(x.as_str()?.trim().split(';').next()?.trim().to_ascii_lowercase()).filter(|t| valid_header(k, t)));
     Ok(BehaviorHints {
+        demuxer: match content_type.as_deref() {
+            Some("application/vnd.apple.mpegurl" | "application/x-mpegurl" | "audio/mpegurl" | "audio/x-mpegurl") => Some("hls"),
+            Some("application/dash+xml") => Some("dash"),
+            _ => None,
+        },
+        not_web_ready: v.get("notWebReady").and_then(|x| x.as_bool()).unwrap_or(false),
         binge_group: text("bingeGroup"),
         request_headers: headers
             .filter_map(|(k, x)| Some((k.clone(), x.as_str()?.trim().to_string())))
