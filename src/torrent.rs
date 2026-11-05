@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::addon::{magnet_peers, parse_magnet_hash};
+use crate::library::MEDIA_EXTS;
 
 /// How long to wait for peers to send a magnet's metadata.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
@@ -59,6 +60,18 @@ pub fn evict(torrents: &[(usize, u64)], cache: u64) -> Vec<usize> {
     sorted.into_iter().take_while(|&(_, b)| (cache == 0 || total > cache) && { total -= b; true }).map(|t| t.0).collect()
 }
 
+/// `(index, name, size)` of the playable files, largest first.
+pub fn media_files(files: &[(String, u64)]) -> Vec<(usize, String, u64)> {
+    let mut v: Vec<_> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, (n, _))| n.rsplit_once('.').is_some_and(|(_, e)| MEDIA_EXTS.contains(&e.to_ascii_lowercase().as_str())))
+        .map(|(i, (n, l))| (i, n.clone(), *l))
+        .collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    v
+}
+
 pub struct TorrentEngine {
     session: Arc<Session>,
     http: SocketAddr,
@@ -70,12 +83,14 @@ pub struct TorrentEngine {
 }
 
 impl TorrentEngine {
-    /// Must be called inside a tokio runtime. `dht=false` is for offline/CI use.
+    /// Must be called inside a tokio runtime. `dht=false` is for offline/CI use. `limits` is (download, upload) in bytes/s; 0 is unlimited.
     /// Clears `download_dir` first: without session persistence, leftover files belong to no torrent.
-    pub async fn start(download_dir: PathBuf, dht: bool, cache: u64, profile: Profile) -> Result<Self> {
+    pub async fn start(download_dir: PathBuf, dht: bool, cache: u64, profile: Profile, limits: (u32, u32)) -> Result<Self> {
         let _ = std::fs::remove_dir_all(&download_dir);
         std::fs::create_dir_all(&download_dir)?;
         let mut opts = SessionOptions { persistence: None, fastresume: false, peer_limit: profile.peer_limit(), ..Default::default() };
+        opts.ratelimits.download_bps = std::num::NonZeroU32::new(limits.0);
+        opts.ratelimits.upload_bps = std::num::NonZeroU32::new(limits.1);
         if !dht {
             opts.dht = None;
         }
@@ -92,9 +107,8 @@ impl TorrentEngine {
         Ok(Self { session, http, cache, pinned: Default::default() })
     }
 
-    /// Add a magnet or local `.torrent` file and return a local HTTP URL streaming the chosen (or largest) file, and the torrent's id.
-    /// `pin` holds the torrent for a download (see `pinned`); undo with [`unpin`](Self::unpin).
-    pub async fn stream_url(&self, magnet: &str, file_idx: Option<usize>, pin: bool) -> Result<(String, usize)> {
+    /// Add a magnet or local `.torrent` file; returns its handle and the file index chosen by `file_idx` or a magnet's `so=`.
+    async fn add(&self, magnet: &str, file_idx: Option<usize>) -> Result<(Arc<librqbit::ManagedTorrent>, Option<usize>)> {
         let (add, peers, file_idx) = if magnet.starts_with("magnet:") {
             parse_magnet_hash(magnet).context("invalid magnet link")?;
             // `so=<idx>` (BEP 53 select-only) carries the addon's fileIdx through saved progress.
@@ -114,10 +128,27 @@ impl TorrentEngine {
         let added = tokio::time::timeout(METADATA_TIMEOUT, self.session.add_torrent(add, Some(opts)))
             .await
             .map_err(|_| anyhow::anyhow!("no peers sent the torrent's metadata within {}s", METADATA_TIMEOUT.as_secs()))??;
-        let handle = match added {
-            AddTorrentResponse::Added(_, h) | AddTorrentResponse::AlreadyManaged(_, h) => h,
+        match added {
+            AddTorrentResponse::Added(_, h) | AddTorrentResponse::AlreadyManaged(_, h) => Ok((h, file_idx)),
             AddTorrentResponse::ListOnly(_) => bail!("unexpected list-only response"),
-        };
+        }
+    }
+
+    /// The media files of a torrent with no chosen file, largest first, when there is more than one to pick from.
+    pub async fn media_choices(&self, magnet: &str) -> Result<Vec<(usize, String, u64)>> {
+        if magnet_chooses_file(magnet) {
+            return Ok(Vec::new());
+        }
+        let (handle, _) = self.add(magnet, None).await?;
+        let files: Vec<(String, u64)> = handle.with_metadata(|m| m.file_infos.iter().map(|f| (f.relative_filename.to_string_lossy().into_owned(), f.len)).collect())?;
+        let media = media_files(&files);
+        Ok(if media.len() > 1 { media } else { Vec::new() })
+    }
+
+    /// Add a magnet or local `.torrent` file and return a local HTTP URL streaming the chosen (or largest) file, and the torrent's id.
+    /// `pin` holds the torrent for a download (see `pinned`); undo with [`unpin`](Self::unpin).
+    pub async fn stream_url(&self, magnet: &str, file_idx: Option<usize>, pin: bool) -> Result<(String, usize)> {
+        let (handle, file_idx) = self.add(magnet, file_idx).await?;
         let lengths: Vec<u64> = handle.with_metadata(|m| m.file_infos.iter().map(|f| f.len).collect())?;
         let idx = match file_idx {
             Some(i) if i < lengths.len() => i,
@@ -163,9 +194,29 @@ impl TorrentEngine {
     }
 }
 
+/// A magnet with any `so` key already names its file, so the picker is skipped. Any value counts,
+/// since the picker appends its own `so=` and a BEP 53 range (`so=1-3`) would duplicate it.
+pub fn magnet_chooses_file(magnet: &str) -> bool {
+    url::Url::parse(magnet).is_ok_and(|u| u.query_pairs().any(|(k, _)| k == "so"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn magnet_with_so_skips_picker() {
+        assert!(magnet_chooses_file("magnet:?xt=urn:btih:abc&so=2"));
+        assert!(magnet_chooses_file("magnet:?xt=urn:btih:abc&so=1-3"), "BEP 53 range also counts");
+        assert!(!magnet_chooses_file("magnet:?xt=urn:btih:abc&dn=x"));
+    }
+
+    #[test]
+    fn media_files_filters_and_sorts_largest_first() {
+        let f = |n: &str, l| (n.to_string(), l);
+        let files = [f("a/readme.txt", 9), f("a/small.MKV", 5), f("a/big.mp4", 50), f("a/sample.mkv", 5), f("noext", 99)];
+        assert_eq!(media_files(&files), vec![(2, "a/big.mp4".into(), 50), (1, "a/small.MKV".into(), 5), (3, "a/sample.mkv".into(), 5)]);
+    }
 
     #[test]
     fn evicts_oldest_until_cache_fits() {
@@ -187,7 +238,7 @@ mod tests {
         let t = librqbit::create_torrent(&src.join("a.mkv"), Default::default(), &librqbit::spawn_utils::BlockingSpawner::new(1)).await.unwrap();
         let file = dir.path().join("a.torrent");
         std::fs::write(&file, t.as_bytes().unwrap()).unwrap();
-        let engine = TorrentEngine::start(dir.path().join("dl"), false, u64::MAX, Profile::Default).await.unwrap();
+        let engine = TorrentEngine::start(dir.path().join("dl"), false, u64::MAX, Profile::Default, (0, 0)).await.unwrap();
         let (_, id) = engine.stream_url(file.to_str().unwrap(), None, true).await.unwrap();
         let paused = || engine.session.get(id.into()).unwrap().is_paused();
         engine.release_except(None).await;
