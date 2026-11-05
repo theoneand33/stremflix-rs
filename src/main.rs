@@ -619,9 +619,14 @@ fn same_addon(installed: &Manifest, fetched: &Manifest) -> bool {
     installed.id == fetched.id
 }
 
-/// Health text for a failed addon check; reqwest reports a deadline as "operation timed out".
-fn health_error(e: &str) -> String {
-    if e.to_lowercase().contains("timed out") { "Timed out".into() } else { format!("Unreachable: {e}") }
+/// Health label for a failed addon check, classified from the typed error: only a transport
+/// failure is "unreachable"; HTTP status and manifest parse errors mean the host answered.
+fn health_error(e: &anyhow::Error) -> String {
+    match e.chain().find_map(|c| c.downcast_ref::<reqwest::Error>()) {
+        Some(r) if r.is_timeout() => "Timed out".into(),
+        Some(_) => format!("Unreachable: {}", e.root_cause()),
+        None => format!("Error: {}", e.root_cause()),
+    }
 }
 
 /// Small secondary pill for toolbar actions (Uninstall, Clear, Stop …).
@@ -3496,7 +3501,7 @@ impl App {
                 for chunk in urls.chunks(4) {
                     let res = concurrently(chunk.to_vec(), |u| {
                         let c = client.clone();
-                        async move { Ok((u.clone(), c.fetch_manifest(&u).await.map_err(|e| e.root_cause().to_string()))) }
+                        async move { Ok((u.clone(), c.fetch_manifest(&u).await.map_err(|e| health_error(&e)))) }
                     })
                     .await;
                     out.extend(res.into_iter().flatten());
@@ -3546,7 +3551,7 @@ impl App {
                     });
                 }
                 Some(Err(e)) => {
-                    ui.label(RichText::new(health_error(e)).weak());
+                    ui.label(RichText::new(e).weak());
                 }
                 Some(Ok(_)) => {
                     ui.label(RichText::new("Reachable").weak());
@@ -4503,13 +4508,24 @@ fn seek_step(v: Option<String>, default: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn health_error_distinguishes_timeout() {
-        assert_eq!(health_error("operation timed out"), "Timed out");
-        assert_eq!(health_error("connection refused"), "Unreachable: connection refused");
-    }
-
     use super::*;
+
+    #[test]
+    fn health_error_classifies_by_type() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (refused, t) = rt.block_on(async {
+            let c = reqwest::Client::new();
+            // A listener that never answers makes the deadline fire, not a refusal.
+            let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/", silent.local_addr().unwrap());
+            (c.get("http://127.0.0.1:1/").send().await.unwrap_err(), c.get(url).timeout(std::time::Duration::from_millis(50)).send().await.unwrap_err())
+        });
+        // Port 1 on localhost refuses at once: a transport error that is not a timeout.
+        assert_eq!(health_error(&anyhow::Error::new(refused)).split(':').next(), Some("Unreachable"));
+        assert!(health_error(&anyhow::anyhow!("HTTP 404 Not Found")).starts_with("Error: HTTP 404"));
+        assert!(t.is_timeout());
+        assert_eq!(health_error(&anyhow::Error::new(t).context("GET x")), "Timed out");
+    }
 
     #[test]
     fn wheel_accumulates_to_steps() {
