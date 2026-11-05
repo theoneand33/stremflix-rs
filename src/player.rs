@@ -130,7 +130,7 @@ const FORMAT_INT64: c_int = 4;
 const FORMAT_DOUBLE: c_int = 5;
 
 /// Observed properties, in `reply_userdata` order.
-const PROPS: [(&str, c_int); 12] = [
+const PROPS: [(&str, c_int); 18] = [
     ("time-pos", FORMAT_DOUBLE),
     ("duration", FORMAT_DOUBLE),
     ("pause", FORMAT_FLAG),
@@ -143,6 +143,12 @@ const PROPS: [(&str, c_int); 12] = [
     ("speed", FORMAT_DOUBLE),
     ("seeking", FORMAT_FLAG),
     ("demuxer-cache-time", FORMAT_DOUBLE),
+    ("video-codec", FORMAT_STRING),
+    ("container-fps", FORMAT_DOUBLE),
+    ("hwdec-current", FORMAT_STRING),
+    ("frame-drop-count", FORMAT_INT64),
+    ("decoder-frame-drop-count", FORMAT_INT64),
+    ("demuxer-cache-duration", FORMAT_DOUBLE),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -171,6 +177,12 @@ pub struct State {
     pub tracks: Vec<Track>,
     /// Playback speed multiplier; 0 until mpv reports it.
     pub speed: f64,
+    /// Stats overlay: video codec, container fps, active hwdec ("no" in software), output / decoder dropped frames, seconds buffered ahead.
+    pub codec: String,
+    pub fps: f64,
+    pub hwdec: String,
+    pub dropped: [usize; 2],
+    pub cache: f64,
     /// Set when the file failed to open/play.
     pub error: Option<String>,
 }
@@ -597,6 +609,12 @@ impl Player {
                 9 => s.speed = f(),
                 10 => s.seeking = flag(),
                 11 => s.cached_to = f(),
+                12 => s.codec = CStr::from_ptr(*(p.data as *const *const c_char)).to_string_lossy().into_owned(),
+                13 => s.fps = f(),
+                14 => s.hwdec = CStr::from_ptr(*(p.data as *const *const c_char)).to_string_lossy().into_owned(),
+                15 => s.dropped[0] = int(),
+                16 => s.dropped[1] = int(),
+                17 => s.cache = f(),
                 _ => {}
             }
         }
