@@ -325,6 +325,12 @@ fn fresh_episodes(seen: &mut Vec<String>, series: &str, eps: &[&str]) -> Vec<Str
     fresh
 }
 
+/// Adds `entry`, replacing any earlier one for the same series, so refetches don't duplicate rows.
+fn upsert_by_id(list: &mut Vec<(MetaPreview, Vec<Video>)>, meta: MetaPreview, videos: Vec<Video>) {
+    list.retain(|(m, _)| m.id != meta.id);
+    list.push((meta, videos));
+}
+
 /// Desktop notification; never blocks the UI and a missing notification service only logs.
 fn os_notify(title: String, body: String) {
     std::thread::spawn(move || {
@@ -1799,7 +1805,6 @@ impl App {
             },
             Msg::NewEpisodes(epoch, meta, mut videos) => {
                 if epoch == self.new_eps_gen {
-                    self.new_episodes.retain(|(m, _)| m.id != meta.id);
                     sort_episodes(&mut videos);
                     // Episodes imported as watched from Stremio, as in `Msg::Episodes`.
                     let bk = format!("bitfield:{}:{}", meta.kind, meta.id);
@@ -1814,7 +1819,8 @@ impl App {
                     }
                     let today = unix_days();
                     let videos = recent_episodes(videos, &date_string(today - (NEW_EPISODE_DAYS - 1)), &date_string(today));
-                    if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) && !videos.is_empty() {
+                    if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) {
+                        // Also with no recent episode: seeds the series' marker so its next one notifies.
                         let ids: Vec<&str> = videos.iter().map(|v| v.id.as_str()).collect();
                         let fresh = fresh_episodes(&mut self.notified, &meta.id, &ids);
                         if let Err(e) = self.db.set_setting("notified_eps", &encode_keys(&self.notified)) {
@@ -1830,7 +1836,9 @@ impl App {
                             self.notice = Some(format!("{}: {}", meta.name, body));
                             os_notify(meta.name.clone(), body);
                         }
-                        self.new_episodes.push((meta, videos));
+                        if !videos.is_empty() {
+                            upsert_by_id(&mut self.new_episodes, meta, videos);
+                        }
                     }
                 }
             }
@@ -5150,6 +5158,23 @@ mod tests {
         fresh_episodes(&mut seen, "tt3", &refs);
         assert_eq!(seen.len(), NOTIFIED_MAX);
         assert_eq!(seen.last().unwrap(), &format!("tt3:{}", NOTIFIED_MAX + 9));
+    }
+
+    #[test]
+    fn empty_window_still_seeds_marker() {
+        let mut seen = Vec::new();
+        assert!(fresh_episodes(&mut seen, "tt1", &[]).is_empty());
+        assert_eq!(fresh_episodes(&mut seen, "tt1", &["tt1:1:5"]), ["tt1:1:5"]);
+    }
+
+    #[test]
+    fn refetch_does_not_duplicate_rows() {
+        let meta = |id: &str| MetaPreview { id: id.into(), kind: "series".into(), name: id.into(), poster: None, background: None, description: None };
+        let mut list = Vec::new();
+        upsert_by_id(&mut list, meta("a"), vec![]);
+        upsert_by_id(&mut list, meta("b"), vec![]);
+        upsert_by_id(&mut list, meta("a"), vec![]);
+        assert_eq!(list.iter().map(|(m, _)| m.id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
     }
 
     #[test]
