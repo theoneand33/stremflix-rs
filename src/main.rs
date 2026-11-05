@@ -949,8 +949,6 @@ struct Playing {
     scrub: Option<f64>,
     /// Video held down: playing at 2x until release.
     fast: bool,
-    /// Pause playback at this time (sleep timer).
-    sleep_at: Option<Instant>,
     /// Press start (egui clock) of a press that began on the video, while the button stays down.
     hold: Option<f64>,
     /// The last click on the video was a hold release, so the next one must not pair with it into a double-click.
@@ -1106,6 +1104,8 @@ struct App {
     pill: Option<(Tab, egui::Rect, egui::Rect, f64)>,
     player: Option<Playing>,
     last_poll: Instant,
+    /// Sleep timer: pause at this time; the minutes chosen. Survives autoplay-next, cleared when the player is left.
+    sleep: Option<(Instant, u64)>,
     /// GL function loader of eframe's context, for libmpv's OpenGL renderer.
     gl_proc: Option<GlProc>,
     window: Geo,
@@ -1234,6 +1234,7 @@ impl App {
             player: None,
             pill: None,
             last_poll: Instant::now(),
+            sleep: None,
             gl_proc: None,
             window: Geo::default(),
             video: None,
@@ -1748,7 +1749,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, sleep_at: None, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None, hidden_vid: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None, hidden_vid: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1818,6 +1819,10 @@ impl App {
     }
 
     fn stop_player(&mut self) {
+        // shortcut: a timer carried by play_next lingers if the next stream never starts, clear it on the next manual stop.
+        if self.player.is_some() {
+            self.sleep = None;
+        }
         self.save_progress();
         self.player = None;
     }
@@ -1887,9 +1892,11 @@ impl App {
             return;
         }
         self.last_poll = Instant::now();
-        if p.sleep_at.is_some_and(|t| Instant::now() >= t) {
-            p.sleep_at = None;
-            let _ = p.player.command(&["set", "pause", "yes"]);
+        if self.sleep.is_some_and(|(t, _)| Instant::now() >= t) {
+            self.sleep = None;
+            if let Err(e) = p.player.command(&["set", "pause", "yes"]) {
+                report(&mut self.error, e);
+            }
         }
         let paused = p.player.state.paused;
         if paused {
@@ -2185,9 +2192,13 @@ impl App {
         let binge = (self.selected.as_ref()).and_then(|(_, streams, _)| streams.iter().find(|s| s.source() == src)?.hints.binge_group.clone());
         let next = (self.selected.as_ref().zip(self.episode.as_ref()))
             .and_then(|((m, ..), cur)| Some((m.clone(), next_episode(&self.episodes, &cur.id)?.clone())));
+        let sleep = self.sleep;
         self.stop_player();
         match next {
-            Some((m, v)) => self.open_streams(ctx, m, Some(v), Autoplay::Only, binge),
+            Some((m, v)) => {
+                self.sleep = sleep;
+                self.open_streams(ctx, m, Some(v), Autoplay::Only, binge)
+            }
             None => {
                 self.release_torrents(None);
             }
@@ -3327,15 +3338,18 @@ impl App {
                                     }
                                 }
                             });
-                            menu_heading(ui, "Sleep timer");
+                            menu_heading(ui, &match self.sleep {
+                                Some((t, _)) => format!("Sleep timer ({} min left)", t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60)),
+                                None => "Sleep timer".into(),
+                            });
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                                if pill(ui, "Off", p.sleep_at.is_none(), egui::Role::RadioButton).clicked() {
-                                    p.sleep_at = None;
+                                if pill(ui, "Off", self.sleep.is_none(), egui::Role::RadioButton).clicked() {
+                                    self.sleep = None;
                                 }
                                 for m in [15u64, 30, 60, 90] {
-                                    if pill(ui, &format!("{m} min"), false, egui::Role::RadioButton).clicked() {
-                                        p.sleep_at = Some(Instant::now() + Duration::from_secs(m * 60));
+                                    if pill(ui, &format!("{m} min"), self.sleep.is_some_and(|(_, c)| c == m), egui::Role::RadioButton).clicked() {
+                                        self.sleep = Some((Instant::now() + Duration::from_secs(m * 60), m));
                                     }
                                 }
                             });
