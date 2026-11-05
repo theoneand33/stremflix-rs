@@ -28,10 +28,10 @@ enum Tab {
     Settings,
 }
 
-/// Torrent cache size choices: label and bytes kept (0 = delete a torrent when its playback stops).
 /// Speed limit choices in bytes/s; 0 is unlimited.
 const SPEED_LIMITS: [(&str, u32); 6] = [("Unlimited", 0), ("500 KB/s", 500_000), ("1 MB/s", 1_000_000), ("2 MB/s", 2_000_000), ("5 MB/s", 5_000_000), ("10 MB/s", 10_000_000)];
 
+/// Torrent cache size choices: label and bytes kept (0 = delete a torrent when its playback stops).
 const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000), ("5 GB", 5_000_000_000), ("10 GB", 10_000_000_000), ("Unlimited", u64::MAX)];
 
 /// A local `.torrent` file path (not a URL or magnet).
