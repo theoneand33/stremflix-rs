@@ -102,12 +102,14 @@ pub struct TorrentEngine {
 }
 
 impl TorrentEngine {
-    /// Must be called inside a tokio runtime. `dht=false` is for offline/CI use.
+    /// Must be called inside a tokio runtime. `dht=false` is for offline/CI use. `limits` is (download, upload) in bytes/s; 0 is unlimited.
     /// Clears `download_dir` first: without session persistence, leftover files belong to no torrent.
-    pub async fn start(download_dir: PathBuf, dht: bool, cache: u64, profile: Profile) -> Result<Self> {
+    pub async fn start(download_dir: PathBuf, dht: bool, cache: u64, profile: Profile, limits: (u32, u32)) -> Result<Self> {
         let _ = std::fs::remove_dir_all(&download_dir);
         std::fs::create_dir_all(&download_dir)?;
         let mut opts = SessionOptions { persistence: None, fastresume: false, peer_limit: profile.peer_limit(), ..Default::default() };
+        opts.ratelimits.download_bps = std::num::NonZeroU32::new(limits.0);
+        opts.ratelimits.upload_bps = std::num::NonZeroU32::new(limits.1);
         if !dht {
             opts.dht = None;
         }
@@ -269,7 +271,7 @@ mod tests {
         let t = librqbit::create_torrent(&src.join("a.mkv"), Default::default(), &librqbit::spawn_utils::BlockingSpawner::new(1)).await.unwrap();
         let file = dir.path().join("a.torrent");
         std::fs::write(&file, t.as_bytes().unwrap()).unwrap();
-        let engine = TorrentEngine::start(dir.path().join("dl"), false, u64::MAX, Profile::Default).await.unwrap();
+        let engine = TorrentEngine::start(dir.path().join("dl"), false, u64::MAX, Profile::Default, (0, 0)).await.unwrap();
         let (_, id) = engine.stream_url(file.to_str().unwrap(), None, true).await.unwrap();
         let paused = || engine.session.get(id.into()).unwrap().is_paused();
         engine.release_except(None).await;

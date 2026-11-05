@@ -6,7 +6,7 @@
 
 use anyhow::{Result, bail};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[repr(C)]
 struct MpvEvent {
@@ -408,6 +408,29 @@ fn pick_sub(subs: &[(String, String)], slang: &str) -> Option<usize> {
     slang.split(',').map(primary).find_map(|want| subs.iter().position(|(_, l)| primary(l) == want))
 }
 
+/// Subtitle files beside a local video as `(path, lang)`: `<stem>.<ext>` or `<stem>.<lang>.<ext>`, case-insensitive.
+/// Reads one directory listing, no recursion. `lang` is empty unless the tag is 2-3 letters.
+/// Returns nothing for URLs and paths that are not existing files.
+pub fn sidecar_subs(video: &Path) -> Vec<(String, String)> {
+    if video.to_string_lossy().contains("://") || !video.is_file() {
+        return vec![];
+    }
+    let (Some(dir), Some(stem)) = (video.parent(), video.file_stem().and_then(|s| s.to_str())) else { return vec![] };
+    let stem = stem.to_lowercase();
+    let mut out: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| {
+        let name = e.file_name().into_string().ok()?.to_lowercase();
+        let (base, ext) = name.rsplit_once('.')?;
+        if !["srt", "ass", "ssa", "vtt", "sub"].contains(&ext) {
+            return None;
+        }
+        let tag = if base == stem { "" } else { base.strip_prefix(&stem)?.strip_prefix('.')? };
+        let lang = if (2..=3).contains(&tag.len()) && tag.bytes().all(|b| b.is_ascii_lowercase()) { tag } else { "" };
+        Some((e.path().to_string_lossy().into_owned(), lang.to_string()))
+    }).collect();
+    out.sort();
+    out
+}
+
 impl Player {
     /// `source` is a URL or local path, passed to `loadfile` as a plain argument (never parsed as options).
     /// `wake` is called from mpv's thread whenever a new frame is ready.
@@ -644,6 +667,18 @@ impl Drop for Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidecar_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["Movie.mkv", "movie.SRT", "Movie.en.ass", "Movie.pt-BR.vtt", "Movie2.srt", "Other.srt", "Movie.txt"] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+        let got: Vec<_> = sidecar_subs(&dir.path().join("Movie.mkv")).into_iter().map(|(p, l)| (Path::new(&p).file_name().unwrap().to_string_lossy().into_owned(), l)).collect();
+        assert_eq!(got, [("Movie.en.ass", "en"), ("Movie.pt-BR.vtt", ""), ("movie.SRT", "")].map(|(p, l)| (p.to_string(), l.to_string())));
+        assert!(sidecar_subs(Path::new("https://x/Movie.mkv")).is_empty());
+        assert!(sidecar_subs(&dir.path().join("Missing.mkv")).is_empty());
+    }
 
     #[test]
     fn video_scaling_values() {
