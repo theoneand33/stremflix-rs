@@ -22,7 +22,7 @@ A nightly build runs every 3 hours when `main` has new commits; tagged releases 
 
 Requirements:
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.95+ (edition 2024)
 - libmpv at runtime and for `cargo test` (`pacman -S mpv`, `apt install libmpv2`). On Windows, put `libmpv-2.dll` next to the exe or on `PATH`.
 - Optional: `yt-dlp` on `PATH` for YouTube (`ytId`) streams and trailers, `ffmpeg` for demo media
 
