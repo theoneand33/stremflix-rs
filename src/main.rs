@@ -1206,6 +1206,8 @@ struct App {
     folder: String,
     /// Preferred audio / subtitle languages (mpv `alang` / `slang`), as edited; saved to the settings table only when valid.
     langs: [String; 2],
+    /// Custom User-Agent as edited; saved and applied only when valid.
+    user_agent: String,
     library: Vec<LibraryItem>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
@@ -1404,6 +1406,8 @@ impl App {
         let tab = db.setting("tab")?;
         let (tx, rx) = channel();
         ACCENT_IDX.store(accent_index(db.setting("accent")?.as_deref()), std::sync::atomic::Ordering::Relaxed);
+        let ua = db.setting("user_agent")?.unwrap_or_default();
+        stremflix_rs::addon::set_user_agent(&stremflix_rs::addon::valid_user_agent(&ua).unwrap_or_default());
         let mut app = Self {
             sub_style: db.setting("sub_style")?.map(|s| SubStyle::decode(&s)).unwrap_or_default(),
             rt: tokio::runtime::Runtime::new()?,
@@ -1468,6 +1472,7 @@ impl App {
             update: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
+            user_agent: ua,
             db,
             data_dir,
             client: AddonClient::new(),
@@ -4746,6 +4751,24 @@ impl App {
             });
         }
         ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(Color32::from_gray(170)));
+        ui.add_space(16.0);
+        ui.label(RichText::new("Network").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.horizontal(|ui| {
+            let l = ui.label("User-Agent:");
+            ui.add_space((150.0 - l.rect.width()).max(0.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut self.user_agent).hint_text("stremflix-rs").desired_width(400.0)).labelled_by(l.id);
+            match stremflix_rs::addon::valid_user_agent(&self.user_agent) {
+                Some(v) if r.changed() => {
+                    stremflix_rs::addon::set_user_agent(&v);
+                    save.push(("user_agent", v));
+                }
+                None => {
+                    ui.label(RichText::new(format!("Printable ASCII only, max {} characters", stremflix_rs::addon::MAX_UA_LEN)).size(13.0).color(Color32::from_rgb(230, 90, 90)));
+                }
+                _ => {}
+            }
+        });
+        ui.label(RichText::new("Sent to addons and for downloads. Empty uses the default. Torrent (librqbit) traffic is not covered.").size(13.0).color(Color32::from_gray(170)));
         ui.add_space(16.0);
         ui.label(RichText::new("Customize Home").size(20.0).strong().family(bold()).color(Color32::WHITE));
         let (mut swap, mut toggle, mut reset) = (None, None, false);

@@ -796,6 +796,40 @@ pub fn check_poster(body: &[u8]) -> Result<()> {
     Ok(())
 }
 
+const DEFAULT_UA: &str = "stremflix-rs";
+pub const MAX_UA_LEN: usize = 200;
+static USER_AGENT: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+/// Trimmed custom User-Agent if header-safe (printable ASCII, at most `MAX_UA_LEN`); empty means the default.
+pub fn valid_user_agent(s: &str) -> Option<String> {
+    let s = s.trim();
+    (s.len() <= MAX_UA_LEN && s.bytes().all(|b| (0x20..0x7f).contains(&b))).then(|| s.to_string())
+}
+
+/// Use `ua` (already validated) for addon and download requests made from now on; addon clients built earlier keep theirs.
+pub fn set_user_agent(ua: &str) {
+    *USER_AGENT.write().unwrap_or_else(|e| e.into_inner()) = ua.to_string();
+}
+
+pub fn user_agent() -> String {
+    let ua = USER_AGENT.read().unwrap_or_else(|e| e.into_inner());
+    if ua.is_empty() { DEFAULT_UA.to_string() } else { ua.clone() }
+}
+
+#[cfg(test)]
+mod user_agent_tests {
+    use super::*;
+
+    #[test]
+    fn user_agent_validation() {
+        assert_eq!(valid_user_agent("  Mozilla/5.0 (X11) ").as_deref(), Some("Mozilla/5.0 (X11)"));
+        assert_eq!(valid_user_agent("").as_deref(), Some(""));
+        assert!(valid_user_agent("a\r\nX-Evil: 1").is_none());
+        assert!(valid_user_agent("caf\u{e9}").is_none());
+        assert!(valid_user_agent(&"a".repeat(MAX_UA_LEN + 1)).is_none());
+    }
+}
+
 /// Proxy from Settings, set once at startup: changes apply on restart. Never log it: it can hold credentials.
 pub static PROXY: std::sync::OnceLock<Url> = std::sync::OnceLock::new();
 
@@ -1056,15 +1090,16 @@ impl AddonClient {
         let http = self.http.get_or_init(|| {
             let b = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
-                .redirect(reqwest::redirect::Policy::limited(3))
-                .user_agent("stremflix-rs"); // GitHub's API rejects requests without one
+                .redirect(reqwest::redirect::Policy::limited(3));
             with_proxy(b).map_err(|e| format!("{e}"))?.build().map_err(|e| format!("HTTP client: {e}"))
         });
         http.as_ref().map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     async fn get(&self, url: Url) -> Result<Vec<u8>> {
-        let mut resp = self.http()?.get(url.clone()).send().await.with_context(|| format!("GET {url}"))?;
+        // Per request, not on the shared client, so a changed User-Agent applies without a restart.
+        // GitHub's API rejects requests without one.
+        let mut resp = self.http()?.get(url.clone()).header(reqwest::header::USER_AGENT, user_agent()).send().await.with_context(|| format!("GET {url}"))?;
         ensure!(resp.status().is_success(), "HTTP {}", resp.status());
         ensure!(resp.content_length().unwrap_or(0) <= MAX_BODY as u64, "response too large");
         let mut body = Vec::new();
@@ -1086,7 +1121,7 @@ impl AddonClient {
     async fn stremio_api(&self, method: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let url = format!("{STREMIO_API}{method}");
         // A whole library takes longer than the client's 15 s default.
-        let req = self.http()?.post(&url).json(&body).timeout(std::time::Duration::from_secs(120));
+        let req = self.http()?.post(&url).header(reqwest::header::USER_AGENT, user_agent()).json(&body).timeout(std::time::Duration::from_secs(120));
         let mut resp = req.send().await.with_context(|| format!("POST {url}"))?;
         let status = resp.status();
         // Errors come back as JSON `{"error": ...}`, so the body is read whatever the status.
@@ -1186,6 +1221,10 @@ impl AddonClient {
     /// Up to `HASH_CHUNK` bytes of `url` from `start`, and the file size from `Content-Range` (or a 200's length).
     async fn chunk_at(&self, url: &Url, headers: &[(String, String)], start: u64) -> Result<(Vec<u8>, u64)> {
         let mut req = self.http()?.get(url.clone()).header("Range", format!("bytes={start}-{}", start + HASH_CHUNK as u64 - 1));
+        // Headers are appended, so a stream's own User-Agent replaces the default instead of adding a second one.
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")) {
+            req = req.header(reqwest::header::USER_AGENT, user_agent());
+        }
         for (k, v) in headers {
             req = req.header(k, v);
         }
