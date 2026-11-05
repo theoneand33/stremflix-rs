@@ -5,4 +5,5 @@ pub mod instance;
 pub mod library;
 pub mod player;
 pub mod torrent;
+pub mod tray;
 pub mod stremio_import;
