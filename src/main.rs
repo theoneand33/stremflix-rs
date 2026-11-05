@@ -839,6 +839,17 @@ fn cover_uv(rect: egui::Rect, size: egui::Vec2) -> egui::Rect {
 }
 
 /// mpv's `keep-open` pauses on the last frame at end of file.
+/// Whether to pause (`Some(true)`) or resume (`Some(false)`) for a minimize change; only resumes what it paused.
+fn pause_step(enabled: bool, away: bool, paused: bool, auto_paused: bool) -> Option<bool> {
+    if auto_paused && !(enabled && away) {
+        Some(false)
+    } else if enabled && away && !paused && !auto_paused {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
     paused && dur > 0.0 && pos >= dur - 1.0
 }
@@ -1012,6 +1023,8 @@ struct Playing {
     awake: Option<Option<keepawake::KeepAwake>>,
     /// Video track to restore once the window is shown again; video is off while hidden.
     hidden_vid: Option<String>,
+    /// Paused by the pause-on-minimize setting, so only then resume on restore.
+    auto_paused: bool,
 }
 
 impl Drop for Playing {
@@ -1149,6 +1162,8 @@ struct App {
     autoplay_next: bool,
     /// Closing the window hides it to the tray instead of quitting.
     tray_on_close: bool,
+    /// Pause playback while the window is minimized or hidden.
+    pause_on_minimize: bool,
     tray: Option<Tray>,
     /// Window hidden to the tray.
     hidden: bool,
@@ -1303,6 +1318,7 @@ impl App {
             light: db.setting("theme")?.as_deref() == Some("light"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
             tray_on_close: db.setting("tray_on_close")?.as_deref() == Some("1"),
+            pause_on_minimize: db.setting("pause_on_minimize")?.as_deref() == Some("1"),
             tray: None,
             hidden: false,
             quit: false,
@@ -2009,7 +2025,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), skips, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), skips, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None, auto_paused: false };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -4350,6 +4366,9 @@ impl App {
             if switch_row(ui, "Minimize to tray on close", &mut self.tray_on_close).changed() {
                 save.push(("tray_on_close", on(self.tray_on_close)));
             }
+            if switch_row(ui, "Pause when minimized", &mut self.pause_on_minimize).changed() {
+                save.push(("pause_on_minimize", on(self.pause_on_minimize)));
+            }
             let step = stepper(ui, "Subtitle size", &format!("{:.1}x", style.scale));
             if step != 0 {
                 style.scale = (style.scale * 10.0).round() / 10.0 + step as f64 * 0.1;
@@ -4713,6 +4732,15 @@ impl eframe::App for App {
                 "no".into()
             });
             if let Err(e) = p.player.command(&["set", "vid", &v]) {
+                report(&mut self.error, e);
+            }
+        }
+        let away = self.hidden || ctx.input(|i| i.viewport().minimized) == Some(true);
+        if let Some(p) = &mut self.player
+            && let Some(pause) = pause_step(self.pause_on_minimize, away, p.player.state.paused, p.auto_paused)
+        {
+            p.auto_paused = pause;
+            if let Err(e) = p.player.command(&["set", "pause", if pause { "yes" } else { "no" }]) {
                 report(&mut self.error, e);
             }
         }
@@ -5109,6 +5137,16 @@ fn seek_step(v: Option<String>, default: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pause_on_minimize_only_resumes_own_pause() {
+        assert_eq!(pause_step(true, true, false, false), Some(true));
+        assert_eq!(pause_step(true, true, true, false), None); // user paused: leave alone
+        assert_eq!(pause_step(true, false, true, true), Some(false));
+        assert_eq!(pause_step(false, true, false, false), None);
+        assert_eq!(pause_step(false, true, true, true), Some(false)); // setting turned off
+        assert_eq!(pause_step(true, true, true, true), None);
+    }
 
     #[test]
     fn wheel_accumulates_to_steps() {
