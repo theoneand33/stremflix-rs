@@ -29,7 +29,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
 | Sleep timer | P3 | S | |
-| Screenshot capture | P3 | S | mpv `screenshot-to-file`. |
 | A-B loop / repeat | P3 | S | |
 | Frame-by-frame stepping | P3 | S | |
 | Picture-in-picture / mini player | P3 | M | egui viewport or a second native window. |
@@ -60,7 +59,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Remote/LAN streaming server | P2 | L | Stremio serves the library to other devices; casting is a separate item. |
 | Addon health indicator (unreachable / timeout) | P3 | S | |
-| QR code to install an addon | P3 | S | |
 
 ### Accounts and sync
 
