@@ -17,7 +17,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Calendar of upcoming episodes for library series | P2 | M | Depends on the saved library. |
 | New-episode notifications | P2 | M | Depends on the saved library. |
-| Hide / reorder Home catalog rows | P2 | M | Rows follow addon priority only. |
 
 ### Library and organization
 
@@ -32,7 +31,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
-| Mouse-wheel volume over the video | P2 | S | |
 | Auto-load sidecar subtitles next to local files | P2 | S | `.srt`/`.ass`/`.vtt` beside the video; only addon subtitles today. |
 | Skip intro / recap / credits from addon markers | P2 | M | Stremio supporter feature; needs an addon source for the timestamps. |
 | Playback stats overlay (peers, speed, dropped frames) | P2 | S | Stremio has a Network button; useful for torrents. |
@@ -92,7 +90,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | UI translations (i18n) | P3 | M | |
 | Auto-install updates | P3 | M | Release builds already show a download link for a newer build; downloading and replacing the binary is still missing. |
 | Android, iOS, TV clients | P3 | XL | Out of scope for an egui desktop app. |
-| Dark/light theme and accent customization | P2 | S | Dark only today. |
 | Remember last tab and window state on launch | P3 | S | |
 | Command-line flags for play/open | P3 | S | Only `stremio://` links are parsed now. |
 | Screen-reader labels and focus-order polish | P3 | M | AccessKit is enabled; coverage is partial. |
