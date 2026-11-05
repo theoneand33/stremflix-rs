@@ -82,6 +82,8 @@ The app takes a `stremio://` link as its first argument; a running instance rece
 stremflix-rs 'stremio:///detail/movie/tt0111161'
 ```
 
+The same argument can be a magnet link, a `.torrent` path, or a local media file path: it plays in the running window (or a new one). `--help` prints usage; unknown flags exit with status 2.
+
 Scheme registration: the Linux AppImage declares it (installed by AppImageLauncher or appimaged); macOS picks it up once `Stremflix-rs.app` is in Applications or opened; Windows registers it per user at start unless another app (e.g. Stremio) owns it.
 
 ### Import from Stremio
