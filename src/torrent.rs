@@ -88,6 +88,25 @@ pub fn evict(torrents: &[(usize, u64)], cache: u64) -> Vec<usize> {
     sorted.into_iter().take_while(|&(_, b)| (cache == 0 || total > cache) && { total -= b; true }).map(|t| t.0).collect()
 }
 
+/// Live numbers for one torrent, for the player's stats overlay.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NetStats {
+    pub peers: u32,
+    /// Bytes per second.
+    pub down: u64,
+    pub up: u64,
+}
+
+/// "1.5 MB/s" from bytes per second.
+pub fn fmt_rate(bytes: u64) -> String {
+    let (mut v, mut u) = (bytes as f64, 0);
+    while v >= 1024.0 && u < 3 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{bytes} B/s") } else { format!("{v:.1} {}/s", ["B", "KB", "MB", "GB"][u]) }
+}
+
 /// `(index, name, size)` of the playable files, largest first.
 pub fn media_files(files: &[(String, u64)]) -> Vec<(usize, String, u64)> {
     let mut v: Vec<_> = files
@@ -114,12 +133,14 @@ pub struct TorrentEngine {
 }
 
 impl TorrentEngine {
-    /// Must be called inside a tokio runtime. `dht=false` is for offline/CI use.
+    /// Must be called inside a tokio runtime. `dht=false` is for offline/CI use. `limits` is (download, upload) in bytes/s; 0 is unlimited.
     /// Clears `download_dir` first: without session persistence, leftover files belong to no torrent.
-    pub async fn start(download_dir: PathBuf, dht: bool, cache: u64, profile: Profile, seed: SeedLimit) -> Result<Arc<Self>> {
+    pub async fn start(download_dir: PathBuf, dht: bool, cache: u64, profile: Profile, limits: (u32, u32), seed: SeedLimit) -> Result<Arc<Self>> {
         let _ = std::fs::remove_dir_all(&download_dir);
         std::fs::create_dir_all(&download_dir)?;
         let mut opts = SessionOptions { persistence: None, fastresume: false, peer_limit: profile.peer_limit(), ..Default::default() };
+        opts.ratelimits.download_bps = std::num::NonZeroU32::new(limits.0);
+        opts.ratelimits.upload_bps = std::num::NonZeroU32::new(limits.1);
         if !dht {
             opts.dht = None;
         }
@@ -247,6 +268,12 @@ impl TorrentEngine {
         Ok((format!("http://{}/torrents/{}/stream/{idx}", self.http, handle.id()), handle.id()))
     }
 
+    /// Peers and speeds of torrent `id`; `None` if it is gone or not live yet.
+    pub fn net_stats(&self, id: usize) -> Option<NetStats> {
+        let live = self.session.get(id.into())?.stats().live?;
+        Some(NetStats { peers: live.snapshot.peer_stats.live, down: live.download_speed.as_bytes(), up: live.upload_speed.as_bytes() })
+    }
+
     /// Drop one download's hold on torrent `id` taken by `stream_url(.., pin: true)`.
     pub async fn unpin(&self, id: usize) {
         let mut p = self.pinned.lock().await;
@@ -301,6 +328,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn formats_rates() {
+        assert_eq!(fmt_rate(0), "0 B/s");
+        assert_eq!(fmt_rate(1023), "1023 B/s");
+        assert_eq!(fmt_rate(1536), "1.5 KB/s");
+        assert_eq!(fmt_rate(5 * 1024 * 1024), "5.0 MB/s");
+    }
+
+    #[test]
     fn magnet_with_so_skips_picker() {
         assert!(magnet_chooses_file("magnet:?xt=urn:btih:abc&so=2"));
         assert!(magnet_chooses_file("magnet:?xt=urn:btih:abc&so=1-3"), "BEP 53 range also counts");
@@ -343,7 +378,7 @@ mod tests {
         let t = librqbit::create_torrent(&src.join("a.mkv"), Default::default(), &librqbit::spawn_utils::BlockingSpawner::new(1)).await.unwrap();
         let file = dir.path().join("a.torrent");
         std::fs::write(&file, t.as_bytes().unwrap()).unwrap();
-        let engine = TorrentEngine::start(dir.path().join("dl"), false, u64::MAX, Profile::Default, Default::default()).await.unwrap();
+        let engine = TorrentEngine::start(dir.path().join("dl"), false, u64::MAX, Profile::Default, (0, 0), Default::default()).await.unwrap();
         let (_, id) = engine.stream_url(file.to_str().unwrap(), None, true).await.unwrap();
         let paused = || engine.session.get(id.into()).unwrap().is_paused();
         engine.release_except(None).await;
