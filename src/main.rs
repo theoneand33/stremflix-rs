@@ -352,7 +352,7 @@ fn upsert_by_id(list: &mut Vec<(MetaPreview, Vec<Video>)>, meta: MetaPreview, vi
 fn os_notify(title: String, body: String) {
     std::thread::spawn(move || {
         if let Err(e) = notify_rust::Notification::new().appname("Stremflix-rs").summary(&title).body(&body).show() {
-            eprintln!("notification: {e}");
+            stremflix_rs::elog!("notification: {e}");
         }
     });
 }
@@ -717,6 +717,16 @@ fn same_addon(installed: &Manifest, fetched: &Manifest) -> bool {
     installed.id == fetched.id
 }
 
+/// Health label for a failed addon check, classified from the typed error: only a transport
+/// failure is "unreachable"; HTTP status and manifest parse errors mean the host answered.
+fn health_error(e: &anyhow::Error) -> String {
+    match e.chain().find_map(|c| c.downcast_ref::<reqwest::Error>()) {
+        Some(r) if r.is_timeout() => "Timed out".into(),
+        Some(_) => format!("Unreachable: {}", e.root_cause()),
+        None => format!("Error: {}", e.root_cause()),
+    }
+}
+
 /// Small secondary pill for toolbar actions (Uninstall, Clear, Stop …).
 fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     pill_button(ui, text, 14.0, vec2(0.0, 32.0), gray_fill(), Color32::WHITE)
@@ -919,6 +929,20 @@ fn looping(repeat: bool, ab: [Option<f64>; 2]) -> bool {
     repeat || (ab[0].is_some() && ab[1].is_some())
 }
 
+/// `timer_paused` bookkeeping: confirmed once mpv reports paused, dropped when the user resumes.
+fn timer_pause_step(state: Option<bool>, paused: bool) -> Option<bool> {
+    match (state, paused) {
+        (Some(false), true) => Some(true),
+        (Some(true), false) => None,
+        (s, _) => s,
+    }
+}
+
+/// End-of-episode autoplay; never after the sleep timer's own pause.
+fn autoplay_due(autoplay_next: bool, timer_paused: Option<bool>, at_end: bool) -> bool {
+    autoplay_next && timer_paused.is_none() && at_end
+}
+
 /// Fraction of the seek bar the cache covers, never behind the playhead.
 fn buffered_frac(pos: f64, cached_to: f64, dur: f64) -> f32 {
     if dur > 0.0 { (cached_to.max(pos) / dur).clamp(0.0, 1.0) as f32 } else { 0.0 }
@@ -1028,21 +1052,21 @@ fn media_controls(cc: &eframe::CreationContext, tx: Sender<Msg>) -> Option<souvl
     let hwnd = match raw_window_handle::HasWindowHandle::window_handle(cc).map(|h| h.as_raw()) {
         Ok(raw_window_handle::RawWindowHandle::Win32(h)) => Some(h.hwnd.get() as *mut std::ffi::c_void),
         _ => {
-            eprintln!("media controls: no window handle");
+            stremflix_rs::elog!("media controls: no window handle");
             return None;
         }
     };
     #[cfg(not(windows))]
     let hwnd = None;
     let config = souvlaki::PlatformConfig { display_name: "Stremflix-rs", dbus_name: "stremflix_rs", hwnd };
-    let mut controls = souvlaki::MediaControls::new(config).inspect_err(|e| eprintln!("media controls: {e:?}")).ok()?;
+    let mut controls = souvlaki::MediaControls::new(config).inspect_err(|e| stremflix_rs::elog!("media controls: {e:?}")).ok()?;
     let ctx = cc.egui_ctx.clone();
     // shortcut: without a D-Bus session souvlaki's MPRIS thread panics (logged on stderr) and the app runs on without controls; pre-check the bus if that noise matters.
     let attached = controls.attach(move |e| {
         let _ = tx.send(Msg::Media(e));
         ctx.request_repaint();
     });
-    attached.inspect_err(|e| eprintln!("media controls: {e:?}")).ok().map(|()| controls)
+    attached.inspect_err(|e| stremflix_rs::elog!("media controls: {e:?}")).ok().map(|()| controls)
 }
 
 struct Playing {
@@ -1256,6 +1280,14 @@ struct App {
     pill: Option<(Tab, egui::Rect, egui::Rect, f64)>,
     player: Option<Playing>,
     last_poll: Instant,
+    /// Sleep timer: pause at this time; the minutes chosen. Survives autoplay-next, cleared when the player is left.
+    sleep: Option<(Instant, u64)>,
+    /// Timer handed from play_next to the next autoplay-started player; consumed once by Msg::Play.
+    /// Every other navigation (`play`, `open_*`, Back) and every error clears it.
+    sleep_carry: Option<(Instant, u64)>,
+    /// The sleep timer paused playback: `Some(false)` until mpv reports paused, then `Some(true)` until resumed.
+    /// Autoplay must not fire while set (see `timer_pause_step`).
+    timer_paused: Option<bool>,
     /// GL function loader of eframe's context, for libmpv's OpenGL renderer.
     gl_proc: Option<GlProc>,
     window: Geo,
@@ -1290,7 +1322,7 @@ fn wayland() -> bool {
 
 /// Show `e` in the UI and on stderr (headless runs, CI).
 fn report(slot: &mut Option<String>, e: impl std::fmt::Display) {
-    eprintln!("error: {e:#}");
+    stremflix_rs::elog!("error: {e:#}");
     *slot = Some(format!("{e:#}"));
 }
 
@@ -1442,6 +1474,9 @@ impl App {
             player: None,
             pill: None,
             last_poll: Instant::now(),
+            sleep: None,
+            sleep_carry: None,
+            timer_paused: None,
             gl_proc: None,
             window: Geo::default(),
             video: None,
@@ -1506,6 +1541,8 @@ impl App {
     /// Resolve `source` (http URL, magnet, or local path) and start playback.
     fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
         self.clear_file_pick();
+        self.sleep_carry = None;
+        self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
@@ -1690,7 +1727,10 @@ impl App {
 
     fn handle(&mut self, ctx: &egui::Context, msg: Msg) {
         match msg {
-            Msg::Error(e) => report(&mut self.error, e),
+            Msg::Error(e) => {
+                self.sleep_carry = None;
+                report(&mut self.error, e);
+            }
             Msg::Installed(url, m, replaces) => {
                 let saved = self.db.add_addon(&url, &m);
                 if let Err(e) = &saved {
@@ -1795,9 +1835,19 @@ impl App {
                 // `Only` autoplays when there's no choice to make; otherwise show the stream picker.
                 if autoplay != Autoplay::Off {
                     match (src, self.play_key()) {
-                        (Some(src), Some((key, title))) => self.play(ctx, key, title, src, subs),
-                        _ => self.show_streams = true,
+                        (Some(src), Some((key, title))) => {
+                            // The autoplay chain: `play` clears the carry like any other navigation, so hand it through.
+                            let carry = self.sleep_carry.take();
+                            self.play(ctx, key, title, src, subs);
+                            self.sleep_carry = carry;
+                        }
+                        _ => {
+                            self.show_streams = true;
+                            self.sleep_carry = None;
+                        }
                     }
+                } else {
+                    self.sleep_carry = None;
                 }
             }
             Msg::Episodes(mut meta, mut m, nav) => {
@@ -2077,7 +2127,9 @@ impl App {
                     }
                     return;
                 }
+                let carry = self.sleep_carry.take();
                 self.stop_player();
+                self.sleep = carry;
                 self.release_torrents(torrent);
                 let prev = self.db.progress(&key).ok().flatten();
                 let start = match &prev {
@@ -2191,6 +2243,9 @@ impl App {
     }
 
     fn stop_player(&mut self) {
+        self.sleep = None;
+        self.sleep_carry = None;
+        self.timer_paused = None;
         self.save_progress();
         self.player = None;
     }
@@ -2251,8 +2306,17 @@ impl App {
             self.release_torrents(None);
             return;
         }
+        if self.sleep.is_some_and(|(t, _)| Instant::now() >= t) {
+            self.sleep = None;
+            self.timer_paused = Some(false);
+            if let Err(e) = p.player.command(&["set", "pause", "yes"]) {
+                report(&mut self.error, e);
+            }
+            return;
+        }
         let st = &p.player.state;
-        if self.autoplay_next && !looping(p.repeat, p.ab) && at_end(st.pos, st.dur, st.paused) && self.playing_episode() {
+        self.timer_paused = timer_pause_step(self.timer_paused, st.paused);
+        if autoplay_due(self.autoplay_next, self.timer_paused, at_end(st.pos, st.dur, st.paused)) && !looping(p.repeat, p.ab) && self.playing_episode() {
             return self.play_next(ctx);
         }
         let Some(p) = &mut self.player else { return };
@@ -2599,9 +2663,13 @@ impl App {
         let binge = (self.selected.as_ref()).and_then(|(_, streams, _)| streams.iter().find(|s| s.source() == src)?.hints.binge_group.clone());
         let next = (self.selected.as_ref().zip(self.episode.as_ref()))
             .and_then(|((m, ..), cur)| Some((m.clone(), next_episode(&self.episodes, &cur.id)?.clone())));
+        let sleep = self.sleep;
         self.stop_player();
         match next {
-            Some((m, v)) => self.open_streams(ctx, m, Some(v), Autoplay::Only, binge),
+            Some((m, v)) => {
+                self.open_streams(ctx, m, Some(v), Autoplay::Only, binge);
+                self.sleep_carry = sleep;
+            }
             None => {
                 self.release_torrents(None);
             }
@@ -2619,6 +2687,7 @@ impl App {
         let client = self.client.clone();
         let addons = self.addons_for("meta", &meta.kind, &meta.id);
         self.clear_file_pick();
+        self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -2698,6 +2767,7 @@ impl App {
         let names: Vec<String> = stream_addons.iter().map(|u| self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default()).collect();
         let sub_addons = self.addons_for("subtitles", &meta.kind, &id);
         self.clear_file_pick();
+        self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -3749,6 +3819,21 @@ impl App {
                                     }
                                 }
                             });
+                            menu_heading(ui, &match self.sleep {
+                                Some((t, _)) => format!("Sleep timer ({} min left)", t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60)),
+                                None => "Sleep timer".into(),
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                if pill(ui, "Off", self.sleep.is_none(), egui::Role::RadioButton).clicked() {
+                                    self.sleep = None;
+                                }
+                                for m in [15u64, 30, 60, 90] {
+                                    if pill(ui, &format!("{m} min"), self.sleep.is_some_and(|(_, c)| c == m), egui::Role::RadioButton).clicked() {
+                                        self.sleep = Some((Instant::now() + Duration::from_secs(m * 60), m));
+                                    }
+                                }
+                            });
                             menu_heading(ui, "Video");
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
@@ -4040,7 +4125,7 @@ impl App {
                 for chunk in urls.chunks(4) {
                     let res = concurrently(chunk.to_vec(), |u| {
                         let c = client.clone();
-                        async move { Ok((u.clone(), c.fetch_manifest(&u).await.map_err(|e| e.root_cause().to_string()))) }
+                        async move { Ok((u.clone(), c.fetch_manifest(&u).await.map_err(|e| health_error(&e)))) }
                     })
                     .await;
                     out.extend(res.into_iter().flatten());
@@ -4090,9 +4175,12 @@ impl App {
                     });
                 }
                 Some(Err(e)) => {
-                    ui.label(RichText::new(format!("Unreachable: {e}")).weak());
+                    ui.label(RichText::new(e).weak());
                 }
-                _ => {}
+                Some(Ok(_)) => {
+                    ui.label(RichText::new("Reachable").weak());
+                }
+                None => {}
             }
             if m.behavior_hints.configuration_required {
                 ui.label(RichText::new("Needs configuration before use. Press Configure.").weak());
@@ -4313,7 +4401,7 @@ impl App {
                             (self.account, self.account_busy, self.confirm_upload, self.account_note) = (None, false, false, None);
                             let client = self.client.clone();
                             // Best effort: the key is already forgotten locally.
-                            self.rt.spawn(async move { client.stremio_logout(&key).await.inspect_err(|e| eprintln!("Stremio sign-out: {e:#}")) });
+                            self.rt.spawn(async move { client.stremio_logout(&key).await.inspect_err(|e| stremflix_rs::elog!("Stremio sign-out: {e:#}")) });
                         }
                         Err(e) => report(&mut self.error, format!("signing out: {e:#}")),
                     }
@@ -4377,6 +4465,25 @@ impl App {
         }
         if let Some(m) = &self.data_msg {
             ui.label(RichText::new(m).size(13.0).color(Color32::from_gray(170)));
+        }
+        ui.label(RichText::new("Diagnostics").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        let out = self.data_dir.join("diagnostics.txt");
+        if ui.button("Export diagnostics").on_hover_text(format!("Version, OS and recent log without secrets, saved to {}", out.display())).clicked() {
+            let summary = format!("addons: {}\nsigned in: {}", self.addons.len(), self.account.is_some());
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+            let res = o.open(&out).and_then(|mut f| {
+                // `mode` only applies to a new file: tighten an older one.
+                #[cfg(unix)]
+                f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+                std::io::Write::write_all(&mut f, stremflix_rs::diag::bundle(&summary).as_bytes())
+            });
+            match res {
+                Ok(()) => self.data_msg = Some(format!("Diagnostics saved to {}", out.display())),
+                Err(e) => report(&mut self.error, format!("diagnostics export: {e}")),
+            }
         }
         ui.add_space(8.0);
         ui.label(RichText::new("Torrents").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
@@ -5044,6 +5151,7 @@ impl eframe::App for App {
                     (self.episodes, self.episode) = (Vec::new(), None);
                     self.scroll_top = true;
                     self.clear_file_pick();
+                    self.sleep_carry = None;
                     self.nav += 1;
                 }
                 ui.add_space(6.0);
@@ -5128,6 +5236,7 @@ fn main() -> eframe::Result {
     if instance::forward(&dir, arg.as_deref().unwrap_or("")) {
         return Ok(());
     }
+    stremflix_rs::diag::init(&dir);
     let mut app = App::new(dir.clone()).expect("failed to initialise app data");
     let ctx_cell: Arc<std::sync::OnceLock<egui::Context>> = Default::default();
     let sink = {
@@ -5143,7 +5252,7 @@ fn main() -> eframe::Result {
         sink(a);
     }
     if let Err(e) = instance::listen(&dir, sink.clone()) {
-        eprintln!("error: links from later launches won't reach this window: {e}");
+        stremflix_rs::elog!("error: links from later launches won't reach this window: {e}");
     }
     #[cfg(windows)]
     std::thread::spawn(instance::register_scheme);
@@ -5172,7 +5281,7 @@ fn main() -> eframe::Result {
         // A failed check (offline, rate limit) only logs: it shouldn't show as an error.
         app.spawn(&cc.egui_ctx, async move {
             Ok(Msg::Update(client.check_update().await.unwrap_or_else(|e| {
-                eprintln!("update check: {e:#}");
+                stremflix_rs::elog!("update check: {e:#}");
                 None
             })))
         });
@@ -5230,7 +5339,7 @@ mod mac_links {
     pub fn install(sink: Box<dyn Fn(String) + Send + Sync>) {
         let _ = SINK.set(sink);
         let Some(cls) = AnyClass::get(c"WinitApplicationDelegate") else {
-            return eprintln!("error: stremio:// links unavailable: winit's app delegate not found");
+            return stremflix_rs::elog!("error: stremio:// links unavailable: winit's app delegate not found");
         };
         // SAFETY: the signature matches the "v@:@@" encoding of -application:openURLs:.
         let added = unsafe {
@@ -5238,7 +5347,7 @@ mod mac_links {
             objc2::ffi::class_addMethod(std::ptr::from_ref(cls).cast_mut(), sel!(application:openURLs:), imp, c"v@:@@".as_ptr())
         };
         if !added.as_bool() {
-            return eprintln!("error: stremio:// links unavailable: delegate already has application:openURLs:");
+            return stremflix_rs::elog!("error: stremio:// links unavailable: delegate already has application:openURLs:");
         }
         // AppKit can cache which selectors a delegate answers when it is set: set it again so the new one counts.
         // SAFETY: plain messages to the shared NSApplication on the main thread.
@@ -5287,6 +5396,23 @@ fn qr_ui(ui: &mut egui::Ui, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_error_classifies_by_type() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (refused, t) = rt.block_on(async {
+            let c = reqwest::Client::new();
+            // A listener that never answers makes the deadline fire, not a refusal.
+            let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/", silent.local_addr().unwrap());
+            (c.get("http://127.0.0.1:1/").send().await.unwrap_err(), c.get(url).timeout(std::time::Duration::from_millis(50)).send().await.unwrap_err())
+        });
+        // Port 1 on localhost refuses at once: a transport error that is not a timeout.
+        assert_eq!(health_error(&anyhow::Error::new(refused)).split(':').next(), Some("Unreachable"));
+        assert!(health_error(&anyhow::anyhow!("HTTP 404 Not Found")).starts_with("Error: HTTP 404"));
+        assert!(t.is_timeout());
+        assert_eq!(health_error(&anyhow::Error::new(t).context("GET x")), "Timed out");
+    }
 
     #[test]
     fn fresh_episodes_seeds_dedupes_and_roundtrips() {
@@ -5357,6 +5483,7 @@ mod tests {
         // An empty refetch (episodes aged out of the window) removes the old row.
         upsert_by_id(&mut list, meta("a"), vec![]);
         assert_eq!(list.iter().map(|(m, _)| m.id.as_str()).collect::<Vec<_>>(), ["b"]);
+
     }
 
     #[test]
@@ -5635,6 +5762,43 @@ mod tests {
         assert!(app.player.is_none());
         app.handle(&ctx, Msg::Streams(m("b"), None, vec![], vec![], Autoplay::Off, None, 2));
         assert_eq!(app.selected.as_ref().map(|(m, ..)| m.id.as_str()), Some("b"), "current reply applies");
+    }
+
+    #[test]
+    fn sleep_carry_survives_autoplay_chain_only() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
+        let one = Stream { url: Some("https://x.example/a".into()), ..Default::default() };
+        let carry = (Instant::now() + Duration::from_secs(600), 30);
+        // Successful autoplay: play advances nav, the carry rides along and Msg::Play consumes it exactly once.
+        app.nav = 3;
+        app.sleep_carry = Some(carry);
+        app.handle(&ctx, Msg::Streams(m.clone(), None, vec![one.clone()], vec![], Autoplay::Only, None, 3));
+        assert_eq!(app.sleep_carry, Some(carry), "survives play");
+        // Picker fallback, a failure, or any other navigation drops it.
+        app.handle(&ctx, Msg::Streams(m.clone(), None, vec![], vec![], Autoplay::Only, None, app.nav));
+        assert!(app.sleep_carry.is_none() && app.show_streams);
+        app.sleep_carry = Some(carry);
+        app.handle(&ctx, Msg::Error("boom".into()));
+        assert!(app.sleep_carry.is_none());
+        // A user-started play never inherits a stale carry.
+        app.sleep_carry = Some(carry);
+        app.play(&ctx, "movie:a".into(), "a".into(), "https://x.example/a".into(), vec![]);
+        assert!(app.sleep_carry.is_none());
+    }
+
+    #[test]
+    fn timer_pause_blocks_autoplay_until_resumed() {
+        assert!(autoplay_due(true, None, true));
+        assert!(!autoplay_due(true, Some(false), true), "pause not yet confirmed");
+        assert!(!autoplay_due(true, Some(true), true));
+        assert!(!autoplay_due(false, None, true));
+        let s = timer_pause_step(Some(false), false);
+        assert_eq!(s, Some(false), "mpv has not reported the pause yet");
+        let s = timer_pause_step(s, true);
+        assert_eq!(s, Some(true));
+        assert_eq!(timer_pause_step(s, false), None, "user resumed");
     }
 
     #[test]
