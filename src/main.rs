@@ -284,6 +284,11 @@ fn arrange_rows(keys: &[String], order: &[String]) -> Vec<usize> {
     out
 }
 
+/// `urls` (global priority) with those in `order` first; stale ids in `order` are ignored, unlisted urls keep global order after.
+fn order_urls(urls: Vec<String>, order: &[String]) -> Vec<String> {
+    arrange_rows(&urls, order).into_iter().map(|i| urls[i].clone()).collect()
+}
+
 /// Content types that can have their own addon order.
 const ADDON_ORDER_KINDS: [&str; 2] = ["movie", "series"];
 
@@ -2339,8 +2344,7 @@ impl App {
             m.has_resource(res) && m.types.iter().any(|t| t == kind) && m.id_prefixes.as_ref().is_none_or(|ps| ps.iter().any(|p| id.starts_with(p.as_str())))
         };
         let urls: Vec<String> = self.addons.iter().filter(|(_, m)| matches(m)).map(|(u, _)| u.clone()).collect();
-        let order = self.addon_orders.get(kind).map_or(&[][..], |o| o);
-        arrange_rows(&urls, order).into_iter().map(|i| urls[i].clone()).collect()
+        order_urls(urls, self.addon_orders.get(kind).map_or(&[][..], |o| o))
     }
 
     /// Fetch a movie's full meta for the detail page from the first addon that serves it.
@@ -5477,6 +5481,16 @@ mod tests {
         })
         .await;
         assert_eq!(out.into_iter().map(Result::unwrap).collect::<Vec<_>>(), [30, 0, 10]);
+    }
+
+    #[test]
+    fn per_type_addon_order() {
+        let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let global = k(&["a", "b", "c"]);
+        assert_eq!(order_urls(global.clone(), &k(&["c", "a", "b"])), k(&["c", "a", "b"]), "per-type order applied");
+        assert_eq!(order_urls(global.clone(), &[]), global, "type without an order follows global");
+        assert_eq!(order_urls(global.clone(), &k(&["gone", "b"])), k(&["b", "a", "c"]), "stale ids ignored");
+        assert_eq!(order_urls(k(&["a", "b", "c", "new"]), &k(&["c", "a", "b"])), k(&["c", "a", "b", "new"]), "new addons appended");
     }
 
     #[test]
