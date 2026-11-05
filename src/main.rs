@@ -37,7 +37,7 @@ const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000),
 
 /// A local `.torrent` file path (not a URL or magnet).
 fn is_torrent_file(s: &str) -> bool {
-    !s.contains("://") && parse_magnet_hash(s).is_none() && std::path::Path::new(s).extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+    !s.contains("://") && !s.starts_with("magnet:") && parse_magnet_hash(s).is_none() && std::path::Path::new(s).extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
 }
 
 /// Played through the torrent engine: a valid magnet (any scheme case, padding trimmed like `Url::parse`) or a `.torrent` file.
@@ -5796,7 +5796,7 @@ mod tests {
         assert!(matches!(cli(&["--"]), Cli::Open(None)) && matches!(cli(&["--", "-no-such.mkv"]), Cli::Bad(m) if m.starts_with("no such file")));
         assert!(matches!(cli(&["MAGNET:?xt=bad"]), Cli::Bad(m) if m.starts_with("unsupported link")));
         assert!(matches!(cli(&[&magnet]), Cli::Open(Some(m)) if m == magnet));
-        assert!(matches!(cli(&[file]), Cli::Open(Some(p)) if p == file));
+        assert!(matches!(cli(&[file]), Cli::Open(Some(p)) if std::path::Path::new(&p) == std::path::absolute(file).unwrap()));
         // Url::parse accepts an upper-case scheme; Msg::Link routing uses the same predicate.
         let upper = magnet.replacen("magnet", "MAGNET", 1);
         assert!(matches!(cli(&[&upper]), Cli::Open(Some(_))) && parse_magnet_hash(&upper).is_some());
