@@ -59,7 +59,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Remote/LAN streaming server | P2 | L | Stremio serves the library to other devices; casting is a separate item. |
 | Addon health indicator (unreachable / timeout) | P3 | S | |
-| QR code to install an addon | P3 | S | |
 | Per-type addon ordering | P3 | S | One global priority list today. |
 
 ### Accounts and sync
