@@ -29,6 +29,17 @@ enum Tab {
     Settings,
 }
 
+impl Tab {
+    fn name(self) -> &'static str {
+        match self { Tab::Home => "home", Tab::Discover => "discover", Tab::Addons => "addons", Tab::Library => "library", Tab::Settings => "settings" }
+    }
+
+    /// Stored value to tab; missing or unknown falls back to Home.
+    fn from_name(s: Option<&str>) -> Tab {
+        [Tab::Home, Tab::Discover, Tab::Addons, Tab::Library, Tab::Settings].into_iter().find(|t| Some(t.name()) == s).unwrap_or(Tab::Home)
+    }
+}
+
 /// Speed limit choices in bytes/s; 0 is unlimited.
 const SPEED_LIMITS: [(&str, u32); 6] = [("Unlimited", 0), ("500 KB/s", 500_000), ("1 MB/s", 1_000_000), ("2 MB/s", 2_000_000), ("5 MB/s", 5_000_000), ("10 MB/s", 10_000_000)];
 
@@ -1359,6 +1370,7 @@ impl App {
         let queue: Vec<Job> = db.download_queue()?.into_iter().map(|q| Job::new(q.d, q.source, q.headers, q.state, q.validator, q.total)).collect();
         download::clear_partial(&data_dir.join("downloads"), &queue.iter().map(|j| j.d.path.clone()).collect::<Vec<_>>());
         let search_history = db.setting("search_history")?.map(|s| db::decode_history(&s)).unwrap_or_default();
+        let tab = db.setting("tab")?;
         let (tx, rx) = channel();
         ACCENT_IDX.store(accent_index(db.setting("accent")?.as_deref()), std::sync::atomic::Ordering::Relaxed);
         let mut app = Self {
@@ -1429,7 +1441,7 @@ impl App {
             torrent: Default::default(),
             tx,
             rx,
-            tab: Tab::Home,
+            tab: Tab::from_name(tab.as_deref()),
             addon_url: String::new(),
             addon_updates: Vec::new(),
             checking_updates: false,
@@ -5126,6 +5138,7 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
         let _ = self.db.set_setting("window", &self.window.to_string());
+        let _ = self.db.set_setting("tab", self.tab.name());
         self.stop_player();
     }
 }
@@ -5354,6 +5367,14 @@ fn qr_ui(ui: &mut egui::Ui, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_name_round_trip() {
+        for t in [Tab::Home, Tab::Discover, Tab::Addons, Tab::Library, Tab::Settings] {
+            assert!(Tab::from_name(Some(t.name())) == t);
+        }
+        assert!(Tab::from_name(Some("bogus")) == Tab::Home && Tab::from_name(None) == Tab::Home);
+    }
 
     #[test]
     fn health_error_classifies_by_type() {
