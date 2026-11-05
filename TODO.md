@@ -51,14 +51,12 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Configurable User-Agent | P3 | S | Some addons and streams reject the default. |
 | Pause playback when the window is minimized | P3 | S | Stremio setting. |
 | Launch playback in a separate window | P3 | M | Stremio setting; egui multi-viewport. |
-| Log file and diagnostics export | P3 | S | |
 
 ### Addons
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Remote/LAN streaming server | P2 | L | Stremio serves the library to other devices; casting is a separate item. |
-| Addon health indicator (unreachable / timeout) | P3 | S | |
 | Per-type addon ordering | P3 | S | One global priority list today. |
 
 ### Accounts and sync
