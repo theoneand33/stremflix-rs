@@ -328,6 +328,57 @@ pub struct BehaviorHints {
     pub video_size: Option<u64>,
     /// `videoHash`: OpenSubtitles hash of the file (16 hex digits).
     pub video_hash: Option<String>,
+    /// `skip`: local extension, validated by [`parse_skips`].
+    pub skip: Vec<Skip>,
+}
+
+/// Which part of an episode a [`Skip`] covers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SkipKind {
+    Intro,
+    Recap,
+    Credits,
+}
+
+impl SkipKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Intro => "Skip intro",
+            Self::Recap => "Skip recap",
+            Self::Credits => "Skip credits",
+        }
+    }
+}
+
+/// A span (seconds) the viewer can jump over.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Skip {
+    pub kind: SkipKind,
+    pub start: f64,
+    pub end: f64,
+}
+
+const MAX_SKIPS: usize = 10;
+const MAX_SKIP_SECS: f64 = 15.0 * 60.0;
+
+/// `[{type: "intro"|"recap"|"credits", start, end}]` in seconds. Invalid entries (unknown type, non-finite,
+/// `start < 0`, `end <= start`, longer than 15 min) are dropped; at most 10 are kept.
+pub fn parse_skips(v: &serde_json::Value) -> Vec<Skip> {
+    let items = v.as_array().map(|a| a.as_slice()).unwrap_or_default();
+    items
+        .iter()
+        .filter_map(|x| {
+            let kind = match x.get("type")?.as_str()? {
+                "intro" => SkipKind::Intro,
+                "recap" => SkipKind::Recap,
+                "credits" => SkipKind::Credits,
+                _ => return None,
+            };
+            let (start, end) = (x.get("start")?.as_f64()?, x.get("end")?.as_f64()?);
+            (start.is_finite() && end.is_finite() && start >= 0.0 && start < end && end - start <= MAX_SKIP_SECS).then_some(Skip { kind, start, end })
+        })
+        .take(MAX_SKIPS)
+        .collect()
 }
 
 const MAX_HEADERS: usize = 32;
@@ -370,6 +421,7 @@ fn behavior_hints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BehaviorHint
         filename: text("filename"),
         video_size: v.get("videoSize").and_then(|x| x.as_u64()),
         video_hash: text("videoHash").filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit())).map(|h| h.to_ascii_lowercase()),
+        skip: v.get("skip").map(parse_skips).unwrap_or_default(),
     })
 }
 
@@ -744,6 +796,67 @@ pub fn check_poster(body: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Proxy from Settings, set once at startup: changes apply on restart. Never log it: it can hold credentials.
+pub static PROXY: std::sync::OnceLock<Url> = std::sync::OnceLock::new();
+
+/// Proxy URL for `kind` ("" = off, "http", "socks5") and `addr` (`host:port`), with credentials percent-encoded.
+/// Errors never echo the input, which may hold a password.
+pub fn proxy_url(kind: &str, addr: &str, user: &str, pass: &str) -> std::result::Result<Option<Url>, &'static str> {
+    // socks5h: DNS goes through the proxy too, so lookups don't leak around a VPN.
+    let scheme = match kind {
+        "" => return Ok(None),
+        "http" => "http",
+        "socks5" => "socks5h",
+        _ => return Err("unknown proxy type"),
+    };
+    let (host, port) = addr.trim().rsplit_once(':').ok_or("use host:port")?;
+    if host.is_empty() || host.chars().any(|c| c.is_whitespace() || c.is_control() || "/?#@\\".contains(c)) {
+        return Err("invalid proxy host");
+    }
+    let port: u16 = port.parse().ok().filter(|&p| p != 0).ok_or("proxy port must be 1-65535")?;
+    let mut url = Url::parse(&format!("{scheme}://{host}:{port}")).map_err(|_| "invalid proxy host")?;
+    if !user.is_empty() || !pass.is_empty() {
+        // Pre-encoded: `Url` leaves a literal `%` alone, so a password like `%41` would decode to `A`.
+        // Only userinfo delimiters: librqbit/mpv take the raw string, so `- _ . ~` must not become `%2D` etc.
+        const USERINFO: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b' ').add(b':').add(b'@').add(b'/').add(b'?').add(b'#').add(b'[').add(b']').add(b'\\').add(b'%').add(b'"').add(b'<').add(b'>').add(b'`').add(b'{').add(b'}').add(b'|').add(b'^');
+        let enc = |s: &str| percent_encoding::utf8_percent_encode(s, USERINFO).to_string();
+        url.set_username(&enc(user)).map_err(|_| "invalid proxy username")?;
+        url.set_password((!pass.is_empty()).then(|| enc(pass)).as_deref()).map_err(|_| "invalid proxy password")?;
+    }
+    Ok(Some(url))
+}
+
+/// `b` routed through [`PROXY`], except loopback (the local torrent stream, local addons).
+pub fn with_proxy(b: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder> {
+    let Some(url) = PROXY.get() else { return Ok(b) };
+    let p = reqwest::Proxy::all(url.as_str()).map_err(|_| anyhow::anyhow!("invalid proxy setting"))?;
+    Ok(b.proxy(p.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1"))))
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn builds_and_validates() {
+        assert_eq!(proxy_url("", "junk", "", ""), Ok(None));
+        let u = |k, a, us, p| proxy_url(k, a, us, p).unwrap().unwrap().to_string();
+        assert_eq!(u("http", "proxy.lan:3128", "", ""), "http://proxy.lan:3128/");
+        assert_eq!(u("socks5", " 10.0.0.1:1080 ", "", ""), "socks5h://10.0.0.1:1080");
+        assert_eq!(u("socks5", "[::1]:1080", "", ""), "socks5h://[::1]:1080");
+        let url = proxy_url("http", "p:8080", "us er@x", "p:@/#%41?é").unwrap().unwrap();
+        assert_eq!(url.as_str(), "http://us%20er%40x:p%3A%40%2F%23%2541%3F%C3%A9@p:8080/");
+        let dec = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8().unwrap().into_owned();
+        assert_eq!((dec(url.username()), dec(url.password().unwrap())), ("us er@x".into(), "p:@/#%41?é".into()));
+        assert_eq!(u("socks5", "h:1", "", "pw"), "socks5h://:pw@h:1");
+        assert_eq!(u("socks5", "h:1", "my-user", "my-pass_.~!"), "socks5h://my-user:my-pass_.~!@h:1");
+        for (k, a) in [("ftp", "h:1"), ("http", "h"), ("http", ":80"), ("http", "h:0"), ("http", "h:65536"), ("http", "h:x"), ("http", "a b:80"), ("http", "h\n:80"), ("http", "u@h:80"), ("http", "h/x:80"), ("http", "a:b:80")] {
+            assert!(proxy_url(k, a, "", "").is_err(), "{k} {a}");
+        }
+        assert!(with_proxy(reqwest::Client::builder()).is_ok());
+    }
+}
+
 #[cfg(test)]
 mod configure_tests {
     use super::*;
@@ -766,6 +879,29 @@ mod configure_tests {
         // A phone cannot reach loopback.
         assert_eq!(install_link("http://127.0.0.1:7070/manifest.json"), None);
         assert_eq!(install_link("https://localhost/manifest.json"), None);
+    }
+
+    #[test]
+    fn skip_markers_are_validated() {
+        let s = |j: &str| parse_skips(&serde_json::from_str(j).unwrap());
+        let ok = s(r#"[{"type":"intro","start":5,"end":65.5},{"type":"recap","start":0,"end":900},{"type":"credits","start":1200,"end":1300}]"#);
+        assert_eq!(ok, [Skip { kind: SkipKind::Intro, start: 5.0, end: 65.5 }, Skip { kind: SkipKind::Recap, start: 0.0, end: 900.0 }, Skip { kind: SkipKind::Credits, start: 1200.0, end: 1300.0 }]);
+        for bad in [
+            r#"[{"type":"intro","start":-1,"end":5}]"#,
+            r#"[{"type":"intro","start":5,"end":5}]"#,
+            r#"[{"type":"intro","start":9,"end":5}]"#,
+            r#"[{"type":"intro","start":0,"end":901}]"#,
+            r#"[{"type":"outro","start":0,"end":5}]"#,
+            r#"[{"type":"intro","start":"0","end":5}]"#,
+            r#"{"type":"intro","start":0,"end":5}"#,
+            r#""junk""#,
+        ] {
+            assert!(s(bad).is_empty(), "{bad}");
+        }
+        let many = format!("[{}]", vec![r#"{"type":"intro","start":0,"end":5}"#; 25].join(","));
+        assert_eq!(s(&many).len(), MAX_SKIPS);
+        let st: Stream = serde_json::from_str(r#"{"url":"https://x.example/v","behaviorHints":{"skip":[{"type":"intro","start":1,"end":2},{"type":"bad"}]}}"#).unwrap();
+        assert_eq!(st.hints.skip.len(), 1);
     }
 
     #[test]
@@ -918,12 +1054,11 @@ impl AddonClient {
 
     fn http(&self) -> Result<&reqwest::Client> {
         let http = self.http.get_or_init(|| {
-            reqwest::Client::builder()
+            let b = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::limited(3))
-                .user_agent("stremflix-rs") // GitHub's API rejects requests without one
-                .build()
-                .map_err(|e| format!("HTTP client: {e}"))
+                .user_agent("stremflix-rs"); // GitHub's API rejects requests without one
+            with_proxy(b).map_err(|e| format!("{e}"))?.build().map_err(|e| format!("HTTP client: {e}"))
         });
         http.as_ref().map_err(|e| anyhow::anyhow!("{e}"))
     }
@@ -978,6 +1113,21 @@ impl AddonClient {
         let addons = self.stremio_api("addonCollectionGet", serde_json::json!({"type": "AddonCollectionGet", "authKey": auth_key, "update": true})).await?;
         let library = self.stremio_api("datastoreGet", serde_json::json!({"authKey": auth_key, "collection": "libraryItem", "ids": [], "all": true})).await?;
         crate::stremio_import::from_account(&addons, &library)
+    }
+
+    /// Upload `up` to the account: its addon list becomes the local one (account-only addons kept at the end),
+    /// and changed library items are put. Returns the number of addons and library items sent.
+    pub async fn stremio_push(&self, auth_key: &str, up: &crate::stremio_import::Upload) -> Result<(usize, usize)> {
+        let remote = self.stremio_api("addonCollectionGet", serde_json::json!({"type": "AddonCollectionGet", "authKey": auth_key, "update": false})).await?;
+        let library = self.stremio_api("datastoreGet", serde_json::json!({"authKey": auth_key, "collection": "libraryItem", "ids": [], "all": true})).await?;
+        ensure!(library.is_array(), "Stremio API: unexpected library response");
+        let addons = crate::stremio_import::addon_collection(&up.addons, &remote)?;
+        let changes = crate::stremio_import::library_changes(up, &library);
+        self.stremio_api("addonCollectionSet", serde_json::json!({"type": "AddonCollectionSet", "authKey": auth_key, "addons": addons})).await?;
+        if !changes.is_empty() {
+            self.stremio_api("datastorePut", serde_json::json!({"authKey": auth_key, "collection": "libraryItem", "changes": changes})).await?;
+        }
+        Ok((addons.len(), changes.len()))
     }
 
     pub async fn fetch_manifest(&self, transport_url: &str) -> Result<Manifest> {
