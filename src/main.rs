@@ -296,10 +296,16 @@ fn decode_keys(s: &str) -> Vec<String> {
 /// How far back an episode's release date still counts as new.
 const NEW_EPISODE_DAYS: i64 = 14;
 
-/// Most `<series id>:<episode id>` keys kept as already notified; the oldest go first.
-const NOTIFIED_MAX: usize = 500;
+/// Most `<series id>:<episode id>` keys kept per series; the oldest of that series go first.
+/// A series' own `<series id>:` marker is never evicted, or its next episode would be silently re-seeded.
+const NOTIFIED_PER_SERIES: usize = 50;
 /// How often saved series are re-checked for new episodes while the app runs.
 const NOTIFY_EVERY: Duration = Duration::from_secs(6 * 3600);
+
+/// Drops every notified key whose series is no longer in the saved library, so stale keys don't pile up.
+fn prune_unsaved(seen: &mut Vec<String>, saved: &[&str]) {
+    seen.retain(|k| saved.iter().any(|id| k.strip_prefix(*id).is_some_and(|r| r.starts_with(':'))));
+}
 
 /// Records `eps` of `series` in `seen` and returns those never seen before. A series
 /// with no entry yet (first run, or newly saved) is only recorded, so its backlog stays silent.
@@ -307,7 +313,7 @@ fn fresh_episodes(seen: &mut Vec<String>, series: &str, eps: &[&str]) -> Vec<Str
     let marker = format!("{series}:");
     let known = seen.contains(&marker);
     if !known {
-        seen.push(marker);
+        seen.push(marker.clone());
     }
     let mut fresh = Vec::new();
     for ep in eps {
@@ -319,8 +325,17 @@ fn fresh_episodes(seen: &mut Vec<String>, series: &str, eps: &[&str]) -> Vec<Str
             }
         }
     }
-    if seen.len() > NOTIFIED_MAX {
-        seen.drain(..seen.len() - NOTIFIED_MAX);
+    // Cap only this series' episode keys (never its marker, never other series), but always
+    // keep the whole current window so an episode still listed can't be dropped and re-notified.
+    let mut excess = seen.iter().filter(|k| k.starts_with(&marker) && **k != marker).count().saturating_sub(NOTIFIED_PER_SERIES.max(eps.len()));
+    if excess > 0 {
+        seen.retain(|k| {
+            let evict = excess > 0 && k.starts_with(&marker) && *k != marker;
+            if evict {
+                excess -= 1;
+            }
+            !evict
+        });
     }
     fresh
 }
@@ -1859,6 +1874,8 @@ impl App {
                     if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) {
                         // Also with no recent episode: seeds the series' marker so its next one notifies.
                         let ids: Vec<&str> = videos.iter().map(|v| v.id.as_str()).collect();
+                        let saved_ids: Vec<&str> = self.saved.iter().filter_map(|t| t.key.strip_prefix("series:")).collect();
+                        prune_unsaved(&mut self.notified, &saved_ids);
                         let fresh = fresh_episodes(&mut self.notified, &meta.id, &ids);
                         if let Err(e) = self.db.set_setting("notified_eps", &encode_keys(&self.notified)) {
                             report(&mut self.error, format!("saving notified episodes: {e:#}"));
@@ -5198,7 +5215,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fresh_episodes_seeds_dedupes_caps_and_roundtrips() {
+    fn fresh_episodes_seeds_dedupes_and_roundtrips() {
         let mut seen = Vec::new();
         // First sight of a series records its backlog silently.
         assert!(fresh_episodes(&mut seen, "tt1", &["tt1:1:1", "tt1:1:2"]).is_empty());
@@ -5210,12 +5227,40 @@ mod tests {
         // Keys with colons and quotes survive the settings encoding.
         seen.push("a\"b:c|d".into());
         assert_eq!(decode_keys(&encode_keys(&seen)), seen);
-        // The cap drops the oldest.
-        let many: Vec<String> = (0..NOTIFIED_MAX + 10).map(|i| i.to_string()).collect();
-        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+    }
+
+    #[test]
+    fn markers_survive_the_cap_and_other_series_are_untouched() {
+        let mut seen = Vec::new();
+        fresh_episodes(&mut seen, "tt1", &["e1", "e2"]);
+        fresh_episodes(&mut seen, "tt3", &[]);
+        // Many batches for one series push it past its per-series cap.
+        for batch in 0..5 {
+            let eps: Vec<String> = (0..20).map(|i| format!("b{batch}e{i}")).collect();
+            let refs: Vec<&str> = eps.iter().map(String::as_str).collect();
+            fresh_episodes(&mut seen, "tt3", &refs);
+        }
+        let tt3: Vec<&String> = seen.iter().filter(|k| k.starts_with("tt3:") && k.as_str() != "tt3:").collect();
+        assert_eq!(tt3.len(), NOTIFIED_PER_SERIES, "capped per series");
+        assert_eq!(tt3.last().unwrap().as_str(), "tt3:b4e19", "newest kept, oldest dropped");
+        // Markers survive the cap pass, and the other series keeps its keys.
+        assert!(seen.contains(&"tt3:".to_string()) && seen.contains(&"tt1:".to_string()));
+        assert!(seen.contains(&"tt1:e1".to_string()) && seen.contains(&"tt1:e2".to_string()));
+        // A series whose marker survived still notifies its next episode instead of re-seeding.
+        assert_eq!(fresh_episodes(&mut seen, "tt3", &["new"]), ["new"]);
+        // A window larger than the cap is kept whole (no re-notify of episodes still listed).
+        let big: Vec<String> = (0..NOTIFIED_PER_SERIES + 5).map(|i| format!("w{i}")).collect();
+        let refs: Vec<&str> = big.iter().map(String::as_str).collect();
         fresh_episodes(&mut seen, "tt3", &refs);
-        assert_eq!(seen.len(), NOTIFIED_MAX);
-        assert_eq!(seen.last().unwrap(), &format!("tt3:{}", NOTIFIED_MAX + 9));
+        assert!(fresh_episodes(&mut seen, "tt3", &refs).is_empty());
+    }
+
+    #[test]
+    fn prune_unsaved_drops_only_unsaved_series() {
+        let mut seen = vec!["tt1:".into(), "tt1:e1".into(), "tt10:".into(), "tt10:e1".into(), "kitsu:7:".into(), "kitsu:7:e1".into(), "gone:".into(), "gone:e1".into()];
+        prune_unsaved(&mut seen, &["tt1", "kitsu:7"]);
+        // tt10 is a different series than tt1 even though its id starts with "tt1".
+        assert_eq!(seen, ["tt1:", "tt1:e1", "kitsu:7:", "kitsu:7:e1"]);
     }
 
     #[test]
