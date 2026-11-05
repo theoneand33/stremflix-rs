@@ -70,7 +70,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| Upload to the Stremio account (addons, library, progress) | P2 | M | Sign-in pulls addons, library and watched titles; nothing is pushed back. |
 | Trakt integration (scrobbling, watched sync) | P3 | L | |
 | Simkl / MyAnimeList / Letterboxd sync | P3 | L | After Trakt. |
 
