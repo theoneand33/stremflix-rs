@@ -320,6 +320,33 @@ fn recent_episodes(videos: Vec<Video>, since: &str, today: &str) -> Vec<Video> {
     videos.into_iter().filter(|v| v.episode.is_some() && v.season != Some(0) && day(v).is_some_and(|d| d.as_str() >= since && d.as_str() <= today)).collect()
 }
 
+/// How far ahead the Library calendar looks.
+const CALENDAR_DAYS: i64 = 30;
+
+/// Calendar entries (series, episode) grouped by release day within `today..=today+CALENDAR_DAYS`, earliest
+/// first, headed Today, Tomorrow, then the date. `released` is read as a UTC date (no timezone database);
+/// anything that is not `YYYY-MM-DD` is skipped.
+fn calendar_groups(entries: &[(MetaPreview, Vec<Video>)], today: i64) -> Vec<(String, Vec<(&MetaPreview, &Video)>)> {
+    let well_formed = |d: &str| d.len() == 10 && d.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() });
+    let (from, to) = (date_string(today), date_string(today + CALENDAR_DAYS));
+    let mut days: Vec<(&str, &MetaPreview, &Video)> = entries
+        .iter()
+        .flat_map(|(m, vs)| vs.iter().map(move |v| (m, v)))
+        .filter(|(_, v)| v.episode.is_some() && v.season != Some(0))
+        .filter_map(|(m, v)| v.released.as_deref().and_then(|d| d.get(..10)).filter(|d| well_formed(d) && *d >= from.as_str() && *d <= to.as_str()).map(|d| (d, m, v)))
+        .collect();
+    days.sort_by(|a, b| (a.0, &a.1.name, a.2.season, a.2.episode).cmp(&(b.0, &b.1.name, b.2.season, b.2.episode)));
+    let mut out: Vec<(String, Vec<(&MetaPreview, &Video)>)> = Vec::new();
+    for (d, m, v) in days {
+        let head = if d == from { "Today".to_string() } else if d == date_string(today + 1) { "Tomorrow".to_string() } else { d.to_string() };
+        match out.last_mut() {
+            Some((h, g)) if *h == head => g.push((m, v)),
+            _ => out.push((head, vec![(m, v)])),
+        }
+    }
+    out
+}
+
 /// Max items kept per catalog row.
 const ROW_CAP: usize = 1000;
 /// Posters kept in memory (bytes and decoded textures) before the cache is cleared.
@@ -1066,6 +1093,8 @@ struct App {
     list_name: String,
     /// Saved series with episodes released in the last `NEW_EPISODE_DAYS` days (watched ones are hidden when drawn).
     new_episodes: Vec<(MetaPreview, Vec<Video>)>,
+    /// Saved series with episodes releasing within `CALENDAR_DAYS` days, for the Library calendar.
+    upcoming: Vec<(MetaPreview, Vec<Video>)>,
     /// Bumped on each `build_rows`; stale `Msg::NewEpisodes` replies are dropped.
     new_eps_gen: u64,
     /// Finished downloads, newest first.
@@ -1238,6 +1267,7 @@ impl App {
             lib_list: None,
             list_name: String::new(),
             new_episodes: Vec::new(),
+            upcoming: Vec::new(),
             new_eps_gen: 0,
             downloads: db.downloads()?,
             queue,
@@ -1766,6 +1796,11 @@ impl App {
                         }
                     }
                     let today = unix_days();
+                    self.upcoming.retain(|(m, _)| m.id != meta.id);
+                    let ahead = recent_episodes(videos.clone(), &date_string(today), &date_string(today + CALENDAR_DAYS));
+                    if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) && !ahead.is_empty() {
+                        self.upcoming.push((meta.clone(), ahead));
+                    }
                     let videos = recent_episodes(videos, &date_string(today - (NEW_EPISODE_DAYS - 1)), &date_string(today));
                     if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) && !videos.is_empty() {
                         self.new_episodes.push((meta, videos));
@@ -2151,6 +2186,7 @@ impl App {
     fn build_rows(&mut self, ctx: &egui::Context) {
         self.new_eps_gen += 1;
         self.new_episodes.clear();
+        self.upcoming.clear();
         let cats: Vec<(&String, &String, &CatalogDef)> = self
             .addons
             .iter()
@@ -4531,6 +4567,27 @@ impl App {
             self.quick_play(&ctx, m);
         }
         ui.separator();
+        let mut cal_open = None;
+        egui::CollapsingHeader::new(RichText::new("Calendar").size(20.0).strong().family(bold())).id_salt("calendar").show(ui, |ui| {
+            let groups = calendar_groups(&self.upcoming, unix_days());
+            if groups.is_empty() {
+                ui.label(RichText::new("No upcoming episodes for saved series in the next 30 days (or still loading).").color(ui.visuals().weak_text_color()));
+            }
+            for (head, eps) in groups {
+                ui.label(RichText::new(head).strong());
+                for (m, v) in eps {
+                    let text = format!("{}  S{}E{}  {}", m.name, v.season.unwrap_or(0), v.episode.unwrap_or(0), v.title.as_deref().unwrap_or(""));
+                    if ui.link(text).clicked() {
+                        cal_open = Some(m.clone());
+                    }
+                }
+            }
+        });
+        if let Some(m) = cal_open {
+            self.tab = Tab::Home;
+            self.open_meta(&ctx, m, false);
+        }
+        ui.separator();
         ui.label(RichText::new("Downloads").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
         if self.downloads.is_empty() && self.queue.is_empty() {
             ui.label(RichText::new("Nothing downloaded yet. Open a title and choose \"Download\" on a stream.").color(ui.visuals().weak_text_color()));
@@ -5071,6 +5128,30 @@ mod tests {
         assert_eq!(accent_index(Some("Green")), 2);
         assert_eq!(accent_index(Some("nope")), 0);
         assert_eq!(accent_index(None), 0);
+    }
+
+    #[test]
+    fn calendar_window() {
+        let meta = MetaPreview { id: "tt1".into(), kind: "series".into(), name: "Show".into(), poster: None, background: None, description: None };
+        let v = |id: &str, d: Option<&str>, season| Video { id: id.into(), title: None, season: Some(season), episode: Some(1), released: d.map(Into::into), thumbnail: None };
+        let today = 19_800; // any fixed day
+        let (t, tm, far) = (date_string(today), date_string(today + 1), date_string(today + 5));
+        let videos = vec![
+            v("far", Some(&format!("{far}T00:00:00.000Z")), 1),
+            v("tm", Some(&tm), 1),
+            v("today", Some(&t), 1),
+            v("past", Some(&date_string(today - 1)), 1),
+            v("out", Some(&date_string(today + CALENDAR_DAYS + 1)), 1),
+            v("bad", Some("2024-0x-10"), 1),
+            v("short", Some("2024"), 1),
+            v("none", None, 1),
+            v("special", Some(&t), 0),
+        ];
+        let entries = [(meta, videos)];
+        let g = calendar_groups(&entries, today);
+        let shape: Vec<(&str, Vec<&str>)> = g.iter().map(|(h, e)| (h.as_str(), e.iter().map(|(_, v)| v.id.as_str()).collect())).collect();
+        assert_eq!(shape, vec![("Today", vec!["today"]), ("Tomorrow", vec!["tm"]), (far.as_str(), vec!["far"])]);
+        assert!(calendar_groups(&[], today).is_empty());
     }
 
     #[test]
