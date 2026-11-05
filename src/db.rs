@@ -42,6 +42,11 @@ pub struct SavedTitle {
     pub title: String,
     pub kind: String,
     pub poster: Option<String>,
+    /// Release year and IMDb rating, when known (older rows and imports: `None` until the detail page loads).
+    pub year: Option<i32>,
+    pub rating: Option<f64>,
+    /// Unix time of the latest progress or watched mark on the title or any of its episodes; read-only, set by `saved_titles`.
+    pub last_watched: Option<i64>,
 }
 
 /// A stream saved for offline playback.
@@ -107,6 +112,9 @@ impl Db {
         )?;
         // Migrate databases created before posters were stored; fails harmlessly if the column exists.
         let _ = conn.execute("ALTER TABLE progress ADD COLUMN poster TEXT", []);
+        // Library sorts by year and rating; older rows stay NULL and sort last.
+        let _ = conn.execute("ALTER TABLE saved_titles ADD COLUMN year INTEGER", []);
+        let _ = conn.execute("ALTER TABLE saved_titles ADD COLUMN rating REAL", []);
         // Addon priority (streams and catalogs follow it); older rows share 0 and keep install order.
         let _ = conn.execute("ALTER TABLE addons ADD COLUMN position INTEGER NOT NULL DEFAULT 0", []);
         Ok(Self { conn })
@@ -185,9 +193,19 @@ impl Db {
     pub fn add_saved_title(&self, t: &SavedTitle) -> Result<()> {
         self.conn.execute("DELETE FROM settings WHERE key = ?1", [format!("unsaved:{}", t.key)])?;
         self.conn.execute(
-            "INSERT INTO saved_titles (key, title, kind, poster) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster)",
-            params![t.key, t.title, t.kind, t.poster],
+            "INSERT INTO saved_titles (key, title, kind, poster, year, rating) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster),
+                 year = coalesce(excluded.year, year), rating = coalesce(excluded.rating, rating)",
+            params![t.key, t.title, t.kind, t.poster, t.year, t.rating],
+        )?;
+        Ok(())
+    }
+
+    /// Fill the year and rating of a saved title (a no-op if it isn't saved); keeps stored values when `None`.
+    pub fn set_saved_facts(&self, key: &str, year: Option<i32>, rating: Option<f64>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE saved_titles SET year = coalesce(?2, year), rating = coalesce(?3, rating) WHERE key = ?1",
+            params![key, year, rating],
         )?;
         Ok(())
     }
@@ -213,9 +231,23 @@ impl Db {
     /// Saved titles, newest first; rows with a malformed key or type are skipped.
     pub fn saved_titles(&self) -> Result<Vec<SavedTitle>> {
         // rowid, not key, breaks same-second ties so the order matches insertion order.
-        let mut st = self.conn.prepare("SELECT key, title, kind, poster FROM saved_titles ORDER BY saved_at DESC, rowid DESC")?;
+        let mut st = self.conn.prepare(
+            "SELECT key, title, kind, poster, year, rating,
+                 max(coalesce((SELECT max(updated_at) FROM progress WHERE key = s.key OR substr(key, 1, length(s.key) + 1) = s.key || ':'), 0),
+                     coalesce((SELECT max(watched_at) FROM watched WHERE key = s.key), 0))
+             FROM saved_titles s ORDER BY saved_at DESC, rowid DESC",
+        )?;
         let rows = st.query_map([], |r| {
-            Ok(SavedTitle { key: r.get(0)?, title: r.get(1)?, kind: r.get(2)?, poster: r.get(3)? })
+            let at: i64 = r.get(6)?;
+            Ok(SavedTitle {
+                key: r.get(0)?,
+                title: r.get(1)?,
+                kind: r.get(2)?,
+                poster: r.get(3)?,
+                year: r.get(4)?,
+                rating: r.get(5)?,
+                last_watched: (at > 0).then_some(at),
+            })
         })?;
         Ok(rows
             .filter_map(|r| r.ok())
@@ -326,8 +358,17 @@ impl Db {
     /// Unwatching an episode also drops its imported series (`<series key>:...`) from Watch It Again,
     /// as its imported count no longer holds; watching one of its episodes lets a sync bring it back.
     pub fn set_watched(&self, key: &str, on: bool) -> Result<()> {
+        self.set_watched_many(&[key.to_string()], on)
+    }
+
+    /// [`Db::set_watched`] for many keys (a season or series of episodes), in one transaction.
+    pub fn set_watched_many(&self, keys: &[String], on: bool) -> Result<()> {
+        self.transaction(|| keys.iter().try_for_each(|k| self.set_watched_one(k, on)))
+    }
+
+    fn set_watched_one(&self, key: &str, on: bool) -> Result<()> {
         let k = format!("watched:{key}");
-        self.transaction(|| {
+        {
             if on {
                 self.set_setting(&k, "1")?;
                 self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
@@ -343,7 +384,7 @@ impl Db {
                 self.conn.execute(&format!("DELETE FROM watched WHERE {parent}"), [key])?;
             }
             Ok(())
-        })
+        }
     }
 
     /// Mark episodes `keys` watched, except ones unwatched here, and drop the imported bitfield setting
@@ -381,4 +422,54 @@ impl Db {
 
 fn row_progress(r: &rusqlite::Row) -> rusqlite::Result<Progress> {
     Ok(Progress { key: r.get(0)?, title: r.get(1)?, source: r.get(2)?, position: r.get(3)?, duration: r.get(4)?, poster: r.get(5)? })
+}
+
+const HISTORY_MAX: usize = 10;
+const HISTORY_QUERY_MAX: usize = 100;
+
+/// Puts `q` first in `h`: trimmed, capped in length, deduped case-insensitively, list capped.
+pub fn push_history(h: &mut Vec<String>, q: &str) {
+    let q: String = q.trim().chars().take(HISTORY_QUERY_MAX).collect();
+    if q.is_empty() {
+        return;
+    }
+    h.retain(|x| !x.eq_ignore_ascii_case(&q) && x.to_lowercase() != q.to_lowercase());
+    h.insert(0, q);
+    h.truncate(HISTORY_MAX);
+}
+
+pub fn encode_history(h: &[String]) -> String {
+    h.join("\n")
+}
+
+pub fn decode_history(s: &str) -> Vec<String> {
+    let mut h = Vec::new();
+    for l in s.lines().rev() {
+        push_history(&mut h, l);
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_push_dedupe_cap_roundtrip() {
+        let mut h = Vec::new();
+        push_history(&mut h, "  Matrix ");
+        push_history(&mut h, "   ");
+        push_history(&mut h, "dune");
+        push_history(&mut h, "MATRIX");
+        assert_eq!(h, ["MATRIX", "dune"]);
+        for i in 0..20 {
+            push_history(&mut h, &format!("q{i}"));
+        }
+        assert_eq!(h.len(), HISTORY_MAX);
+        assert_eq!(h[0], "q19");
+        push_history(&mut h, &"x".repeat(500));
+        assert_eq!(h[0].len(), HISTORY_QUERY_MAX);
+        assert_eq!(decode_history(&encode_history(&h)), h);
+        assert!(decode_history("").is_empty());
+    }
 }
