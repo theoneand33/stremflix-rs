@@ -352,7 +352,7 @@ fn upsert_by_id(list: &mut Vec<(MetaPreview, Vec<Video>)>, meta: MetaPreview, vi
 fn os_notify(title: String, body: String) {
     std::thread::spawn(move || {
         if let Err(e) = notify_rust::Notification::new().appname("Stremflix-rs").summary(&title).body(&body).show() {
-            eprintln!("notification: {e}");
+            stremflix_rs::elog!("notification: {e}");
         }
     });
 }
@@ -4340,8 +4340,18 @@ impl App {
         let out = self.data_dir.join("diagnostics.txt");
         if ui.button("Export diagnostics").on_hover_text(format!("Version, OS and recent log without secrets, saved to {}", out.display())).clicked() {
             let summary = format!("addons: {}\nsigned in: {}", self.addons.len(), self.account.is_some());
-            match std::fs::write(&out, stremflix_rs::diag::bundle(&summary)) {
-                Ok(()) => self.error = Some(format!("Diagnostics saved to {}", out.display())),
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+            let res = o.open(&out).and_then(|mut f| {
+                // `mode` only applies to a new file: tighten an older one.
+                #[cfg(unix)]
+                f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+                std::io::Write::write_all(&mut f, stremflix_rs::diag::bundle(&summary).as_bytes())
+            });
+            match res {
+                Ok(()) => self.data_msg = Some(format!("Diagnostics saved to {}", out.display())),
                 Err(e) => report(&mut self.error, format!("diagnostics export: {e}")),
             }
         }

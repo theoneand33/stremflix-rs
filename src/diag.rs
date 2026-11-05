@@ -24,6 +24,8 @@ pub fn log(msg: &str) {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
     if let Ok(mut f) = o.open(p) {
+        #[cfg(unix)]
+        let _ = std::fs::set_permissions(p, std::os::unix::fs::PermissionsExt::from_mode(0o600));
         let _ = writeln!(f, "[{t}] {}", redact(msg));
     }
 }
@@ -38,10 +40,6 @@ macro_rules! elog {
 pub fn redact(s: &str) -> String {
     s.split_inclusive(char::is_whitespace)
         .map(|w| {
-            if let Some(i) = w.find("magnet:") {
-                let end = w[i..].find(|c: char| c.is_whitespace() || "\"'<>)".contains(c)).map_or(w.len(), |e| i + e);
-                return format!("{}magnet:<redacted>{}", &w[..i], &w[end..]);
-            }
             let Some(i) = w.find("://") else { return w.to_string() };
             let start = w[..i].char_indices().rev().find(|(_, c)| !c.is_ascii_alphanumeric() && !"+-.".contains(*c)).map_or(0, |(p, c)| p + c.len_utf8());
             let rest = &w[i + 3..];
@@ -50,6 +48,14 @@ pub fn redact(s: &str) -> String {
             let authority = url.split(['/', '?', '#']).next().unwrap_or("");
             let host = authority.rsplit('@').next().unwrap_or("");
             format!("{}://{host}/<redacted>{tail}", &w[start..i])
+        })
+        .collect::<String>()
+        .split_inclusive(char::is_whitespace)
+        .map(|w| {
+            // URLs went first so a magnet inside a URL path/query is already gone; ASCII lowercase keeps byte offsets.
+            let Some(i) = w.to_ascii_lowercase().find("magnet:") else { return w.to_string() };
+            let end = w[i..].find(|c: char| c.is_whitespace() || "\"'<>)".contains(c)).map_or(w.len(), |e| i + e);
+            format!("{}magnet:<redacted>{}", &w[..i], &w[end..])
         })
         .collect()
 }
@@ -80,6 +86,8 @@ mod tests {
         let u = redact("“https://a.example/SECRET” 日本https://b.example/TOKEN");
         assert_eq!(u, "https://a.example/<redacted> https://b.example/<redacted>");
         assert!(!u.contains("SECRET") && !u.contains("TOKEN"));
+        let n = redact("GET https://host/SECRET?u=magnet:?xt=urn:btih:ABC123 x MAGNET:?xt=urn:btih:DEF456");
+        assert_eq!(n, "GET https://host/<redacted> x magnet:<redacted>");
         assert!(!redact("日本magnet:?xt=urn:btih:ABC123").contains("ABC123"));
     }
 }
