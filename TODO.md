@@ -67,7 +67,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Support `notWebReady` and `proxyHeaders.response` hints | P2 | M | `proxyHeaders.request` is handled; these are not. |
 | Remote/LAN streaming server | P2 | L | Stremio serves the library to other devices; casting is a separate item. |
 | Addon health indicator (unreachable / timeout) | P3 | S | |
-| Install from `stremio://` addon links pasted in Addons | P3 | S | Deep links only cover detail pages today. |
 | QR code to install an addon | P3 | S | |
 | Per-type addon ordering | P3 | S | One global priority list today. |
 

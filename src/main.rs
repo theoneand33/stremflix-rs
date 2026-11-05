@@ -3574,6 +3574,10 @@ impl App {
     fn ui_addons(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if form_row(ui, "Manifest URL:", &mut self.addon_url, "http://127.0.0.1:7070/manifest.json", "Install", None, false) {
+            // A pasted stremio:// link becomes its manifest URL (http for loopback).
+            if let Some(stremflix_rs::addon::DeepLink::Addon(u)) = stremflix_rs::addon::parse_deep_link(&self.addon_url) {
+                self.addon_url = u.into();
+            }
             let (client, url) = (self.client.clone(), self.addon_url.trim().to_string());
             self.spawn(&ctx, async move {
                 let m = client.fetch_manifest(&url).await?;
