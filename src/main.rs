@@ -904,6 +904,20 @@ fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
     paused && dur > 0.0 && pos >= dur - 1.0
 }
 
+/// `timer_paused` bookkeeping: confirmed once mpv reports paused, dropped when the user resumes.
+fn timer_pause_step(state: Option<bool>, paused: bool) -> Option<bool> {
+    match (state, paused) {
+        (Some(false), true) => Some(true),
+        (Some(true), false) => None,
+        (s, _) => s,
+    }
+}
+
+/// End-of-episode autoplay; never after the sleep timer's own pause.
+fn autoplay_due(autoplay_next: bool, timer_paused: Option<bool>, at_end: bool) -> bool {
+    autoplay_next && timer_paused.is_none() && at_end
+}
+
 /// Fraction of the seek bar the cache covers, never behind the playhead.
 fn buffered_frac(pos: f64, cached_to: f64, dur: f64) -> f32 {
     if dur > 0.0 { (cached_to.max(pos) / dur).clamp(0.0, 1.0) as f32 } else { 0.0 }
@@ -1239,8 +1253,12 @@ struct App {
     last_poll: Instant,
     /// Sleep timer: pause at this time; the minutes chosen. Survives autoplay-next, cleared when the player is left.
     sleep: Option<(Instant, u64)>,
-    /// Timer waiting for the next episode's player; only valid for the `nav` that play_next opened.
-    sleep_carry: Option<((Instant, u64), u64)>,
+    /// Timer handed from play_next to the next autoplay-started player; consumed once by Msg::Play.
+    /// Every other navigation (`play`, `open_*`, Back) and every error clears it.
+    sleep_carry: Option<(Instant, u64)>,
+    /// The sleep timer paused playback: `Some(false)` until mpv reports paused, then `Some(true)` until resumed.
+    /// Autoplay must not fire while set (see `timer_pause_step`).
+    timer_paused: Option<bool>,
     /// GL function loader of eframe's context, for libmpv's OpenGL renderer.
     gl_proc: Option<GlProc>,
     window: Geo,
@@ -1429,6 +1447,7 @@ impl App {
             last_poll: Instant::now(),
             sleep: None,
             sleep_carry: None,
+            timer_paused: None,
             gl_proc: None,
             window: Geo::default(),
             video: None,
@@ -1493,6 +1512,8 @@ impl App {
     /// Resolve `source` (http URL, magnet, or local path) and start playback.
     fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
         self.clear_file_pick();
+        self.sleep_carry = None;
+        self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
@@ -1677,7 +1698,10 @@ impl App {
 
     fn handle(&mut self, ctx: &egui::Context, msg: Msg) {
         match msg {
-            Msg::Error(e) => report(&mut self.error, e),
+            Msg::Error(e) => {
+                self.sleep_carry = None;
+                report(&mut self.error, e);
+            }
             Msg::Installed(url, m, replaces) => {
                 let saved = self.db.add_addon(&url, &m);
                 if let Err(e) = &saved {
@@ -1783,11 +1807,10 @@ impl App {
                 if autoplay != Autoplay::Off {
                     match (src, self.play_key()) {
                         (Some(src), Some((key, title))) => {
+                            // The autoplay chain: `play` clears the carry like any other navigation, so hand it through.
+                            let carry = self.sleep_carry.take();
                             self.play(ctx, key, title, src, subs);
-                            // `play` advanced nav; the carry must match the nav Msg::Play arrives with.
-                            if let Some((_, n)) = &mut self.sleep_carry {
-                                *n = self.nav;
-                            }
+                            self.sleep_carry = carry;
                         }
                         _ => {
                             self.show_streams = true;
@@ -2077,7 +2100,7 @@ impl App {
                 }
                 let carry = self.sleep_carry.take();
                 self.stop_player();
-                self.sleep = carry.filter(|(_, n)| *n == nav).map(|(s, _)| s);
+                self.sleep = carry;
                 self.release_torrents(torrent);
                 let prev = self.db.progress(&key).ok().flatten();
                 let start = match &prev {
@@ -2193,6 +2216,7 @@ impl App {
     fn stop_player(&mut self) {
         self.sleep = None;
         self.sleep_carry = None;
+        self.timer_paused = None;
         self.save_progress();
         self.player = None;
     }
@@ -2253,16 +2277,17 @@ impl App {
             self.release_torrents(None);
             return;
         }
-        // Before the autoplay check: an expired timer must not roll into the next episode.
         if self.sleep.is_some_and(|(t, _)| Instant::now() >= t) {
             self.sleep = None;
+            self.timer_paused = Some(false);
             if let Err(e) = p.player.command(&["set", "pause", "yes"]) {
                 report(&mut self.error, e);
             }
             return;
         }
         let st = &p.player.state;
-        if self.autoplay_next && at_end(st.pos, st.dur, st.paused) && self.playing_episode() {
+        self.timer_paused = timer_pause_step(self.timer_paused, st.paused);
+        if autoplay_due(self.autoplay_next, self.timer_paused, at_end(st.pos, st.dur, st.paused)) && self.playing_episode() {
             return self.play_next(ctx);
         }
         let Some(p) = &mut self.player else { return };
@@ -2614,7 +2639,7 @@ impl App {
         match next {
             Some((m, v)) => {
                 self.open_streams(ctx, m, Some(v), Autoplay::Only, binge);
-                self.sleep_carry = sleep.map(|s| (s, self.nav));
+                self.sleep_carry = sleep;
             }
             None => {
                 self.release_torrents(None);
@@ -2633,6 +2658,7 @@ impl App {
         let client = self.client.clone();
         let addons = self.addons_for("meta", &meta.kind, &meta.id);
         self.clear_file_pick();
+        self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -2712,6 +2738,7 @@ impl App {
         let names: Vec<String> = stream_addons.iter().map(|u| self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default()).collect();
         let sub_addons = self.addons_for("subtitles", &meta.kind, &id);
         self.clear_file_pick();
+        self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -5050,6 +5077,7 @@ impl eframe::App for App {
                     (self.episodes, self.episode) = (Vec::new(), None);
                     self.scroll_top = true;
                     self.clear_file_pick();
+                    self.sleep_carry = None;
                     self.nav += 1;
                 }
                 ui.add_space(6.0);
@@ -5640,27 +5668,40 @@ mod tests {
     }
 
     #[test]
-    fn sleep_carry_dies_when_autoplay_falls_back_to_picker() {
-        let (_dir, mut app) = test_app();
-        let ctx = egui::Context::default();
-        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
-        app.nav = 3;
-        app.sleep_carry = Some(((Instant::now(), 30), 3));
-        app.handle(&ctx, Msg::Streams(m, None, vec![], vec![], Autoplay::Only, None, 3));
-        assert!(app.sleep_carry.is_none() && app.show_streams);
-    }
-
-    #[test]
-    fn sleep_carry_follows_nav_after_autoplay() {
+    fn sleep_carry_survives_autoplay_chain_only() {
         let (_dir, mut app) = test_app();
         let ctx = egui::Context::default();
         let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
         let one = Stream { url: Some("https://x.example/a".into()), ..Default::default() };
+        let carry = (Instant::now() + Duration::from_secs(600), 30);
+        // Successful autoplay: play advances nav, the carry rides along and Msg::Play consumes it exactly once.
         app.nav = 3;
-        app.sleep_carry = Some(((Instant::now(), 30), 3));
-        app.handle(&ctx, Msg::Streams(m, None, vec![one], vec![], Autoplay::Only, None, 3));
-        assert_eq!(app.nav, 4, "play advanced nav");
-        assert_eq!(app.sleep_carry.map(|(_, n)| n), Some(4), "carry matches the Msg::Play nav");
+        app.sleep_carry = Some(carry);
+        app.handle(&ctx, Msg::Streams(m.clone(), None, vec![one.clone()], vec![], Autoplay::Only, None, 3));
+        assert_eq!(app.sleep_carry, Some(carry), "survives play");
+        // Picker fallback, a failure, or any other navigation drops it.
+        app.handle(&ctx, Msg::Streams(m.clone(), None, vec![], vec![], Autoplay::Only, None, app.nav));
+        assert!(app.sleep_carry.is_none() && app.show_streams);
+        app.sleep_carry = Some(carry);
+        app.handle(&ctx, Msg::Error("boom".into()));
+        assert!(app.sleep_carry.is_none());
+        // A user-started play never inherits a stale carry.
+        app.sleep_carry = Some(carry);
+        app.play(&ctx, "movie:a".into(), "a".into(), "https://x.example/a".into(), vec![]);
+        assert!(app.sleep_carry.is_none());
+    }
+
+    #[test]
+    fn timer_pause_blocks_autoplay_until_resumed() {
+        assert!(autoplay_due(true, None, true));
+        assert!(!autoplay_due(true, Some(false), true), "pause not yet confirmed");
+        assert!(!autoplay_due(true, Some(true), true));
+        assert!(!autoplay_due(false, None, true));
+        let s = timer_pause_step(Some(false), false);
+        assert_eq!(s, Some(false), "mpv has not reported the pause yet");
+        let s = timer_pause_step(s, true);
+        assert_eq!(s, Some(true));
+        assert_eq!(timer_pause_step(s, false), None, "user resumed");
     }
 
     #[test]
