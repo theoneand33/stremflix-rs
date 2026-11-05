@@ -7,6 +7,7 @@ src/library.rs  Recursive media-file scan (walkdir)
 src/download.rs Offline downloads: safe file names, streaming a URL (or the local torrent stream) to a file
 src/player.rs   libmpv (FFI) in-process: OpenGL-rendered frames, observed properties, IPC server
 src/torrent.rs  librqbit session + its HTTP streaming API on 127.0.0.1
+src/tray.rs     Tray icon (Show/Hide, Play/Pause, Quit): ksni StatusNotifierItem over D-Bus on Linux (no GTK), tray-icon on Windows/macOS
 src/stremio_import.rs  Reads a local Stremio's localStorage (WebKit SQLite or Chromium LevelDB via rusty-leveldb)
 src/main.rs     egui/eframe GUI; tokio runtime for network/torrent work, results via mpsc
 test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed via librqbit.
@@ -24,6 +25,8 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 
 - **egui + video surface.** egui renders through its own GL/wgpu painter and has no native video widget. The options are (a) libmpv's render API into an egui texture or GL callback, which needs unsafe FFI, libmpv at runtime, and GL context sharing with eframe's glow backend, or (b) mpv's `--wid` embedding, which only works on X11 and breaks on Wayland/macOS. eframe runs on its glow (OpenGL) backend instead of the default wgpu, so libmpv can render into eframe's own GL context. eframe exposes that context's `get_proc_address`, and libmpv uses it to load GL functions. mpv renders during `App::ui` into an app-owned framebuffer at on-screen pixel size. The app then resets the GL state that mpv changes and egui's painter relies on: framebuffer, active texture, program, VAO, unpack alignment, scissor and blend. This works on X11, Wayland, macOS and Xvfb (Mesa llvmpipe).
 - **librqbit + tokio vs. egui's synchronous loop.** The app owns a tokio runtime. UI events spawn async tasks, and results return over `std::sync::mpsc` with `ctx.request_repaint()`. The UI thread never blocks.
+- **Minimize to tray vs. egui's loop.** A hidden window gets no `App::ui`, only `App::logic`, so messages, tray clicks and player polling run in `logic`. mpv's frames aren't rendered meanwhile, which would stall its core, so the video track is off (`vid=no`) while hidden and restored when shown. Without a tray host (no D-Bus, no StatusNotifierWatcher) closing quits as before. Wayland can't hide windows, so the window minimizes there.
+- **OS media controls: souvlaki** (MPRIS on Linux, SMTC on Windows via the window's HWND, MPNowPlaying on macOS). Its `use_zbus` feature talks D-Bus in pure Rust, so there is no libdbus build dependency. Media-key events come back over the same `mpsc` channel with `ctx.request_repaint()`. Without a D-Bus session (CI, Xvfb) its MPRIS thread fails, logs, and the app runs on without controls.
 - **librqbit's HTTP API** needs the `http-api` feature and also `tracing-subscriber-utils` (librqbit 9.1 fails to compile without it). It also needs `librqbit-dualstack-sockets` for its listener type.
 
 ## Protocol notes
@@ -46,5 +49,7 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 ## Persistence
 
 SQLite in WAL mode at `$STREMFLIX_RS_DATA/stremflix-rs.db`. Progress keys are `<type>:<id>` for addon items, `file:<path>` for local files, and `btih:<hash>` for raw magnets. Each row stores a resumable source: URL, magnet, or path.
+
+Saved titles (`saved_titles`) are the default library. User lists live in `lists` (name unique ignoring case) and `list_items` (`list_id`, saved-title key; cascades when a list is deleted); adding to a list saves the title, and unsaving removes it from every list.
 
 Downloads go to `$STREMFLIX_RS_DATA/downloads/`, named from the sanitized title (never from addon or torrent file paths), written to `<name>.part` and renamed when complete. The `downloads` table keeps path, type, meta id, video id and title; playing one uses the streaming progress key `<type>:<video id>`. A downloading torrent is pinned so other playback doesn't stop it.
