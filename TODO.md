@@ -28,7 +28,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
-| A-B loop / repeat | P3 | S | |
 | Frame-by-frame stepping | P3 | S | |
 | Picture-in-picture / mini player | P3 | M | egui viewport or a second native window. |
 | Audio output device selection | P3 | M | mpv `audio-device`. |
