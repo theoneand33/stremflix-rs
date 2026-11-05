@@ -539,6 +539,27 @@ pub fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_TEXT && !s.chars().any(|c| c.is_control() || c == '/')
 }
 
+/// `localhost` or a loopback IP: only this machine can reach it.
+fn is_loopback(u: &Url) -> bool {
+    match u.host() {
+        Some(url::Host::Domain(d)) => d == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// The `stremio://` install link for an https manifest URL (what a phone's Stremio opens).
+/// `None` unless the link parses back to the same URL, and for loopback hosts a phone cannot reach.
+pub fn install_link(manifest_url: &str) -> Option<String> {
+    let u = safe_http_url(manifest_url)?;
+    if is_loopback(&u) {
+        return None;
+    }
+    let link = format!("stremio://{}", u.as_str().split_once("://")?.1);
+    (parse_deep_link(&link) == Some(DeepLink::Addon(u))).then_some(link)
+}
+
 /// A `stremio://` link from the OS (browser, other apps).
 #[derive(Debug, PartialEq)]
 pub enum DeepLink {
@@ -567,13 +588,8 @@ pub fn parse_deep_link(s: &str) -> Option<DeepLink> {
         return None;
     }
     // Local addons (the SDK's own landing page links) serve plain http.
-    let local = match u.host() {
-        Some(url::Host::Domain(d)) => d == "localhost",
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    };
-    safe_http_url(&format!("{}://{rest}", if local { "http" } else { "https" })).map(DeepLink::Addon)
+    let scheme = if is_loopback(&u) { "http" } else { "https" };
+    safe_http_url(&format!("{scheme}://{rest}")).map(DeepLink::Addon)
 }
 
 fn from_json<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
@@ -878,6 +894,26 @@ mod proxy_tests {
 #[cfg(test)]
 mod configure_tests {
     use super::*;
+
+    #[test]
+    fn install_link_roundtrips() {
+        let l = install_link("https://a.example/x/manifest.json").unwrap();
+        assert_eq!(l, "stremio://a.example/x/manifest.json");
+        assert_eq!(parse_deep_link(&l), Some(DeepLink::Addon(Url::parse("https://a.example/x/manifest.json").unwrap())));
+        assert_eq!(install_link("file:///x"), None);
+    }
+
+    #[test]
+    fn install_link_only_when_it_roundtrips() {
+        // Plain http would come back as https.
+        assert_eq!(install_link("http://192.168.1.5/manifest.json"), None);
+        // Query and fragment are rejected by parse_deep_link.
+        assert_eq!(install_link("https://a/manifest.json?x=1"), None);
+        assert_eq!(install_link("https://a/manifest.json#f"), None);
+        // A phone cannot reach loopback.
+        assert_eq!(install_link("http://127.0.0.1:7070/manifest.json"), None);
+        assert_eq!(install_link("https://localhost/manifest.json"), None);
+    }
 
     #[test]
     fn skip_markers_are_validated() {
