@@ -88,7 +88,7 @@ pub fn register_scheme() {
         &["add", &format!(r"{key}\shell\open\command"), "/ve", "/d", &cmd, "/f"],
     ] {
         if !reg(args).is_ok_and(|o| o.status.success()) {
-            eprintln!("error: registering stremio:// links failed");
+            crate::elog!("error: registering stremio:// links failed");
             return;
         }
     }
