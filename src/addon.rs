@@ -715,7 +715,9 @@ pub fn proxy_url(kind: &str, addr: &str, user: &str, pass: &str) -> std::result:
     let mut url = Url::parse(&format!("{scheme}://{host}:{port}")).map_err(|_| "invalid proxy host")?;
     if !user.is_empty() || !pass.is_empty() {
         // Pre-encoded: `Url` leaves a literal `%` alone, so a password like `%41` would decode to `A`.
-        let enc = |s: &str| percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string();
+        // Only userinfo delimiters: librqbit/mpv take the raw string, so `- _ . ~` must not become `%2D` etc.
+        const USERINFO: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b' ').add(b':').add(b'@').add(b'/').add(b'?').add(b'#').add(b'[').add(b']').add(b'\\').add(b'%').add(b'"').add(b'<').add(b'>').add(b'`').add(b'{').add(b'}').add(b'|').add(b'^');
+        let enc = |s: &str| percent_encoding::utf8_percent_encode(s, USERINFO).to_string();
         url.set_username(&enc(user)).map_err(|_| "invalid proxy username")?;
         url.set_password((!pass.is_empty()).then(|| enc(pass)).as_deref()).map_err(|_| "invalid proxy password")?;
     }
@@ -745,6 +747,7 @@ mod proxy_tests {
         let dec = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8().unwrap().into_owned();
         assert_eq!((dec(url.username()), dec(url.password().unwrap())), ("us er@x".into(), "p:@/#%41?é".into()));
         assert_eq!(u("socks5", "h:1", "", "pw"), "socks5h://:pw@h:1");
+        assert_eq!(u("socks5", "h:1", "my-user", "my-pass_.~!"), "socks5h://my-user:my-pass_.~!@h:1");
         for (k, a) in [("ftp", "h:1"), ("http", "h"), ("http", ":80"), ("http", "h:0"), ("http", "h:65536"), ("http", "h:x"), ("http", "a b:80"), ("http", "h\n:80"), ("http", "u@h:80"), ("http", "h/x:80"), ("http", "a:b:80")] {
             assert!(proxy_url(k, a, "", "").is_err(), "{k} {a}");
         }
