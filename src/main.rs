@@ -18,6 +18,7 @@ use eframe::glow::{self, HasContext};
 use stremflix_rs::player::{GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{Profile, TorrentEngine};
+use stremflix_rs::tray::{self, Tray};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -231,6 +232,8 @@ enum Msg {
     Link(String),
     /// A download that finished, or why it failed.
     Downloaded(Download, Result<(), String>),
+    /// A tray menu item or icon click.
+    Tray(tray::Action),
     /// Progress key and the subtitles every addon offered for it.
     SubSearch(String, Vec<SubFound>),
     /// A saved subtitle's path, or why saving failed.
@@ -963,6 +966,8 @@ struct Playing {
     zoom: i32,
     /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
     awake: Option<Option<keepawake::KeepAwake>>,
+    /// Video track to restore once the window is shown again; video is off while hidden.
+    hidden_vid: Option<String>,
 }
 
 impl Drop for Playing {
@@ -1077,6 +1082,13 @@ struct App {
     light: bool,
     /// Play the next episode when one ends.
     autoplay_next: bool,
+    /// Closing the window hides it to the tray instead of quitting.
+    tray_on_close: bool,
+    tray: Option<Tray>,
+    /// Window hidden to the tray.
+    hidden: bool,
+    /// Quit was picked in the tray: let the close through.
+    quit: bool,
     ui_scale: f32,
     /// Playback speed every video starts at.
     default_speed: f64,
@@ -1114,6 +1126,10 @@ fn data_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(std::env::temp_dir);
     base.join("stremflix-rs")
+}
+
+fn wayland() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 /// Show `e` in the UI and on stderr (headless runs, CI).
@@ -1173,6 +1189,10 @@ impl App {
             home_all: Vec::new(),
             light: db.setting("theme")?.as_deref() == Some("light"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
+            tray_on_close: db.setting("tray_on_close")?.as_deref() == Some("1"),
+            tray: None,
+            hidden: false,
+            quit: false,
             volume: db.setting("volume")?.and_then(|v| v.parse().ok()).filter(|v| (0.0..=130.0).contains(v)).unwrap_or(100.0),
             ui_scale: clamp_scale(db.setting("ui_scale")?.and_then(|v| v.parse().ok()).unwrap_or(1.0)),
             default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
@@ -1522,10 +1542,19 @@ impl App {
                 let autoplay = if show.is_some() { Autoplay::Off } else { Autoplay::Top };
                 self.open_streams(ctx, meta, Some(v), autoplay, binge);
             }
+            Msg::Tray(tray::Action::Toggle) => self.show_window(ctx, self.hidden),
+            Msg::Tray(tray::Action::PlayPause) => {
+                if let Some(Err(e)) = self.player.as_ref().map(|p| p.player.command(&["cycle", "pause"])) {
+                    report(&mut self.error, e);
+                }
+            }
+            Msg::Tray(tray::Action::Quit) => {
+                self.quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             Msg::Link(s) => match stremflix_rs::addon::parse_deep_link(&s) {
                 Some(link) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.show_window(ctx, true);
                     // Leave the player like its Back button does, or the link opens behind it.
                     if self.player.is_some() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -1534,10 +1563,7 @@ impl App {
                     }
                     self.open_link(ctx, link);
                 }
-                None if s.is_empty() => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
+                None if s.is_empty() => self.show_window(ctx, true),
                 None => report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200))),
             },
             Msg::NewEpisodes(epoch, meta, mut videos) => {
@@ -1722,7 +1748,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, sleep_at: None, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, sleep_at: None, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None, hidden_vid: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1774,6 +1800,20 @@ impl App {
                 self.recent = self.db.recent_progress(20).unwrap_or_default();
             }
             Err(e) => report(&mut self.error, format!("saving watched state: {e:#}")),
+        }
+    }
+
+    /// Shows and focuses the window, or hides it to the tray.
+    fn show_window(&mut self, ctx: &egui::Context, show: bool) {
+        self.hidden = !show;
+        // shortcut: Wayland can't hide a window (winit ignores Visible), so it minimizes there instead.
+        if !show && wayland() {
+            return ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show));
+        if show {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
     }
 
@@ -3863,6 +3903,9 @@ impl App {
             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                 save.push(("hwdec", on(self.hwdec)));
             }
+            if switch_row(ui, "Minimize to tray on close", &mut self.tray_on_close).changed() {
+                save.push(("tray_on_close", on(self.tray_on_close)));
+            }
             let step = stepper(ui, "Subtitle size", &format!("{:.1}x", style.scale));
             if step != 0 {
                 style.scale = (style.scale * 10.0).round() / 10.0 + step as f64 * 0.1;
@@ -4123,6 +4166,33 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Runs before each `ui`, and alone while the window is hidden, so messages, tray clicks and playback keep going.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.handle(ctx, msg);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.tray_on_close && !self.quit && self.tray.as_ref().is_some_and(Tray::is_up) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.show_window(ctx, false);
+        }
+        self.poll_player(ctx);
+        self.publish_media();
+        // Hidden, `ui` doesn't run and mpv's frames aren't rendered, which stalls its core: play audio only meanwhile.
+        // A minimized Wayland window is no different from one minimized by hand, so it keeps its video.
+        if let Some(p) = &mut self.player
+            && (self.hidden && !wayland()) != p.hidden_vid.is_some()
+        {
+            let v = p.hidden_vid.take().unwrap_or_else(|| {
+                p.hidden_vid = Some(p.player.state.tracks.iter().find(|t| t.kind == "video" && t.selected).map_or("auto".into(), |t| t.id.to_string()));
+                "no".into()
+            });
+            if let Err(e) = p.player.command(&["set", "vid", &v]) {
+                report(&mut self.error, e);
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // egui's built-in zoom keys change the factor too: bound it, then persist any change.
@@ -4141,12 +4211,6 @@ impl eframe::App for App {
         if ctx.cumulative_frame_nr() == 2 {
             std::thread::spawn(stremflix_rs::player::load_mpv);
         }
-        while let Ok(msg) = self.rx.try_recv() {
-            self.handle(&ctx, msg);
-        }
-        self.poll_player(&ctx);
-        self.publish_media();
-        ctx.request_repaint_after(Duration::from_millis(500));
         // A dropped .torrent file, or a magnet pasted with no text field focused, plays at once.
         // Window systems deliver dropped files only, not dropped text, so magnets come in by paste.
         let (dropped, pasted) = ctx.input(|i| {
@@ -4424,6 +4488,11 @@ fn main() -> eframe::Result {
                 eprintln!("update check: {e:#}");
                 None
             })))
+        });
+        let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
+        app.tray = tray::spawn(&app.rt, include_bytes!("../assets/icon.png"), move |a| {
+            let _ = tx.send(Msg::Tray(a));
+            ctx.request_repaint();
         });
         let _ = ctx_cell.set(cc.egui_ctx.clone());
         Ok(Box::new(app))
