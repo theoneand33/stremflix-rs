@@ -1825,7 +1825,7 @@ impl App {
                     }
                     match link {
                         Some(link) => self.open_link(ctx, link),
-                        None if is_torrent_file(&s) || s.starts_with("magnet:") => self.play_torrent(ctx, &s),
+                        None if is_torrent_file(&s) || parse_magnet_hash(&s).is_some() => self.play_torrent(ctx, &s),
                         None => {
                             let name = std::path::Path::new(&s).file_stem().map_or("Video".into(), |n| n.to_string_lossy().into_owned());
                             self.play(ctx, format!("file:{s}"), name, s, vec![]);
@@ -5610,6 +5610,9 @@ mod tests {
         assert!(matches!(cli(&["stremio:///detail/movie/tt1"]), Cli::Open(Some(_))));
         assert!(matches!(cli(&[&magnet]), Cli::Open(Some(m)) if m == magnet));
         assert!(matches!(cli(&[file]), Cli::Open(Some(p)) if p == file));
+        // Url::parse accepts an upper-case scheme; Msg::Link routing uses the same predicate.
+        let upper = magnet.replacen("magnet", "MAGNET", 1);
+        assert!(matches!(cli(&[&upper]), Cli::Open(Some(_))) && parse_magnet_hash(&upper).is_some());
         for bad in [&["--nope"][..], &["magnet:?xt=bad"], &["https://x.example/a.torrent"], &["/no/such.mkv"], &[file, file]] {
             assert!(matches!(cli(bad), Cli::Bad(_)), "{bad:?}");
         }
