@@ -277,6 +277,9 @@ fn arrange_rows(keys: &[String], order: &[String]) -> Vec<usize> {
     out
 }
 
+/// Content types that can have their own addon order.
+const ADDON_ORDER_KINDS: [&str; 2] = ["movie", "series"];
+
 /// Keys contain `|` and URLs, so settings hold them as a JSON array.
 fn encode_keys(keys: &[String]) -> String {
     serde_json::to_string(keys).unwrap_or_default()
@@ -1079,6 +1082,10 @@ struct App {
     hwdec: bool,
     /// Custom Home row order and hidden rows (row keys).
     home_order: Vec<String>,
+    /// Addon priority per content type (movie, series): addon URLs, first = highest; a type without one follows the global order.
+    addon_orders: HashMap<String, Vec<String>>,
+    /// Type whose order the Addons tab edits; empty = the global order.
+    addon_order_kind: String,
     home_hidden: Vec<String>,
     /// Every Home row as (key, title) in display order, hidden ones included.
     home_all: Vec<(String, String)>,
@@ -1191,6 +1198,8 @@ impl App {
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
+            addon_orders: ADDON_ORDER_KINDS.iter().filter_map(|k| Some((k.to_string(), decode_keys(&db.setting(&format!("addon_order:{k}")).ok()??)))).collect(),
+            addon_order_kind: String::new(),
             home_hidden: decode_keys(&db.setting("home_hidden")?.unwrap_or_default()),
             home_all: Vec::new(),
             light: db.setting("theme")?.as_deref() == Some("light"),
@@ -2073,7 +2082,9 @@ impl App {
         let matches = |m: &Manifest| {
             m.has_resource(res) && m.types.iter().any(|t| t == kind) && m.id_prefixes.as_ref().is_none_or(|ps| ps.iter().any(|p| id.starts_with(p.as_str())))
         };
-        self.addons.iter().filter(|(_, m)| matches(m)).map(|(u, _)| u.clone()).collect()
+        let urls: Vec<String> = self.addons.iter().filter(|(_, m)| matches(m)).map(|(u, _)| u.clone()).collect();
+        let order = self.addon_orders.get(kind).map_or(&[][..], |o| o);
+        arrange_rows(&urls, order).into_iter().map(|i| urls[i].clone()).collect()
     }
 
     /// Fetch a movie's full meta for the detail page from the first addon that serves it.
@@ -3599,15 +3610,24 @@ impl App {
         let mut replace = None;
         let mut swap = None;
         let mut details = None;
+        ui.horizontal(|ui| {
+            ui.label("Order for:");
+            for (k, label) in [("", "All"), ("movie", "Movies"), ("series", "Series")] {
+                ui.selectable_value(&mut self.addon_order_kind, k.to_string(), label);
+            }
+        });
         let n = self.addons.len();
-        for (i, (url, m)) in self.addons.iter().enumerate() {
+        let urls: Vec<String> = self.addons.iter().map(|(u, _)| u.clone()).collect();
+        let view = arrange_rows(&urls, self.addon_orders.get(&self.addon_order_kind).map_or(&[][..], |o| o));
+        for (pos, &i) in view.iter().enumerate() {
+            let (url, m) = &self.addons[i];
             ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
                 // Order is priority: streams and catalogs of higher addons come first.
-                if ui.add_enabled_ui(i > 0, |ui| small_button(ui, "Up")).inner.on_hover_text("Higher priority").clicked() {
-                    swap = Some(i - 1);
+                if ui.add_enabled_ui(pos > 0, |ui| small_button(ui, "Up")).inner.on_hover_text("Higher priority").clicked() {
+                    swap = Some(pos - 1);
                 }
-                if ui.add_enabled_ui(i + 1 < n, |ui| small_button(ui, "Down")).inner.on_hover_text("Lower priority").clicked() {
-                    swap = Some(i);
+                if ui.add_enabled_ui(pos + 1 < n, |ui| small_button(ui, "Down")).inner.on_hover_text("Lower priority").clicked() {
+                    swap = Some(pos);
                 }
                 ui.label(format!("{} {} ({})", m.name, m.version, url));
                 let open = self.addon_details.as_ref() == Some(url);
@@ -3675,10 +3695,19 @@ impl App {
         if let Some(d) = details {
             self.addon_details = d;
         }
-        if let Some(i) = swap {
-            self.addons.swap(i, i + 1);
-            let urls: Vec<String> = self.addons.iter().map(|(u, _)| u.clone()).collect();
-            if let Err(e) = self.db.reorder_addons(&urls) {
+        if let Some(p) = swap {
+            let mut ordered: Vec<String> = view.iter().map(|&i| urls[i].clone()).collect();
+            ordered.swap(p, p + 1);
+            let kind = self.addon_order_kind.clone();
+            let saved = if kind.is_empty() {
+                self.addons.sort_by_key(|(u, _)| ordered.iter().position(|o| o == u));
+                self.db.reorder_addons(&ordered)
+            } else {
+                let r = self.db.set_setting(&format!("addon_order:{kind}"), &encode_keys(&ordered));
+                self.addon_orders.insert(kind, ordered);
+                r
+            };
+            if let Err(e) = saved {
                 report(&mut self.error, format!("saving addon order: {e:#}"));
             }
             self.build_rows(&ctx);
@@ -4971,7 +5000,7 @@ mod tests {
         let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let keys = k(&["a", "b", "c", "d"]);
         assert_eq!(arrange_rows(&keys, &k(&["c", "zz", "a", "c"])), [2, 0, 1, 3], "stale and repeated keys ignored, rest keep priority");
-        assert_eq!(arrange_rows(&keys, &[]), [0, 1, 2, 3]);
+        assert_eq!(arrange_rows(&keys, &[]), [0, 1, 2, 3], "no per-type order falls back to the global one");
         let odd = k(&["http://h/m.json|movie|top \"x\"", "b"]);
         assert_eq!(decode_keys(&encode_keys(&odd)), odd);
         assert!(decode_keys("garbage").is_empty());
