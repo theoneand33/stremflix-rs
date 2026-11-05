@@ -1,4 +1,4 @@
-//! SQLite persistence: addons, library folders/items, saved titles, settings, watch progress.
+//! SQLite persistence: addons, library folders/items, saved titles and lists, settings, watch progress.
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -49,6 +49,22 @@ pub struct SavedTitle {
     pub last_watched: Option<i64>,
 }
 
+/// A user list ("collection") of saved titles.
+#[derive(Debug, Clone, PartialEq)]
+pub struct List {
+    pub id: i64,
+    pub name: String,
+    /// Saved-title keys in the list.
+    pub keys: std::collections::HashSet<String>,
+}
+
+/// Trimmed list name, or an error unless it is 1–60 characters.
+fn list_name(name: &str) -> Result<&str> {
+    let n = name.trim();
+    anyhow::ensure!((1..=60).contains(&n.chars().count()), "list names are 1–60 characters");
+    Ok(n)
+}
+
 /// A stream saved for offline playback.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Download {
@@ -97,6 +113,7 @@ impl Db {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL; -- safe with WAL; a crash loses at most the last commit, and progress saves every second
+             PRAGMA foreign_keys=ON;
              CREATE TABLE IF NOT EXISTS addons (transport_url TEXT PRIMARY KEY, manifest TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS library_folders (path TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS library_items (path TEXT PRIMARY KEY, folder TEXT NOT NULL, title TEXT NOT NULL);
@@ -108,7 +125,11 @@ impl Db {
              CREATE TABLE IF NOT EXISTS saved_titles (key TEXT PRIMARY KEY, title TEXT NOT NULL, kind TEXT NOT NULL,
                  poster TEXT, saved_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS downloads (path TEXT PRIMARY KEY, kind TEXT NOT NULL, meta_id TEXT NOT NULL,
-                 video_id TEXT NOT NULL, title TEXT NOT NULL, added_at INTEGER NOT NULL DEFAULT (unixepoch()));",
+                 video_id TEXT NOT NULL, title TEXT NOT NULL, added_at INTEGER NOT NULL DEFAULT (unixepoch()));
+             CREATE TABLE IF NOT EXISTS lists (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                 created INTEGER NOT NULL DEFAULT (unixepoch()));
+             CREATE TABLE IF NOT EXISTS list_items (list_id INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+                 title_key TEXT NOT NULL, added INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (list_id, title_key));",
         )?;
         // Migrate databases created before posters were stored; fails harmlessly if the column exists.
         let _ = conn.execute("ALTER TABLE progress ADD COLUMN poster TEXT", []);
@@ -224,6 +245,7 @@ impl Db {
     pub fn remove_saved_title(&self, key: &str) -> Result<()> {
         self.transaction(|| {
             self.conn.execute("DELETE FROM saved_titles WHERE key = ?1", [key])?;
+            self.conn.execute("DELETE FROM list_items WHERE title_key = ?1", [key])?;
             self.set_setting(&format!("unsaved:{key}"), "1")
         })
     }
@@ -253,6 +275,51 @@ impl Db {
             .filter_map(|r| r.ok())
             .filter(|t| valid_id(&t.key) && valid_id(&t.kind) && !t.title.trim().is_empty())
             .collect())
+    }
+
+    /// New list; the name is trimmed, 1–60 characters, and unique ignoring case.
+    pub fn create_list(&self, name: &str) -> Result<i64> {
+        self.conn.execute("INSERT INTO lists (name) VALUES (?1)", [list_name(name)?])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn rename_list(&self, id: i64, name: &str) -> Result<()> {
+        self.conn.execute("UPDATE lists SET name = ?2 WHERE id = ?1", params![id, list_name(name)?])?;
+        Ok(())
+    }
+
+    /// Its items go with it (cascade); the titles stay saved.
+    pub fn delete_list(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM lists WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Add `t` to list `id` (saving it too if needed), or take it out of the list.
+    pub fn set_in_list(&self, id: i64, t: &SavedTitle, on: bool) -> Result<()> {
+        if !on {
+            self.conn.execute("DELETE FROM list_items WHERE list_id = ?1 AND title_key = ?2", params![id, t.key])?;
+            return Ok(());
+        }
+        self.transaction(|| {
+            self.add_saved_title(t)?;
+            self.conn.execute("INSERT OR IGNORE INTO list_items (list_id, title_key) VALUES (?1, ?2)", params![id, t.key])?;
+            Ok(())
+        })
+    }
+
+    /// Lists by name (case-insensitive), with their title keys.
+    pub fn lists(&self) -> Result<Vec<List>> {
+        let mut st = self.conn.prepare("SELECT id, name FROM lists ORDER BY name")?;
+        let mut lists: Vec<List> =
+            st.query_map([], |r| Ok(List { id: r.get(0)?, name: r.get(1)?, keys: Default::default() }))?.collect::<rusqlite::Result<_>>()?;
+        let mut st = self.conn.prepare("SELECT list_id, title_key FROM list_items")?;
+        for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, key) = r?;
+            if let Some(l) = lists.iter_mut().find(|l| l.id == id) {
+                l.keys.insert(key);
+            }
+        }
+        Ok(lists)
     }
 
     pub fn add_download(&self, d: &Download) -> Result<()> {
