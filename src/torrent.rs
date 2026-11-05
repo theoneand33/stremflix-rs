@@ -144,6 +144,10 @@ impl TorrentEngine {
         if !dht {
             opts.dht = None;
         }
+        // librqbit only speaks SOCKS5: peers and HTTP trackers go through it; DHT and UDP trackers don't.
+        if let Some(p) = crate::addon::PROXY.get().filter(|p| p.scheme() == "socks5h") {
+            opts.connect = Some(librqbit::ConnectionOptions { proxy_url: Some(p.to_string()), ..Default::default() });
+        }
         let session = Session::new_with_opts(download_dir, opts).await.context("start torrent session")?;
         let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
             "127.0.0.1:0".parse().unwrap(),
