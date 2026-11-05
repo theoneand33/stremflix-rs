@@ -9,13 +9,13 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use anyhow::Context;
-use stremflix_rs::addon::{AddonClient, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
+use stremflix_rs::addon::{AddonClient, Skip, SkipKind, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
 use stremflix_rs::instance;
 use stremflix_rs::db::{self, Db, Download, List, Progress, SavedTitle, Watched};
 use stremflix_rs::download;
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{self, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
+use stremflix_rs::player::{self, chapter_skips, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{NetStats, Profile, TorrentEngine, fmt_rate};
 use stremflix_rs::tray::{self, Tray};
@@ -966,6 +966,8 @@ struct Playing {
     wheel: f32,
     /// The up-next card was dismissed.
     next_dismissed: bool,
+    /// Addon-marked spans of the playing stream (`behaviorHints.skip`).
+    skips: Vec<Skip>,
     /// Stats overlay shown; `net` is its torrent line, refreshed by a task about once per second (`net_next`, egui clock).
     stats: bool,
     net: Arc<std::sync::Mutex<Option<NetStats>>>,
@@ -1760,6 +1762,10 @@ impl App {
                     report(&mut self.error, "no OpenGL context for the player");
                     return;
                 };
+                let skips = (self.selected.as_ref())
+                    .and_then(|(_, streams, _)| streams.iter().find(|s| s.source().as_ref() == Some(&source)))
+                    .map(|s| s.hints.skip.clone())
+                    .unwrap_or_default();
                 let setting = |k| self.db.setting(k).ok().flatten();
                 let lang = |k| setting(k).unwrap_or_default();
                 let subs_off = self.subs_off();
@@ -1783,7 +1789,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), skips, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -3530,6 +3536,26 @@ impl App {
                         if id == "up_next_watch" { next = true } else { p.next_dismissed = true }
                     }
                 }
+            }
+        }
+        // Skip button while the playhead is in an addon-marked or chapter-named intro/recap/credits span.
+        // Credits of a series episode with a next one are left to the up-next card.
+        let spans = p.skips.iter().copied().chain(chapter_skips(&st.chapters, st.dur));
+        if let Some(sk) = spans.filter(|s| !(has_next && s.kind == SkipKind::Credits)).find(|s| s.start <= st.pos && st.pos < s.end)
+            && rect.width() >= 250.0
+        {
+            let r = egui::Rect::from_min_size(pos2(rect.right() - 32.0 - 200.0, rect.bottom() - 130.0 - 50.0), vec2(200.0, 50.0));
+            let paint = ui.painter().clone();
+            let resp = ui.interact(r, ui.scope_id().with("skip"), Sense::CLICK).on_hover_cursor(egui::CursorIcon::PointingHand);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, sk.kind.label()));
+            paint.rect_filled(r, 25, Color32::from_rgb(22, 22, 26));
+            paint.rect_stroke(r, 25, egui::Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Inside);
+            if resp.hovered() {
+                paint.rect_filled(r, 25, Color32::from_white_alpha(20));
+            }
+            paint.text(r.center(), egui::Align2::CENTER_CENTER, sk.kind.label(), egui::FontId::proportional(17.0), Color32::WHITE);
+            if resp.clicked() {
+                seek = Some((sk.end, false));
             }
         }
         let style = style.clamped();

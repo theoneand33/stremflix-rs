@@ -30,7 +30,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
-| Skip intro / recap / credits from addon markers | P2 | M | Stremio supporter feature; needs an addon source for the timestamps. |
 | Sleep timer | P3 | S | |
 | Screenshot capture | P3 | S | mpv `screenshot-to-file`. |
 | A-B loop / repeat | P3 | S | |
