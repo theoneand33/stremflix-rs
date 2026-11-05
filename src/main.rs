@@ -1090,6 +1090,9 @@ struct App {
     torrent_limits: (u32, u32),
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
+    /// Settings > Data: path typed for an import, and the last export/import result.
+    data_import: String,
+    data_msg: Option<String>,
     /// mpv hardware decoding.
     hwdec: bool,
     /// Custom Home row order and hidden rows (row keys).
@@ -1207,6 +1210,8 @@ impl App {
                 db.setting("torrent_down_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
                 db.setting("torrent_up_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             ),
+            data_import: String::new(),
+            data_msg: None,
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
@@ -3945,6 +3950,24 @@ impl App {
                     Ok(Msg::SignedIn(email, key))
                 });
             }
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new("Data").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        if small_button(ui, "Export data…").on_hover_text("Write addons, saved titles, progress and settings to a JSON file in the data folder").clicked() {
+            match self.db.export_file(&self.data_dir.join("exports")) {
+                Ok(p) => self.data_msg = Some(format!("Exported to {}", p.display())),
+                Err(e) => report(&mut self.error, format!("exporting: {e:#}")),
+            }
+        }
+        ui.label(RichText::new("The export includes addon URLs, which can hold account tokens. Keep it private.").size(13.0).color(Color32::from_gray(170)));
+        if form_row(ui, "Import data…:", &mut self.data_import, "/path/to/stremflix-rs-export.json", "Import", Some("Merges the file into your data; nothing is deleted"), false) {
+            match self.db.import_file(std::path::Path::new(self.data_import.trim())) {
+                Ok(m) => self.data_msg = Some(format!("{m}. Restart the app to apply.")),
+                Err(e) => report(&mut self.error, format!("importing: {e:#}")),
+            }
+        }
+        if let Some(m) = &self.data_msg {
+            ui.label(RichText::new(m).size(13.0).color(Color32::from_gray(170)));
         }
         ui.add_space(8.0);
         ui.label(RichText::new("Torrents").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));

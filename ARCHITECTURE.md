@@ -50,6 +50,8 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 
 SQLite in WAL mode at `$STREMFLIX_RS_DATA/stremflix-rs.db`. Progress keys are `<type>:<id>` for addon items, `file:<path>` for local files, and `btih:<hash>` for raw magnets. Each row stores a resumable source: URL, magnet, or path.
 
+Settings > Data exports addons, saved titles, progress, watched marks and safe settings to `exports/stremflix-rs-<time>.json` (`{"format":"stremflix-rs-export","version":1}`; no auth key, no local paths). Import treats the file as untrusted (16 MiB cap, validated entries) and merges it in one transaction, keeping newer progress.
+
 Saved titles (`saved_titles`) are the default library. User lists live in `lists` (name unique ignoring case) and `list_items` (`list_id`, saved-title key; cascades when a list is deleted); adding to a list saves the title, and unsaving removes it from every list.
 
 Downloads go to `$STREMFLIX_RS_DATA/downloads/`, named from the sanitized title (never from addon or torrent file paths), written to `<name>.part` and renamed when complete. The `downloads` table keeps path, type, meta id, video id and title; playing one uses the streaming progress key `<type>:<video id>`. A downloading torrent is pinned so other playback doesn't stop it.
