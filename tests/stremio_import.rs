@@ -183,7 +183,7 @@ fn unwatched_episode_survives_bitfield() {
 fn imported_saved_titles_keep_stremio_order() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("a.db")).unwrap();
-    let t = |id: &str| stremflix_rs::db::SavedTitle { key: format!("movie:{id}"), title: id.into(), kind: "movie".into(), poster: None };
+    let t = |id: &str| stremflix_rs::db::SavedTitle { key: format!("movie:{id}"), title: id.into(), kind: "movie".into(), poster: None, year: None, rating: None, last_watched: None };
     let imp = Import { saved: vec![(t("old"), "2024-01-01T00:00:00Z".into()), (t("new"), "2025-01-01T00:00:00Z".into())], ..Default::default() };
     imp.save(&db).unwrap();
     assert_eq!(db.saved_titles().unwrap().iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["new", "old"]);
@@ -198,7 +198,7 @@ fn upload_builds_addon_collection_and_library_changes() {
     let m = |id: &str| stremflix_rs::addon::parse_manifest(format!(r#"{{"id":"{id}","version":"2","name":"N{id}","resources":["stream"],"types":["movie"]}}"#).as_bytes()).unwrap();
     db.add_addon("https://b.example/manifest.json", &m("b")).unwrap();
     db.add_addon("https://a.example/manifest.json", &m("a")).unwrap();
-    let saved = |key: &str, kind: &str| SavedTitle { key: key.into(), title: format!("T {key}"), kind: kind.into(), poster: None };
+    let saved = |key: &str, kind: &str| SavedTitle { key: key.into(), title: format!("T {key}"), kind: kind.into(), poster: None, year: None, rating: None, last_watched: None };
     db.add_saved_title(&saved("movie:tt1", "movie")).unwrap();
     db.add_saved_title(&saved("series:tt2", "series")).unwrap();
     let prog = |key: &str| Progress { key: key.into(), title: "P".into(), source: "https://s.example/v".into(), position: 12.5, duration: 100.0, poster: None };
@@ -254,7 +254,8 @@ fn upload_builds_addon_collection_and_library_changes() {
     let imp = from_account(&serde_json::json!({"addons": addons}), &serde_json::Value::Array(changes)).unwrap();
     let mut keys: Vec<_> = imp.saved.iter().map(|(t, _)| t.key.as_str()).collect();
     keys.sort();
-    assert_eq!(keys, ["movie:tt1", "series:tt2"]);
+    assert_eq!(keys, ["movie:tt1"]);
+    // tt2 stays removed on the account, so it is not pulled back.
     assert_eq!(imp.addons.len(), 2, "manifest-less account addon is skipped on pull");
 }
 

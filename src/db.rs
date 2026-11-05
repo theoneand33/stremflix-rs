@@ -1,4 +1,4 @@
-//! SQLite persistence: addons, library folders/items, saved titles, settings, watch progress.
+//! SQLite persistence: addons, library folders/items, saved titles and lists, settings, watch progress.
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -42,6 +42,27 @@ pub struct SavedTitle {
     pub title: String,
     pub kind: String,
     pub poster: Option<String>,
+    /// Release year and IMDb rating, when known (older rows and imports: `None` until the detail page loads).
+    pub year: Option<i32>,
+    pub rating: Option<f64>,
+    /// Unix time of the latest progress or watched mark on the title or any of its episodes; read-only, set by `saved_titles`.
+    pub last_watched: Option<i64>,
+}
+
+/// A user list ("collection") of saved titles.
+#[derive(Debug, Clone, PartialEq)]
+pub struct List {
+    pub id: i64,
+    pub name: String,
+    /// Saved-title keys in the list.
+    pub keys: std::collections::HashSet<String>,
+}
+
+/// Trimmed list name, or an error unless it is 1–60 characters.
+fn list_name(name: &str) -> Result<&str> {
+    let n = name.trim();
+    anyhow::ensure!((1..=60).contains(&n.chars().count()), "list names are 1–60 characters");
+    Ok(n)
 }
 
 /// A stream saved for offline playback.
@@ -92,6 +113,7 @@ impl Db {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL; -- safe with WAL; a crash loses at most the last commit, and progress saves every second
+             PRAGMA foreign_keys=ON;
              CREATE TABLE IF NOT EXISTS addons (transport_url TEXT PRIMARY KEY, manifest TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS library_folders (path TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS library_items (path TEXT PRIMARY KEY, folder TEXT NOT NULL, title TEXT NOT NULL);
@@ -103,10 +125,17 @@ impl Db {
              CREATE TABLE IF NOT EXISTS saved_titles (key TEXT PRIMARY KEY, title TEXT NOT NULL, kind TEXT NOT NULL,
                  poster TEXT, saved_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS downloads (path TEXT PRIMARY KEY, kind TEXT NOT NULL, meta_id TEXT NOT NULL,
-                 video_id TEXT NOT NULL, title TEXT NOT NULL, added_at INTEGER NOT NULL DEFAULT (unixepoch()));",
+                 video_id TEXT NOT NULL, title TEXT NOT NULL, added_at INTEGER NOT NULL DEFAULT (unixepoch()));
+             CREATE TABLE IF NOT EXISTS lists (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                 created INTEGER NOT NULL DEFAULT (unixepoch()));
+             CREATE TABLE IF NOT EXISTS list_items (list_id INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+                 title_key TEXT NOT NULL, added INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (list_id, title_key));",
         )?;
         // Migrate databases created before posters were stored; fails harmlessly if the column exists.
         let _ = conn.execute("ALTER TABLE progress ADD COLUMN poster TEXT", []);
+        // Library sorts by year and rating; older rows stay NULL and sort last.
+        let _ = conn.execute("ALTER TABLE saved_titles ADD COLUMN year INTEGER", []);
+        let _ = conn.execute("ALTER TABLE saved_titles ADD COLUMN rating REAL", []);
         // Addon priority (streams and catalogs follow it); older rows share 0 and keep install order.
         let _ = conn.execute("ALTER TABLE addons ADD COLUMN position INTEGER NOT NULL DEFAULT 0", []);
         Ok(Self { conn })
@@ -185,9 +214,19 @@ impl Db {
     pub fn add_saved_title(&self, t: &SavedTitle) -> Result<()> {
         self.conn.execute("DELETE FROM settings WHERE key = ?1", [format!("unsaved:{}", t.key)])?;
         self.conn.execute(
-            "INSERT INTO saved_titles (key, title, kind, poster) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster)",
-            params![t.key, t.title, t.kind, t.poster],
+            "INSERT INTO saved_titles (key, title, kind, poster, year, rating) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(key) DO UPDATE SET title = excluded.title, poster = coalesce(excluded.poster, poster),
+                 year = coalesce(excluded.year, year), rating = coalesce(excluded.rating, rating)",
+            params![t.key, t.title, t.kind, t.poster, t.year, t.rating],
+        )?;
+        Ok(())
+    }
+
+    /// Fill the year and rating of a saved title (a no-op if it isn't saved); keeps stored values when `None`.
+    pub fn set_saved_facts(&self, key: &str, year: Option<i32>, rating: Option<f64>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE saved_titles SET year = coalesce(?2, year), rating = coalesce(?3, rating) WHERE key = ?1",
+            params![key, year, rating],
         )?;
         Ok(())
     }
@@ -206,6 +245,7 @@ impl Db {
     pub fn remove_saved_title(&self, key: &str) -> Result<()> {
         self.transaction(|| {
             self.conn.execute("DELETE FROM saved_titles WHERE key = ?1", [key])?;
+            self.conn.execute("DELETE FROM list_items WHERE title_key = ?1", [key])?;
             self.set_setting(&format!("unsaved:{key}"), "1")
         })
     }
@@ -213,14 +253,73 @@ impl Db {
     /// Saved titles, newest first; rows with a malformed key or type are skipped.
     pub fn saved_titles(&self) -> Result<Vec<SavedTitle>> {
         // rowid, not key, breaks same-second ties so the order matches insertion order.
-        let mut st = self.conn.prepare("SELECT key, title, kind, poster FROM saved_titles ORDER BY saved_at DESC, rowid DESC")?;
+        let mut st = self.conn.prepare(
+            "SELECT key, title, kind, poster, year, rating,
+                 max(coalesce((SELECT max(updated_at) FROM progress WHERE key = s.key OR substr(key, 1, length(s.key) + 1) = s.key || ':'), 0),
+                     coalesce((SELECT max(watched_at) FROM watched WHERE key = s.key), 0))
+             FROM saved_titles s ORDER BY saved_at DESC, rowid DESC",
+        )?;
         let rows = st.query_map([], |r| {
-            Ok(SavedTitle { key: r.get(0)?, title: r.get(1)?, kind: r.get(2)?, poster: r.get(3)? })
+            let at: i64 = r.get(6)?;
+            Ok(SavedTitle {
+                key: r.get(0)?,
+                title: r.get(1)?,
+                kind: r.get(2)?,
+                poster: r.get(3)?,
+                year: r.get(4)?,
+                rating: r.get(5)?,
+                last_watched: (at > 0).then_some(at),
+            })
         })?;
         Ok(rows
             .filter_map(|r| r.ok())
             .filter(|t| valid_id(&t.key) && valid_id(&t.kind) && !t.title.trim().is_empty())
             .collect())
+    }
+
+    /// New list; the name is trimmed, 1–60 characters, and unique ignoring case.
+    pub fn create_list(&self, name: &str) -> Result<i64> {
+        self.conn.execute("INSERT INTO lists (name) VALUES (?1)", [list_name(name)?])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn rename_list(&self, id: i64, name: &str) -> Result<()> {
+        self.conn.execute("UPDATE lists SET name = ?2 WHERE id = ?1", params![id, list_name(name)?])?;
+        Ok(())
+    }
+
+    /// Its items go with it (cascade); the titles stay saved.
+    pub fn delete_list(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM lists WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Add `t` to list `id` (saving it too if needed), or take it out of the list.
+    pub fn set_in_list(&self, id: i64, t: &SavedTitle, on: bool) -> Result<()> {
+        if !on {
+            self.conn.execute("DELETE FROM list_items WHERE list_id = ?1 AND title_key = ?2", params![id, t.key])?;
+            return Ok(());
+        }
+        self.transaction(|| {
+            self.add_saved_title(t)?;
+            self.conn.execute("INSERT OR IGNORE INTO list_items (list_id, title_key) VALUES (?1, ?2)", params![id, t.key])?;
+            Ok(())
+        })
+    }
+
+    /// Lists by name (case-insensitive), with their title keys.
+    pub fn lists(&self) -> Result<Vec<List>> {
+        let mut st = self.conn.prepare("SELECT id, name FROM lists ORDER BY name")?;
+        let mut lists: Vec<List> =
+            st.query_map([], |r| Ok(List { id: r.get(0)?, name: r.get(1)?, keys: Default::default() }))?.collect::<rusqlite::Result<_>>()?;
+        let mut st = self.conn.prepare("SELECT list_id, title_key FROM list_items")?;
+        for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, key) = r?;
+            if let Some(l) = lists.iter_mut().find(|l| l.id == id) {
+                l.keys.insert(key);
+            }
+        }
+        Ok(lists)
     }
 
     pub fn add_download(&self, d: &Download) -> Result<()> {
@@ -326,8 +425,17 @@ impl Db {
     /// Unwatching an episode also drops its imported series (`<series key>:...`) from Watch It Again,
     /// as its imported count no longer holds; watching one of its episodes lets a sync bring it back.
     pub fn set_watched(&self, key: &str, on: bool) -> Result<()> {
+        self.set_watched_many(&[key.to_string()], on)
+    }
+
+    /// [`Db::set_watched`] for many keys (a season or series of episodes), in one transaction.
+    pub fn set_watched_many(&self, keys: &[String], on: bool) -> Result<()> {
+        self.transaction(|| keys.iter().try_for_each(|k| self.set_watched_one(k, on)))
+    }
+
+    fn set_watched_one(&self, key: &str, on: bool) -> Result<()> {
         let k = format!("watched:{key}");
-        self.transaction(|| {
+        {
             if on {
                 self.set_setting(&k, "1")?;
                 self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
@@ -343,7 +451,7 @@ impl Db {
                 self.conn.execute(&format!("DELETE FROM watched WHERE {parent}"), [key])?;
             }
             Ok(())
-        })
+        }
     }
 
     /// Mark episodes `keys` watched, except ones unwatched here, and drop the imported bitfield setting
@@ -394,4 +502,54 @@ impl Db {
 
 fn row_progress(r: &rusqlite::Row) -> rusqlite::Result<Progress> {
     Ok(Progress { key: r.get(0)?, title: r.get(1)?, source: r.get(2)?, position: r.get(3)?, duration: r.get(4)?, poster: r.get(5)? })
+}
+
+const HISTORY_MAX: usize = 10;
+const HISTORY_QUERY_MAX: usize = 100;
+
+/// Puts `q` first in `h`: trimmed, capped in length, deduped case-insensitively, list capped.
+pub fn push_history(h: &mut Vec<String>, q: &str) {
+    let q: String = q.trim().chars().take(HISTORY_QUERY_MAX).collect();
+    if q.is_empty() {
+        return;
+    }
+    h.retain(|x| !x.eq_ignore_ascii_case(&q) && x.to_lowercase() != q.to_lowercase());
+    h.insert(0, q);
+    h.truncate(HISTORY_MAX);
+}
+
+pub fn encode_history(h: &[String]) -> String {
+    h.join("\n")
+}
+
+pub fn decode_history(s: &str) -> Vec<String> {
+    let mut h = Vec::new();
+    for l in s.lines().rev() {
+        push_history(&mut h, l);
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_push_dedupe_cap_roundtrip() {
+        let mut h = Vec::new();
+        push_history(&mut h, "  Matrix ");
+        push_history(&mut h, "   ");
+        push_history(&mut h, "dune");
+        push_history(&mut h, "MATRIX");
+        assert_eq!(h, ["MATRIX", "dune"]);
+        for i in 0..20 {
+            push_history(&mut h, &format!("q{i}"));
+        }
+        assert_eq!(h.len(), HISTORY_MAX);
+        assert_eq!(h[0], "q19");
+        push_history(&mut h, &"x".repeat(500));
+        assert_eq!(h[0].len(), HISTORY_QUERY_MAX);
+        assert_eq!(decode_history(&encode_history(&h)), h);
+        assert!(decode_history("").is_empty());
+    }
 }

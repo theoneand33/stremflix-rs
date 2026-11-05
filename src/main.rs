@@ -11,13 +11,14 @@ use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use anyhow::Context;
 use stremflix_rs::addon::{AddonClient, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
 use stremflix_rs::instance;
-use stremflix_rs::db::{Db, Download, Progress, SavedTitle, Watched};
+use stremflix_rs::db::{self, Db, Download, List, Progress, SavedTitle, Watched};
 use stremflix_rs::download;
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{GlProc, Player, SPEEDS, SUB_COLORS, SubStyle, hwdec_value, prefer_lang, valid_langs};
+use stremflix_rs::player::{self, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{Profile, TorrentEngine};
+use stremflix_rs::tray::{self, Tray};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -27,6 +28,9 @@ enum Tab {
     Library,
     Settings,
 }
+
+/// Speed limit choices in bytes/s; 0 is unlimited.
+const SPEED_LIMITS: [(&str, u32); 6] = [("Unlimited", 0), ("500 KB/s", 500_000), ("1 MB/s", 1_000_000), ("2 MB/s", 2_000_000), ("5 MB/s", 5_000_000), ("10 MB/s", 10_000_000)];
 
 /// Torrent cache size choices: label and bytes kept (0 = delete a torrent when its playback stops).
 const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000), ("5 GB", 5_000_000_000), ("10 GB", 10_000_000_000), ("Unlimited", u64::MAX)];
@@ -72,12 +76,41 @@ fn open_external(command: &str, url: &str) -> anyhow::Result<()> {
 
 /// Addon subtitles as (url, lang).
 type Subs = Vec<(String, String)>;
+/// Media file `(index, name, size)` of a torrent.
+type MediaFile = (usize, String, u64);
+
+/// A subtitle an addon offers for the playing item, listed in the player's search panel.
+#[derive(Clone)]
+struct SubFound {
+    addon: String,
+    lang: String,
+    url: String,
+}
+
+/// State of the player's subtitle search panel.
+#[derive(Default)]
+struct SubSearch {
+    open: bool,
+    busy: bool,
+    filter: String,
+    results: Vec<SubFound>,
+    status: String,
+}
+
+/// Results whose language or addon name contains `q` (case-insensitive, blank matches all).
+fn filter_subs<'a>(found: &'a [SubFound], q: &str) -> Vec<&'a SubFound> {
+    let q = q.trim().to_lowercase();
+    found.iter().filter(|f| f.lang.to_lowercase().contains(&q) || f.addon.to_lowercase().contains(&q)).collect()
+}
 
 /// Order of the saved-titles list in the Library tab.
 #[derive(PartialEq, Clone, Copy)]
 enum LibSort {
     Added,
     Title,
+    Watched,
+    Rating,
+    Year,
 }
 
 /// Type filter of the saved-titles list in the Library tab.
@@ -93,6 +126,9 @@ impl LibSort {
         match self {
             Self::Added => "Recently added",
             Self::Title => "Title A–Z",
+            Self::Watched => "Recently watched",
+            Self::Rating => "Rating",
+            Self::Year => "Year",
         }
     }
 }
@@ -115,11 +151,32 @@ impl LibKind {
     }
 }
 
-/// Saved titles of `kind`, newest first unless sorted by title (case-insensitive).
-fn saved_view(items: &[SavedTitle], kind: LibKind, sort: LibSort) -> Vec<&SavedTitle> {
-    let mut v: Vec<&SavedTitle> = items.iter().filter(|t| kind.matches(&t.kind)).collect();
-    if sort == LibSort::Title {
-        v.sort_by_key(|t| t.title.to_lowercase());
+/// Release year from free text like "2010" or "2010–2015".
+fn parse_year(s: &str) -> Option<i32> {
+    let d: String = s.chars().skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
+    d.parse().ok().filter(|y| (1800..=2200).contains(y))
+}
+
+/// Year and IMDb rating of a title's details.
+fn saved_facts(d: &Meta) -> (Option<i32>, Option<f64>) {
+    (d.release_info.as_deref().and_then(parse_year), d.imdb_rating.as_deref().and_then(|r| r.trim().parse::<f64>().ok()).filter(|r| (0.0..=10.0).contains(r)))
+}
+
+/// Case-insensitive substring match; a blank query matches everything.
+fn title_matches(title: &str, query: &str) -> bool {
+    title.to_lowercase().contains(&query.trim().to_lowercase())
+}
+
+/// Saved titles of `kind` matching `query`, newest first unless sorted: by title (case-insensitive), or best first with missing values last.
+fn saved_view<'a>(items: &'a [SavedTitle], kind: LibKind, sort: LibSort, query: &str) -> Vec<&'a SavedTitle> {
+    let mut v: Vec<&SavedTitle> = items.iter().filter(|t| kind.matches(&t.kind) && title_matches(&t.title, query)).collect();
+    // Stable sorts keep the "Recently added" order among ties; `None` is the smallest, so it ends up last when reversed.
+    match sort {
+        LibSort::Added => {}
+        LibSort::Title => v.sort_by_key(|t| t.title.to_lowercase()),
+        LibSort::Watched => v.sort_by_key(|t| std::cmp::Reverse(t.last_watched)),
+        LibSort::Year => v.sort_by_key(|t| std::cmp::Reverse(t.year)),
+        LibSort::Rating => v.sort_by(|a, b| b.rating.unwrap_or(f64::NEG_INFINITY).total_cmp(&a.rating.unwrap_or(f64::NEG_INFINITY))),
     }
     v
 }
@@ -135,6 +192,8 @@ enum Autoplay {
 enum Msg {
     Error(String),
     Installed(String, Manifest, Option<String>),
+    /// Fresh manifest (or error) per installed addon URL, from "Check for updates".
+    UpdateCheck(Vec<(String, Result<Manifest, String>)>),
     /// Search title and results.
     Catalog(String, Vec<MetaPreview>),
     /// Row source (addon URL, type, catalog id) and its items or error.
@@ -152,10 +211,14 @@ enum Msg {
     Episodes(MetaPreview, Meta, u64),
     /// Full meta of a movie (genres, cast, ...) for the detail page.
     Details(Meta),
+    /// `new_eps_gen`, a saved series and its recently released episodes.
+    NewEpisodes(u64, MetaPreview, Vec<Video>),
     /// poster URL, image bytes (empty on failure)
     Poster(String, Vec<u8>),
     /// key, title, resumable source, playable URL/path, subtitle URLs, torrent id, the `nav` it was requested at
     Play(String, String, String, String, Subs, Option<usize>, u64),
+    /// key, title, magnet, subtitle URLs, the media files `(index, name, size)` to choose from, the `nav` it was requested at
+    PickFile(String, String, String, Subs, Vec<MediaFile>, u64),
     /// progress key, poster URL found for a Continue Watching entry
     RecentPoster(String, String),
     /// Stremio storage that was read, and what it holds.
@@ -174,6 +237,14 @@ enum Msg {
     Link(String),
     /// A download that finished, or why it failed.
     Downloaded(Download, Result<(), String>),
+    /// A tray menu item or icon click.
+    Tray(tray::Action),
+    /// Progress key and the subtitles every addon offered for it.
+    SubSearch(String, Vec<SubFound>),
+    /// A saved subtitle's path, or why saving failed.
+    SubSaved(Result<PathBuf, String>),
+    /// A media key or OS media overlay button.
+    Media(souvlaki::MediaControlEvent),
 }
 
 /// One horizontal catalog row on the home screen.
@@ -189,6 +260,62 @@ struct Row {
     loading_more: bool,
     /// Last page was empty, had nothing new, or failed.
     exhausted: bool,
+}
+
+/// Stable id of a Home row: `<addon url>|<type>|<catalog id>`.
+fn row_key(src: &(String, String, String)) -> String {
+    format!("{}|{}|{}", src.0, src.1, src.2)
+}
+
+/// Indices into `keys` with the keys in `order` first (unknown or repeated ones skipped), the rest in their own order.
+fn arrange_rows(keys: &[String], order: &[String]) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for k in order {
+        if let Some(i) = keys.iter().position(|x| x == k)
+            && !out.contains(&i)
+        {
+            out.push(i);
+        }
+    }
+    let rest: Vec<usize> = (0..keys.len()).filter(|i| !out.contains(i)).collect();
+    out.extend(rest);
+    out
+}
+
+/// Keys contain `|` and URLs, so settings hold them as a JSON array.
+fn encode_keys(keys: &[String]) -> String {
+    serde_json::to_string(keys).unwrap_or_default()
+}
+
+fn decode_keys(s: &str) -> Vec<String> {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
+/// How far back an episode's release date still counts as new.
+const NEW_EPISODE_DAYS: i64 = 14;
+
+/// Days since 1970-01-01 (UTC) today.
+fn unix_days() -> i64 {
+    (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) / 86400) as i64
+}
+
+/// `YYYY-MM-DD` of a day count since 1970-01-01 (civil-from-days).
+fn date_string(days: i64) -> String {
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + i64::from(m <= 2))
+}
+
+/// Numbered episodes released on `since..=today` (`YYYY-MM-DD`), in list order.
+fn recent_episodes(videos: Vec<Video>, since: &str, today: &str) -> Vec<Video> {
+    let day = |v: &Video| v.released.as_deref().and_then(|d| d.get(..10)).map(str::to_owned);
+    videos.into_iter().filter(|v| v.episode.is_some() && v.season != Some(0) && day(v).is_some_and(|d| d.as_str() >= since && d.as_str() <= today)).collect()
 }
 
 /// Max items kept per catalog row.
@@ -222,8 +349,51 @@ struct Discover {
 }
 
 const RED: Color32 = Color32::from_rgb(229, 9, 20);
-/// Stremio's purple, used for the player's seek bar.
-const ACCENT: Color32 = Color32::from_rgb(123, 91, 245);
+/// Selectable accent colors; the first is Stremio's purple.
+const ACCENTS: [(&str, Color32); 4] = [
+    ("Purple", Color32::from_rgb(123, 91, 245)),
+    ("Blue", Color32::from_rgb(37, 120, 235)),
+    ("Green", Color32::from_rgb(30, 160, 90)),
+    ("Orange", Color32::from_rgb(230, 120, 20)),
+];
+static ACCENT_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn accent() -> Color32 {
+    ACCENTS[ACCENT_IDX.load(std::sync::atomic::Ordering::Relaxed)].1
+}
+/// Index of the saved accent name; unknown or missing falls back to the default.
+fn accent_index(name: Option<&str>) -> usize {
+    ACCENTS.iter().position(|a| Some(a.0) == name).unwrap_or(0)
+}
+/// Strong text color at `alpha`: a hover/fill wash that reads on both themes.
+fn tint(ui: &egui::Ui, alpha: u8) -> Color32 {
+    let c = ui.visuals().strong_text_color();
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
+}
+/// Applies the theme and accent to egui; the player menu keeps the dark visuals.
+fn apply_theme(ctx: &egui::Context, light: bool) {
+    for (theme, is_light) in [(egui::Theme::Dark, false), (egui::Theme::Light, true)] {
+        let mut v = if is_light { egui::Visuals::light() } else { egui::Visuals::dark() };
+        v.panel_fill = if is_light { Color32::from_gray(245) } else { Color32::from_rgb(20, 20, 20) };
+        v.window_fill = v.panel_fill;
+        v.extreme_bg_color = if is_light { Color32::WHITE } else { Color32::from_gray(32) };
+        v.selection.bg_fill = accent();
+        if !is_light {
+            // Keep the old dark palette: egui's defaults are dimmer than the grays used before theming.
+            v.widgets.noninteractive.fg_stroke.color = Color32::from_gray(200);
+            v.weak_text_color = Some(Color32::from_gray(170));
+        }
+        // Netflix-style flat buttons: no outline or grow on hover, gray that dims when hovered.
+        let w = &mut v.widgets;
+        let grays = if is_light { [215, 200, 185, 200] } else { [82, 56, 45, 56] };
+        for (st, gray) in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open].into_iter().zip(grays) {
+            (st.weak_bg_fill, st.bg_stroke, st.corner_radius, st.expansion) = (Color32::from_gray(gray), egui::Stroke::NONE, 4.into(), 0.0);
+            st.fg_stroke.color = if is_light { Color32::BLACK } else { Color32::WHITE };
+        }
+        ctx.set_visuals_of(theme, v);
+        ctx.style_mut_of(theme, |s| s.spacing.button_padding = vec2(14.0, 6.0));
+    }
+    ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
+}
 const CARD: egui::Vec2 = egui::Vec2::new(150.0, 225.0);
 
 /// Netflix-style card: no border, grows on hover/focus, shrinks while pressed.
@@ -301,14 +471,14 @@ enum Menu {
 /// Keyboard-focus outline for the popover's custom controls.
 fn focus_ring(ui: &egui::Ui, r: &egui::Response, radius: u8) {
     if r.has_focus() {
-        ui.painter().rect_stroke(r.rect, radius, egui::Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+        ui.painter().rect_stroke(r.rect, radius, egui::Stroke::new(2.0, accent()), egui::StrokeKind::Inside);
     }
 }
 
 /// Small caps section heading inside a player popover.
 fn menu_heading(ui: &mut egui::Ui, text: &str) {
     ui.add_space(12.0);
-    ui.label(RichText::new(text.to_uppercase()).size(11.5).family(bold()).color(Color32::from_gray(140)));
+    ui.label(RichText::new(text.to_uppercase()).size(11.5).family(bold()).color(ui.visuals().weak_text_color()));
     ui.add_space(4.0);
 }
 
@@ -319,13 +489,13 @@ fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     focus_ring(ui, &r, 6);
     let p = ui.painter();
     if r.hovered() {
-        p.rect_filled(rect, 6, Color32::from_white_alpha(14));
+        p.rect_filled(rect, 6, tint(ui, 14));
     }
     if selected {
-        p.text(pos2(rect.left() + 14.0, rect.center().y), egui::Align2::LEFT_CENTER, icons::CHECK, egui::FontId::new(16.0, phosphor()), ACCENT);
+        p.text(pos2(rect.left() + 14.0, rect.center().y), egui::Align2::LEFT_CENTER, icons::CHECK, egui::FontId::new(16.0, phosphor()), accent());
     }
     let font = egui::FontId::new(15.0, if selected { bold() } else { egui::FontFamily::Proportional });
-    let color = if selected { Color32::WHITE } else { Color32::from_gray(200) };
+    let color = if selected { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
     let mut job = egui::text::LayoutJob::simple_singleline(label.to_string(), font, color);
     job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - 50.0);
     let g = p.layout_job(job);
@@ -333,15 +503,21 @@ fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Bounds a UI zoom factor to 0.75-2.0 in 0.05 steps; non-finite falls back to 1.0.
+fn clamp_scale(z: f32) -> f32 {
+    if z.is_finite() { ((z * 20.0).round() / 20.0).clamp(0.75, 2.0) } else { 1.0 }
+}
+
 /// Rounded chip, accent-filled when selected.
 fn pill(ui: &mut egui::Ui, label: &str, selected: bool, role: egui::Role) -> egui::Response {
-    let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::new(14.0, if selected { bold() } else { egui::FontFamily::Proportional }), Color32::WHITE);
+    let fg = if selected { Color32::WHITE } else { ui.visuals().strong_text_color() };
+    let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::new(14.0, if selected { bold() } else { egui::FontFamily::Proportional }), fg);
     let (rect, r) = ui.allocate_exact_size(vec2(g.size().x + 24.0, 30.0), Sense::click());
     r.widget_info(|| egui::WidgetInfo::selected(role, true, selected, label));
-    let fill = if selected { ACCENT } else { Color32::from_white_alpha(if r.hovered() { 30 } else { 16 }) };
+    let fill = if selected { accent() } else { tint(ui, if r.hovered() { 30 } else { 16 }) };
     ui.painter().rect_filled(rect, 15, fill);
     focus_ring(ui, &r, 15);
-    ui.painter().galley(rect.center() - g.size() / 2.0, g, Color32::WHITE);
+    ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -351,7 +527,7 @@ fn swatch(ui: &mut egui::Ui, name: &str, color: Color32, selected: bool) -> egui
     r.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, name));
     focus_ring(ui, &r, 15);
     if selected || r.hovered() {
-        ui.painter().circle_stroke(rect.center(), 13.0, egui::Stroke::new(2.0, if selected { ACCENT } else { Color32::from_gray(120) }));
+        ui.painter().circle_stroke(rect.center(), 13.0, egui::Stroke::new(2.0, if selected { accent() } else { Color32::from_gray(120) }));
     }
     ui.painter().circle_filled(rect.center(), 9.0, color);
     r.on_hover_text(name).on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -362,12 +538,12 @@ fn stepper(ui: &mut egui::Ui, label: &str, value: &str) -> i32 {
     let mut step = 0;
     ui.horizontal(|ui| {
         ui.set_min_height(36.0);
-        ui.label(RichText::new(label).size(15.0).color(Color32::from_gray(210)));
+        ui.label(RichText::new(label).size(15.0).color(ui.visuals().text_color()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if pill(ui, "+", false, egui::Role::Button).on_hover_text(format!("Increase {label}")).clicked() {
                 step = 1;
             }
-            ui.add_sized([56.0, 30.0], egui::Label::new(RichText::new(value).size(14.0).color(Color32::WHITE)));
+            ui.add_sized([56.0, 30.0], egui::Label::new(RichText::new(value).size(14.0).color(ui.visuals().strong_text_color())));
             if pill(ui, "−", false, egui::Role::Button).on_hover_text(format!("Decrease {label}")).clicked() {
                 step = -1;
             }
@@ -387,12 +563,12 @@ fn switch_row(ui: &mut egui::Ui, label: &str, on: &mut bool) -> egui::Response {
     focus_ring(ui, &r, 6);
     let p = ui.painter();
     if r.hovered() {
-        p.rect_filled(rect, 6, Color32::from_white_alpha(14));
+        p.rect_filled(rect, 6, tint(ui, 14));
     }
-    p.text(pos2(rect.left() + 8.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(15.0), Color32::from_gray(210));
+    p.text(pos2(rect.left() + 8.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(15.0), ui.visuals().text_color());
     let t = ui.ctx().animate_bool_with_time(r.id, *on, 0.12);
     let track = egui::Rect::from_center_size(pos2(rect.right() - 26.0, rect.center().y), vec2(36.0, 20.0));
-    p.rect_filled(track, 10, Color32::from_gray(80).lerp_to_gamma(ACCENT, t));
+    p.rect_filled(track, 10, Color32::from_gray(80).lerp_to_gamma(accent(), t));
     p.circle_filled(pos2(egui::lerp(track.left() + 10.0..=track.right() - 10.0, t), track.center().y), 7.0, Color32::WHITE);
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -446,6 +622,11 @@ fn hero_button(ui: &mut egui::Ui, text: &str, fill: [Color32; 2], text_color: Co
     pill_button(ui, text, 18.0, vec2(130.0, 46.0), fill, text_color)
 }
 
+/// An update must keep the installed addon's id, or it would replace a different addon.
+fn same_addon(installed: &Manifest, fetched: &Manifest) -> bool {
+    installed.id == fetched.id
+}
+
 /// Small secondary pill for toolbar actions (Uninstall, Clear, Stop …).
 fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     pill_button(ui, text, 14.0, vec2(0.0, 32.0), gray_fill(), Color32::WHITE)
@@ -480,7 +661,7 @@ fn card_text(ui: &egui::Ui, rect: egui::Rect, text: &str) {
     // Clipped: a very long title would otherwise spill past the card.
     let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     p.rect_filled(rect, 6, Color32::from_gray(40));
-    let mut job = egui::text::LayoutJob::simple(text.to_owned(), egui::FontId::proportional(15.0), ui.visuals().text_color(), rect.width() - 16.0);
+    let mut job = egui::text::LayoutJob::simple(text.to_owned(), egui::FontId::proportional(15.0), Color32::WHITE, rect.width() - 16.0);
     job.halign = Align::Center; // each line centered around x = 0
     let g = p.layout_job(job);
     p.galley(pos2(rect.center().x, rect.center().y - g.size().y / 2.0), g, Color32::WHITE);
@@ -495,7 +676,8 @@ fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream, reserve: f32) -> egui::Re
     let described = stem.is_some_and(|f| parts.iter().any(|p| p.contains(f)));
     let file = if described { String::new() } else { [s.hints.filename.clone(), s.hints.video_size.map(fmt_size)].into_iter().flatten().collect::<Vec<_>>().join("  ·  ") };
     let external = (s.target().is_none()).then_some("Opens in your browser");
-    let details: Vec<&str> = parts.into_iter().chain(Some(file.as_str()).filter(|f| !f.is_empty())).chain(external).collect();
+    let not_web_ready = s.hints.not_web_ready.then_some("Not web-ready (plays directly here)");
+    let details: Vec<&str> = parts.into_iter().chain(Some(file.as_str()).filter(|f| !f.is_empty())).chain(not_web_ready).chain(external).collect();
     list_row(ui, n, head, details.join("\n"), reserve)
 }
 
@@ -520,10 +702,11 @@ const EPISODE_BUTTON: egui::Vec2 = egui::Vec2::new(150.0, 32.0);
 fn list_row(ui: &mut egui::Ui, n: usize, head: String, details: String, reserve: f32) -> egui::Response {
     let (w, text_x, pad) = (ui.available_width().min(960.0), 84.0, 18.0);
     let wrap = (w - text_x - 96.0 - reserve).max(40.0);
+    let (strong, weak, panel) = (ui.visuals().strong_text_color(), ui.visuals().weak_text_color(), ui.visuals().panel_fill);
     let p = ui.painter();
-    let hg = p.layout(head.clone(), egui::FontId::new(17.0, bold()), Color32::WHITE, wrap);
+    let hg = p.layout(head.clone(), egui::FontId::new(17.0, bold()), strong, wrap);
     let has_details = !details.is_empty();
-    let mut job = egui::text::LayoutJob::simple(details, egui::FontId::proportional(14.0), Color32::from_gray(170), wrap);
+    let mut job = egui::text::LayoutJob::simple(details, egui::FontId::proportional(14.0), weak, wrap);
     job.sections[0].format.line_height = Some(20.0);
     let dg = p.layout_job(job);
     let block = hg.size().y + if has_details { 8.0 + dg.size().y } else { 0.0 };
@@ -531,19 +714,20 @@ fn list_row(ui: &mut egui::Ui, n: usize, head: String, details: String, reserve:
     let (rect, r) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Play {head}")));
     let t = ui.ctx().animate_bool(r.id, r.hovered() || r.has_focus());
+    // Hover wash: strong text at alpha 34 is the old gray 51 on the dark panel.
+    let hover = tint(ui, 34);
     let p = ui.painter();
     // Inset so neighbouring rows' highlights never touch.
-    p.rect_filled(rect.shrink2(vec2(4.0, 4.0)), 8, Color32::from_gray(51).gamma_multiply(t));
-    let num = p.layout_no_wrap(n.to_string(), egui::FontId::proportional(24.0), Color32::from_gray(210));
-    p.galley(pos2(rect.left() + text_x / 2.0 - num.size().x / 2.0, rect.center().y - num.size().y / 2.0), num, Color32::WHITE);
+    p.rect_filled(rect.shrink2(vec2(4.0, 4.0)), 8, hover.gamma_multiply(t));
+    let num = p.layout_no_wrap(n.to_string(), egui::FontId::proportional(24.0), strong);
+    p.galley(pos2(rect.left() + text_x / 2.0 - num.size().x / 2.0, rect.center().y - num.size().y / 2.0), num, strong);
     let top = rect.center().y - block / 2.0;
-    p.galley(pos2(rect.left() + text_x, top), hg.clone(), Color32::WHITE);
-    p.galley(pos2(rect.left() + text_x, top + hg.size().y + 8.0), dg, Color32::WHITE);
-    // Play button: outlined circle that fills white on hover.
+    p.galley(pos2(rect.left() + text_x, top), hg.clone(), strong);
+    p.galley(pos2(rect.left() + text_x, top + hg.size().y + 8.0), dg, weak);
+    // Play button: outlined circle that fills with strong text on hover.
     let c = pos2(rect.right() - 48.0, rect.center().y);
-    let fg = Color32::from_gray(160).lerp_to_gamma(Color32::WHITE, t);
-    p.circle(c, 20.0, Color32::WHITE.gamma_multiply(t), (2.0, fg));
-    let tri = Color32::WHITE.lerp_to_gamma(Color32::BLACK, t);
+    p.circle(c, 20.0, strong.gamma_multiply(t), (2.0, strong));
+    let tri = strong.lerp_to_gamma(panel, t);
     p.add(egui::Shape::convex_polygon(vec![c + vec2(-6.0, -9.0), c + vec2(10.0, 0.0), c + vec2(-6.0, 9.0)], tri, egui::Stroke::NONE));
     r
 }
@@ -587,8 +771,13 @@ const TRAILER: &str = "trailer/";
 /// The addon's `proxyHeaders` for playing `url`, only when it is that addon's own http(s) stream:
 /// never for torrents (`url` is then the local torrent server, not `source`) or local files.
 fn request_headers(streams: &[Stream], source: &str, url: &str) -> Vec<(String, String)> {
+    own_stream(streams, source, url).map(|s| s.hints.request_headers.clone()).unwrap_or_default()
+}
+
+/// The stream whose own http(s) URL is `url`, when `url` is also the `source` being played.
+fn own_stream<'a>(streams: &'a [Stream], source: &str, url: &str) -> Option<&'a Stream> {
     let own = |s: &&Stream| matches!(s.target(), Some(PlayTarget::Http(u)) if u.as_str() == url);
-    (source == url).then(|| streams.iter().find(own)).flatten().map(|s| s.hints.request_headers.clone()).unwrap_or_default()
+    (source == url).then(|| streams.iter().find(own)).flatten()
 }
 
 /// Series id of a local episode progress key's video id, for history saved before the series id was stored:
@@ -623,6 +812,11 @@ fn cover_uv(rect: egui::Rect, size: egui::Vec2) -> egui::Rect {
 /// mpv's `keep-open` pauses on the last frame at end of file.
 fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
     paused && dur > 0.0 && pos >= dur - 1.0
+}
+
+/// Fraction of the seek bar the cache covers, never behind the playhead.
+fn buffered_frac(pos: f64, cached_to: f64, dur: f64) -> f32 {
+    if dur > 0.0 { (cached_to.max(pos) / dur).clamp(0.0, 1.0) as f32 } else { 0.0 }
 }
 
 /// The playable source when there is exactly one; `None` when there's a choice (or nothing).
@@ -697,6 +891,55 @@ where
     out
 }
 
+/// What an OS media control event does to the player.
+#[derive(Debug, PartialEq)]
+enum MediaAction {
+    Cmd(&'static [&'static str]),
+    /// Seconds, and whether relative.
+    Seek(f64, bool),
+    Next,
+    Stop,
+}
+
+fn media_action(e: souvlaki::MediaControlEvent) -> Option<MediaAction> {
+    use souvlaki::{MediaControlEvent as E, SeekDirection};
+    let sign = |d| if d == SeekDirection::Forward { 1.0 } else { -1.0 };
+    Some(match e {
+        E::Play => MediaAction::Cmd(&["set", "pause", "no"]),
+        E::Pause => MediaAction::Cmd(&["set", "pause", "yes"]),
+        E::Toggle => MediaAction::Cmd(&["cycle", "pause"]),
+        E::Next => MediaAction::Next,
+        E::Stop => MediaAction::Stop,
+        E::Seek(d) => MediaAction::Seek(10.0 * sign(d), true),
+        E::SeekBy(d, by) => MediaAction::Seek(by.as_secs_f64() * sign(d), true),
+        E::SetPosition(p) => MediaAction::Seek(p.0.as_secs_f64(), false),
+        _ => return None,
+    })
+}
+
+/// OS media controls, sending their events to the UI thread; `None` (logged) where unavailable.
+fn media_controls(cc: &eframe::CreationContext, tx: Sender<Msg>) -> Option<souvlaki::MediaControls> {
+    #[cfg(windows)]
+    let hwnd = match raw_window_handle::HasWindowHandle::window_handle(cc).map(|h| h.as_raw()) {
+        Ok(raw_window_handle::RawWindowHandle::Win32(h)) => Some(h.hwnd.get() as *mut std::ffi::c_void),
+        _ => {
+            eprintln!("media controls: no window handle");
+            return None;
+        }
+    };
+    #[cfg(not(windows))]
+    let hwnd = None;
+    let config = souvlaki::PlatformConfig { display_name: "Stremflix-rs", dbus_name: "stremflix_rs", hwnd };
+    let mut controls = souvlaki::MediaControls::new(config).inspect_err(|e| eprintln!("media controls: {e:?}")).ok()?;
+    let ctx = cc.egui_ctx.clone();
+    // shortcut: without a D-Bus session souvlaki's MPRIS thread panics (logged on stderr) and the app runs on without controls; pre-check the bus if that noise matters.
+    let attached = controls.attach(move |e| {
+        let _ = tx.send(Msg::Media(e));
+        ctx.request_repaint();
+    });
+    attached.inspect_err(|e| eprintln!("media controls: {e:?}")).ok().map(|()| controls)
+}
+
 struct Playing {
     player: Player,
     key: String,
@@ -721,10 +964,19 @@ struct Playing {
     hold: Option<f64>,
     /// The last click on the video was a hold release, so the next one must not pair with it into a double-click.
     after_hold: bool,
+    /// Wheel scroll not yet turned into volume steps (points).
+    wheel: f32,
     /// The up-next card was dismissed.
     next_dismissed: bool,
+    search: SubSearch,
+    /// Per-session picture scaling: aspect override index into `ASPECTS`, fill (crop) instead of fit, zoom in tenths.
+    aspect: usize,
+    fill: bool,
+    zoom: i32,
     /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
     awake: Option<Option<keepawake::KeepAwake>>,
+    /// Video track to restore once the window is shown again; video is off while hidden.
+    hidden_vid: Option<String>,
 }
 
 impl Drop for Playing {
@@ -759,6 +1011,9 @@ struct App {
     tab: Tab,
     addons: Vec<(String, Manifest)>,
     addon_url: String,
+    /// Last "Check for updates" result per addon URL.
+    addon_updates: Vec<(String, Result<Manifest, String>)>,
+    checking_updates: bool,
     /// Addon being reconfigured (old transport URL) and the pasted result URL.
     configuring: Option<(String, String)>,
     /// Addon catalog picked in the Addons tab (addon URL, type, catalog id) and its addons (`None` while loading).
@@ -786,6 +1041,8 @@ struct App {
     show_streams: bool,
     magnet: String,
     search: String,
+    /// Recent submitted queries, newest first; persisted in settings as `search_history`.
+    search_history: Vec<String>,
     /// Poster bytes by URL; `None` while loading, empty if the fetch failed.
     posters: HashMap<String, Option<Arc<[u8]>>>,
     folder: String,
@@ -794,11 +1051,22 @@ struct App {
     library: Vec<LibraryItem>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
+    /// User lists of saved titles; `lib_list` is the one shown in Library (`None` = all saved).
+    lists: Vec<List>,
+    lib_list: Option<i64>,
+    /// Name typed for a new or renamed list.
+    list_name: String,
+    /// Saved series with episodes released in the last `NEW_EPISODE_DAYS` days (watched ones are hidden when drawn).
+    new_episodes: Vec<(MetaPreview, Vec<Video>)>,
+    /// Bumped on each `build_rows`; stale `Msg::NewEpisodes` replies are dropped.
+    new_eps_gen: u64,
     /// Finished downloads, newest first, and those still running.
     downloads: Vec<Download>,
     downloading: Vec<Download>,
     lib_sort: LibSort,
     lib_kind: LibKind,
+    /// Title filter of the Library tab.
+    lib_query: String,
     recent: Vec<Progress>,
     watched: Vec<Watched>,
     /// Keys (`<type>:<id>`) of movies and episodes marked watched.
@@ -820,16 +1088,38 @@ struct App {
     torrent_dir: String,
     torrent_cache: u64,
     torrent_profile: Profile,
+    /// (download, upload) in bytes/s; 0 is unlimited.
+    torrent_limits: (u32, u32),
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
     /// mpv hardware decoding.
     hwdec: bool,
+    /// Custom Home row order and hidden rows (row keys).
+    home_order: Vec<String>,
+    home_hidden: Vec<String>,
+    /// Every Home row as (key, title) in display order, hidden ones included.
+    home_all: Vec<(String, String)>,
+    light: bool,
     /// Play the next episode when one ends.
     autoplay_next: bool,
+    /// Closing the window hides it to the tray instead of quitting.
+    tray_on_close: bool,
+    tray: Option<Tray>,
+    /// Window hidden to the tray.
+    hidden: bool,
+    /// Quit was picked in the tray: let the close through.
+    quit: bool,
+    ui_scale: f32,
     /// Playback speed every video starts at.
     default_speed: f64,
+    /// Player volume (0-130) every video starts at; saved when the user changes it.
+    volume: f64,
+    /// Arrow-key seek in seconds: plain and with Shift.
+    seek_steps: [u32; 2],
     /// Last error, shown in a dismissible red line until cleared.
     error: Option<String>,
+    /// A multi-file torrent waiting for the user to pick a file: key, title, magnet, subtitles, files, selected index.
+    file_pick: Option<(String, String, String, Subs, Vec<MediaFile>, usize)>,
     /// Release page of a newer build, shown until dismissed.
     update: Option<String>,
     /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
@@ -838,8 +1128,12 @@ struct App {
     last_poll: Instant,
     /// GL function loader of eframe's context, for libmpv's OpenGL renderer.
     gl_proc: Option<GlProc>,
+    window: Geo,
     /// Video framebuffer, its texture (owned by egui once registered) and pixel size; reused across playbacks.
     video: Option<(glow::Framebuffer, glow::Texture, egui::TextureId, [usize; 2])>,
+    media: Option<souvlaki::MediaControls>,
+    /// Title, paused and duration (s) last published to the media controls.
+    media_shown: Option<(String, bool, u64)>,
 }
 
 fn data_dir() -> PathBuf {
@@ -852,6 +1146,10 @@ fn data_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(std::env::temp_dir);
     base.join("stremflix-rs")
+}
+
+fn wayland() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 /// Show `e` in the UI and on stderr (headless runs, CI).
@@ -876,18 +1174,26 @@ fn fmt_time(s: f64) -> String {
 impl App {
     fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
         let db = Db::open(&data_dir.join("stremflix-rs.db"))?;
+        let search_history = db.setting("search_history")?.map(|s| db::decode_history(&s)).unwrap_or_default();
         download::clear_partial(&data_dir.join("downloads"));
         let (tx, rx) = channel();
+        ACCENT_IDX.store(accent_index(db.setting("accent")?.as_deref()), std::sync::atomic::Ordering::Relaxed);
         let mut app = Self {
             sub_style: db.setting("sub_style")?.map(|s| SubStyle::decode(&s)).unwrap_or_default(),
             rt: tokio::runtime::Runtime::new()?,
             addons: db.addons()?,
             library: db.library_items()?,
             saved: db.saved_titles()?,
+            lists: db.lists()?,
+            lib_list: None,
+            list_name: String::new(),
+            new_episodes: Vec::new(),
+            new_eps_gen: 0,
             downloads: db.downloads()?,
             downloading: Vec::new(),
             lib_sort: LibSort::Added,
             lib_kind: LibKind::All,
+            lib_query: String::new(),
             recent: db.recent_progress(20)?,
             watched: db.watched(50)?,
             watched_keys: db.watched_keys()?,
@@ -901,11 +1207,27 @@ impl App {
             torrent_dir: db.setting("torrent_dir")?.unwrap_or_default(),
             torrent_cache: db.setting("torrent_cache")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             torrent_profile: Profile::from_label(&db.setting("torrent_profile")?.unwrap_or_default()),
+            torrent_limits: (
+                db.setting("torrent_down_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
+                db.setting("torrent_up_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
+            ),
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
+            home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
+            home_hidden: decode_keys(&db.setting("home_hidden")?.unwrap_or_default()),
+            home_all: Vec::new(),
+            light: db.setting("theme")?.as_deref() == Some("light"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
+            tray_on_close: db.setting("tray_on_close")?.as_deref() == Some("1"),
+            tray: None,
+            hidden: false,
+            quit: false,
+            volume: db.setting("volume")?.and_then(|v| v.parse().ok()).filter(|v| (0.0..=130.0).contains(v)).unwrap_or(100.0),
+            ui_scale: clamp_scale(db.setting("ui_scale")?.and_then(|v| v.parse().ok()).unwrap_or(1.0)),
             default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
+            seek_steps: [seek_step(db.setting("seek_step")?, 10), seek_step(db.setting("seek_step_shift")?, 30)],
             error: None,
+            file_pick: None,
             update: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
@@ -917,6 +1239,8 @@ impl App {
             rx,
             tab: Tab::Home,
             addon_url: String::new(),
+            addon_updates: Vec::new(),
+            checking_updates: false,
             configuring: None,
             browse: None,
             rows: Vec::new(),
@@ -934,12 +1258,16 @@ impl App {
             show_streams: false,
             magnet: String::new(),
             search: String::new(),
+            search_history,
             posters: HashMap::new(),
             player: None,
             pill: None,
             last_poll: Instant::now(),
             gl_proc: None,
+            window: Geo::default(),
             video: None,
+            media: None,
+            media_shown: None,
         };
         if app.addons.is_empty() {
             app.tab = Tab::Addons;
@@ -990,10 +1318,15 @@ impl App {
 
     /// Resolve `source` (http URL, magnet, or local path) and start playback.
     fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
+        self.clear_file_pick();
         self.nav += 1;
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
         let torrent = source.starts_with("magnet:") || is_torrent_file(&source);
+        let mut subs = subs;
+        if !torrent {
+            subs.extend(player::sidecar_subs(std::path::Path::new(&source))); // empty for URLs and missing paths
+        }
         if !torrent && lookup.is_none() {
             let _ = self.tx.send(Msg::Play(key, title, source.clone(), source, subs, None, nav));
             return;
@@ -1002,7 +1335,14 @@ impl App {
         self.spawn(ctx, async move {
             let (url, id) = match torrent {
                 true => {
-                    let (url, id) = start.await?.stream_url(&source, None, false).await?;
+                    let engine = start.await?;
+                    if source.starts_with("magnet:") {
+                        let files = engine.media_choices(&source).await?;
+                        if !files.is_empty() {
+                            return Ok(Msg::PickFile(key, title, source, subs, files, nav));
+                        }
+                    }
+                    let (url, id) = engine.stream_url(&source, None, false).await?;
                     (url, Some(id))
                 }
                 false => (source.clone(), None),
@@ -1022,9 +1362,9 @@ impl App {
             Some(d) => PathBuf::from(d).join("stremflix-rs-torrents"),
             None => self.data_dir.join("torrents"),
         };
-        let (cell, cache, profile) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile);
+        let (cell, cache, profile, limits) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile, self.torrent_limits);
         let dht = std::env::var_os("STREMFLIX_RS_NO_DHT").is_none();
-        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile).await.map(Arc::new) }).await.cloned() }
+        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile, limits).await.map(Arc::new) }).await.cloned() }
     }
 
     /// What a hash-matched subtitle query needs for the selected title's stream `source`;
@@ -1084,6 +1424,13 @@ impl App {
         }
     }
 
+    /// Drop a pending file picker and stop its torrent, which nothing else will play.
+    fn clear_file_pick(&mut self) {
+        if self.file_pick.take().is_some() {
+            self.release_torrents(self.player.as_ref().and_then(|p| p.torrent));
+        }
+    }
+
     fn handle(&mut self, ctx: &egui::Context, msg: Msg) {
         match msg {
             Msg::Error(e) => report(&mut self.error, e),
@@ -1115,6 +1462,10 @@ impl App {
                 }
                 self.build_rows(ctx);
                 self.fetch_recent_posters(ctx);
+            }
+            Msg::UpdateCheck(res) => {
+                self.checking_updates = false;
+                self.addon_updates = res;
             }
             Msg::Catalog(name, items) => {
                 self.search_results = Some((name, items));
@@ -1200,6 +1551,7 @@ impl App {
                 let mut videos = std::mem::take(&mut m.videos);
                 // A Continue Watching entry only knows the episode title.
                 let meta = MetaPreview { name: m.name.clone(), poster: meta.poster.or(m.poster.clone()), ..meta };
+                self.backfill_saved_facts(&m);
                 self.details = Some(m);
                 sort_episodes(&mut videos);
                 // Episodes imported as watched from Stremio: saved once as local marks, so they can be unmarked.
@@ -1242,10 +1594,19 @@ impl App {
                 let autoplay = if show.is_some() { Autoplay::Off } else { Autoplay::Top };
                 self.open_streams(ctx, meta, Some(v), autoplay, binge);
             }
+            Msg::Tray(tray::Action::Toggle) => self.show_window(ctx, self.hidden),
+            Msg::Tray(tray::Action::PlayPause) => {
+                if let Some(Err(e)) = self.player.as_ref().map(|p| p.player.command(&["cycle", "pause"])) {
+                    report(&mut self.error, e);
+                }
+            }
+            Msg::Tray(tray::Action::Quit) => {
+                self.quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             Msg::Link(s) => match stremflix_rs::addon::parse_deep_link(&s) {
                 Some(link) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.show_window(ctx, true);
                     // Leave the player like its Back button does, or the link opens behind it.
                     if self.player.is_some() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -1254,17 +1615,37 @@ impl App {
                     }
                     self.open_link(ctx, link);
                 }
-                None if s.is_empty() => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
+                None if s.is_empty() => self.show_window(ctx, true),
                 None => report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200))),
             },
+            Msg::NewEpisodes(epoch, meta, mut videos) => {
+                if epoch == self.new_eps_gen {
+                    self.new_episodes.retain(|(m, _)| m.id != meta.id);
+                    sort_episodes(&mut videos);
+                    // Episodes imported as watched from Stremio, as in `Msg::Episodes`.
+                    let bk = format!("bitfield:{}:{}", meta.kind, meta.id);
+                    if let Ok(Some(field)) = self.db.setting(&bk) {
+                        let keys: Vec<String> = stremio_import::watched_videos(&field, &videos).into_iter().map(|id| format!("{}:{id}", meta.kind)).collect();
+                        if !keys.is_empty() {
+                            match self.db.apply_watched_bitfield(&bk, &keys) {
+                                Ok(marked) => self.watched_keys.extend(marked),
+                                Err(e) => report(&mut self.error, format!("saving watched episodes: {e:#}")),
+                            }
+                        }
+                    }
+                    let today = unix_days();
+                    let videos = recent_episodes(videos, &date_string(today - (NEW_EPISODE_DAYS - 1)), &date_string(today));
+                    if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) && !videos.is_empty() {
+                        self.new_episodes.push((meta, videos));
+                    }
+                }
+            }
             Msg::Details(m) => {
                 if self.details_want == (m.kind.clone(), m.id.clone()) {
                     if let Some((sel, ..)) = self.selected.as_mut() {
                         fill_deep_linked(sel, &m);
                     }
+                    self.backfill_saved_facts(&m);
                     self.details = Some(m);
                 }
             }
@@ -1329,6 +1710,21 @@ impl App {
                 }
             }
             Msg::Update(url) => self.update = url,
+            Msg::SubSearch(key, found) => {
+                if let Some(p) = self.player.as_mut().filter(|p| p.key == key) {
+                    p.search.busy = false;
+                    p.search.results = found;
+                }
+            }
+            Msg::SubSaved(res) => {
+                if let Some(p) = &mut self.player {
+                    p.search.status = match res {
+                        Ok(path) => format!("Saved {}", path.display()),
+                        Err(e) => format!("Save failed: {e}"),
+                    };
+                }
+            }
+            Msg::Media(e) => self.media_event(ctx, e),
             Msg::Downloaded(d, res) => {
                 self.downloading.retain(|x| x.path != d.path);
                 let res = match res.map_err(anyhow::Error::msg) {
@@ -1357,6 +1753,14 @@ impl App {
             }
             Msg::Poster(url, bytes) => {
                 self.posters.insert(url, Some(bytes.into()));
+            }
+            Msg::PickFile(key, title, source, subs, files, nav) => {
+                if nav == self.nav {
+                    let first = files[0].0;
+                    self.file_pick = Some((key, title, source, subs, files, first));
+                } else {
+                    self.release_torrents(self.player.as_ref().and_then(|p| p.torrent));
+                }
             }
             Msg::Play(key, title, source, url, subs, torrent, nav) => {
                 if nav != self.nav {
@@ -1387,6 +1791,7 @@ impl App {
                 let lang = |k| setting(k).unwrap_or_default();
                 let subs_off = self.subs_off();
                 let headers = self.selected.as_ref().map(|(_, streams, _)| request_headers(streams, &source, &url)).unwrap_or_default();
+                let demuxer = self.selected.as_ref().and_then(|(_, streams, _)| own_stream(streams, &source, &url)).and_then(|s| s.hints.demuxer);
                 // Remember the episode's series (its key holds only the video id) and the stream's binge group
                 // (empty if none), so the series' play button and Continue Watching can find them later.
                 if let (Some((m, streams, _)), Some(_)) = (&self.selected, &self.episode)
@@ -1396,13 +1801,16 @@ impl App {
                     let _ = self.db.set_setting(&format!("series:{key}"), &m.id);
                     let _ = self.db.set_setting(&format!("binge:{}:{}", m.kind, m.id), &group.unwrap_or_default());
                 }
-                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], subs_off, &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
+                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], subs_off, &headers, demuxer, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
                         if self.default_speed != 1.0 {
                             let _ = player.command(&["set", "speed", &self.default_speed.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, awake: None };
+                        if self.volume != 100.0 {
+                            let _ = player.command(&["set", "volume", &self.volume.to_string()]);
+                        }
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None, hidden_vid: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1443,7 +1851,11 @@ impl App {
     }
 
     fn set_watched(&mut self, key: &str, on: bool) {
-        match self.db.set_watched(key, on) {
+        self.set_watched_many(&[key.to_string()], on);
+    }
+
+    fn set_watched_many(&mut self, keys: &[String], on: bool) {
+        match self.db.set_watched_many(keys, on) {
             Ok(()) => {
                 self.watched_keys = self.db.watched_keys().unwrap_or_default();
                 self.watched = self.db.watched(50).unwrap_or_default();
@@ -1453,9 +1865,69 @@ impl App {
         }
     }
 
+    /// Shows and focuses the window, or hides it to the tray.
+    fn show_window(&mut self, ctx: &egui::Context, show: bool) {
+        self.hidden = !show;
+        // shortcut: Wayland can't hide a window (winit ignores Visible), so it minimizes there instead.
+        if !show && wayland() {
+            return ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show));
+        if show {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
     fn stop_player(&mut self) {
         self.save_progress();
         self.player = None;
+    }
+
+    /// A media key or OS overlay button; ignored when nothing plays.
+    fn media_event(&mut self, ctx: &egui::Context, e: souvlaki::MediaControlEvent) {
+        let Some(p) = &mut self.player else { return };
+        let res = match media_action(e) {
+            Some(MediaAction::Cmd(args)) => p.player.command(args),
+            Some(MediaAction::Seek(to, relative)) => p.player.seek(to, relative),
+            Some(MediaAction::Next) => {
+                if self.playing_episode() {
+                    self.play_next(ctx);
+                }
+                return;
+            }
+            Some(MediaAction::Stop) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                self.stop_player();
+                return self.release_torrents(None);
+            }
+            None => return,
+        };
+        if let Err(e) = res {
+            report(&mut self.error, e);
+        }
+    }
+
+    /// Publish the title, duration and play state to the OS media controls when they change.
+    fn publish_media(&mut self) {
+        let Some(mc) = &mut self.media else { return };
+        let shown = self.player.as_ref().map(|p| (p.title.clone(), p.player.state.paused, p.player.state.dur as u64));
+        if shown == self.media_shown {
+            return;
+        }
+        // Errors are ignored: without a D-Bus session every call fails, and the failure was logged at startup.
+        // shortcut: the position is sent only with these changes, so a seek leaves the OS's interpolated position stale until the next pause/play.
+        let _ = match &shown {
+            None => mc.set_playback(souvlaki::MediaPlayback::Stopped),
+            Some((title, paused, dur)) => {
+                let duration = (*dur > 0).then(|| Duration::from_secs(*dur));
+                let _ = mc.set_metadata(souvlaki::MediaMetadata { title: Some(title), duration, ..Default::default() });
+                let pos = self.player.as_ref().map_or(0.0, |p| p.player.state.pos);
+                let progress = Duration::try_from_secs_f64(pos).ok().map(souvlaki::MediaPosition);
+                mc.set_playback(if *paused { souvlaki::MediaPlayback::Paused { progress } } else { souvlaki::MediaPlayback::Playing { progress } })
+            }
+        };
+        self.media_shown = shown;
     }
 
     fn poll_player(&mut self, ctx: &egui::Context) {
@@ -1513,6 +1985,8 @@ impl App {
 
     /// Rebuild home rows from installed catalogs: generic Trending/Popular rows first, then the rest.
     fn build_rows(&mut self, ctx: &egui::Context) {
+        self.new_eps_gen += 1;
+        self.new_episodes.clear();
         let cats: Vec<(&String, &String, &CatalogDef)> = self
             .addons
             .iter()
@@ -1541,19 +2015,61 @@ impl App {
             let suffix = if name.to_lowercase().contains(&kind.to_lowercase()) { String::new() } else { format!(" ({kind})") };
             rows.push((format!("{addon} - {name}{suffix}"), i));
         }
-        self.rows = rows
+        let rows: Vec<Row> = rows
             .into_iter()
             .map(|(title, i)| {
                 let (u, _, c) = cats[i];
                 Row { title, src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: c.supports("skip"), fetched: 0, loading_more: false, exhausted: false }
             })
             .collect();
+        let keys: Vec<String> = rows.iter().map(|r| row_key(&r.src)).collect();
+        let mut rows: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
+        let ordered: Vec<Row> = arrange_rows(&keys, &self.home_order).into_iter().filter_map(|i| rows[i].take()).collect();
+        self.home_all = ordered.iter().map(|r| (row_key(&r.src), r.title.clone())).collect();
+        self.rows = ordered.into_iter().filter(|r| !self.home_hidden.contains(&row_key(&r.src))).collect();
         for src in self.rows.iter().map(|r| r.src.clone()).collect::<Vec<_>>() {
             let client = self.client.clone();
             self.spawn(ctx, async move {
                 let res = client.catalog(&src.0, &src.1, &src.2, 0).await.map_err(|e| format!("{e:#}"));
                 Ok(Msg::Row(src, res))
             });
+        }
+        self.fetch_new_episodes(ctx);
+    }
+
+    /// Ask a meta addon for the episodes of each saved series and keep those released recently.
+    fn fetch_new_episodes(&self, ctx: &egui::Context) {
+        // At most 4 meta requests in flight, so a long library doesn't flood the addons.
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
+        for meta in self.saved.iter().filter(|t| t.kind == "series").filter_map(SavedTitle::preview) {
+            let addons = self.addons_for("meta", &meta.kind, &meta.id);
+            let (client, tx, ctx, epoch, slots) = (self.client.clone(), self.tx.clone(), ctx.clone(), self.new_eps_gen, slots.clone());
+            // Not `spawn`: a series whose meta fails to load just has no row entry.
+            self.rt.spawn(async move {
+                let Ok(_permit) = slots.acquire_owned().await else { return };
+                for u in &addons {
+                    // Like `open_meta`: an addon without episodes doesn't end the search.
+                    if let Ok(m) = client.meta(u, &meta.kind, &meta.id).await
+                        && !m.videos.is_empty()
+                    {
+                        let _ = tx.send(Msg::NewEpisodes(epoch, meta, m.videos));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    fn remember_search(&mut self, query: &str) {
+        db::push_history(&mut self.search_history, query);
+        self.save_search_history();
+    }
+
+    fn save_search_history(&mut self) {
+        let r = if self.search_history.is_empty() { self.db.remove_setting("search_history") } else { self.db.set_setting("search_history", &db::encode_history(&self.search_history)) };
+        if let Err(e) = r {
+            report(&mut self.error, e);
         }
     }
 
@@ -1562,6 +2078,7 @@ impl App {
         if query.is_empty() {
             return;
         }
+        self.remember_search(&query);
         let targets: Vec<(String, String, String)> = self
             .addons
             .iter()
@@ -1665,20 +2182,80 @@ impl App {
         }
     }
 
+    /// Store year and rating on a saved title once its details are known (imports and older rows lack them).
+    fn backfill_saved_facts(&mut self, d: &Meta) {
+        let key = format!("{}:{}", d.kind, d.id);
+        let (year, rating) = saved_facts(d);
+        if let Some(t) = self.saved.iter_mut().find(|t| t.key == key && (year.is_some_and(|y| t.year != Some(y)) || rating.is_some_and(|r| t.rating != Some(r)))) {
+            (t.year, t.rating) = (year.or(t.year), rating.or(t.rating));
+            if let Err(e) = self.db.set_saved_facts(&key, year, rating) {
+                report(&mut self.error, format!("saving library: {e:#}"));
+            }
+        }
+    }
+
     /// Add the selected title to the library, or remove it.
     fn toggle_saved(&mut self, meta: &MetaPreview) {
         let key = format!("{}:{}", meta.kind, meta.id);
         let res = if self.saved.iter().any(|t| t.key == key) {
             self.saved.retain(|t| t.key != key);
+            self.lists.iter_mut().for_each(|l| _ = l.keys.remove(&key));
             self.db.remove_saved_title(&key)
         } else {
-            let t = SavedTitle { key, title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone() };
+            let t = SavedTitle { key, title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone(), year: None, rating: None, last_watched: None };
+            let t = match self.details.as_ref().filter(|d| d.kind == meta.kind && d.id == meta.id).map(saved_facts) {
+                Some((year, rating)) => SavedTitle { year, rating, ..t },
+                None => t,
+            };
             self.saved.insert(0, t.clone());
             self.db.add_saved_title(&t)
         };
         if let Err(e) = res {
             report(&mut self.error, format!("saving library: {e:#}"));
         }
+    }
+
+    /// Re-read lists (and saved titles, which joining a list can add) after a list change; `res` errors are shown.
+    fn lists_changed(&mut self, res: anyhow::Result<()>) {
+        if let Err(e) = res {
+            report(&mut self.error, format!("saving list: {e:#}"));
+        }
+        self.saved = self.db.saved_titles().unwrap_or_default();
+        self.lists = self.db.lists().unwrap_or_default();
+        if !self.lists.iter().any(|l| Some(l.id) == self.lib_list) {
+            self.lib_list = None;
+        }
+    }
+
+    /// "Add to list" menu: a checkbox per list, plus a new list that gets `meta`.
+    fn list_menu(&mut self, ui: &mut egui::Ui, meta: &MetaPreview) {
+        let t = SavedTitle { key: format!("{}:{}", meta.kind, meta.id), title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone(), year: None, rating: None, last_watched: None };
+        ui.menu_button(format!("{}  Add to list", icons::PLUS), |ui| {
+            let mut change = None;
+            for l in &self.lists {
+                let mut on = l.keys.contains(&t.key);
+                if ui.checkbox(&mut on, &l.name).changed() {
+                    change = Some((l.id, on));
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.list_name).hint_text("New list…").char_limit(60).desired_width(140.0));
+                if ui.button("Create").clicked() {
+                    match self.db.create_list(&self.list_name) {
+                        Ok(id) => {
+                            self.list_name.clear();
+                            change = Some((id, true));
+                        }
+                        Err(e) => report(&mut self.error, format!("creating list: {e:#}")),
+                    }
+                }
+            });
+            if let Some((id, on)) = change {
+                let res = self.db.set_in_list(id, &t, on);
+                self.lists_changed(res);
+            }
+        });
     }
 
     /// Progress key and player title of the selected movie or episode.
@@ -1729,6 +2306,7 @@ impl App {
         }
         let client = self.client.clone();
         let addons = self.addons_for("meta", &meta.kind, &meta.id);
+        self.clear_file_pick();
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -1768,6 +2346,7 @@ impl App {
         match link {
             DeepLink::Addon(url) => {
                 // Invalidate in-flight play/streams/episodes replies so they can't act over the Addons tab.
+                self.clear_file_pick();
                 (self.pending, self.nav) = (None, self.nav + 1);
                 (self.tab, self.addon_url) = (Tab::Addons, url.into());
             }
@@ -1806,6 +2385,7 @@ impl App {
         let stream_addons = self.addons_for("stream", &meta.kind, &id);
         let names: Vec<String> = stream_addons.iter().map(|u| self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default()).collect();
         let sub_addons = self.addons_for("subtitles", &meta.kind, &id);
+        self.clear_file_pick();
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -1879,7 +2459,9 @@ impl App {
             let _ = self.tx.send(Msg::Play(key, format!("{} - {}", d.name, t.title.as_deref().unwrap_or("Trailer")), src.clone(), src, vec![], None, self.nav));
         }
         let mut episode = None;
+        let mut fresh_click: Option<(MetaPreview, String)> = None;
         let mut toggle: Option<(String, bool)> = None;
+        let mut bulk: Option<(Vec<String>, bool)> = None;
         let mut save = None;
         // Movies show their streams; a series shows them once an episode is picked.
         if let Some((m, streams, subs)) = &self.selected
@@ -1888,11 +2470,11 @@ impl App {
         {
             ui.add_space(16.0);
             ui.horizontal(|ui| {
-                let r = ui.label(RichText::new("Streams").size(24.0).strong().family(bold()).color(Color32::WHITE));
+                let r = ui.label(RichText::new("Streams").size(24.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
                 if std::mem::take(&mut self.show_streams) {
                     r.scroll_to_me(Some(Align::TOP));
                 }
-                ui.label(RichText::new(format!("{}  ·  {} subtitle track{}", key.1, subs.len(), if subs.len() == 1 { "" } else { "s" })).size(15.0).color(Color32::from_gray(170)));
+                ui.label(RichText::new(format!("{}  ·  {} subtitle track{}", key.1, subs.len(), if subs.len() == 1 { "" } else { "s" })).size(15.0).color(ui.visuals().weak_text_color()));
                 let seen = self.watched_keys.contains(&key.0);
                 if small_button(ui, if seen { "Mark unwatched" } else { "Mark watched" }).clicked() {
                     toggle = Some((key.0.clone(), !seen));
@@ -1902,7 +2484,7 @@ impl App {
             for (i, s) in streams.iter().enumerate() {
                 if (i == 0 || streams[i - 1].addon != s.addon) && !s.addon.is_empty() {
                     ui.add_space(8.0);
-                    ui.label(RichText::new(&s.addon).size(17.0).family(bold()).color(Color32::from_gray(200)));
+                    ui.label(RichText::new(&s.addon).size(17.0).family(bold()).color(ui.visuals().weak_text_color()));
                 }
                 // YouTube needs yt-dlp, which only mpv runs; a playlist GET would save only the manifest.
                 let src = s.source().filter(|src| !stremflix_rs::addon::is_youtube(src) && !is_playlist(src));
@@ -1937,7 +2519,7 @@ impl App {
         {
             ui.add_space(16.0);
             ui.horizontal(|ui| {
-                let r = ui.label(RichText::new("Episodes").size(24.0).strong().family(bold()).color(Color32::WHITE));
+                let r = ui.label(RichText::new("Episodes").size(24.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
                 if self.episode.is_none() && std::mem::take(&mut self.show_streams) {
                     r.scroll_to_me(Some(Align::TOP));
                 }
@@ -1948,6 +2530,13 @@ impl App {
                         ui.selectable_value(&mut self.season, s, season_label(s));
                     }
                 });
+                for (scope, season) in [("season", Some(self.season)), ("series", None)] {
+                    let keys: Vec<String> = self.episodes.iter().filter(|v| season.is_none_or(|s| v.season == s)).map(|v| format!("{}:{}", meta.kind, v.id)).collect();
+                    let all = keys.iter().all(|k| self.watched_keys.contains(k));
+                    if small_button(ui, &format!("Mark {scope} {}", if all { "unwatched" } else { "watched" })).clicked() {
+                        bulk = Some((keys, !all));
+                    }
+                }
             });
             ui.add_space(8.0);
             for v in self.episodes.iter().filter(|v| v.season == self.season) {
@@ -2006,6 +2595,28 @@ impl App {
                 });
             });
         }
+        let mut fresh: Vec<(&MetaPreview, &Video)> = self
+            .new_episodes
+            .iter()
+            .filter(|(m, _)| self.saved.iter().any(|t| t.key == format!("series:{}", m.id)))
+            .filter_map(|(m, vs)| vs.iter().filter(|v| !self.watched_keys.contains(&format!("{}:{}", m.kind, v.id))).max_by_key(|v| (v.released.as_deref().and_then(|d| d.get(..10)), v.season, v.episode)).map(|v| (m, v)))
+            .collect();
+        fresh.sort_by(|a, b| b.1.released.cmp(&a.1.released));
+        if !fresh.is_empty() {
+            Self::row_title(ui, "New Episodes");
+            egui::ScrollArea::horizontal().id_salt("new_episodes").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (m, v) in fresh {
+                        let label = format!("{} S{}E{}", m.name, v.season.unwrap_or(0), v.episode.unwrap_or(0));
+                        let (r, rect) = card(ui, CARD, &label);
+                        self.paint_poster(ui, &r, rect, &m.poster, &m.name, &mut want);
+                        if r.on_hover_text(label).clicked() {
+                            fresh_click = Some((m.clone(), v.id.clone()));
+                        }
+                    }
+                });
+            });
+        }
         if !self.watched.is_empty() {
             Self::row_title(ui, "Watch It Again");
             egui::ScrollArea::horizontal().id_salt("watched").show(ui, |ui| {
@@ -2031,7 +2642,7 @@ impl App {
         if let Some((title, items)) = &self.search_results {
             ui.add_space(18.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(title).size(20.0).strong().family(bold()).color(Color32::WHITE));
+                ui.label(RichText::new(title).size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
                 clear = small_button(ui, "Clear").clicked();
             });
             if items.is_empty() {
@@ -2077,6 +2688,9 @@ impl App {
         if let Some((k, on)) = toggle {
             self.set_watched(&k, on);
         }
+        if let Some((keys, on)) = bulk {
+            self.set_watched_many(&keys, on);
+        }
         if let Some(k) = remove {
             match self.db.remove_progress(&k) {
                 Ok(()) => self.recent = self.db.recent_progress(20).unwrap_or_default(),
@@ -2091,6 +2705,12 @@ impl App {
         }
         if let Some((m, v)) = episode {
             self.open_streams(&ctx, m, Some(v), Autoplay::Only, None);
+        }
+        // Load the series page first, so no other series' episode list stays under it.
+        if let Some((m, id)) = fresh_click {
+            let sid = m.id.clone();
+            self.open_meta(&ctx, m, false);
+            self.pending = Some((sid, Some(id)));
         }
         if let Some((k, t, s, subs)) = play {
             self.play(&ctx, k, t, s, subs);
@@ -2217,7 +2837,7 @@ impl App {
 
     fn row_title(ui: &mut egui::Ui, title: &str) {
         ui.add_space(22.0);
-        ui.label(RichText::new(title).size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.label(RichText::new(title).size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
         ui.add_space(4.0);
     }
 
@@ -2313,6 +2933,7 @@ impl App {
                 if hero_button(ui, &label, [gray(179), gray(102)], Color32::WHITE).clicked() {
                     self.toggle_saved(meta);
                 }
+                self.list_menu(ui, meta);
             });
             ui.add_space(12.0);
             if let Some(d) = &meta.description {
@@ -2338,14 +2959,14 @@ impl App {
     /// Returns the trailer the user clicked.
     fn ui_details<'a>(ui: &mut egui::Ui, d: &'a Meta) -> Option<&'a Stream> {
         ui.add_space(14.0);
-        let gray = Color32::from_gray(170);
+        let gray = ui.visuals().weak_text_color();
         let facts: Vec<String> = [d.release_info.clone(), d.runtime.clone(), d.imdb_rating.as_ref().map(|r| format!("IMDb {r}"))]
             .into_iter()
             .flatten()
             .chain((!d.genres.is_empty()).then(|| d.genres.join(", ")))
             .collect();
         if !facts.is_empty() {
-            ui.label(RichText::new(facts.join("  ·  ")).size(16.0).color(Color32::WHITE));
+            ui.label(RichText::new(facts.join("  ·  ")).size(16.0).color(ui.visuals().strong_text_color()));
         }
         for (name, list) in [("Cast", &d.cast), ("Director", &d.director)] {
             if !list.is_empty() {
@@ -2406,6 +3027,7 @@ impl App {
         let mut cmd = |a: &[&str]| cmds.push(a.iter().map(|s| s.to_string()).collect());
         let (mut back, mut toggle_fs, mut external) = (false, false, false);
         let mut seek: Option<(f64, bool)> = None;
+        let (mut search_req, mut sub_act): (bool, Option<(bool, SubFound)>) = (false, None);
         let mut style = self.sub_style;
         ui.painter().rect_filled(rect, 0, Color32::BLACK);
 
@@ -2413,7 +3035,8 @@ impl App {
         let [vw, vh] = p.player.state.video;
         if let (true, Some(gl)) = (vw > 0 && vh > 0, frame.gl().cloned()) {
             let fit = (rect.width() / vw as f32).min(rect.height() / vh as f32);
-            let vrect = egui::Rect::from_center_size(rect.center(), vec2(vw as f32, vh as f32) * fit);
+            // Fill renders into the whole window so panscan has something to crop.
+            let vrect = if p.fill { rect } else { egui::Rect::from_center_size(rect.center(), vec2(vw as f32, vh as f32) * fit) };
             let px = vrect.size() * ctx.pixels_per_point();
             let size = [(px.x as usize).max(1), (px.y as usize).max(1)];
             let video = match self.video {
@@ -2497,17 +3120,30 @@ impl App {
             p.after_hold = long;
         }
         let focused = ctx.memory(|m| m.focused());
+        let line = ctx.options(|o| o.input_options.line_scroll_speed); // read outside ctx.input to avoid nested locking
+        let mut new_vol = None;
         ctx.input(|i| {
             use egui::Key::*;
             let k = |key| i.key_pressed(key);
             // Space activates a focused popover control, so it must not also toggle pause.
             // A short Space press pauses on release; a hold is 2x speed, like the mouse.
             if (i.key_released(Space) && focused.is_none() && !long) || k(K) { cmd(&["cycle", "pause"]) }
-            if k(ArrowLeft) { seek = Some((-10.0, true)) }
-            if k(ArrowRight) { seek = Some((10.0, true)) }
-            if k(ArrowUp) { cmd(&["add", "volume", "5"]) }
-            if k(ArrowDown) { cmd(&["add", "volume", "-5"]) }
+            let step = self.seek_steps[i.modifiers.shift as usize] as f64;
+            if k(ArrowLeft) { seek = Some((-step, true)) }
+            if k(ArrowRight) { seek = Some((step, true)) }
+            if k(ArrowUp) { cmd(&["add", "volume", "5"]); new_vol = Some(st.volume + 5.0) }
+            if k(ArrowDown) { cmd(&["add", "volume", "-5"]); new_vol = Some(st.volume - 5.0) }
             if k(M) { cmd(&["cycle", "mute"]) }
+            // mpv pauses on its own after a frame step.
+            if k(Period) { cmd(&["frame-step"]) }
+            if k(Comma) { cmd(&["frame-back-step"]) }
+            // Wheel over the bare video only: `hovered` is false under a popover or a control.
+            if bg.hovered() && p.menu.is_none() {
+                let n = wheel_steps(&mut p.wheel, i.smooth_scroll_delta.y, line);
+                if n != 0 { cmd(&["add", "volume", &(n * 5).to_string()]); new_vol = Some(st.volume + f64::from(n * 5)) }
+            } else {
+                p.wheel = 0.0;
+            }
             toggle_fs |= k(F);
             if k(Escape) {
                 if fs { toggle_fs = true } else { back = true }
@@ -2586,9 +3222,11 @@ impl App {
             let th = ctx.animate_value_with_time(r.id.with("h"), if hot { 6.0 } else { 4.0 }, 0.1);
             let track = egui::Rect::from_center_size(bar.center(), vec2(bar.width(), th));
             paint.rect_filled(track, 2, Color32::from_gray(128).gamma_multiply(a * 0.5));
-            paint.rect_filled(egui::Rect::from_min_size(track.min, vec2(track.width() * frac, th)), 2, ACCENT.gamma_multiply(a));
+            let buf = buffered_frac(pos, st.cached_to, st.dur);
+            paint.rect_filled(egui::Rect::from_min_size(track.min, vec2(track.width() * buf, th)), 2, Color32::from_gray(160).gamma_multiply(a * 0.6));
+            paint.rect_filled(egui::Rect::from_min_size(track.min, vec2(track.width() * frac, th)), 2, accent().gamma_multiply(a));
             let knob = pos2(track.left() + track.width() * frac, track.center().y);
-            paint.circle_filled(knob, if hot { 9.0 } else { 7.0 }, ACCENT.gamma_multiply(a));
+            paint.circle_filled(knob, if hot { 9.0 } else { 7.0 }, accent().gamma_multiply(a));
             paint.circle_filled(knob, 3.0, white);
             if let Some(h) = r.hover_pos().filter(|_| st.dur > 0.0) {
                 paint.text(pos2(h.x, bar.top() - 6.0), egui::Align2::CENTER_BOTTOM, fmt_time(at(h.x)), font.clone(), white);
@@ -2615,6 +3253,7 @@ impl App {
             if let Some(q) = vr.interact_pointer_pos().filter(|_| vr.dragged() || vr.clicked()) {
                 let v = ((q.x - vbar.left()) / vbar.width()).clamp(0.0, 1.0) * 100.0;
                 cmd(&["set", "volume", &format!("{v:.0}")]);
+                new_vol = Some(v.round().into());
                 // The slider shows 0 while muted, so setting a volume also unmutes.
                 if st.muted {
                     cmd(&["set", "mute", "no"]);
@@ -2630,7 +3269,7 @@ impl App {
                 let bx = rect.right() - 52.0 - (2 - i) as f32 * 64.0;
                 let b = icon(ui, pos2(bx, y), glyph, label);
                 if p.menu == Some(m) {
-                    paint.rect_filled(egui::Rect::from_center_size(pos2(bx, y + 22.0), vec2(18.0, 3.0)), 2, ACCENT.gamma_multiply(a));
+                    paint.rect_filled(egui::Rect::from_center_size(pos2(bx, y + 22.0), vec2(18.0, 3.0)), 2, accent().gamma_multiply(a));
                 }
                 if b.clicked() {
                     p.menu = if p.menu == Some(m) { None } else { Some(m) };
@@ -2643,6 +3282,7 @@ impl App {
                 let right = (rect.right() - 52.0 - (2 - i) as f32 * 64.0 + 150.0).min(rect.right() - 16.0);
                 egui::Area::new(ui.scope_id().with(("menu", i))).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_BOTTOM).fixed_pos(pos2(right, y - 70.0)).show(&ctx, |ui| {
                     egui::Frame::new().fill(Color32::from_rgba_unmultiplied(24, 24, 28, 245)).stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(18))).corner_radius(12).inner_margin(egui::Margin::symmetric(12, 14)).show(ui, |ui| {
+                        ui.style_mut().visuals = ui.ctx().style_of(egui::Theme::Dark).visuals.clone();
                         ui.set_width(300.0);
                         ui.spacing_mut().item_spacing.y = 2.0;
                         let title = match m { Menu::Audio => "Audio", Menu::Subtitles => "Subtitles", Menu::Playback => "Playback" };
@@ -2662,6 +3302,15 @@ impl App {
                                         let v = id.map_or("no".to_string(), |i| i.to_string());
                                         cmd(&["set", prop, &v]);
                                         // Remember the subtitle choice for the next video: Off, or the picked language first in `slang`.
+                                        if kind == "audio" {
+                                            // Remember the audio language: the picked track's language first in `alang`.
+                                            if let Some(v) = lang.and_then(|l| prefer_lang(&self.langs[0], l)) {
+                                                self.langs[0] = v.clone();
+                                                if let Err(e) = self.db.set_setting("alang", &v) {
+                                                    report(&mut self.error, format!("saving alang: {e:#}"));
+                                                }
+                                            }
+                                        }
                                         if kind == "sub" {
                                             let mut save = vec![("sub_off", if id.is_none() { "1" } else { "0" }.to_string())];
                                             // shortcut: name-only addon languages ("English") fail `valid_langs` and aren't remembered; map names to codes if users hit it.
@@ -2678,7 +3327,43 @@ impl App {
                                     }
                                 }
                             });
+                            if kind == "audio" {
+                                style.audio_delay += stepper(ui, "Audio delay", &format!("{:+.1}s", style.audio_delay)) as f64 * 0.1;
+                                if style.audio_delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(accent())).frame(false)).clicked() {
+                                    style.audio_delay = 0.0;
+                                }
+                            }
                             if kind == "sub" {
+                                menu_heading(ui, "Search");
+                                let s = &mut p.search;
+                                if ui.add(egui::Button::new(RichText::new(if s.open { "Hide search" } else { "Search subtitles" }).size(14.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(16)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0))).clicked() {
+                                    s.open = !s.open;
+                                    search_req = s.open && s.results.is_empty() && !s.busy;
+                                }
+                                if s.open {
+                                    ui.add(egui::TextEdit::singleline(&mut s.filter).hint_text("Filter by language or addon").desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
+                                    let hits = filter_subs(&s.results, &s.filter);
+                                    let note = if s.busy { "Searching..." } else if hits.is_empty() { "No subtitles found" } else { "" };
+                                    if !note.is_empty() {
+                                        ui.label(RichText::new(note).size(14.0).color(Color32::from_gray(150)));
+                                    }
+                                    egui::ScrollArea::vertical().id_salt("sub_search").max_height(200.0).show(ui, |ui| {
+                                        // shortcut: first 100 matches only; type a filter to narrow.
+                                        for f in hits.into_iter().take(100) {
+                                            ui.horizontal(|ui| {
+                                                if ui.small_button("Save").on_hover_text("Save next to the video or in downloads").clicked() {
+                                                    sub_act = Some((true, f.clone()));
+                                                }
+                                                if menu_row(ui, &format!("{} · {}", f.lang, f.addon), false).clicked() {
+                                                    sub_act = Some((false, f.clone()));
+                                                }
+                                            });
+                                        }
+                                    });
+                                    if !s.status.is_empty() {
+                                        ui.label(RichText::new(&s.status).size(13.0).color(Color32::from_gray(170)));
+                                    }
+                                }
                                 menu_heading(ui, "Style");
                                 style.scale = (style.scale * 10.0).round() / 10.0 + stepper(ui, "Size", &format!("{:.1}x", style.scale)) as f64 * 0.1;
                                 ui.horizontal(|ui| {
@@ -2691,9 +3376,20 @@ impl App {
                                         }
                                     });
                                 });
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Outline").size(15.0).color(Color32::from_gray(210)));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        for (i, (name, hex)) in SUB_OUTLINES.iter().enumerate().rev() {
+                                            if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::BLACK), style.outline == i).clicked() {
+                                                style.outline = i;
+                                            }
+                                        }
+                                    });
+                                });
+                                style.pos += stepper(ui, "Position", &format!("{}%", style.pos)) as f64 * 5.0;
                                 switch_row(ui, "Background box", &mut style.background);
                                 style.delay += stepper(ui, "Delay", &format!("{:+.1}s", style.delay)) as f64 * 0.1;
-                                if style.delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(ACCENT)).frame(false)).clicked() {
+                                if style.delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(accent())).frame(false)).clicked() {
                                     style.delay = 0.0;
                                 }
                             }
@@ -2726,10 +3422,36 @@ impl App {
                                 for sp in SPEEDS {
                                     if pill(ui, &format!("{sp}x"), (st.speed - sp).abs() < 0.01, egui::Role::RadioButton).clicked() {
                                         cmd(&["set", "speed", &sp.to_string()]);
+                                        // Also the starting speed of the next video, like the Default speed setting.
+                                        self.default_speed = sp;
+                                        if let Err(e) = self.db.set_setting("default_speed", &sp.to_string()) {
+                                            report(&mut self.error, format!("saving default_speed: {e:#}"));
+                                        }
                                     }
                                 }
                             });
                             menu_heading(ui, "Video");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                for (i, (name, v)) in ASPECTS.iter().enumerate() {
+                                    if pill(ui, name, p.aspect == i, egui::Role::RadioButton).clicked() {
+                                        p.aspect = i;
+                                        cmd(&["set", "video-aspect-override", v]);
+                                    }
+                                }
+                            });
+                            if switch_row(ui, "Fill screen (crop)", &mut p.fill).changed() {
+                                cmd(&["set", "panscan", if p.fill { "1.0" } else { "0.0" }]);
+                            }
+                            let step = stepper(ui, "Zoom", &if p.zoom == 0 { "0.0".into() } else { format!("{:+.1}", p.zoom as f64 / 10.0) });
+                            if step != 0 {
+                                p.zoom = (p.zoom + step).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
+                                cmd(&["set", "video-zoom", &zoom_value(p.zoom)]);
+                            }
+                            if p.zoom != 0 && ui.add(egui::Button::new(RichText::new("Reset zoom").size(13.0).color(accent())).frame(false)).clicked() {
+                                p.zoom = 0;
+                                cmd(&["set", "video-zoom", "0"]);
+                            }
                             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                                 cmd(&["set", "hwdec", hwdec_value(self.hwdec)]);
                                 if let Err(e) = self.db.set_setting("hwdec", if self.hwdec { "1" } else { "0" }) {
@@ -2810,6 +3532,12 @@ impl App {
             }
             let _ = p.player.apply_sub_style(&style);
         }
+        if let Some(v) = new_vol.map(|v| v.clamp(0.0, 130.0)).filter(|v| *v != self.volume) {
+            self.volume = v;
+            if let Err(e) = self.db.set_setting("volume", &v.to_string()) {
+                report(&mut self.error, format!("saving volume: {e:#}"));
+            }
+        }
         if external {
             match open_external(&self.external_player, &p.url) {
                 Ok(()) => cmds.push(vec!["set".into(), "pause".into(), "yes".into()]),
@@ -2830,6 +3558,48 @@ impl App {
                 report(&mut self.error, e);
             }
         }
+        let (key, source, title) = (p.key.clone(), p.source.clone(), p.title.clone());
+        if let Some((save, f)) = sub_act {
+            if save {
+                // Beside a local or downloaded video, else in the downloads folder.
+                let src = std::path::Path::new(&source);
+                let dir = src.is_file().then(|| src.parent().map(PathBuf::from)).flatten().unwrap_or_else(|| self.data_dir.join("downloads"));
+                let client = self.client.clone();
+                p.search.status = "Saving...".into();
+                self.spawn(&ctx, async move {
+                    let res = async { download::save_subtitle(&dir, &title, &f.lang, &client.subtitle_file(&f.url).await?).await }.await;
+                    Ok(Msg::SubSaved(res.map_err(|e| format!("{e:#}"))))
+                });
+            } else if let Err(e) = p.player.add_sub(&f.url, &f.lang) {
+                report(&mut self.error, e);
+            }
+        }
+        if search_req {
+            let lookup = self.sub_lookup(&key, &source);
+            let names: Vec<(String, String)> = lookup.iter().flat_map(|l| &l.addons).map(|u| (u.clone(), self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default())).collect();
+            if let Some(p) = &mut self.player {
+                p.search.busy = lookup.is_some();
+                p.search.status = if lookup.is_some() { String::new() } else { "No subtitle addons for this item".into() };
+            }
+            if let Some(l) = lookup {
+                let client = self.client.clone();
+                // Like `hashed_subs`: the stream's hash and file name let OpenSubtitles-style addons match the exact file.
+                let extra: Vec<(&str, String)> = [("videoHash", l.hints.video_hash.clone()), ("videoSize", l.hints.video_size.map(|n| n.to_string())), ("filename", l.hints.filename.clone())]
+                    .into_iter()
+                    .filter_map(|(k, v)| Some((k, v?)))
+                    .collect();
+                self.spawn(&ctx, async move {
+                    let ask = |(u, name): (String, String)| {
+                        let (c, k, i, e) = (client.clone(), l.kind.clone(), l.id.clone(), extra.clone());
+                        async move { Ok(c.subtitles(&u, &k, &i, &e).await?.into_iter().map(|s| SubFound { addon: name.clone(), lang: s.lang, url: s.url }).collect::<Vec<_>>()) }
+                    };
+                    let mut found: Vec<SubFound> = concurrently(names, ask).await.into_iter().flatten().flatten().collect();
+                    let mut seen = std::collections::HashSet::new();
+                    found.retain(|f| seen.insert(f.url.clone()));
+                    Ok(Msg::SubSearch(key, found))
+                });
+            }
+        }
         if toggle_fs {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
         }
@@ -2847,6 +3617,10 @@ impl App {
     fn ui_addons(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if form_row(ui, "Manifest URL:", &mut self.addon_url, "http://127.0.0.1:7070/manifest.json", "Install", None, false) {
+            // A pasted stremio:// link becomes its manifest URL (http for loopback).
+            if let Some(stremflix_rs::addon::DeepLink::Addon(u)) = stremflix_rs::addon::parse_deep_link(&self.addon_url) {
+                self.addon_url = u.into();
+            }
             let (client, url) = (self.client.clone(), self.addon_url.trim().to_string());
             self.spawn(&ctx, async move {
                 let m = client.fetch_manifest(&url).await?;
@@ -2861,7 +3635,25 @@ impl App {
                 Ok(Msg::Imported(imp))
             });
         }
+        if ui.add_enabled(!self.checking_updates && !self.addons.is_empty(), egui::Button::new(if self.checking_updates { "Checking..." } else { "Check for updates" })).clicked() {
+            self.checking_updates = true;
+            let (client, urls) = (self.client.clone(), self.addons.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>());
+            self.spawn(&ctx, async move {
+                let mut out = Vec::new();
+                // Four at a time keeps a long addon list from opening dozens of connections.
+                for chunk in urls.chunks(4) {
+                    let res = concurrently(chunk.to_vec(), |u| {
+                        let c = client.clone();
+                        async move { Ok((u.clone(), c.fetch_manifest(&u).await.map_err(|e| e.root_cause().to_string()))) }
+                    })
+                    .await;
+                    out.extend(res.into_iter().flatten());
+                }
+                Ok(Msg::UpdateCheck(out))
+            });
+        }
         ui.separator();
+        let mut update = None;
         let mut remove = None;
         let mut configure = None;
         let mut replace = None;
@@ -2889,6 +3681,23 @@ impl App {
                     remove = Some(url.clone());
                 }
             });
+            match self.addon_updates.iter().find(|(u, _)| u == url).map(|(_, r)| r) {
+                Some(Ok(new)) if !same_addon(m, new) => {
+                    ui.label(RichText::new("Addon id changed; not offered").weak());
+                }
+                Some(Ok(new)) if stremflix_rs::addon::is_newer(&new.version, &m.version) => {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Update available: {} \u{2192} {}", m.version, new.version));
+                        if small_button(ui, "Update").clicked() {
+                            update = Some((url.clone(), new.clone()));
+                        }
+                    });
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(format!("Unreachable: {e}")).weak());
+                }
+                _ => {}
+            }
             if m.behavior_hints.configuration_required {
                 ui.label(RichText::new("Needs configuration before use. Press Configure.").weak());
             }
@@ -2900,6 +3709,12 @@ impl App {
             {
                 replace = Some((old.clone(), pasted.trim().to_string()));
             }
+        }
+        if let Some((url, new)) = update
+            && self.addons.iter().any(|(u, m)| *u == url && same_addon(m, &new))
+        {
+            self.addon_updates.retain(|(u, _)| *u != url);
+            self.handle(&ctx, Msg::Installed(url, new, None));
         }
         if let Some((old, new)) = replace {
             let client = self.client.clone();
@@ -2940,7 +3755,7 @@ impl App {
     fn ui_browse_addons(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.separator();
-        ui.label(RichText::new("Browse addons").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.label(RichText::new("Browse addons").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
         let label = |addon: &str, c: &CatalogDef| sanitize_text(&format!("{addon} - {} ({})", c.name.as_deref().unwrap_or(&c.id), kind_label(&c.kind)), 400);
         let sources: Vec<(AddonCatalogSrc, String)> = self
             .addons
@@ -3012,7 +3827,7 @@ impl App {
         // Types and resource names are not sanitized at parse time; strip control and bidi characters here.
         let list = |v: Vec<&str>| v.into_iter().map(|t| sanitize_text(t, 64)).collect::<Vec<_>>().join(", ");
         let catalogs: Vec<&str> = m.catalogs.iter().map(|c| c.name.as_deref().unwrap_or(&c.id)).collect();
-        let gray = Color32::from_gray(170);
+        let gray = ui.visuals().weak_text_color();
         egui::Frame::new().inner_margin(egui::Margin { left: 24, top: 4, bottom: 8, right: 0 }).show(ui, |ui| {
             let facts = [
                 ("ID", sanitize_text(&m.id, 300)),
@@ -3025,7 +3840,7 @@ impl App {
                 ui.add(egui::Label::new(RichText::new(format!("{name}: {v}")).color(gray)).wrap());
             }
             if let Some(d) = &m.description {
-                ui.add(egui::Label::new(RichText::new(d).color(Color32::WHITE)).wrap());
+                ui.add(egui::Label::new(RichText::new(d).color(ui.visuals().strong_text_color())).wrap());
             }
         });
     }
@@ -3044,7 +3859,38 @@ impl App {
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         let mut save: Vec<(&str, String)> = Vec::new();
         ui.add_space(8.0);
-        ui.label(RichText::new("Stremio account").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.label(RichText::new("Appearance").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Theme").size(15.0).color(ui.visuals().text_color()));
+            for (name, light) in [("Dark", false), ("Light", true)] {
+                if pill(ui, name, self.light == light, egui::Role::RadioButton).clicked() && self.light != light {
+                    self.light = light;
+                    save.push(("theme", name.to_lowercase()));
+                }
+            }
+            ui.add_space(12.0);
+            ui.label(RichText::new("Accent").size(15.0).color(ui.visuals().text_color()));
+            for (i, (name, color)) in ACCENTS.iter().enumerate() {
+                let cur = ACCENT_IDX.load(std::sync::atomic::Ordering::Relaxed);
+                if swatch(ui, name, *color, cur == i).clicked() && cur != i {
+                    ACCENT_IDX.store(i, std::sync::atomic::Ordering::Relaxed);
+                    save.push(("accent", name.to_string()));
+                }
+            }
+        });
+        ui.scope(|ui| {
+            ui.set_max_width(550.0);
+            let step = stepper(ui, "UI scale", &format!("{:.0}%", self.ui_scale * 100.0));
+            if step != 0 {
+                ui.ctx().set_zoom_factor(clamp_scale(self.ui_scale + step as f32 * 0.25));
+            }
+        });
+        ui.label(RichText::new("Also Ctrl and +, Ctrl and −, Ctrl and 0.").size(13.0).color(ui.visuals().weak_text_color()));
+        if !save.is_empty() {
+            apply_theme(ui.ctx(), self.light);
+        }
+        ui.add_space(16.0);
+        ui.label(RichText::new("Stremio account").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
         let ctx = ui.ctx().clone();
         if let Some(email) = self.account.clone() {
             ui.horizontal(|ui| {
@@ -3103,7 +3949,7 @@ impl App {
                     ui.spinner();
                 }
             });
-            ui.label(RichText::new("Copies your addons, library and watched titles from api.strem.io. Settings can upload them back after signing in.").size(13.0).color(Color32::from_gray(170)));
+            ui.label(RichText::new("Copies your addons, library and watched titles from api.strem.io. Settings can upload them back after signing in.").size(13.0).color(ui.visuals().weak_text_color()));
             let email = self.login.0.trim().to_string();
             if go && !email.is_empty() && !self.login.1.is_empty() {
                 // Not kept after use, even if signing in fails.
@@ -3116,7 +3962,7 @@ impl App {
             }
         }
         ui.add_space(8.0);
-        ui.label(RichText::new("Torrents").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.label(RichText::new("Torrents").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
         let hint = self.data_dir.join("torrents").display().to_string();
         if form_row(ui, "Cache location:", &mut self.torrent_dir, &hint, "Save", Some("Empty: the app's data folder"), true) {
             let d = self.torrent_dir.trim().to_string();
@@ -3150,13 +3996,27 @@ impl App {
                 }
             });
         });
+        for (title, key, val) in [("Download limit:", "torrent_down_limit", &mut self.torrent_limits.0), ("Upload limit:", "torrent_up_limit", &mut self.torrent_limits.1)] {
+            ui.horizontal(|ui| {
+                let l = ui.label(title);
+                ui.add_space((150.0 - l.rect.width()).max(0.0));
+                let label = SPEED_LIMITS.iter().find(|c| c.1 == *val).map_or("Custom", |c| c.0);
+                egui::ComboBox::from_id_salt(key).selected_text(label).show_ui(ui, |ui| {
+                    for (name, bps) in SPEED_LIMITS {
+                        if ui.selectable_value(val, bps, name).changed() {
+                            save.push((key, bps.to_string()));
+                        }
+                    }
+                });
+            });
+        }
         let note = "Stopped torrents stay on disk up to the cache size, and are cleared when the app starts.";
-        ui.label(RichText::new(note).size(13.0).color(Color32::from_gray(170)));
+        ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
         if self.torrent.get().is_some() {
-            ui.label(RichText::new("A torrent has already played: restart the app to apply changes.").size(13.0).color(Color32::from_gray(170)));
+            ui.label(RichText::new("A torrent has already played: restart the app to apply changes.").size(13.0).color(ui.visuals().weak_text_color()));
         }
         ui.add_space(16.0);
-        ui.label(RichText::new("Player").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.label(RichText::new("Player").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
         if form_row(ui, "External player:", &mut self.external_player, "vlc", "Save", Some("Command run with the stream URL; no shell"), true) {
             save.push(("external_player", self.external_player.trim().to_string()));
         }
@@ -3170,12 +4030,15 @@ impl App {
             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                 save.push(("hwdec", on(self.hwdec)));
             }
+            if switch_row(ui, "Minimize to tray on close", &mut self.tray_on_close).changed() {
+                save.push(("tray_on_close", on(self.tray_on_close)));
+            }
             let step = stepper(ui, "Subtitle size", &format!("{:.1}x", style.scale));
             if step != 0 {
                 style.scale = (style.scale * 10.0).round() / 10.0 + step as f64 * 0.1;
             }
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Subtitle color").size(15.0).color(Color32::from_gray(210)));
+                ui.label(RichText::new("Subtitle color").size(15.0).color(ui.visuals().weak_text_color()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     for (i, (name, hex)) in SUB_COLORS.iter().enumerate().rev() {
                         if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::WHITE), style.color == i).clicked() {
@@ -3184,9 +4047,20 @@ impl App {
                     }
                 });
             });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Subtitle outline").size(15.0).color(ui.visuals().weak_text_color()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for (i, (name, hex)) in SUB_OUTLINES.iter().enumerate().rev() {
+                        if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::BLACK), style.outline == i).clicked() {
+                            style.outline = i;
+                        }
+                    }
+                });
+            });
+            style.pos += stepper(ui, "Subtitle position", &format!("{}%", style.pos)) as f64 * 5.0;
             switch_row(ui, "Subtitle background box", &mut style.background);
             style.delay += stepper(ui, "Subtitle delay", &format!("{:+.1}s", style.delay)) as f64 * 0.1;
-            if style.delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(ACCENT)).frame(false)).clicked() {
+            if style.delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(accent())).frame(false)).clicked() {
                 style.delay = 0.0;
             }
             let mut off = self.subs_off();
@@ -3194,7 +4068,7 @@ impl App {
                 save.push(("sub_off", if off { "1" } else { "0" }.into()));
             }
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Default speed").size(15.0).color(Color32::from_gray(210)));
+                ui.label(RichText::new("Default speed").size(15.0).color(ui.visuals().weak_text_color()));
                 ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
                 for sp in SPEEDS {
                     if pill(ui, &format!("{sp}x"), self.default_speed == sp, egui::Role::RadioButton).clicked() {
@@ -3209,8 +4083,16 @@ impl App {
             self.sub_style = style;
             save.push(("sub_style", style.encode()));
         }
+        ui.horizontal(|ui| {
+            for (i, key, label) in [(0, "seek_step", "Arrow-key seek"), (1, "seek_step_shift", "Shift + arrow seek")] {
+                ui.label(label);
+                if ui.add(egui::DragValue::new(&mut self.seek_steps[i]).range(SEEK_STEP_RANGE).suffix(" s")).changed() {
+                    save.push((key, self.seek_steps[i].to_string()));
+                }
+            }
+        });
         ui.add_space(16.0);
-        ui.label(RichText::new("Languages").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.label(RichText::new("Languages").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
         for (i, key, label) in [(0, "alang", "Audio:"), (1, "slang", "Subtitles:")] {
             ui.horizontal(|ui| {
                 let l = ui.label(label);
@@ -3232,6 +4114,58 @@ impl App {
             });
         }
         ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(Color32::from_gray(170)));
+        ui.add_space(16.0);
+        ui.label(RichText::new("Customize Home").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        let (mut swap, mut toggle, mut reset) = (None, None, false);
+        let n = self.home_all.len();
+        for (i, (key, title)) in self.home_all.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.add_enabled_ui(i > 0, |ui| small_button(ui, "Up")).inner.clicked() {
+                    swap = Some(i - 1);
+                }
+                if ui.add_enabled_ui(i + 1 < n, |ui| small_button(ui, "Down")).inner.clicked() {
+                    swap = Some(i);
+                }
+                let hidden = self.home_hidden.contains(key);
+                if small_button(ui, if hidden { "Show" } else { "Hide" }).clicked() {
+                    toggle = Some(key.clone());
+                }
+                ui.label(if hidden { RichText::new(title).weak() } else { RichText::new(title) });
+            });
+        }
+        if self.home_all.is_empty() {
+            ui.label(RichText::new("No catalog rows yet.").weak());
+        }
+        if small_button(ui, "Reset").on_hover_text("Addon order, nothing hidden").clicked() {
+            reset = true;
+        }
+        if swap.is_some() || toggle.is_some() || reset {
+            // Show and Reset need a fetch, so they rebuild. Up, Down and Hide reorder or filter the loaded rows.
+            let rebuild = reset || toggle.as_ref().is_some_and(|k| self.home_hidden.contains(k));
+            if let Some(i) = swap {
+                self.home_all.swap(i, i + 1);
+                self.home_order = self.home_all.iter().map(|(k, _)| k.clone()).collect();
+            }
+            if let Some(k) = toggle {
+                match self.home_hidden.iter().position(|x| *x == k) {
+                    Some(p) => drop(self.home_hidden.remove(p)),
+                    None => self.home_hidden.push(k),
+                }
+            }
+            if reset {
+                (self.home_order, self.home_hidden) = (Vec::new(), Vec::new());
+            }
+            save.push(("home_order", encode_keys(&self.home_order)));
+            save.push(("home_hidden", encode_keys(&self.home_hidden)));
+            if rebuild {
+                self.build_rows(&ctx);
+            } else {
+                let order = &self.home_all;
+                self.rows.sort_by_key(|r| order.iter().position(|(k, _)| *k == row_key(&r.src)));
+                self.rows.retain(|r| !self.home_hidden.contains(&row_key(&r.src)));
+            }
+        }
+        ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(ui.visuals().weak_text_color()));
         for (k, v) in save {
             if let Err(e) = self.db.set_setting(k, &v) {
                 report(&mut self.error, format!("saving {k}: {e:#}"));
@@ -3243,24 +4177,65 @@ impl App {
         let ctx = ui.ctx().clone();
         let (mut want, mut open, mut quick) = (Vec::new(), None, None);
         ui.horizontal(|ui| {
+            ui.label(RichText::new("Saved titles").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
             ui.label(RichText::new("Saved titles").size(20.0).strong().family(bold()).color(Color32::WHITE));
+            let before = self.lib_sort;
             egui::ComboBox::from_id_salt("lib_sort").selected_text(self.lib_sort.label()).show_ui(ui, |ui| {
-                for s in [LibSort::Added, LibSort::Title] {
+                for s in [LibSort::Added, LibSort::Title, LibSort::Watched, LibSort::Rating, LibSort::Year] {
                     ui.selectable_value(&mut self.lib_sort, s, s.label());
                 }
             });
+            // Watch times are read when loaded, so refresh them when the order is picked.
+            if self.lib_sort != before {
+                self.saved = self.db.saved_titles().unwrap_or_default();
+            }
             egui::ComboBox::from_id_salt("lib_kind").selected_text(self.lib_kind.label()).show_ui(ui, |ui| {
                 for k in [LibKind::All, LibKind::Movie, LibKind::Series] {
                     ui.selectable_value(&mut self.lib_kind, k, k.label());
                 }
             });
+            let list = self.lists.iter().find(|l| Some(l.id) == self.lib_list);
+            egui::ComboBox::from_id_salt("lib_list").selected_text(list.map_or("All saved", |l| l.name.as_str())).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.lib_list, None, "All saved");
+                for l in &self.lists {
+                    ui.selectable_value(&mut self.lib_list, Some(l.id), &l.name);
+                }
+            });
+            ui.add(egui::TextEdit::singleline(&mut self.list_name).hint_text("List name").char_limit(60).desired_width(140.0));
+            let mut res = None;
+            if ui.button("New list").clicked() {
+                res = Some(self.db.create_list(&self.list_name).map(|id| self.lib_list = Some(id)));
+            }
+            if let Some(id) = self.lib_list {
+                if ui.button("Rename").clicked() {
+                    res = Some(self.db.rename_list(id, &self.list_name));
+                }
+                if ui.button("Delete list").on_hover_text("Its titles stay saved").clicked() {
+                    res = Some(self.db.delete_list(id));
+                }
+            }
+            if let Some(res) = res {
+                if res.is_ok() {
+                    self.list_name.clear();
+                }
+                self.lists_changed(res);
+            }
+            let edit = ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Filter by title").desired_width(180.0));
+            if (edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape))) || (!self.lib_query.is_empty() && small_button(ui, "x").on_hover_text("Clear filter").clicked()) {
+                self.lib_query.clear();
+            }
         });
         ui.add_space(4.0);
-        let items: Vec<MetaPreview> = saved_view(&self.saved, self.lib_kind, self.lib_sort).into_iter().filter_map(SavedTitle::preview).collect();
+        let list = self.lists.iter().find(|l| Some(l.id) == self.lib_list);
+        let items: Vec<MetaPreview> = saved_view(&self.saved, self.lib_kind, self.lib_sort, &self.lib_query)
+            .into_iter()
+            .filter(|t| list.is_none_or(|l| l.keys.contains(&t.key)))
+            .filter_map(SavedTitle::preview)
+            .collect();
         if self.saved.is_empty() {
-            ui.label(RichText::new("Nothing saved yet. Open a title and choose \"Add to library\".").color(Color32::from_gray(170)));
+            ui.label(RichText::new("Nothing saved yet. Open a title and choose \"Add to library\".").color(ui.visuals().weak_text_color()));
         } else if items.is_empty() {
-            ui.label(RichText::new("No saved titles of this type.").color(Color32::from_gray(170)));
+            ui.label(RichText::new(if list.is_some() { "No titles match in this list." } else { "No saved titles match." }).color(ui.visuals().weak_text_color()));
         }
         self.ui_cards(ui, "saved", &items, &mut want, &mut open, &mut quick);
         for u in want {
@@ -3275,9 +4250,9 @@ impl App {
             self.quick_play(&ctx, m);
         }
         ui.separator();
-        ui.label(RichText::new("Downloads").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.label(RichText::new("Downloads").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
         if self.downloads.is_empty() && self.downloading.is_empty() {
-            ui.label(RichText::new("Nothing downloaded yet. Open a title and choose \"Download\" on a stream.").color(Color32::from_gray(170)));
+            ui.label(RichText::new("Nothing downloaded yet. Open a title and choose \"Download\" on a stream.").color(ui.visuals().weak_text_color()));
         }
         for d in &self.downloading {
             ui.horizontal(|ui| {
@@ -3333,7 +4308,7 @@ impl App {
         }
         ui.separator();
         let mut play = None;
-        for it in &self.library {
+        for it in self.library.iter().filter(|it| title_matches(&it.title, &self.lib_query)) {
             ui.horizontal(|ui| {
                 if primary_button(ui, &format!("Play {}", it.title)).clicked() {
                     play = Some(it.clone());
@@ -3349,17 +4324,51 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Runs before each `ui`, and alone while the window is hidden, so messages, tray clicks and playback keep going.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.handle(ctx, msg);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.tray_on_close && !self.quit && self.tray.as_ref().is_some_and(Tray::is_up) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.show_window(ctx, false);
+        }
+        self.poll_player(ctx);
+        self.publish_media();
+        // Hidden, `ui` doesn't run and mpv's frames aren't rendered, which stalls its core: play audio only meanwhile.
+        // A minimized Wayland window is no different from one minimized by hand, so it keeps its video.
+        if let Some(p) = &mut self.player
+            && (self.hidden && !wayland()) != p.hidden_vid.is_some()
+        {
+            let v = p.hidden_vid.take().unwrap_or_else(|| {
+                p.hidden_vid = Some(p.player.state.tracks.iter().find(|t| t.kind == "video" && t.selected).map_or("auto".into(), |t| t.id.to_string()));
+                "no".into()
+            });
+            if let Err(e) = p.player.command(&["set", "vid", &v]) {
+                report(&mut self.error, e);
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // egui's built-in zoom keys change the factor too: bound it, then persist any change.
+        let zoom = clamp_scale(ctx.zoom_factor());
+        if zoom != ctx.zoom_factor() {
+            ctx.set_zoom_factor(zoom);
+        }
+        if zoom != self.ui_scale {
+            self.ui_scale = zoom;
+            if let Err(e) = self.db.set_setting("ui_scale", &zoom.to_string()) {
+                report(&mut self.error, format!("saving ui_scale: {e:#}"));
+            }
+        }
+        ctx.input(|i| self.window.track(i.viewport()));
         // Load libmpv off the UI thread once the first frames are up: loading it earlier delayed them by ~140 ms.
         if ctx.cumulative_frame_nr() == 2 {
             std::thread::spawn(stremflix_rs::player::load_mpv);
         }
-        while let Ok(msg) = self.rx.try_recv() {
-            self.handle(&ctx, msg);
-        }
-        self.poll_player(&ctx);
-        ctx.request_repaint_after(Duration::from_millis(500));
         // A dropped .torrent file, or a magnet pasted with no text field focused, plays at once.
         // Window systems deliver dropped files only, not dropped text, so magnets come in by paste.
         let (dropped, pasted) = ctx.input(|i| {
@@ -3386,7 +4395,7 @@ impl eframe::App for App {
                 let mut sel_rect = None;
                 for (tab, name) in [(Tab::Home, "Home"), (Tab::Discover, "Discover"), (Tab::Addons, "Addons"), (Tab::Library, "Library"), (Tab::Settings, "Settings")] {
                     let text = RichText::new(name).size(15.0);
-                    let text = if self.tab == tab { text.strong().family(bold()).color(Color32::WHITE) } else { text.color(Color32::from_gray(180)) };
+                    let text = if self.tab == tab { text.strong().family(bold()).color(ui.visuals().strong_text_color()) } else { text.color(ui.visuals().weak_text_color()) };
                     // Width of the bold label, so selecting a tab doesn't shift the ones after it.
                     let w = ui.painter().layout_no_wrap(name.into(), egui::FontId::new(15.0, bold()), Color32::WHITE).size().x + 2.0 * ui.spacing().button_padding.x;
                     let r = ui.add(egui::Button::new(text).fill(Color32::TRANSPARENT).min_size(vec2(w, 34.0))).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -3399,7 +4408,7 @@ impl eframe::App for App {
                 }
                 if let Some(target) = sel_rect {
                     let rect = self.pill_rect(&ctx, target);
-                    ui.painter().set(pill_slot, egui::epaint::RectShape::filled(rect, 17, Color32::from_gray(51)));
+                    ui.painter().set(pill_slot, egui::epaint::RectShape::filled(rect, 17, tint(ui, 34)));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // Search in the same dark gray pill; Enter or the icon runs it.
@@ -3409,17 +4418,78 @@ impl eframe::App for App {
                     let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Titles, people, genres").frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 2, ..Default::default() })).desired_width(170.0)); // top margin: optically center the text; width leaves room for five tabs at the 1000 px default size
                     let (icon, b) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
                     b.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Search"));
-                    ui.painter().text(icon.center(), egui::Align2::CENTER_CENTER, icons::MAGNIFYING_GLASS, egui::FontId::proportional(18.0), Color32::from_gray(180));
+                    ui.painter().text(icon.center(), egui::Align2::CENTER_CENTER, icons::MAGNIFYING_GLASS, egui::FontId::proportional(18.0), ui.visuals().weak_text_color());
                     let b = b.on_hover_text("Search").on_hover_cursor(egui::CursorIcon::PointingHand);
                     let pill = r.rect.union(b.rect);
-                    ui.painter().set(bg, egui::epaint::RectShape::filled(egui::Rect::from_center_size(pos2(pill.center().x, icon.center().y), vec2(pill.width() + 24.0, 34.0)), 17, Color32::from_gray(51)));
+                    ui.painter().set(bg, egui::epaint::RectShape::filled(egui::Rect::from_center_size(pos2(pill.center().x, icon.center().y), vec2(pill.width() + 24.0, 34.0)), 17, tint(ui, 34)));
                     let r = r.labelled_by(b.id);
                     if b.clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                         self.tab = Tab::Home;
                         self.search(&ctx);
                     }
+                    // Recent searches under the empty, focused box. The popup stays up while the pointer is on it,
+                    // since pressing it takes focus from the field before the click lands.
+                    let id = ui.make_persistent_id("search_history");
+                    let over = ui.ctx().data(|d| d.get_temp::<egui::Rect>(id)).is_some_and(|p| ui.input(|i| i.pointer.hover_pos()).is_some_and(|h| p.contains(h)));
+                    if (r.has_focus() || over) && self.search.is_empty() && !self.search_history.is_empty() {
+                        let (mut pick, mut del, mut clear) = (None, None, false);
+                        let area = egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(pos2(pill.left() - 12.0, pill.bottom() + 12.0)).show(ui.ctx(), |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(220.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Recent searches").small().color(ui.visuals().weak_text_color()));
+                                    if ui.small_button("Clear").clicked() {
+                                        clear = true;
+                                    }
+                                });
+                                for (i, q) in self.search_history.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        if ui.add(egui::Button::new(q).frame(false)).clicked() {
+                                            pick = Some(q.clone());
+                                        }
+                                        if ui.add(egui::Button::new(icons::X).frame(false)).on_hover_text("Remove").clicked() {
+                                            del = Some(i);
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                        ui.ctx().data_mut(|d| d.insert_temp(id, area.response.rect));
+                        if clear || del.is_some() {
+                            match del {
+                                Some(i) => drop(self.search_history.remove(i)),
+                                None => self.search_history.clear(),
+                            }
+                            self.save_search_history();
+                        }
+                        if let Some(q) = pick {
+                            self.search = q;
+                            self.tab = Tab::Home;
+                            self.search(&ctx);
+                        }
+                    } else {
+                        ui.ctx().data_mut(|d| d.remove::<egui::Rect>(id));
+                    }
                 });
             });
+            let mut chosen = None;
+            if let Some((_, title, _, _, files, sel)) = &mut self.file_pick {
+                let mut open = true;
+                egui::Window::new(format!("Choose a file: {}", sanitize_text(title, 80))).open(&mut open).collapsible(false).show(&ctx, |ui| {
+                    for (i, name, len) in files.iter() {
+                        ui.radio_value(sel, *i, format!("{}  ({})", sanitize_text(name, 120), fmt_size(*len)));
+                    }
+                    if ui.button("Play").clicked() {
+                        chosen = Some(*sel);
+                    }
+                });
+                if !open {
+                    self.clear_file_pick();
+                }
+            }
+            if let (Some(idx), Some((key, title, source, subs, _, _))) = (chosen, self.file_pick.take()) {
+                self.play(&ctx, key, title, format!("{source}&so={idx}"), subs);
+            }
             if let Some(e) = self.error.clone() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("Error: {e}")).color(Color32::from_rgb(230, 90, 90)));
@@ -3444,6 +4514,7 @@ impl eframe::App for App {
                     (self.selected, self.details) = (None, None);
                     (self.episodes, self.episode) = (Vec::new(), None);
                     self.scroll_top = true;
+                    self.clear_file_pick();
                     self.nav += 1;
                 }
                 ui.add_space(6.0);
@@ -3459,7 +4530,65 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
+        let _ = self.db.set_setting("window", &self.window.to_string());
         self.stop_player();
+    }
+}
+
+/// Window size/position restored on launch. Default is a maximized 1000x700 window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Geo {
+    size: [f32; 2],
+    pos: Option<[f32; 2]>,
+    maximized: bool,
+}
+
+impl Default for Geo {
+    fn default() -> Self {
+        Self { size: [1000.0, 700.0], pos: None, maximized: true }
+    }
+}
+
+impl std::fmt::Display for Geo {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{},{},{}", self.size[0], self.size[1], u8::from(self.maximized))?;
+        self.pos.map_or(Ok(()), |p| write!(f, ",{},{}", p[0], p[1]))
+    }
+}
+
+impl std::str::FromStr for Geo {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        let n: Vec<f32> = s.split(',').map(|v| v.parse().map_err(|_| ())).collect::<Result<_, _>>()?;
+        if !n.iter().all(|v| v.is_finite()) || !matches!(n.len(), 3 | 5) || !(200.0..=16384.0).contains(&n[0]) || !(150.0..=16384.0).contains(&n[1]) {
+            return Err(());
+        }
+        // Off-screen positions (e.g. Windows' -32000 minimized spot) drop the position, keep the size.
+        let pos = (n.len() == 5 && n[3].abs() <= 10000.0 && n[4].abs() <= 10000.0).then(|| [n[3], n[4]]);
+        Ok(Self { size: [n[0], n[1]], pos, maximized: n[2] != 0.0 })
+    }
+}
+
+impl Geo {
+    /// Fullscreen is transient and a maximized rect is not the restore size, so those keep the last normal rect.
+    fn track(&mut self, vp: &egui::ViewportInfo) {
+        if vp.minimized == Some(true) || vp.fullscreen == Some(true) {
+            return;
+        }
+        // Unknown (None) keeps the last known state.
+        if let Some(m) = vp.maximized {
+            self.maximized = m;
+        }
+        if self.maximized {
+            return;
+        }
+        // Clamp to the ranges from_str accepts, or one bad field would discard the whole record on next launch.
+        if let Some(r) = vp.inner_rect {
+            self.size = [r.width().clamp(200.0, 16384.0), r.height().clamp(150.0, 16384.0)];
+        }
+        // shortcut: Wayland reports no outer position, so only size is restored there.
+        let pos = vp.outer_rect.map(|r| [r.min.x, r.min.y]).filter(|p| p.iter().all(|v| v.abs() <= 10000.0));
+        self.pos = pos.or(self.pos);
     }
 }
 
@@ -3489,10 +4618,13 @@ fn main() -> eframe::Result {
     }
     #[cfg(windows)]
     std::thread::spawn(instance::register_scheme);
+    app.window = app.db.setting("window").ok().flatten().and_then(|s| s.parse().ok()).unwrap_or_default();
+    let mut vp = egui::ViewportBuilder::default().with_inner_size(app.window.size).with_maximized(app.window.maximized);
+    if let Some(p) = app.window.pos {
+        vp = vp.with_position(p);
+    }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 700.0])
-            .with_maximized(true)
+        viewport: vp
             .with_title("Stremflix-rs")
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("bundled icon is a valid PNG")),
         ..Default::default()
@@ -3500,21 +4632,10 @@ fn main() -> eframe::Result {
     let creator: eframe::AppCreator = Box::new(move |cc| {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         install_fonts(&cc.egui_ctx);
-        let mut v = egui::Visuals::dark();
-        v.panel_fill = Color32::from_rgb(20, 20, 20);
-        v.window_fill = v.panel_fill;
-        v.extreme_bg_color = Color32::from_gray(32);
-        v.selection.bg_fill = RED;
-        // Netflix-style flat buttons: no outline or grow on hover, gray that dims when hovered.
-        let w = &mut v.widgets;
-        for (st, gray) in [(&mut w.inactive, 82), (&mut w.hovered, 56), (&mut w.active, 45), (&mut w.open, 56)] {
-            (st.weak_bg_fill, st.bg_stroke, st.corner_radius, st.expansion) = (Color32::from_gray(gray), egui::Stroke::NONE, 4.into(), 0.0);
-            st.fg_stroke.color = Color32::WHITE;
-        }
-        cc.egui_ctx.set_theme(egui::Theme::Dark);
-        cc.egui_ctx.set_visuals_of(egui::Theme::Dark, v);
-        cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| s.spacing.button_padding = vec2(14.0, 6.0));
+        apply_theme(&cc.egui_ctx, app.light);
+        cc.egui_ctx.set_zoom_factor(app.ui_scale);
         app.gl_proc = cc.get_proc_address.clone();
+        app.media = media_controls(cc, app.tx.clone());
         app.build_rows(&cc.egui_ctx);
         app.fetch_recent_posters(&cc.egui_ctx);
         app.sync_account(&cc.egui_ctx);
@@ -3525,6 +4646,11 @@ fn main() -> eframe::Result {
                 eprintln!("update check: {e:#}");
                 None
             })))
+        });
+        let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
+        app.tray = tray::spawn(&app.rt, include_bytes!("../assets/icon.png"), move |a| {
+            let _ = tx.send(Msg::Tray(a));
+            ctx.request_repaint();
         });
         let _ = ctx_cell.set(cc.egui_ctx.clone());
         Ok(Box::new(app))
@@ -3596,9 +4722,105 @@ mod mac_links {
     }
 }
 
+/// Turn wheel scroll (points) into whole volume steps, keeping the remainder; one wheel line is one step.
+fn wheel_steps(acc: &mut f32, dy: f32, line: f32) -> i32 {
+    if dy * *acc < 0.0 { *acc = 0.0; } // a direction change starts fresh
+    *acc += dy;
+    let n = (*acc / line).trunc();
+    *acc -= n * line;
+    n as i32
+}
+
+const SEEK_STEP_RANGE: std::ops::RangeInclusive<u32> = 1..=600;
+
+/// Saved seek step in seconds; a missing, unparsable or out-of-range value falls back to `default`.
+fn seek_step(v: Option<String>, default: u32) -> u32 {
+    v.and_then(|v| v.parse().ok()).filter(|v| SEEK_STEP_RANGE.contains(v)).unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_accumulates_to_steps() {
+        let mut acc = 0.0;
+        // egui's native line_scroll_speed: one real notch is 40 pt.
+        assert_eq!(wheel_steps(&mut acc, 40.0, 40.0), 1);
+        assert_eq!((0..5).map(|_| wheel_steps(&mut acc, 40.0, 40.0)).sum::<i32>(), 5);
+        assert_eq!(wheel_steps(&mut acc, -80.0, 40.0), -2);
+        assert_eq!((0..4).map(|_| wheel_steps(&mut acc, 10.0, 40.0)).sum::<i32>(), 1);
+        assert_eq!(wheel_steps(&mut acc, 0.0, 40.0), 0);
+        // A +30 leftover must not cancel a fresh -40 notch.
+        acc = 30.0;
+        assert_eq!(wheel_steps(&mut acc, -40.0, 40.0), -1);
+    }
+
+    #[test]
+    fn accent_name_decodes_with_fallback() {
+        assert_eq!(accent_index(Some("Green")), 2);
+        assert_eq!(accent_index(Some("nope")), 0);
+        assert_eq!(accent_index(None), 0);
+    }
+
+    #[test]
+    fn new_episodes_window() {
+        assert_eq!(date_string(0), "1970-01-01");
+        assert_eq!(date_string(19782), "2024-02-29");
+        let v = |id: &str, season, rel: Option<&str>| Video { id: id.into(), title: None, season, episode: Some(1), released: rel.map(Into::into), thumbnail: None };
+        let vs = vec![
+            v("old", Some(1), Some("2024-01-01T00:00:00.000Z")),
+            v("new", Some(1), Some("2024-03-05T00:00:00.000Z")),
+            v("future", Some(1), Some("2024-04-01")),
+            v("special", Some(0), Some("2024-03-05")),
+            v("undated", Some(1), None),
+        ];
+        let ids: Vec<_> = recent_episodes(vs, "2024-02-20", "2024-03-06").into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, ["new"]);
+        // Both ends of the window are inclusive; a day outside either is not.
+        let edge = vec![v("before", Some(1), Some("2024-02-19")), v("since", Some(1), Some("2024-02-20")), v("today", Some(1), Some("2024-03-06")), v("after", Some(1), Some("2024-03-07"))];
+        let ids: Vec<_> = recent_episodes(edge, "2024-02-20", "2024-03-06").into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, ["since", "today"]);
+    }
+
+    #[test]
+    fn buffered_frac_clamps() {
+        assert_eq!(buffered_frac(10.0, 50.0, 100.0), 0.5);
+        assert_eq!(buffered_frac(10.0, 0.0, 100.0), 0.1);
+        assert_eq!(buffered_frac(10.0, 500.0, 100.0), 1.0);
+        assert_eq!(buffered_frac(10.0, 50.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn clamp_scale_bounds_and_rounds() {
+        assert_eq!(clamp_scale(0.1), 0.75);
+        assert_eq!(clamp_scale(9.0), 2.0);
+        assert_eq!(clamp_scale(1.1000001), 1.1);
+        assert_eq!(clamp_scale(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn geo_round_trips_and_rejects_junk() {
+        let g = Geo { size: [800.0, 600.0], pos: Some([-10.0, 20.0]), maximized: false };
+        assert_eq!(g.to_string().parse(), Ok(g));
+        assert_eq!(Geo::default().to_string().parse(), Ok(Geo::default()));
+        assert!("1,2,3".parse::<Geo>().is_err() && "x".parse::<Geo>().is_err() && "800,600,0,1".parse::<Geo>().is_err());
+        assert!("20000,600,0".parse::<Geo>().is_err() && "800,20000,0".parse::<Geo>().is_err());
+        assert_eq!("800,600,0,-32000,-32000".parse(), Ok(Geo { size: [800.0, 600.0], pos: None, maximized: false }));
+    }
+
+    #[test]
+    fn geo_track_keeps_state_and_stays_parseable() {
+        let r = |w, h| egui::Rect::from_min_size(egui::pos2(50_000.0, 5.0), egui::vec2(w, h));
+        let vp = |maximized, fullscreen, w, h| egui::ViewportInfo { maximized, fullscreen, inner_rect: Some(r(w, h)), outer_rect: Some(r(w, h)), ..Default::default() };
+        let mut g = Geo { maximized: true, ..Default::default() };
+        g.track(&vp(None, Some(true), 1920.0, 1080.0));
+        g.track(&vp(None, None, 1920.0, 1080.0));
+        assert!(g.maximized && g.size == [1000.0, 700.0]);
+        g.track(&vp(Some(false), None, 10.0, 99999.0));
+        assert!(!g.maximized && g.size == [200.0, 16384.0] && g.pos.is_none());
+        assert_eq!(g.to_string().parse(), Ok(g));
+    }
 
     #[test]
     fn saved_view_filters_and_sorts() {
@@ -3607,17 +4829,69 @@ mod tests {
             title: title.into(),
             kind: key.split_once(':').unwrap().0.into(),
             poster: None,
+            year: None,
+            rating: None,
+            last_watched: None,
         };
         // Newest first, as stored.
         let items = [t("series:tt2", "beta"), t("movie:tt3", "Alpha"), t("movie:tt1", "gamma")];
         let keys = |v: Vec<&SavedTitle>| v.into_iter().map(|t| t.key.clone()).collect::<Vec<_>>();
-        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Added)), ["series:tt2", "movie:tt3", "movie:tt1"]);
-        assert_eq!(keys(saved_view(&items, LibKind::Movie, LibSort::Added)), ["movie:tt3", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Added, "")), ["series:tt2", "movie:tt3", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::Movie, LibSort::Added, "")), ["movie:tt3", "movie:tt1"]);
         // Case-insensitive title order, and the filter holds while sorting.
-        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Title)), ["movie:tt3", "series:tt2", "movie:tt1"]);
-        assert_eq!(keys(saved_view(&items, LibKind::Series, LibSort::Title)), ["series:tt2"]);
-        assert!(saved_view(&items, LibKind::Series, LibSort::Added).len() == 1);
-        assert_eq!(saved_view(&[], LibKind::All, LibSort::Title).len(), 0);
+        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Title, "")), ["movie:tt3", "series:tt2", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::Series, LibSort::Title, "")), ["series:tt2"]);
+        assert!(saved_view(&items, LibKind::Series, LibSort::Added, "").len() == 1);
+        // Watched, rating and year: best first, missing last, ties keep the added order.
+        let items = [
+            SavedTitle { last_watched: Some(5), year: Some(1999), rating: Some(6.0), ..items[0].clone() },
+            items[1].clone(),
+            SavedTitle { last_watched: Some(9), year: Some(2020), rating: Some(8.5), ..items[2].clone() },
+        ];
+        let best_first = ["movie:tt1", "series:tt2", "movie:tt3"];
+        for sort in [LibSort::Watched, LibSort::Rating, LibSort::Year] {
+            assert_eq!(keys(saved_view(&items, LibKind::All, sort, "")), best_first);
+        }
+        assert_eq!(parse_year("2010–2015"), Some(2010));
+        assert_eq!(parse_year("n/a"), None);
+        assert_eq!(saved_view(&[], LibKind::All, LibSort::Title, "").len(), 0);
+        // Query combines with kind and sort.
+        assert_eq!(keys(saved_view(&items, LibKind::All, LibSort::Title, " A ")), ["movie:tt3", "series:tt2", "movie:tt1"]);
+        assert_eq!(keys(saved_view(&items, LibKind::Movie, LibSort::Added, "ALPH")), ["movie:tt3"]);
+    }
+
+    #[test]
+    fn title_match_folds_case() {
+        assert!(title_matches("Amélie", "AMÉL"));
+        assert!(title_matches("Straße", "straße"));
+        assert!(title_matches("anything", "  "));
+        assert!(!title_matches("Alpha", "beta"));
+    }
+
+    #[test]
+    fn media_events_map_to_player_actions() {
+        use souvlaki::{MediaControlEvent as E, MediaPosition, SeekDirection::*};
+        let s = Duration::from_secs;
+        assert_eq!(media_action(E::Toggle), Some(MediaAction::Cmd(&["cycle", "pause"])));
+        assert_eq!(media_action(E::Play), Some(MediaAction::Cmd(&["set", "pause", "no"])));
+        assert_eq!(media_action(E::Pause), Some(MediaAction::Cmd(&["set", "pause", "yes"])));
+        assert_eq!(media_action(E::Next), Some(MediaAction::Next));
+        assert_eq!(media_action(E::Stop), Some(MediaAction::Stop));
+        assert_eq!(media_action(E::Seek(Backward)), Some(MediaAction::Seek(-10.0, true)));
+        assert_eq!(media_action(E::SeekBy(Forward, s(30))), Some(MediaAction::Seek(30.0, true)));
+        assert_eq!(media_action(E::SetPosition(MediaPosition(s(95)))), Some(MediaAction::Seek(95.0, false)));
+        assert_eq!(media_action(E::Previous), None);
+        assert_eq!(media_action(E::Quit), None);
+    }
+
+    #[test]
+    fn saved_facts_rejects_non_finite_ratings() {
+        let rated = |r: &str| serde_json::from_value::<Meta>(serde_json::json!({"id": "tt1", "type": "movie", "name": "x", "imdbRating": r})).unwrap();
+        assert_eq!(saved_facts(&rated("NaN")).1, None);
+        assert_eq!(saved_facts(&rated("inf")).1, None);
+        assert_eq!(saved_facts(&rated("infinity")).1, None);
+        assert_eq!(saved_facts(&rated("11")).1, None);
+        assert_eq!(saved_facts(&rated("8.5")).1, Some(8.5));
     }
 
     #[test]
@@ -3744,6 +5018,16 @@ mod tests {
         assert!(app.recent.is_empty() && app.db.progress("movie:tt1").unwrap().is_none());
     }
 
+    #[test]
+    fn filter_subs_matches_lang_or_addon() {
+        let f = |addon: &str, lang: &str| SubFound { addon: addon.into(), lang: lang.into(), url: String::new() };
+        let all = [f("OpenSubtitles", "eng"), f("Other", "por-BR"), f("Other", "fre")];
+        assert_eq!(filter_subs(&all, " ENG ").len(), 1);
+        assert_eq!(filter_subs(&all, "other").len(), 2);
+        assert_eq!(filter_subs(&all, "").len(), 3);
+        assert!(filter_subs(&all, "xx").is_empty());
+    }
+
     #[tokio::test]
     async fn hashed_subs_put_matches_first() {
         let base = test_addon::spawn(test_addon::Config { media_dir: None, torrent: None }).unwrap();
@@ -3772,6 +5056,42 @@ mod tests {
         })
         .await;
         assert_eq!(out.into_iter().map(Result::unwrap).collect::<Vec<_>>(), [30, 0, 10]);
+    }
+
+    #[test]
+    fn home_rows_order_and_keys() {
+        let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let keys = k(&["a", "b", "c", "d"]);
+        assert_eq!(arrange_rows(&keys, &k(&["c", "zz", "a", "c"])), [2, 0, 1, 3], "stale and repeated keys ignored, rest keep priority");
+        assert_eq!(arrange_rows(&keys, &[]), [0, 1, 2, 3]);
+        let odd = k(&["http://h/m.json|movie|top \"x\"", "b"]);
+        assert_eq!(decode_keys(&encode_keys(&odd)), odd);
+        assert!(decode_keys("garbage").is_empty());
+        assert_eq!(row_key(&("u".into(), "movie".into(), "top".into())), "u|movie|top");
+    }
+
+    #[test]
+    fn version_compare() {
+        use stremflix_rs::addon::is_newer;
+        assert!(is_newer("1.10.0", "1.9.9"));
+        assert!(is_newer("2", "1.9"));
+        assert!(!is_newer("1.0", "1.0.0"));
+        assert!(!is_newer("1.0.0", "1.0.1"));
+        assert!(is_newer("v1.1.0", "1.0.0"));
+        assert!(!is_newer("1.0.0-beta", "1.0.0"), "same core, suffix only");
+        assert!(is_newer("1.1.0-beta", "1.0.0"));
+        assert!(!is_newer("1.0.0", "1.0.0-beta"));
+        assert!(is_newer("1.0.1+build5", "1.0.0"));
+        assert!(!is_newer("1.0.0-beta", "1.0.0-beta"));
+        assert!(!is_newer("nightly", "1.0.0"), "non-numeric is never offered");
+        assert!(!is_newer("1.0.0", "nightly"));
+    }
+
+    #[test]
+    fn update_keeps_addon_id() {
+        let m = |id: &str| stremflix_rs::addon::parse_manifest(format!(r#"{{"id":"{id}","version":"1","name":"A","resources":["stream"],"types":["movie"]}}"#).as_bytes()).unwrap();
+        assert!(same_addon(&m("a"), &m("a")));
+        assert!(!same_addon(&m("a"), &m("b")));
     }
 
     #[test]
@@ -3838,6 +5158,14 @@ mod tests {
         assert_eq!(command_words("  mpv   --fs "), ["mpv", "--fs"]);
         assert_eq!(command_words(r#"a "" b"#), ["a", "", "b"]);
         assert!(command_words("   ").is_empty());
+    }
+
+    #[test]
+    fn seek_step_validates() {
+        assert_eq!(seek_step(Some("15".into()), 10), 15);
+        for bad in [None, Some("0".into()), Some("601".into()), Some("-5".into()), Some("x".into())] {
+            assert_eq!(seek_step(bad, 10), 10);
+        }
     }
 
     #[test]

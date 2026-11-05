@@ -314,6 +314,22 @@ fn stream_behavior_hints() {
 }
 
 #[test]
+fn not_web_ready_and_response_headers() {
+    let s = parse_streams(
+        br#"{"streams": [
+        {"url": "https://a.example/1", "behaviorHints": {"notWebReady": true, "proxyHeaders": {"response": {"content-TYPE": " Application/X-MpegURL ; charset=utf-8"}}}},
+        {"url": "https://a.example/2", "behaviorHints": {"notWebReady": "yes", "proxyHeaders": {"response": {"Content-Type": "application/dash+xml"}}}},
+        {"url": "https://a.example/3", "behaviorHints": {"proxyHeaders": {"response": {"Content-Type": "application/vnd.apple.mpegurl\r\nX-Evil: 1"}}}},
+        {"url": "https://a.example/4", "behaviorHints": {"proxyHeaders": {"response": {"Content-Type": "video/mp4", "X-Other": "a\r\nb"}}}},
+        {"url": "https://a.example/5", "behaviorHints": {"proxyHeaders": {"response": "junk"}}}
+    ]}"#,
+    )
+    .unwrap();
+    let got: Vec<_> = s.iter().map(|s| (s.hints.not_web_ready, s.hints.demuxer)).collect();
+    assert_eq!(got, [(true, Some("hls")), (false, Some("dash")), (false, None), (false, None), (false, None)]);
+}
+
+#[test]
 fn subtitle_parsing() {
     let s = parse_subtitles(br#"{"subtitles": [
         {"id": "1", "url": "https://subs.example/en.vtt", "lang": "eng"},
