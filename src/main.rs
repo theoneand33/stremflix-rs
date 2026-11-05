@@ -9,15 +9,15 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use anyhow::Context;
-use stremflix_rs::addon::{AddonClient, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
+use stremflix_rs::addon::{AddonClient, Skip, SkipKind, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
 use stremflix_rs::instance;
 use stremflix_rs::db::{self, Db, Download, List, Progress, SavedTitle, Watched};
 use stremflix_rs::download::{self, State};
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{self, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
+use stremflix_rs::player::{self, chapter_skips, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
-use stremflix_rs::torrent::{Profile, TorrentEngine};
+use stremflix_rs::torrent::{NetStats, Profile, TorrentEngine, fmt_rate};
 use stremflix_rs::tray::{self, Tray};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -227,6 +227,8 @@ enum Msg {
     SignedIn(String, Result<String, String>),
     /// Account auth key a sync ran with, and what it pulled or the error.
     Synced(String, Result<Import, String>),
+    /// Account auth key an upload ran with, and its summary or the error.
+    Uploaded(String, Result<String, String>),
     /// Library folder and its scanned media files.
     Scanned(PathBuf, Result<Vec<LibraryItem>, String>),
     /// Release page of a newer build, if any.
@@ -968,6 +970,12 @@ struct Playing {
     wheel: f32,
     /// The up-next card was dismissed.
     next_dismissed: bool,
+    /// Addon-marked spans of the playing stream (`behaviorHints.skip`).
+    skips: Vec<Skip>,
+    /// Stats overlay shown; `net` is its torrent line, refreshed by a task about once per second (`net_next`, egui clock).
+    stats: bool,
+    net: Arc<std::sync::Mutex<Option<NetStats>>>,
+    net_next: f64,
     search: SubSearch,
     /// Per-session picture scaling: aspect override index into `ASPECTS`, fill (crop) instead of fit, zoom in tenths.
     aspect: usize,
@@ -1081,16 +1089,25 @@ struct App {
     account: Option<String>,
     /// A sign-in or sync is running.
     account_busy: bool,
+    /// "Upload to account" was clicked and waits for confirmation.
+    confirm_upload: bool,
+    /// Result of the last upload.
+    account_note: Option<String>,
     /// Addon whose details are shown in the Addons tab.
     addon_details: Option<String>,
     /// Torrent download folder as edited (empty = in the data directory); saved when valid.
     torrent_dir: String,
     torrent_cache: u64,
     torrent_profile: Profile,
+    /// Proxy type ("", "http", "socks5"), host:port, username, password as saved; applied at startup.
+    proxy: [String; 4],
     /// (download, upload) in bytes/s; 0 is unlimited.
     torrent_limits: (u32, u32),
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
+    /// Settings > Data: path typed for an import, and the last export/import result.
+    data_import: String,
+    data_msg: Option<String>,
     /// mpv hardware decoding.
     hwdec: bool,
     /// Custom Home row order and hidden rows (row keys).
@@ -1235,14 +1252,19 @@ impl App {
             login: Default::default(),
             account: db.setting("stremio_auth")?.filter(|k| !k.is_empty()).map(|_| db.setting("stremio_email").ok().flatten().filter(|e| !e.is_empty()).unwrap_or_else(|| "a Stremio account".into())),
             account_busy: false,
+            confirm_upload: false,
+            account_note: None,
             addon_details: None,
             torrent_dir: db.setting("torrent_dir")?.unwrap_or_default(),
             torrent_cache: db.setting("torrent_cache")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             torrent_profile: Profile::from_label(&db.setting("torrent_profile")?.unwrap_or_default()),
+            proxy: [db.setting("proxy_kind")?.unwrap_or_default(), db.setting("proxy_addr")?.unwrap_or_default(), db.setting("proxy_user")?.unwrap_or_default(), db.setting("proxy_pass")?.unwrap_or_default()],
             torrent_limits: (
                 db.setting("torrent_down_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
                 db.setting("torrent_up_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             ),
+            data_import: String::new(),
+            data_msg: None,
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
@@ -1304,6 +1326,14 @@ impl App {
         if app.addons.is_empty() {
             app.tab = Tab::Addons;
         }
+        let [kind, addr, user, pass] = &app.proxy;
+        match stremflix_rs::addon::proxy_url(kind, addr, user, pass) {
+            Ok(Some(p)) => {
+                let _ = stremflix_rs::addon::PROXY.set(p);
+            }
+            Ok(None) => {}
+            Err(e) => report(&mut app.error, format!("proxy setting ignored: {e}")),
+        }
         Ok(app)
     }
 
@@ -1326,6 +1356,25 @@ impl App {
         self.spawn(ctx, async move {
             let imp = client.stremio_pull(&key).await.map_err(|e| format!("Stremio account sync: {e:#}"));
             Ok(Msg::Synced(key, imp))
+        });
+    }
+
+    /// Push local addons and library to the signed-in Stremio account.
+    fn upload_account(&mut self, ctx: &egui::Context) {
+        if self.account_busy {
+            return;
+        }
+        let Some(key) = self.db.setting("stremio_auth").ok().flatten().filter(|k| !k.is_empty()) else { return };
+        let up = match stremio_import::Upload::read(&self.db) {
+            Ok(up) => up,
+            Err(e) => return report(&mut self.error, format!("reading library: {e:#}")),
+        };
+        (self.account_busy, self.account_note) = (true, None);
+        let client = self.client.clone();
+        self.spawn(ctx, async move {
+            let r = client.stremio_push(&key, &up).await;
+            let r = r.map(|(a, l)| format!("Uploaded {a} addons and {l} changed library items.")).map_err(|e| format!("Stremio account upload: {e:#}"));
+            Ok(Msg::Uploaded(key, r))
         });
     }
 
@@ -1751,6 +1800,15 @@ impl App {
                     }
                 }
             }
+            Msg::Uploaded(key, r) => {
+                if self.db.setting("stremio_auth").ok().flatten().as_deref() == Some(key.as_str()) {
+                    self.account_busy = false;
+                    match r {
+                        Ok(note) => self.account_note = Some(note),
+                        Err(e) => report(&mut self.error, e),
+                    }
+                }
+            }
             Msg::Imported(imp) => {
                 if let Err(e) = imp.save(&self.db) {
                     report(&mut self.error, format!("saving import: {e:#}"));
@@ -1889,6 +1947,10 @@ impl App {
                     report(&mut self.error, "no OpenGL context for the player");
                     return;
                 };
+                let skips = (self.selected.as_ref())
+                    .and_then(|(_, streams, _)| streams.iter().find(|s| s.source().as_ref() == Some(&source)))
+                    .map(|s| s.hints.skip.clone())
+                    .unwrap_or_default();
                 let setting = |k| self.db.setting(k).ok().flatten();
                 let lang = |k| setting(k).unwrap_or_default();
                 let subs_off = self.subs_off();
@@ -1912,7 +1974,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None, hidden_vid: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), skips, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -3236,6 +3298,7 @@ impl App {
             if k(ArrowUp) { cmd(&["add", "volume", "5"]); new_vol = Some(st.volume + 5.0) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]); new_vol = Some(st.volume - 5.0) }
             if k(M) { cmd(&["cycle", "mute"]) }
+            if k(I) && focused.is_none() { p.stats = !p.stats }
             // mpv pauses on its own after a frame step.
             if k(Period) { cmd(&["frame-step"]) }
             if k(Comma) { cmd(&["frame-back-step"]) }
@@ -3560,12 +3623,46 @@ impl App {
                                     report(&mut self.error, format!("saving hwdec: {e:#}"));
                                 }
                             }
+                            switch_row(ui, "Playback stats (I)", &mut p.stats);
                             ui.add_space(8.0);
-                            external = ui.add(egui::Button::new(RichText::new("Open in external player").size(14.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(16)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0))).on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
+                            external =ui.add(egui::Button::new(RichText::new("Open in external player").size(14.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(16)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0))).on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
                         }
                     });
                 });
             }
+        }
+        // Stats overlay: mpv values arrive through observed properties; the torrent line is polled off the UI thread.
+        if p.stats {
+            if let (Some(id), Some(engine), true) = (p.torrent, self.torrent.get(), now >= p.net_next) {
+                p.net_next = now + 1.0;
+                let (engine, net, ctx) = (engine.clone(), p.net.clone(), ctx.clone());
+                self.rt.spawn(async move {
+                    *net.lock().unwrap() = engine.net_stats(id);
+                    ctx.request_repaint();
+                });
+            }
+            ctx.request_repaint_after(Duration::from_secs(1));
+            let net = *p.net.lock().unwrap();
+            let mut rows = vec![
+                ("Video", format!("{} {}x{} @ {:.2} fps", if st.codec.is_empty() { "?" } else { &st.codec }, vw, vh, st.fps)),
+                ("Hwdec", if st.hwdec.is_empty() { "no".into() } else { st.hwdec.clone() }),
+                ("Dropped", format!("{} output, {} decoder", st.dropped[0], st.dropped[1])),
+                ("Buffer", format!("{:.1} s", st.cache)),
+            ];
+            if p.torrent.is_some() {
+                rows.push(("Peers", net.map_or("-".into(), |n| n.peers.to_string())));
+                rows.push(("Speed", net.map_or("-".into(), |n| format!("{} down, {} up", fmt_rate(n.down), fmt_rate(n.up)))));
+            }
+            egui::Area::new(ui.scope_id().with("stats")).order(egui::Order::Foreground).fixed_pos(pos2(rect.left() + 16.0, rect.top() + 72.0)).interactable(false).show(&ctx, |ui| {
+                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(24, 24, 28, 230)).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+                    for (k, v) in rows {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{k:<8}")).size(13.0).monospace().color(Color32::from_gray(150)));
+                            ui.label(RichText::new(v).size(13.0).monospace().color(Color32::WHITE));
+                        });
+                    }
+                });
+            });
         }
         // Up next: in an episode's last 30 s, a card slides in from the right to play the next one.
         if let Some((series, label, img)) = up_next {
@@ -3624,6 +3721,26 @@ impl App {
                         if id == "up_next_watch" { next = true } else { p.next_dismissed = true }
                     }
                 }
+            }
+        }
+        // Skip button while the playhead is in an addon-marked or chapter-named intro/recap/credits span.
+        // Credits of a series episode with a next one are left to the up-next card.
+        let spans = p.skips.iter().copied().chain(chapter_skips(&st.chapters, st.dur));
+        if let Some(sk) = spans.filter(|s| !(has_next && s.kind == SkipKind::Credits)).find(|s| s.start <= st.pos && st.pos < s.end)
+            && rect.width() >= 250.0
+        {
+            let r = egui::Rect::from_min_size(pos2(rect.right() - 32.0 - 200.0, rect.bottom() - 130.0 - 50.0), vec2(200.0, 50.0));
+            let paint = ui.painter().clone();
+            let resp = ui.interact(r, ui.scope_id().with("skip"), Sense::CLICK).on_hover_cursor(egui::CursorIcon::PointingHand);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, sk.kind.label()));
+            paint.rect_filled(r, 25, Color32::from_rgb(22, 22, 26));
+            paint.rect_stroke(r, 25, egui::Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Inside);
+            if resp.hovered() {
+                paint.rect_filled(r, 25, Color32::from_white_alpha(20));
+            }
+            paint.text(r.center(), egui::Align2::CENTER_CENTER, sk.kind.label(), egui::FontId::proportional(17.0), Color32::WHITE);
+            if resp.clicked() {
+                seek = Some((sk.end, false));
             }
         }
         let style = style.clamped();
@@ -4001,6 +4118,9 @@ impl App {
                 if ui.add_enabled_ui(!busy, |ui| primary_button(ui, "Sync")).inner.on_hover_text("Copy the account's addons and library here").clicked() {
                     self.sync_account(&ctx);
                 }
+                if ui.add_enabled_ui(!busy, |ui| small_button(ui, "Upload to account")).inner.on_hover_text("Copy addons and library from here to the account").clicked() {
+                    self.confirm_upload = true;
+                }
                 if busy {
                     ui.spinner();
                 }
@@ -4010,7 +4130,7 @@ impl App {
                     match cleared {
                         Ok(()) => {
                             // A running sync for this key is dropped when it ends.
-                            (self.account, self.account_busy) = (None, false);
+                            (self.account, self.account_busy, self.confirm_upload, self.account_note) = (None, false, false, None);
                             let client = self.client.clone();
                             // Best effort: the key is already forgotten locally.
                             self.rt.spawn(async move { client.stremio_logout(&key).await.inspect_err(|e| eprintln!("Stremio sign-out: {e:#}")) });
@@ -4019,6 +4139,21 @@ impl App {
                     }
                 }
             });
+            if self.confirm_upload {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Overwrites the account's addon list with this order (addons only on the account are kept, last). Saved titles missing on the account are added (ones it has, even removed, stay as they are), and progress is updated only where it is newer there. Nothing is deleted.").size(13.0).color(Color32::from_gray(170)));
+                    if primary_button(ui, "Upload").clicked() {
+                        self.confirm_upload = false;
+                        self.upload_account(&ctx);
+                    }
+                    if small_button(ui, "Cancel").clicked() {
+                        self.confirm_upload = false;
+                    }
+                });
+            }
+            if let Some(note) = &self.account_note {
+                ui.label(RichText::new(note).size(13.0).color(Color32::from_gray(170)));
+            }
         } else {
             let mut go = false;
             ui.horizontal(|ui| {
@@ -4033,7 +4168,7 @@ impl App {
                     ui.spinner();
                 }
             });
-            ui.label(RichText::new("Copies your addons, library and watched titles from api.strem.io; nothing is uploaded.").size(13.0).color(ui.visuals().weak_text_color()));
+            ui.label(RichText::new("Copies your addons, library and watched titles from api.strem.io. Settings can upload them back after signing in.").size(13.0).color(ui.visuals().weak_text_color()));
             let email = self.login.0.trim().to_string();
             if go && !email.is_empty() && !self.login.1.is_empty() {
                 // Not kept after use, even if signing in fails.
@@ -4044,6 +4179,24 @@ impl App {
                     Ok(Msg::SignedIn(email, key))
                 });
             }
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new("Data").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        if small_button(ui, "Export data…").on_hover_text("Write addons, saved titles, progress and settings to a JSON file in the data folder").clicked() {
+            match self.db.export_file(&self.data_dir.join("exports")) {
+                Ok(p) => self.data_msg = Some(format!("Exported to {}", p.display())),
+                Err(e) => report(&mut self.error, format!("exporting: {e:#}")),
+            }
+        }
+        ui.label(RichText::new("The export includes addon URLs, which can hold account tokens. Keep it private.").size(13.0).color(Color32::from_gray(170)));
+        if form_row(ui, "Import data…:", &mut self.data_import, "/path/to/stremflix-rs-export.json", "Import", Some("Merges the file into your data; nothing is deleted"), false) {
+            match self.db.import_file(std::path::Path::new(self.data_import.trim())) {
+                Ok(m) => self.data_msg = Some(format!("{m}. Restart the app to apply.")),
+                Err(e) => report(&mut self.error, format!("importing: {e:#}")),
+            }
+        }
+        if let Some(m) = &self.data_msg {
+            ui.label(RichText::new(m).size(13.0).color(Color32::from_gray(170)));
         }
         ui.add_space(8.0);
         ui.label(RichText::new("Torrents").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
@@ -4099,6 +4252,50 @@ impl App {
         if self.torrent.get().is_some() {
             ui.label(RichText::new("A torrent has already played: restart the app to apply changes.").size(13.0).color(ui.visuals().weak_text_color()));
         }
+        ui.add_space(16.0);
+        ui.label(RichText::new("Proxy").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        let kinds = [("", "Off"), ("http", "HTTP"), ("socks5", "SOCKS5")];
+        ui.horizontal(|ui| {
+            let l = ui.label("Type:");
+            ui.add_space((150.0 - l.rect.width()).max(0.0));
+            let shown = kinds.iter().find(|k| k.0 == self.proxy[0]).map_or("Off", |k| k.1);
+            egui::ComboBox::from_id_salt("proxy_kind").selected_text(shown).show_ui(ui, |ui| {
+                for (k, name) in kinds {
+                    ui.selectable_value(&mut self.proxy[0], k.to_string(), name);
+                }
+            });
+        });
+        let mut apply = false;
+        if !self.proxy[0].is_empty() {
+            ui.horizontal(|ui| {
+                let l = ui.label("Address:");
+                ui.add_space((150.0 - l.rect.width()).max(0.0));
+                ui.add(egui::TextEdit::singleline(&mut self.proxy[1]).hint_text("host:port").desired_width(260.0)).labelled_by(l.id);
+            });
+            ui.horizontal(|ui| {
+                let l = ui.label("Username:");
+                ui.add_space((150.0 - l.rect.width()).max(0.0));
+                ui.add(egui::TextEdit::singleline(&mut self.proxy[2]).hint_text("optional").desired_width(160.0)).labelled_by(l.id);
+                let l = ui.label("Password:");
+                ui.add(egui::TextEdit::singleline(&mut self.proxy[3]).password(true).desired_width(160.0)).labelled_by(l.id);
+            });
+        }
+        let [kind, addr, user, pass] = &self.proxy;
+        match stremflix_rs::addon::proxy_url(kind, addr, user, pass) {
+            Ok(_) => apply = primary_button(ui, "Save proxy").clicked(),
+            Err(e) => {
+                ui.label(RichText::new(e).size(13.0).color(Color32::from_rgb(230, 90, 90)));
+            }
+        }
+        if apply {
+            for (k, v) in ["proxy_kind", "proxy_addr", "proxy_user", "proxy_pass"].into_iter().zip(&self.proxy) {
+                save.push((k, v.clone()));
+            }
+        }
+        let note = "Applies after a restart. HTTP covers addons, downloads, the update check and mpv streams, but not torrents. \
+            SOCKS5 covers addons, downloads, the update check and torrent peers and HTTP trackers, but not mpv's direct HTTP streams \
+            (mpv has no SOCKS support) or DHT. The password is stored unencrypted in the app's database.";
+        ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
         ui.add_space(16.0);
         ui.label(RichText::new("Player").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
         if form_row(ui, "External player:", &mut self.external_player, "vlc", "Save", Some("Command run with the stream URL; no shell"), true) {

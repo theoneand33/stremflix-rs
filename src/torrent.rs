@@ -60,6 +60,25 @@ pub fn evict(torrents: &[(usize, u64)], cache: u64) -> Vec<usize> {
     sorted.into_iter().take_while(|&(_, b)| (cache == 0 || total > cache) && { total -= b; true }).map(|t| t.0).collect()
 }
 
+/// Live numbers for one torrent, for the player's stats overlay.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NetStats {
+    pub peers: u32,
+    /// Bytes per second.
+    pub down: u64,
+    pub up: u64,
+}
+
+/// "1.5 MB/s" from bytes per second.
+pub fn fmt_rate(bytes: u64) -> String {
+    let (mut v, mut u) = (bytes as f64, 0);
+    while v >= 1024.0 && u < 3 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{bytes} B/s") } else { format!("{v:.1} {}/s", ["B", "KB", "MB", "GB"][u]) }
+}
+
 /// `(index, name, size)` of the playable files, largest first.
 pub fn media_files(files: &[(String, u64)]) -> Vec<(usize, String, u64)> {
     let mut v: Vec<_> = files
@@ -93,6 +112,10 @@ impl TorrentEngine {
         opts.ratelimits.upload_bps = std::num::NonZeroU32::new(limits.1);
         if !dht {
             opts.dht = None;
+        }
+        // librqbit only speaks SOCKS5: peers and HTTP trackers go through it; DHT and UDP trackers don't.
+        if let Some(p) = crate::addon::PROXY.get().filter(|p| p.scheme() == "socks5h") {
+            opts.connect = Some(librqbit::ConnectionOptions { proxy_url: Some(p.to_string()), ..Default::default() });
         }
         let session = Session::new_with_opts(download_dir, opts).await.context("start torrent session")?;
         let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
@@ -166,6 +189,12 @@ impl TorrentEngine {
         Ok((format!("http://{}/torrents/{}/stream/{idx}", self.http, handle.id()), handle.id()))
     }
 
+    /// Peers and speeds of torrent `id`; `None` if it is gone or not live yet.
+    pub fn net_stats(&self, id: usize) -> Option<NetStats> {
+        let live = self.session.get(id.into())?.stats().live?;
+        Some(NetStats { peers: live.snapshot.peer_stats.live, down: live.download_speed.as_bytes(), up: live.upload_speed.as_bytes() })
+    }
+
     /// Drop one download's hold on torrent `id` taken by `stream_url(.., pin: true)`.
     pub async fn unpin(&self, id: usize) {
         let mut p = self.pinned.lock().await;
@@ -203,6 +232,14 @@ pub fn magnet_chooses_file(magnet: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_rates() {
+        assert_eq!(fmt_rate(0), "0 B/s");
+        assert_eq!(fmt_rate(1023), "1023 B/s");
+        assert_eq!(fmt_rate(1536), "1.5 KB/s");
+        assert_eq!(fmt_rate(5 * 1024 * 1024), "5.0 MB/s");
+    }
 
     #[test]
     fn magnet_with_so_skips_picker() {
