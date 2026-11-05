@@ -1386,7 +1386,7 @@ impl App {
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
-            addon_orders: ADDON_ORDER_KINDS.iter().map(|k| Ok((k.to_string(), decode_keys(&db.setting(&format!("addon_order:{k}"))?.unwrap_or_default())))).collect::<Result<_>>()?,
+            addon_orders: ADDON_ORDER_KINDS.iter().map(|k| Ok((k.to_string(), decode_keys(&db.setting(&format!("addon_order:{k}"))?.unwrap_or_default())))).collect::<anyhow::Result<_>>()?,
             addon_order_kind: String::new(),
             home_hidden: decode_keys(&db.setting("home_hidden")?.unwrap_or_default()),
             home_all: Vec::new(),
