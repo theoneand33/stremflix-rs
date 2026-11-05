@@ -4044,7 +4044,7 @@ impl App {
                 _ => {}
             }
         });
-        ui.label(RichText::new("Sent to addons and for downloads. Empty uses the default. Addon requests pick it up after a restart.").size(13.0).color(Color32::from_gray(170)));
+        ui.label(RichText::new("Sent to addons and for downloads. Empty uses the default. Torrent (librqbit) traffic is not covered.").size(13.0).color(Color32::from_gray(170)));
         ui.add_space(16.0);
         ui.label(RichText::new("Customize Home").size(20.0).strong().family(bold()).color(Color32::WHITE));
         let (mut swap, mut toggle, mut reset) = (None, None, false);

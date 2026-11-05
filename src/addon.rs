@@ -903,7 +903,6 @@ impl AddonClient {
             reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::limited(3))
-                .user_agent(user_agent()) // GitHub's API rejects requests without one
                 .build()
                 .map_err(|e| format!("HTTP client: {e}"))
         });
@@ -911,7 +910,9 @@ impl AddonClient {
     }
 
     async fn get(&self, url: Url) -> Result<Vec<u8>> {
-        let mut resp = self.http()?.get(url.clone()).send().await.with_context(|| format!("GET {url}"))?;
+        // Per request, not on the shared client, so a changed User-Agent applies without a restart.
+        // GitHub's API rejects requests without one.
+        let mut resp = self.http()?.get(url.clone()).header(reqwest::header::USER_AGENT, user_agent()).send().await.with_context(|| format!("GET {url}"))?;
         ensure!(resp.status().is_success(), "HTTP {}", resp.status());
         ensure!(resp.content_length().unwrap_or(0) <= MAX_BODY as u64, "response too large");
         let mut body = Vec::new();
@@ -933,7 +934,7 @@ impl AddonClient {
     async fn stremio_api(&self, method: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let url = format!("{STREMIO_API}{method}");
         // A whole library takes longer than the client's 15 s default.
-        let req = self.http()?.post(&url).json(&body).timeout(std::time::Duration::from_secs(120));
+        let req = self.http()?.post(&url).header(reqwest::header::USER_AGENT, user_agent()).json(&body).timeout(std::time::Duration::from_secs(120));
         let mut resp = req.send().await.with_context(|| format!("POST {url}"))?;
         let status = resp.status();
         // Errors come back as JSON `{"error": ...}`, so the body is read whatever the status.
@@ -1018,6 +1019,10 @@ impl AddonClient {
     /// Up to `HASH_CHUNK` bytes of `url` from `start`, and the file size from `Content-Range` (or a 200's length).
     async fn chunk_at(&self, url: &Url, headers: &[(String, String)], start: u64) -> Result<(Vec<u8>, u64)> {
         let mut req = self.http()?.get(url.clone()).header("Range", format!("bytes={start}-{}", start + HASH_CHUNK as u64 - 1));
+        // Headers are appended, so a stream's own User-Agent replaces the default instead of adding a second one.
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")) {
+            req = req.header(reqwest::header::USER_AGENT, user_agent());
+        }
         for (k, v) in headers {
             req = req.header(k, v);
         }

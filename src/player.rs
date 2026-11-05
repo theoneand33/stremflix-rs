@@ -436,6 +436,7 @@ impl Player {
         if subs_off {
             opts.push(("sid".into(), "no".into()));
         }
+        opts.push(("user-agent".into(), crate::addon::user_agent())); // default; an addon's own User-Agent comes later and wins
         opts.extend(header_options(headers));
         opts.extend(parse_args(&std::env::var("STREMFLIX_RS_MPV_ARGS").unwrap_or_default()));
         for (k, v) in &opts {
