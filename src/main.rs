@@ -15,9 +15,9 @@ use stremflix_rs::db::{self, Db, Download, List, Progress, SavedTitle, Watched};
 use stremflix_rs::download;
 use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
-use stremflix_rs::player::{GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
+use stremflix_rs::player::{self, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
-use stremflix_rs::torrent::{Profile, TorrentEngine};
+use stremflix_rs::torrent::{NetStats, Profile, TorrentEngine, fmt_rate};
 use stremflix_rs::tray::{self, Tray};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -28,6 +28,9 @@ enum Tab {
     Library,
     Settings,
 }
+
+/// Speed limit choices in bytes/s; 0 is unlimited.
+const SPEED_LIMITS: [(&str, u32); 6] = [("Unlimited", 0), ("500 KB/s", 500_000), ("1 MB/s", 1_000_000), ("2 MB/s", 2_000_000), ("5 MB/s", 5_000_000), ("10 MB/s", 10_000_000)];
 
 /// Torrent cache size choices: label and bytes kept (0 = delete a torrent when its playback stops).
 const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000), ("5 GB", 5_000_000_000), ("10 GB", 10_000_000_000), ("Unlimited", u64::MAX)];
@@ -671,7 +674,8 @@ fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream, reserve: f32) -> egui::Re
     let described = stem.is_some_and(|f| parts.iter().any(|p| p.contains(f)));
     let file = if described { String::new() } else { [s.hints.filename.clone(), s.hints.video_size.map(fmt_size)].into_iter().flatten().collect::<Vec<_>>().join("  ·  ") };
     let external = (s.target().is_none()).then_some("Opens in your browser");
-    let details: Vec<&str> = parts.into_iter().chain(Some(file.as_str()).filter(|f| !f.is_empty())).chain(external).collect();
+    let not_web_ready = s.hints.not_web_ready.then_some("Not web-ready (plays directly here)");
+    let details: Vec<&str> = parts.into_iter().chain(Some(file.as_str()).filter(|f| !f.is_empty())).chain(not_web_ready).chain(external).collect();
     list_row(ui, n, head, details.join("\n"), reserve)
 }
 
@@ -765,8 +769,13 @@ const TRAILER: &str = "trailer/";
 /// The addon's `proxyHeaders` for playing `url`, only when it is that addon's own http(s) stream:
 /// never for torrents (`url` is then the local torrent server, not `source`) or local files.
 fn request_headers(streams: &[Stream], source: &str, url: &str) -> Vec<(String, String)> {
+    own_stream(streams, source, url).map(|s| s.hints.request_headers.clone()).unwrap_or_default()
+}
+
+/// The stream whose own http(s) URL is `url`, when `url` is also the `source` being played.
+fn own_stream<'a>(streams: &'a [Stream], source: &str, url: &str) -> Option<&'a Stream> {
     let own = |s: &&Stream| matches!(s.target(), Some(PlayTarget::Http(u)) if u.as_str() == url);
-    (source == url).then(|| streams.iter().find(own)).flatten().map(|s| s.hints.request_headers.clone()).unwrap_or_default()
+    (source == url).then(|| streams.iter().find(own)).flatten()
 }
 
 /// Series id of a local episode progress key's video id, for history saved before the series id was stored:
@@ -957,6 +966,10 @@ struct Playing {
     wheel: f32,
     /// The up-next card was dismissed.
     next_dismissed: bool,
+    /// Stats overlay shown; `net` is its torrent line, refreshed by a task about once per second (`net_next`, egui clock).
+    stats: bool,
+    net: Arc<std::sync::Mutex<Option<NetStats>>>,
+    net_next: f64,
     search: SubSearch,
     /// Per-session picture scaling: aspect override index into `ASPECTS`, fill (crop) instead of fit, zoom in tenths.
     aspect: usize,
@@ -1073,6 +1086,8 @@ struct App {
     torrent_dir: String,
     torrent_cache: u64,
     torrent_profile: Profile,
+    /// (download, upload) in bytes/s; 0 is unlimited.
+    torrent_limits: (u32, u32),
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
     /// mpv hardware decoding.
@@ -1111,6 +1126,8 @@ struct App {
     last_poll: Instant,
     /// Sleep timer: pause at this time; the minutes chosen. Survives autoplay-next, cleared when the player is left.
     sleep: Option<(Instant, u64)>,
+    /// Timer waiting for the next episode's player; only valid for the `nav` that play_next opened.
+    sleep_carry: Option<((Instant, u64), u64)>,
     /// GL function loader of eframe's context, for libmpv's OpenGL renderer.
     gl_proc: Option<GlProc>,
     window: Geo,
@@ -1190,6 +1207,10 @@ impl App {
             torrent_dir: db.setting("torrent_dir")?.unwrap_or_default(),
             torrent_cache: db.setting("torrent_cache")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             torrent_profile: Profile::from_label(&db.setting("torrent_profile")?.unwrap_or_default()),
+            torrent_limits: (
+                db.setting("torrent_down_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
+                db.setting("torrent_up_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
+            ),
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
@@ -1243,6 +1264,7 @@ impl App {
             pill: None,
             last_poll: Instant::now(),
             sleep: None,
+            sleep_carry: None,
             gl_proc: None,
             window: Geo::default(),
             video: None,
@@ -1284,6 +1306,10 @@ impl App {
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
         let torrent = source.starts_with("magnet:") || is_torrent_file(&source);
+        let mut subs = subs;
+        if !torrent {
+            subs.extend(player::sidecar_subs(std::path::Path::new(&source))); // empty for URLs and missing paths
+        }
         if !torrent && lookup.is_none() {
             let _ = self.tx.send(Msg::Play(key, title, source.clone(), source, subs, None, nav));
             return;
@@ -1319,9 +1345,9 @@ impl App {
             Some(d) => PathBuf::from(d).join("stremflix-rs-torrents"),
             None => self.data_dir.join("torrents"),
         };
-        let (cell, cache, profile) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile);
+        let (cell, cache, profile, limits) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile, self.torrent_limits);
         let dht = std::env::var_os("STREMFLIX_RS_NO_DHT").is_none();
-        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile).await.map(Arc::new) }).await.cloned() }
+        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile, limits).await.map(Arc::new) }).await.cloned() }
     }
 
     /// What a hash-matched subtitle query needs for the selected title's stream `source`;
@@ -1496,8 +1522,13 @@ impl App {
                 if autoplay != Autoplay::Off {
                     match (src, self.play_key()) {
                         (Some(src), Some((key, title))) => self.play(ctx, key, title, src, subs),
-                        _ => self.show_streams = true,
+                        _ => {
+                            self.show_streams = true;
+                            self.sleep_carry = None;
+                        }
                     }
+                } else {
+                    self.sleep_carry = None;
                 }
             }
             Msg::Episodes(mut meta, mut m, nav) => {
@@ -1718,7 +1749,9 @@ impl App {
                     }
                     return;
                 }
+                let carry = self.sleep_carry.take();
                 self.stop_player();
+                self.sleep = carry.filter(|(_, n)| *n == nav).map(|(s, _)| s);
                 self.release_torrents(torrent);
                 let prev = self.db.progress(&key).ok().flatten();
                 let start = match &prev {
@@ -1739,6 +1772,7 @@ impl App {
                 let lang = |k| setting(k).unwrap_or_default();
                 let subs_off = self.subs_off();
                 let headers = self.selected.as_ref().map(|(_, streams, _)| request_headers(streams, &source, &url)).unwrap_or_default();
+                let demuxer = self.selected.as_ref().and_then(|(_, streams, _)| own_stream(streams, &source, &url)).and_then(|s| s.hints.demuxer);
                 // Remember the episode's series (its key holds only the video id) and the stream's binge group
                 // (empty if none), so the series' play button and Continue Watching can find them later.
                 if let (Some((m, streams, _)), Some(_)) = (&self.selected, &self.episode)
@@ -1748,7 +1782,7 @@ impl App {
                     let _ = self.db.set_setting(&format!("series:{key}"), &m.id);
                     let _ = self.db.set_setting(&format!("binge:{}:{}", m.kind, m.id), &group.unwrap_or_default());
                 }
-                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], subs_off, &headers, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
+                match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], subs_off, &headers, demuxer, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
                         if self.default_speed != 1.0 {
@@ -1757,7 +1791,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None, hidden_vid: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1827,10 +1861,8 @@ impl App {
     }
 
     fn stop_player(&mut self) {
-        // shortcut: a timer carried by play_next lingers if the next stream never starts, clear it on the next manual stop.
-        if self.player.is_some() {
-            self.sleep = None;
-        }
+        self.sleep = None;
+        self.sleep_carry = None;
         self.save_progress();
         self.player = None;
     }
@@ -2248,8 +2280,8 @@ impl App {
         self.stop_player();
         match next {
             Some((m, v)) => {
-                self.sleep = sleep;
-                self.open_streams(ctx, m, Some(v), Autoplay::Only, binge)
+                self.open_streams(ctx, m, Some(v), Autoplay::Only, binge);
+                self.sleep_carry = sleep.map(|s| (s, self.nav));
             }
             None => {
                 self.release_torrents(None);
@@ -3095,6 +3127,7 @@ impl App {
             if k(ArrowUp) { cmd(&["add", "volume", "5"]); new_vol = Some(st.volume + 5.0) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]); new_vol = Some(st.volume - 5.0) }
             if k(M) { cmd(&["cycle", "mute"]) }
+            if k(I) && focused.is_none() { p.stats = !p.stats }
             // mpv pauses on its own after a frame step.
             if k(Period) { cmd(&["frame-step"]) }
             if k(Comma) { cmd(&["frame-back-step"]) }
@@ -3434,12 +3467,46 @@ impl App {
                                     report(&mut self.error, format!("saving hwdec: {e:#}"));
                                 }
                             }
+                            switch_row(ui, "Playback stats (I)", &mut p.stats);
                             ui.add_space(8.0);
-                            external = ui.add(egui::Button::new(RichText::new("Open in external player").size(14.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(16)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0))).on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
+                            external =ui.add(egui::Button::new(RichText::new("Open in external player").size(14.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(16)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0))).on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
                         }
                     });
                 });
             }
+        }
+        // Stats overlay: mpv values arrive through observed properties; the torrent line is polled off the UI thread.
+        if p.stats {
+            if let (Some(id), Some(engine), true) = (p.torrent, self.torrent.get(), now >= p.net_next) {
+                p.net_next = now + 1.0;
+                let (engine, net, ctx) = (engine.clone(), p.net.clone(), ctx.clone());
+                self.rt.spawn(async move {
+                    *net.lock().unwrap() = engine.net_stats(id);
+                    ctx.request_repaint();
+                });
+            }
+            ctx.request_repaint_after(Duration::from_secs(1));
+            let net = *p.net.lock().unwrap();
+            let mut rows = vec![
+                ("Video", format!("{} {}x{} @ {:.2} fps", if st.codec.is_empty() { "?" } else { &st.codec }, vw, vh, st.fps)),
+                ("Hwdec", if st.hwdec.is_empty() { "no".into() } else { st.hwdec.clone() }),
+                ("Dropped", format!("{} output, {} decoder", st.dropped[0], st.dropped[1])),
+                ("Buffer", format!("{:.1} s", st.cache)),
+            ];
+            if p.torrent.is_some() {
+                rows.push(("Peers", net.map_or("-".into(), |n| n.peers.to_string())));
+                rows.push(("Speed", net.map_or("-".into(), |n| format!("{} down, {} up", fmt_rate(n.down), fmt_rate(n.up)))));
+            }
+            egui::Area::new(ui.scope_id().with("stats")).order(egui::Order::Foreground).fixed_pos(pos2(rect.left() + 16.0, rect.top() + 72.0)).interactable(false).show(&ctx, |ui| {
+                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(24, 24, 28, 230)).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+                    for (k, v) in rows {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{k:<8}")).size(13.0).monospace().color(Color32::from_gray(150)));
+                            ui.label(RichText::new(v).size(13.0).monospace().color(Color32::WHITE));
+                        });
+                    }
+                });
+            });
         }
         // Up next: in an episode's last 30 s, a card slides in from the right to play the next one.
         if let Some((series, label, img)) = up_next {
@@ -3593,6 +3660,10 @@ impl App {
     fn ui_addons(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if form_row(ui, "Manifest URL:", &mut self.addon_url, "http://127.0.0.1:7070/manifest.json", "Install", None, false) {
+            // A pasted stremio:// link becomes its manifest URL (http for loopback).
+            if let Some(stremflix_rs::addon::DeepLink::Addon(u)) = stremflix_rs::addon::parse_deep_link(&self.addon_url) {
+                self.addon_url = u.into();
+            }
             let (client, url) = (self.client.clone(), self.addon_url.trim().to_string());
             self.spawn(&ctx, async move {
                 let m = client.fetch_manifest(&url).await?;
@@ -3950,6 +4021,20 @@ impl App {
                 }
             });
         });
+        for (title, key, val) in [("Download limit:", "torrent_down_limit", &mut self.torrent_limits.0), ("Upload limit:", "torrent_up_limit", &mut self.torrent_limits.1)] {
+            ui.horizontal(|ui| {
+                let l = ui.label(title);
+                ui.add_space((150.0 - l.rect.width()).max(0.0));
+                let label = SPEED_LIMITS.iter().find(|c| c.1 == *val).map_or("Custom", |c| c.0);
+                egui::ComboBox::from_id_salt(key).selected_text(label).show_ui(ui, |ui| {
+                    for (name, bps) in SPEED_LIMITS {
+                        if ui.selectable_value(val, bps, name).changed() {
+                            save.push((key, bps.to_string()));
+                        }
+                    }
+                });
+            });
+        }
         let note = "Stopped torrents stay on disk up to the cache size, and are cleared when the app starts.";
         ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
         if self.torrent.get().is_some() {
@@ -4930,6 +5015,17 @@ mod tests {
         assert!(app.player.is_none());
         app.handle(&ctx, Msg::Streams(m("b"), None, vec![], vec![], Autoplay::Off, None, 2));
         assert_eq!(app.selected.as_ref().map(|(m, ..)| m.id.as_str()), Some("b"), "current reply applies");
+    }
+
+    #[test]
+    fn sleep_carry_dies_when_autoplay_falls_back_to_picker() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
+        app.nav = 3;
+        app.sleep_carry = Some(((Instant::now(), 30), 3));
+        app.handle(&ctx, Msg::Streams(m, None, vec![], vec![], Autoplay::Only, None, 3));
+        assert!(app.sleep_carry.is_none() && app.show_streams);
     }
 
     #[test]

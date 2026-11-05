@@ -30,9 +30,7 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
-| Auto-load sidecar subtitles next to local files | P2 | S | `.srt`/`.ass`/`.vtt` beside the video; only addon subtitles today. |
 | Skip intro / recap / credits from addon markers | P2 | M | Stremio supporter feature; needs an addon source for the timestamps. |
-| Playback stats overlay (peers, speed, dropped frames) | P2 | S | Stremio has a Network button; useful for torrents. |
 | Screenshot capture | P3 | S | mpv `screenshot-to-file`. |
 | A-B loop / repeat | P3 | S | |
 | Frame-by-frame stepping | P3 | S | |
@@ -46,7 +44,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Download queue with progress and pause/resume | P2 | M | Builds on the download manager. |
-| Download / upload speed limits | P3 | S | librqbit supports rate limits. |
 | Seeding limits (ratio/time) and a torrent manager UI | P3 | S | Torrents are stopped and deleted automatically now. |
 | Custom listen port / UPnP / NAT-PMP | P3 | M | |
 
@@ -65,10 +62,8 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| Support `notWebReady` and `proxyHeaders.response` hints | P2 | M | `proxyHeaders.request` is handled; these are not. |
 | Remote/LAN streaming server | P2 | L | Stremio serves the library to other devices; casting is a separate item. |
 | Addon health indicator (unreachable / timeout) | P3 | S | |
-| Install from `stremio://` addon links pasted in Addons | P3 | S | Deep links only cover detail pages today. |
 | QR code to install an addon | P3 | S | |
 | Per-type addon ordering | P3 | S | One global priority list today. |
 
