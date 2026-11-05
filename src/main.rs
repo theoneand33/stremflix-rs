@@ -296,6 +296,67 @@ fn decode_keys(s: &str) -> Vec<String> {
 /// How far back an episode's release date still counts as new.
 const NEW_EPISODE_DAYS: i64 = 14;
 
+/// Most `<series id>:<episode id>` keys kept per series; the oldest of that series go first.
+/// A series' own `<series id>:` marker is never evicted, or its next episode would be silently re-seeded.
+const NOTIFIED_PER_SERIES: usize = 50;
+/// How often saved series are re-checked for new episodes while the app runs.
+const NOTIFY_EVERY: Duration = Duration::from_secs(6 * 3600);
+
+/// Drops every notified key whose series is no longer in the saved library, so stale keys don't pile up.
+fn prune_unsaved(seen: &mut Vec<String>, saved: &[&str]) {
+    seen.retain(|k| saved.iter().any(|id| k.strip_prefix(*id).is_some_and(|r| r.starts_with(':'))));
+}
+
+/// Records `eps` of `series` in `seen` and returns those never seen before. A series
+/// with no entry yet (first run, or newly saved) is only recorded, so its backlog stays silent.
+fn fresh_episodes(seen: &mut Vec<String>, series: &str, eps: &[&str]) -> Vec<String> {
+    let marker = format!("{series}:");
+    let known = seen.contains(&marker);
+    if !known {
+        seen.push(marker.clone());
+    }
+    let mut fresh = Vec::new();
+    for ep in eps {
+        let k = format!("{series}:{ep}");
+        if !seen.contains(&k) {
+            seen.push(k);
+            if known {
+                fresh.push(ep.to_string());
+            }
+        }
+    }
+    // Cap only this series' episode keys (never its marker, never other series), but always
+    // keep the whole current window so an episode still listed can't be dropped and re-notified.
+    let mut excess = seen.iter().filter(|k| k.starts_with(&marker) && **k != marker).count().saturating_sub(NOTIFIED_PER_SERIES.max(eps.len()));
+    if excess > 0 {
+        seen.retain(|k| {
+            let evict = excess > 0 && k.starts_with(&marker) && *k != marker;
+            if evict {
+                excess -= 1;
+            }
+            !evict
+        });
+    }
+    fresh
+}
+
+/// Replaces any earlier row for the series, so refetches don't duplicate rows; an empty `videos` only removes it.
+fn upsert_by_id(list: &mut Vec<(MetaPreview, Vec<Video>)>, meta: MetaPreview, videos: Vec<Video>) {
+    list.retain(|(m, _)| m.id != meta.id);
+    if !videos.is_empty() {
+        list.push((meta, videos));
+    }
+}
+
+/// Desktop notification; never blocks the UI and a missing notification service only logs.
+fn os_notify(title: String, body: String) {
+    std::thread::spawn(move || {
+        if let Err(e) = notify_rust::Notification::new().appname("Stremflix-rs").summary(&title).body(&body).show() {
+            eprintln!("notification: {e}");
+        }
+    });
+}
+
 /// Days since 1970-01-01 (UTC) today.
 fn unix_days() -> i64 {
     (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) / 86400) as i64
@@ -1116,6 +1177,11 @@ struct App {
     upcoming: Vec<(MetaPreview, Vec<Video>)>,
     /// Bumped on each `build_rows`; stale `Msg::NewEpisodes` replies are dropped.
     new_eps_gen: u64,
+    /// "Notify about new episodes" setting, the keys already notified, the last check, and the in-app banner.
+    notify_eps: bool,
+    notified: Vec<String>,
+    notify_check: Instant,
+    notice: Option<String>,
     /// Finished downloads, newest first.
     downloads: Vec<Download>,
     /// Downloads waiting, running, paused or failed, oldest first.
@@ -1288,6 +1354,10 @@ impl App {
             new_episodes: Vec::new(),
             upcoming: Vec::new(),
             new_eps_gen: 0,
+            notify_eps: db.setting("notify_eps")?.as_deref() != Some("0"),
+            notified: db.setting("notified_eps")?.map(|s| decode_keys(&s)).unwrap_or_default(),
+            notify_check: Instant::now(),
+            notice: None,
             downloads: db.downloads()?,
             queue,
             download_runs: 0,
@@ -1801,7 +1871,6 @@ impl App {
             },
             Msg::NewEpisodes(epoch, meta, mut videos) => {
                 if epoch == self.new_eps_gen {
-                    self.new_episodes.retain(|(m, _)| m.id != meta.id);
                     sort_episodes(&mut videos);
                     // Episodes imported as watched from Stremio, as in `Msg::Episodes`.
                     let bk = format!("bitfield:{}:{}", meta.kind, meta.id);
@@ -1821,8 +1890,26 @@ impl App {
                         self.upcoming.push((meta.clone(), ahead));
                     }
                     let videos = recent_episodes(videos, &date_string(today - (NEW_EPISODE_DAYS - 1)), &date_string(today));
-                    if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) && !videos.is_empty() {
-                        self.new_episodes.push((meta, videos));
+                    if self.saved.iter().any(|t| t.key == format!("series:{}", meta.id)) {
+                        // Also with no recent episode: seeds the series' marker so its next one notifies.
+                        let ids: Vec<&str> = videos.iter().map(|v| v.id.as_str()).collect();
+                        let saved_ids: Vec<&str> = self.saved.iter().filter_map(|t| t.key.strip_prefix("series:")).collect();
+                        prune_unsaved(&mut self.notified, &saved_ids);
+                        let fresh = fresh_episodes(&mut self.notified, &meta.id, &ids);
+                        if let Err(e) = self.db.set_setting("notified_eps", &encode_keys(&self.notified)) {
+                            report(&mut self.error, format!("saving notified episodes: {e:#}"));
+                        }
+                        let labels: Vec<String> = videos
+                            .iter()
+                            .filter(|v| fresh.contains(&v.id) && !self.watched_keys.contains(&format!("{}:{}", meta.kind, v.id)))
+                            .map(|v| format!("S{}E{}", v.season.unwrap_or(0), v.episode.unwrap_or(0)))
+                            .collect();
+                        if self.notify_eps && !labels.is_empty() {
+                            let body = format!("New: {}", labels.join(", "));
+                            self.notice = Some(format!("{}: {}", meta.name, body));
+                            os_notify(meta.name.clone(), body);
+                        }
+                        upsert_by_id(&mut self.new_episodes, meta, videos);
                     }
                 }
             }
@@ -4389,6 +4476,9 @@ impl App {
             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                 save.push(("hwdec", on(self.hwdec)));
             }
+            if switch_row(ui, "Notify about new episodes", &mut self.notify_eps).changed() {
+                save.push(("notify_eps", on(self.notify_eps)));
+            }
             if switch_row(ui, "Minimize to tray on close", &mut self.tray_on_close).changed() {
                 save.push(("tray_on_close", on(self.tray_on_close)));
             }
@@ -4743,6 +4833,12 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.show_window(ctx, false);
         }
+        // Also while hidden to the tray: `logic` runs on this wake-up.
+        if self.notify_check.elapsed() >= NOTIFY_EVERY {
+            self.notify_check = Instant::now();
+            self.fetch_new_episodes(ctx);
+        }
+        ctx.request_repaint_after(NOTIFY_EVERY.saturating_sub(self.notify_check.elapsed()));
         self.poll_player(ctx);
         self.publish_media();
         // Hidden, `ui` doesn't run and mpv's frames aren't rendered, which stalls its core: play audio only meanwhile.
@@ -4905,6 +5001,14 @@ impl eframe::App for App {
                     ui.label(RichText::new(format!("Error: {e}")).color(Color32::from_rgb(230, 90, 90)));
                     if ui.small_button("Dismiss").clicked() {
                         self.error = None;
+                    }
+                });
+            }
+            if let Some(n) = self.notice.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(n);
+                    if ui.small_button("Dismiss").clicked() {
+                        self.notice = None;
                     }
                 });
             }
@@ -5151,6 +5255,77 @@ fn seek_step(v: Option<String>, default: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_episodes_seeds_dedupes_and_roundtrips() {
+        let mut seen = Vec::new();
+        // First sight of a series records its backlog silently.
+        assert!(fresh_episodes(&mut seen, "tt1", &["tt1:1:1", "tt1:1:2"]).is_empty());
+        assert_eq!(fresh_episodes(&mut seen, "tt1", &["tt1:1:1", "tt1:1:2", "tt1:1:3"]), ["tt1:1:3"]);
+        // Each episode notifies once.
+        assert!(fresh_episodes(&mut seen, "tt1", &["tt1:1:3"]).is_empty());
+        // Another series is seeded on its own.
+        assert!(fresh_episodes(&mut seen, "tt2", &["tt2:1:1"]).is_empty());
+        // Keys with colons and quotes survive the settings encoding.
+        seen.push("a\"b:c|d".into());
+        assert_eq!(decode_keys(&encode_keys(&seen)), seen);
+    }
+
+    #[test]
+    fn markers_survive_the_cap_and_other_series_are_untouched() {
+        let mut seen = Vec::new();
+        fresh_episodes(&mut seen, "tt1", &["e1", "e2"]);
+        fresh_episodes(&mut seen, "tt3", &[]);
+        // Many batches for one series push it past its per-series cap.
+        for batch in 0..5 {
+            let eps: Vec<String> = (0..20).map(|i| format!("b{batch}e{i}")).collect();
+            let refs: Vec<&str> = eps.iter().map(String::as_str).collect();
+            fresh_episodes(&mut seen, "tt3", &refs);
+        }
+        let tt3: Vec<&String> = seen.iter().filter(|k| k.starts_with("tt3:") && k.as_str() != "tt3:").collect();
+        assert_eq!(tt3.len(), NOTIFIED_PER_SERIES, "capped per series");
+        assert_eq!(tt3.last().unwrap().as_str(), "tt3:b4e19", "newest kept, oldest dropped");
+        // Markers survive the cap pass, and the other series keeps its keys.
+        assert!(seen.contains(&"tt3:".to_string()) && seen.contains(&"tt1:".to_string()));
+        assert!(seen.contains(&"tt1:e1".to_string()) && seen.contains(&"tt1:e2".to_string()));
+        // A series whose marker survived still notifies its next episode instead of re-seeding.
+        assert_eq!(fresh_episodes(&mut seen, "tt3", &["new"]), ["new"]);
+        // A window larger than the cap is kept whole (no re-notify of episodes still listed).
+        let big: Vec<String> = (0..NOTIFIED_PER_SERIES + 5).map(|i| format!("w{i}")).collect();
+        let refs: Vec<&str> = big.iter().map(String::as_str).collect();
+        fresh_episodes(&mut seen, "tt3", &refs);
+        assert!(fresh_episodes(&mut seen, "tt3", &refs).is_empty());
+    }
+
+    #[test]
+    fn prune_unsaved_drops_only_unsaved_series() {
+        let mut seen = vec!["tt1:".into(), "tt1:e1".into(), "tt10:".into(), "tt10:e1".into(), "kitsu:7:".into(), "kitsu:7:e1".into(), "gone:".into(), "gone:e1".into()];
+        prune_unsaved(&mut seen, &["tt1", "kitsu:7"]);
+        // tt10 is a different series than tt1 even though its id starts with "tt1".
+        assert_eq!(seen, ["tt1:", "tt1:e1", "kitsu:7:", "kitsu:7:e1"]);
+    }
+
+    #[test]
+    fn empty_window_still_seeds_marker() {
+        let mut seen = Vec::new();
+        assert!(fresh_episodes(&mut seen, "tt1", &[]).is_empty());
+        assert_eq!(fresh_episodes(&mut seen, "tt1", &["tt1:1:5"]), ["tt1:1:5"]);
+    }
+
+    #[test]
+    fn refetch_does_not_duplicate_rows() {
+        let meta = |id: &str| MetaPreview { id: id.into(), kind: "series".into(), name: id.into(), poster: None, background: None, description: None };
+        let video = |id: &str| Video { id: id.into(), title: None, released: None, season: Some(1), episode: Some(1), thumbnail: None };
+        let mut list = Vec::new();
+        upsert_by_id(&mut list, meta("a"), vec![video("a1")]);
+        upsert_by_id(&mut list, meta("b"), vec![video("b1")]);
+        upsert_by_id(&mut list, meta("a"), vec![video("a2")]);
+        assert_eq!(list.iter().map(|(m, _)| m.id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        assert_eq!(list[1].1[0].id, "a2");
+        // An empty refetch (episodes aged out of the window) removes the old row.
+        upsert_by_id(&mut list, meta("a"), vec![]);
+        assert_eq!(list.iter().map(|(m, _)| m.id.as_str()).collect::<Vec<_>>(), ["b"]);
+    }
 
     #[test]
     fn wheel_accumulates_to_steps() {
