@@ -3953,7 +3953,7 @@ impl App {
             let summary = format!("addons: {}\nsigned in: {}", self.addons.len(), self.account.is_some());
             match std::fs::write(&out, stremflix_rs::diag::bundle(&summary)) {
                 Ok(()) => self.error = Some(format!("Diagnostics saved to {}", out.display())),
-                Err(e) => report(&mut self.error, &format!("diagnostics export: {e}")),
+                Err(e) => report(&mut self.error, format!("diagnostics export: {e}")),
             }
         }
         ui.add_space(8.0);

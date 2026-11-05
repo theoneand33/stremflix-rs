@@ -19,8 +19,12 @@ pub fn log(msg: &str) {
         let _ = std::fs::rename(p, p.with_extension("log.1"));
     }
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-        let _ = writeln!(f, "[{t}] {msg}");
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    if let Ok(mut f) = o.open(p) {
+        let _ = writeln!(f, "[{t}] {}", redact(msg));
     }
 }
 
@@ -30,9 +34,14 @@ macro_rules! elog {
 }
 
 /// Keeps only scheme://host of URLs: userinfo, path (addon configs embed tokens there), query and fragment go.
+/// Magnet links (info hashes, trackers) are replaced whole.
 pub fn redact(s: &str) -> String {
     s.split_inclusive(char::is_whitespace)
         .map(|w| {
+            if let Some(i) = w.find("magnet:") {
+                let end = w[i..].find(|c: char| c.is_whitespace() || "\"'<>)".contains(c)).map_or(w.len(), |e| i + e);
+                return format!("{}magnet:<redacted>{}", &w[..i], &w[end..]);
+            }
             let Some(i) = w.find("://") else { return w.to_string() };
             let start = w[..i].rfind(|c: char| !c.is_ascii_alphanumeric() && !"+-.".contains(c)).map_or(0, |p| p + 1);
             let rest = &w[i + 3..];
@@ -65,5 +74,8 @@ mod tests {
         assert_eq!(r, "fetch https://addon.example:7000/<redacted> failed\nnext");
         assert!(!r.contains("SECRET") && !r.contains("pw") && !r.contains("abc"));
         assert_eq!(redact("no urls here"), "no urls here");
+        let m = redact("add magnet:?xt=urn:btih:ABC123&tr=x ok");
+        assert_eq!(m, "add magnet:<redacted> ok");
+        assert!(!m.contains("ABC123"));
     }
 }
