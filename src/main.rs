@@ -1298,6 +1298,12 @@ struct App {
     media_shown: Option<(String, bool, u64)>,
 }
 
+/// `<data>/screenshots/<title>-<unix secs>.png`, with the title reduced to filename-safe characters.
+fn screenshot_path(dir: &std::path::Path, title: &str, secs: u64) -> PathBuf {
+    let t: String = title.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).take(60).collect();
+    dir.join("screenshots").join(format!("{t}-{secs}.png"))
+}
+
 fn data_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("STREMFLIX_RS_DATA") {
         return d.into();
@@ -3482,6 +3488,12 @@ impl App {
             if k(ArrowUp) { cmd(&["add", "volume", "5"]); new_vol = Some(st.volume + 5.0) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]); new_vol = Some(st.volume - 5.0) }
             if k(M) { cmd(&["cycle", "mute"]) }
+            if k(S) && focused.is_none() {
+                let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                let path = screenshot_path(&self.data_dir, &p.title, secs);
+                let _ = path.parent().map(std::fs::create_dir_all);
+                cmd(&["screenshot-to-file", &path.to_string_lossy(), "video"]);
+            }
             if k(I) && focused.is_none() { p.stats = !p.stats }
             // mpv pauses on its own after a frame step.
             if k(Period) { cmd(&["frame-step"]) }
@@ -4106,6 +4118,9 @@ impl App {
             }
             if self.addon_details.as_ref() == Some(url) {
                 Self::ui_addon_details(ui, m);
+            }
+            if let Some(link) = stremflix_rs::addon::install_link(url) {
+                ui.collapsing("Install on phone (QR)", |ui| qr_ui(ui, &link));
             }
             if let Some((old, pasted)) = self.configuring.as_mut().filter(|(o, _)| o == url)
                 && form_row(ui, "Configured URL:", pasted, "https://.../manifest.json", "Replace", None, false)
@@ -5282,6 +5297,23 @@ fn seek_step(v: Option<String>, default: u32) -> u32 {
     v.and_then(|v| v.parse().ok()).filter(|v| SEEK_STEP_RANGE.contains(v)).unwrap_or(default)
 }
 
+/// Draw `text` as a QR code of egui rects (no image files); dark on white so phones scan it in any theme.
+fn qr_ui(ui: &mut egui::Ui, text: &str) {
+    let Ok(code) = qrcode::QrCode::new(text) else {
+        ui.label(RichText::new("Link too long for a QR code").weak());
+        return;
+    };
+    let (w, quiet, px) = (code.width(), 2, 4.0);
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat((w + 2 * quiet) as f32 * px), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
+    for (i, c) in code.to_colors().into_iter().enumerate() {
+        if c == qrcode::Color::Dark {
+            let p = rect.min + vec2(((i % w) + quiet) as f32, ((i / w) + quiet) as f32) * px;
+            ui.painter().rect_filled(egui::Rect::from_min_size(p, egui::Vec2::splat(px)), 0.0, Color32::BLACK);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5822,6 +5854,12 @@ mod tests {
         for not in ["https://x.example/a.torrent", "magnet:?xt=urn:btih:a.torrent", "/m/a.mkv", "/m/torrent"] {
             assert!(!is_torrent_file(not), "{not}");
         }
+    }
+
+    #[test]
+    fn screenshot_path_is_filename_safe() {
+        let p = screenshot_path(std::path::Path::new("/d"), "A/B: c", 7);
+        assert_eq!(p, std::path::Path::new("/d/screenshots/A_B__c-7.png"));
     }
 
     #[test]
