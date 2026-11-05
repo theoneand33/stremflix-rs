@@ -43,7 +43,7 @@ pub fn redact(s: &str) -> String {
                 return format!("{}magnet:<redacted>{}", &w[..i], &w[end..]);
             }
             let Some(i) = w.find("://") else { return w.to_string() };
-            let start = w[..i].rfind(|c: char| !c.is_ascii_alphanumeric() && !"+-.".contains(c)).map_or(0, |p| p + 1);
+            let start = w[..i].char_indices().rev().find(|(_, c)| !c.is_ascii_alphanumeric() && !"+-.".contains(*c)).map_or(0, |(p, c)| p + c.len_utf8());
             let rest = &w[i + 3..];
             let end = rest.find(|c: char| c.is_whitespace() || "\"'<>)".contains(c)).unwrap_or(rest.len());
             let (url, tail) = rest.split_at(end);
@@ -77,5 +77,9 @@ mod tests {
         let m = redact("add magnet:?xt=urn:btih:ABC123&tr=x ok");
         assert_eq!(m, "add magnet:<redacted> ok");
         assert!(!m.contains("ABC123"));
+        let u = redact("“https://a.example/SECRET” 日本https://b.example/TOKEN");
+        assert_eq!(u, "https://a.example/<redacted> https://b.example/<redacted>");
+        assert!(!u.contains("SECRET") && !u.contains("TOKEN"));
+        assert!(!redact("日本magnet:?xt=urn:btih:ABC123").contains("ABC123"));
     }
 }
