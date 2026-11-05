@@ -1310,7 +1310,7 @@ impl App {
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
-            addon_orders: ADDON_ORDER_KINDS.iter().filter_map(|k| Some((k.to_string(), decode_keys(&db.setting(&format!("addon_order:{k}")).ok()??)))).collect(),
+            addon_orders: ADDON_ORDER_KINDS.iter().map(|k| Ok((k.to_string(), decode_keys(&db.setting(&format!("addon_order:{k}"))?.unwrap_or_default())))).collect::<Result<_>>()?,
             addon_order_kind: String::new(),
             home_hidden: decode_keys(&db.setting("home_hidden")?.unwrap_or_default()),
             home_all: Vec::new(),
@@ -3929,11 +3929,16 @@ impl App {
         let mut replace = None;
         let mut swap = None;
         let mut details = None;
+        let mut reset_order = false;
         ui.horizontal(|ui| {
             ui.label("Order for:");
             for (k, label) in [("", "All"), ("movie", "Movies"), ("series", "Series")] {
                 ui.selectable_value(&mut self.addon_order_kind, k.to_string(), label);
             }
+            if !self.addon_order_kind.is_empty() && self.addon_orders.get(&self.addon_order_kind).is_some_and(|o| !o.is_empty()) && small_button(ui, "Reset to global").clicked() {
+                reset_order = true;
+            }
+            ui.label("Per-type order applies to metadata, streams and subtitles; catalog rows and search keep the global order.");
         });
         let n = self.addons.len();
         let urls: Vec<String> = self.addons.iter().map(|(u, _)| u.clone()).collect();
@@ -4014,6 +4019,15 @@ impl App {
         if let Some(d) = details {
             self.addon_details = d;
         }
+        if reset_order {
+            match self.db.set_setting(&format!("addon_order:{}", self.addon_order_kind), "") {
+                Ok(()) => {
+                    self.addon_orders.remove(&self.addon_order_kind);
+                    self.build_rows(&ctx);
+                }
+                Err(e) => report(&mut self.error, format!("saving addon order: {e:#}")),
+            }
+        }
         if let Some(p) = swap {
             let mut ordered: Vec<String> = view.iter().map(|&i| urls[i].clone()).collect();
             ordered.swap(p, p + 1);
@@ -4023,7 +4037,9 @@ impl App {
                 self.db.reorder_addons(&ordered)
             } else {
                 let r = self.db.set_setting(&format!("addon_order:{kind}"), &encode_keys(&ordered));
-                self.addon_orders.insert(kind, ordered);
+                if r.is_ok() {
+                    self.addon_orders.insert(kind, ordered);
+                }
                 r
             };
             if let Err(e) = saved {
