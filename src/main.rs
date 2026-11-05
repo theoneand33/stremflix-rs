@@ -3591,6 +3591,9 @@ impl App {
             if self.addon_details.as_ref() == Some(url) {
                 Self::ui_addon_details(ui, m);
             }
+            if let Some(link) = stremflix_rs::addon::install_link(url) {
+                ui.collapsing("Install on phone (QR)", |ui| qr_ui(ui, &link));
+            }
             if let Some((old, pasted)) = self.configuring.as_mut().filter(|(o, _)| o == url)
                 && form_row(ui, "Configured URL:", pasted, "https://.../manifest.json", "Replace", None, false)
             {
@@ -4560,6 +4563,23 @@ const SEEK_STEP_RANGE: std::ops::RangeInclusive<u32> = 1..=600;
 /// Saved seek step in seconds; a missing, unparsable or out-of-range value falls back to `default`.
 fn seek_step(v: Option<String>, default: u32) -> u32 {
     v.and_then(|v| v.parse().ok()).filter(|v| SEEK_STEP_RANGE.contains(v)).unwrap_or(default)
+}
+
+/// Draw `text` as a QR code of egui rects (no image files); dark on white so phones scan it in any theme.
+fn qr_ui(ui: &mut egui::Ui, text: &str) {
+    let Ok(code) = qrcode::QrCode::new(text) else {
+        ui.label(RichText::new("Link too long for a QR code").weak());
+        return;
+    };
+    let (w, quiet, px) = (code.width(), 2, 4.0);
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat((w + 2 * quiet) as f32 * px), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
+    for (i, c) in code.to_colors().into_iter().enumerate() {
+        if c == qrcode::Color::Dark {
+            let p = rect.min + vec2(((i % w) + quiet) as f32, ((i / w) + quiet) as f32) * px;
+            ui.painter().rect_filled(egui::Rect::from_min_size(p, egui::Vec2::splat(px)), 0.0, Color32::BLACK);
+        }
+    }
 }
 
 #[cfg(test)]

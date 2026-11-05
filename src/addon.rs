@@ -471,6 +471,12 @@ pub fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_TEXT && !s.chars().any(|c| c.is_control() || c == '/')
 }
 
+/// The `stremio://` install link for an http(s) manifest URL (what a phone's Stremio opens).
+pub fn install_link(manifest_url: &str) -> Option<String> {
+    let u = safe_http_url(manifest_url)?;
+    Some(format!("stremio://{}", u.as_str().split_once("://")?.1))
+}
+
 /// A `stremio://` link from the OS (browser, other apps).
 #[derive(Debug, PartialEq)]
 pub enum DeepLink {
@@ -715,6 +721,14 @@ pub fn check_poster(body: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod configure_tests {
     use super::*;
+
+    #[test]
+    fn install_link_roundtrips() {
+        let l = install_link("https://a.example/x/manifest.json").unwrap();
+        assert_eq!(l, "stremio://a.example/x/manifest.json");
+        assert_eq!(parse_deep_link(&l), Some(DeepLink::Addon(Url::parse("https://a.example/x/manifest.json").unwrap())));
+        assert_eq!(install_link("file:///x"), None);
+    }
 
     #[test]
     fn configure_url_derivation() {
