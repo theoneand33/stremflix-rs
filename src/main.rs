@@ -961,6 +961,10 @@ struct Playing {
     /// Per-session picture scaling: aspect override index into `ASPECTS`, fill (crop) instead of fit, zoom in tenths.
     aspect: usize,
     fill: bool,
+    /// A-B loop points in seconds, as set from the menu.
+    ab: [Option<f64>; 2],
+    /// Repeat the current file.
+    repeat: bool,
     zoom: i32,
     /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
     awake: Option<Option<keepawake::KeepAwake>>,
@@ -1754,7 +1758,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None, hidden_vid: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), awake: None, hidden_vid: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -3396,6 +3400,25 @@ impl App {
                                 p.zoom = 0;
                                 cmd(&["set", "video-zoom", "0"]);
                             }
+                            if switch_row(ui, "Repeat file", &mut p.repeat).changed() {
+                                cmd(&["set", "loop-file", if p.repeat { "inf" } else { "no" }]);
+                            }
+                            menu_heading(ui, "A-B loop");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                for (i, (name, prop)) in [("A", "ab-loop-a"), ("B", "ab-loop-b")].into_iter().enumerate() {
+                                    let label = p.ab[i].map_or(format!("Set {name}"), |t| format!("{name} {t:.0}s"));
+                                    if pill(ui, &label, p.ab[i].is_some(), egui::Role::Button).clicked() {
+                                        p.ab[i] = Some(st.pos);
+                                        cmd(&["set", prop, &st.pos.to_string()]);
+                                    }
+                                }
+                                if pill(ui, "Clear", false, egui::Role::Button).clicked() {
+                                    p.ab = [None; 2];
+                                    cmd(&["set", "ab-loop-a", "no"]);
+                                    cmd(&["set", "ab-loop-b", "no"]);
+                                }
+                            });
                             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                                 cmd(&["set", "hwdec", hwdec_value(self.hwdec)]);
                                 if let Err(e) = self.db.set_setting("hwdec", if self.hwdec { "1" } else { "0" }) {
