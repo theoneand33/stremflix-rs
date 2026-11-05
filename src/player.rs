@@ -439,7 +439,7 @@ impl Player {
     /// yt-dlp runs only for the exact YouTube URL built from a validated `ytId`; `hwdec` toggles hardware decoding.
     /// Must be called, rendered and dropped with the GUI's GL context current.
     #[allow(clippy::too_many_arguments)] // player setup options; bundling them adds no clarity
-    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], subs_off: bool, headers: &[(String, String)], hwdec: bool, gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
+    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], subs_off: bool, headers: &[(String, String)], demuxer: Option<&str>, hwdec: bool, gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
         load_mpv().map_err(anyhow::Error::msg)?;
         let mpv = unsafe { mpv_create() };
         if mpv.is_null() {
@@ -472,6 +472,7 @@ impl Player {
             opts.push(("sid".into(), "no".into()));
         }
         opts.extend(header_options(headers));
+        opts.extend(demuxer.map(|f| ("demuxer-lavf-format".to_string(), f.to_string())));
         opts.extend(parse_args(&std::env::var("STREMFLIX_RS_MPV_ARGS").unwrap_or_default()));
         for (k, v) in &opts {
             let rc = unsafe { mpv_set_option_string(mpv, cstr(k).as_ptr(), cstr(v).as_ptr()) };
