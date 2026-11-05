@@ -345,6 +345,11 @@ pub fn parse_args(s: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Not a remote URL: a file path, or the loopback torrent stream (never proxied).
+fn is_local(source: &str) -> bool {
+    url::Url::parse(source).ok().and_then(|u| u.host_str().map(|h| matches!(h, "localhost" | "127.0.0.1" | "[::1]"))).unwrap_or(true)
+}
+
 /// HTTP request headers as mpv options: User-Agent as the plain-string `user-agent`, the rest as the
 /// comma-separated `http-header-fields` list. mpv reads `\,` as a literal comma, but a value's own
 /// backslash would make that ambiguous, so such headers are dropped.
@@ -508,12 +513,16 @@ impl Player {
             opts.push(("sid".into(), "no".into()));
         }
         opts.extend(header_options(headers));
+        // ffmpeg has no SOCKS support, so only an HTTP proxy reaches mpv; the local torrent stream stays direct.
+        if let Some(p) = crate::addon::PROXY.get().filter(|p| p.scheme() == "http" && !is_local(source)) {
+            opts.push(("http-proxy".into(), p.to_string()));
+        }
         opts.extend(demuxer.map(|f| ("demuxer-lavf-format".to_string(), f.to_string())));
         opts.extend(parse_args(&std::env::var("STREMFLIX_RS_MPV_ARGS").unwrap_or_default()));
         for (k, v) in &opts {
             let rc = unsafe { mpv_set_option_string(mpv, cstr(k).as_ptr(), cstr(v).as_ptr()) };
             if rc < 0 {
-                bail!("mpv option {k}={v}: {}", err_text(rc));
+                bail!("mpv option {k}={}: {}", if k == "http-proxy" { "<proxy>" } else { v }, err_text(rc));
             }
         }
         let rc = unsafe { mpv_initialize(mpv) };
@@ -706,6 +715,14 @@ impl Drop for Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_sources_skip_the_proxy() {
+        for s in ["/home/a.mkv", "C:\\a.mkv", "http://127.0.0.1:4000/torrents/0/stream/1", "http://localhost/x", "http://[::1]:9/x"] {
+            assert!(is_local(s), "{s}");
+        }
+        assert!(!is_local("https://cdn.example/a.mp4"));
+    }
 
     #[test]
     fn chapter_titles_classify_by_word() {
