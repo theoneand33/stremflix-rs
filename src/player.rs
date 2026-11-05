@@ -350,6 +350,13 @@ fn is_local(source: &str) -> bool {
     url::Url::parse(source).ok().and_then(|u| u.host_str().map(|h| matches!(h, "localhost" | "127.0.0.1" | "[::1]"))).unwrap_or(true)
 }
 
+/// Default User-Agent first; an addon's own User-Agent comes later in `header_options` and wins.
+fn ua_and_headers(default_ua: String, headers: &[(String, String)]) -> Vec<(String, String)> {
+    let mut o = vec![("user-agent".to_string(), default_ua)];
+    o.extend(header_options(headers));
+    o
+}
+
 /// HTTP request headers as mpv options: User-Agent as the plain-string `user-agent`, the rest as the
 /// comma-separated `http-header-fields` list. mpv reads `\,` as a literal comma, but a value's own
 /// backslash would make that ambiguous, so such headers are dropped.
@@ -512,8 +519,7 @@ impl Player {
         if subs_off {
             opts.push(("sid".into(), "no".into()));
         }
-        opts.push(("user-agent".into(), crate::addon::user_agent())); // default; an addon's own User-Agent comes later and wins
-        opts.extend(header_options(headers));
+        opts.extend(ua_and_headers(crate::addon::user_agent(), headers));
         // ffmpeg has no SOCKS support, so only an HTTP proxy reaches mpv; the local torrent stream stays direct.
         if let Some(p) = crate::addon::PROXY.get().filter(|p| p.scheme() == "http" && !is_local(source)) {
             opts.push(("http-proxy".into(), p.to_string()));
@@ -844,6 +850,13 @@ mod tests {
         let o = header_options(&[h("User-Agent", "Moz (KHTML, like Gecko)"), h("Referer", "https://a.example/"), h("Accept", "a, b"), h("X-Bad", r"c\")]);
         assert_eq!(o, [h("user-agent", "Moz (KHTML, like Gecko)"), h("http-header-fields", r"Referer: https://a.example/,Accept: a\, b")]);
         assert!(header_options(&[]).is_empty());
+    }
+
+    #[test]
+    fn addon_user_agent_comes_after_default() {
+        let h = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let o = ua_and_headers("def".into(), &[h("User-Agent", "addon")]);
+        assert_eq!(o, [h("user-agent", "def"), h("user-agent", "addon")]);
     }
 
     #[test]

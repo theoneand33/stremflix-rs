@@ -1054,7 +1054,7 @@ impl AddonClient {
         let http = self.http.get_or_init(|| {
             let b = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
-                .redirect(reqwest::redirect::Policy::limited(3))
+                .redirect(reqwest::redirect::Policy::limited(3));
             with_proxy(b).map_err(|e| format!("{e}"))?.build().map_err(|e| format!("HTTP client: {e}"))
         });
         http.as_ref().map_err(|e| anyhow::anyhow!("{e}"))
