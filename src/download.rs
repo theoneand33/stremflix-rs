@@ -26,6 +26,26 @@ pub fn file_name(title: &str, hint: Option<&str>) -> String {
     format!("{stem}.{ext}")
 }
 
+/// `<sanitized title> <lang>.srt`; addon text never reaches the path. mpv sniffs the format, so `.srt` fits any text subtitle.
+pub fn subtitle_name(title: &str, lang: &str) -> String {
+    let n = file_name(&format!("{title} {lang}"), None);
+    format!("{}.srt", n.strip_suffix(".mkv").unwrap_or(&n))
+}
+
+/// Write `data` to a free `subtitle_name` in `dir`; the path it landed at.
+pub async fn save_subtitle(dir: &Path, title: &str, lang: &str, data: &[u8]) -> Result<PathBuf> {
+    let path = reserve(dir, &subtitle_name(title, lang))?;
+    let res = match tokio::fs::write(part(&path), data).await {
+        Ok(()) => tokio::fs::rename(part(&path), &path).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(part(&path));
+        return Err(e.into());
+    }
+    Ok(path)
+}
+
 /// Where a download is written until it completes.
 pub fn part(path: &Path) -> PathBuf {
     let mut p = path.as_os_str().to_owned();
@@ -99,20 +119,31 @@ pub fn clear_partial(dir: &Path, keep: &[PathBuf]) {
     }
 }
 
-/// Byte offset to continue from after asking for `bytes=have-`: `have` only if the server answered
-/// 206 with a `Content-Range` starting there, else 0 (it ignored the range, so start over).
-pub fn resume_start(have: u64, status: u16, content_range: Option<&str>) -> u64 {
-    let start = content_range.and_then(|c| c.strip_prefix("bytes ")?.split('-').next()?.parse::<u64>().ok());
-    if status == 206 && start == Some(have) { have } else { 0 }
+/// Stored in place of an ETag for sources that cannot change under us (a torrent stream is fixed by its info hash).
+pub const IMMUTABLE: &str = "immutable";
+
+/// Byte offset to continue from after asking for `bytes=have-`: `have` only if the server answered 206
+/// with a `Content-Range` that starts there and whose total is `total`, else 0 (start over).
+pub fn resume_start(have: u64, status: u16, content_range: Option<&str>, total: u64) -> u64 {
+    let range = content_range.and_then(|c| c.strip_prefix("bytes ")?.split_once('/'));
+    let start = range.and_then(|(r, _)| r.split('-').next()?.parse::<u64>().ok());
+    let all = range.and_then(|(_, t)| t.parse::<u64>().ok());
+    if status == 206 && start == Some(have) && all == Some(total) { have } else { 0 }
 }
 
 /// Download `url` (with the addon's request `headers`) into `part(dest)`, then move it to `dest`.
-/// Continues a `.part` left by a pause if the server supports ranges. `progress(got, total)` runs about 4 times a second.
-pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path, mut progress: impl FnMut(u64, u64)) -> Result<()> {
+/// Continues a `.part` left by a pause only if the file is unchanged: `prev` is the validator (ETag or
+/// Last-Modified, sent as `If-Range`) and total size stored when it started; without them it restarts.
+/// `progress(got, total, validator)` runs about 4 times a second. When `cancel` fires (or its sender
+/// drops) the written bytes are flushed first, so the `.part` length is the resume offset.
+pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path, prev: (&str, u64), cancel: &mut tokio::sync::oneshot::Receiver<()>, mut progress: impl FnMut(u64, u64, &str)) -> Result<()> {
     // No total timeout: a movie can take hours. A stalled connection still fails.
     let client = reqwest::Client::builder().user_agent("stremflix-rs").connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(120)).build()?;
     let tmp = part(dest);
     let mut have = tokio::fs::metadata(&tmp).await.map_or(0, |m| m.len());
+    if prev.0.is_empty() || prev.1 == 0 {
+        have = 0;
+    }
     let (mut resp, start) = loop {
         let mut req = client.get(url);
         for (k, v) in headers {
@@ -120,8 +151,11 @@ pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path, mut pro
         }
         if have > 0 {
             req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
+            if prev.0 != IMMUTABLE {
+                req = req.header(reqwest::header::IF_RANGE, prev.0);
+            }
         }
-        let resp = req.send().await.context("download")?;
+        let resp = tokio::select! { r = req.send() => r.context("download")?, _ = &mut *cancel => anyhow::bail!("stopped") };
         // 416: the `.part` is not a prefix of the file (or is all of it); start over.
         if have > 0 && resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
             have = 0;
@@ -129,7 +163,12 @@ pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path, mut pro
         }
         let resp = resp.error_for_status()?;
         let cr = resp.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok());
-        let start = if have > 0 { resume_start(have, resp.status().as_u16(), cr) } else { 0 };
+        let start = if have > 0 { resume_start(have, resp.status().as_u16(), cr, prev.1) } else { 0 };
+        // A 206 that doesn't continue our `.part` (the file changed): ask again for the whole file.
+        if have > 0 && start == 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            have = 0;
+            continue;
+        }
         break (resp, start);
     };
     let kind = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
@@ -139,19 +178,32 @@ pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path, mut pro
     let Some(body) = resp.content_length() else { anyhow::bail!("the server gave no file size (likely a live stream), so it can't be downloaded") };
     ensure!(body > 0 || start > 0, "the server sent an empty file");
     let len = start + body;
+    let h = |n| resp.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let validator = h("etag").filter(|e| !e.starts_with("W/")).or_else(|| h("last-modified")).unwrap_or_else(|| if prev.0 == IMMUTABLE { IMMUTABLE.into() } else { String::new() });
     let mut f = tokio::fs::OpenOptions::new().write(true).create(true).append(start > 0).truncate(start == 0).open(&tmp).await?;
     let mut got = start;
     let mut last = Instant::now();
-    progress(got, len);
-    while let Some(chunk) = resp.chunk().await? {
+    progress(got, len, &validator);
+    loop {
+        let chunk = tokio::select! {
+            c = resp.chunk() => c?,
+            _ = &mut *cancel => {
+                // Await the last buffered write so the `.part` length is exactly what was received.
+                f.flush().await?;
+                f.sync_all().await?;
+                anyhow::bail!("stopped")
+            }
+        };
+        let Some(chunk) = chunk else { break };
         f.write_all(&chunk).await?;
         got += chunk.len() as u64;
         if last.elapsed() >= Duration::from_millis(250) {
             last = Instant::now();
-            progress(got, len);
+            progress(got, len, &validator);
         }
     }
     ensure!(len == got, "download cut off at {got} of {len} bytes");
+    f.flush().await?;
     f.sync_all().await?;
     finish(&tmp, dest)
 }
@@ -187,6 +239,7 @@ mod tests {
         assert_eq!(file_name(&"x".repeat(500), None).len(), 124);
         assert!(file_name(&"é".repeat(500), None).len() <= 124, "capped by bytes");
         assert_eq!(file_name("nul", None), "_nul.mkv");
+        assert_eq!(subtitle_name("../x/Film: 2", "eng"), "___x_Film_ 2 eng.srt");
     }
 
     #[test]
@@ -215,10 +268,12 @@ mod tests {
 
     #[test]
     fn resume_needs_a_matching_206() {
-        assert_eq!(resume_start(5, 206, Some("bytes 5-9/10")), 5);
-        assert_eq!(resume_start(5, 200, None), 0, "range ignored");
-        assert_eq!(resume_start(5, 206, Some("bytes 0-9/10")), 0, "wrong offset");
-        assert_eq!(resume_start(5, 206, None), 0);
+        assert_eq!(resume_start(5, 206, Some("bytes 5-9/10"), 10), 5);
+        assert_eq!(resume_start(5, 200, None, 10), 0, "range ignored");
+        assert_eq!(resume_start(5, 206, Some("bytes 0-9/10"), 10), 0, "wrong offset");
+        assert_eq!(resume_start(5, 206, Some("bytes 5-12/13"), 10), 0, "file size changed");
+        assert_eq!(resume_start(5, 206, Some("bytes 5-9/*"), 10), 0, "unknown total");
+        assert_eq!(resume_start(5, 206, None, 10), 0);
     }
 
     #[test]
@@ -247,28 +302,73 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let dest = reserve(dir.path(), "a.mp4").unwrap();
-        fetch(&format!("http://{addr}/a.mp4"), &[], &dest, |_, _| {}).await.unwrap();
+        let (_tx, mut rx) = tokio::sync::oneshot::channel();
+        fetch(&format!("http://{addr}/a.mp4"), &[], &dest, ("", 0), &mut rx, |_, _, _| {}).await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
         assert!(!part(&dest).exists());
     }
 
-    #[tokio::test]
-    async fn fetch_resumes_with_a_range() {
+    /// Serves one canned response per connection and returns the lower-cased requests.
+    fn serve(responses: Vec<&'static [u8]>) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
+        let h = std::thread::spawn(move || {
             use std::io::{Read, Write};
-            let (mut s, _) = listener.accept().unwrap();
-            let mut buf = [0; 1024];
-            let n = s.read(&mut buf).unwrap();
-            s.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-4/5\r\nContent-Length: 3\r\nConnection: close\r\n\r\nllo").unwrap();
-            String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+            responses
+                .into_iter()
+                .map(|r| {
+                    let (mut s, _) = listener.accept().unwrap();
+                    let mut buf = [0; 1024];
+                    let n = s.read(&mut buf).unwrap();
+                    s.write_all(r).unwrap();
+                    String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+                })
+                .collect()
         });
+        (addr, h)
+    }
+
+    #[tokio::test]
+    async fn fetch_resumes_with_a_range() {
+        let (addr, server) = serve(vec![b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-4/5\r\nContent-Length: 3\r\nConnection: close\r\n\r\nllo"]);
         let dir = tempfile::tempdir().unwrap();
         let dest = reserve(dir.path(), "a.mp4").unwrap();
         std::fs::write(part(&dest), b"he").unwrap();
-        fetch(&format!("http://{addr}/a.mp4"), &[], &dest, |_, _| {}).await.unwrap();
-        assert!(server.join().unwrap().contains("range: bytes=2-"));
+        let (_tx, mut rx) = tokio::sync::oneshot::channel();
+        fetch(&format!("http://{addr}/a.mp4"), &[], &dest, ("\"v1\"", 5), &mut rx, |_, _, _| {}).await.unwrap();
+        let req = &server.join().unwrap()[0];
+        assert!(req.contains("range: bytes=2-") && req.contains("if-range: \"v1\""), "{req}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn fetch_restarts_when_the_file_changed() {
+        // The server ignores If-Range's mismatch by sending a 206 of a different total, then serves the whole new file.
+        let (addr, server) = serve(vec![
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-8/9\r\nContent-Length: 7\r\nConnection: close\r\n\r\nrld-new",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nETag: \"v2\"\r\nConnection: close\r\n\r\nworld-new",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = reserve(dir.path(), "a.mp4").unwrap();
+        std::fs::write(part(&dest), b"he").unwrap();
+        let (_tx, mut rx) = tokio::sync::oneshot::channel();
+        let seen = std::cell::RefCell::new(String::new());
+        fetch(&format!("http://{addr}/a.mp4"), &[], &dest, ("\"v1\"", 5), &mut rx, |_, _, v| *seen.borrow_mut() = v.to_string()).await.unwrap();
+        let reqs = server.join().unwrap();
+        assert!(reqs[0].contains("range: bytes=2-") && !reqs[1].contains("range:"), "{reqs:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"world-new");
+        assert_eq!(*seen.borrow(), "\"v2\"");
+    }
+
+    #[tokio::test]
+    async fn fetch_without_a_validator_restarts() {
+        let (addr, server) = serve(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"]);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = reserve(dir.path(), "a.mp4").unwrap();
+        std::fs::write(part(&dest), b"he").unwrap();
+        let (_tx, mut rx) = tokio::sync::oneshot::channel();
+        fetch(&format!("http://{addr}/a.mp4"), &[], &dest, ("", 5), &mut rx, |_, _, _| {}).await.unwrap();
+        assert!(!server.join().unwrap()[0].contains("range:"));
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
     }
 }

@@ -58,8 +58,9 @@ For series, pick a season and episode. ⏭ in the player opens the next episode.
 | Key | Action |
 |---|---|
 | Space, K, click | Pause |
-| ←/→ | Skip 10 s |
-| ↑/↓, M | Volume, mute |
+| ←/→, Shift+←/→ | Skip 10 s / 30 s (Settings) |
+| ↑/↓, wheel, M | Volume, mute |
+| ,/. | Step one frame back / forward (pauses) |
 | F, double-click | Full screen |
 | Esc | Leave full screen / back |
 
@@ -67,7 +68,7 @@ The bottom-right buttons open the Audio, Subtitles, and Playback panels. Playbac
 
 ### Torrents
 
-Play a magnet or `.torrent` from Library → Torrent, drop a `.torrent` on the window, or paste a magnet with no text field focused (dragging magnet links doesn't work). Settings sets the torrent folder, a cache size, and a connection profile (Soft 40 / Default 128 / Fast 300 peers). With no cache (the default), a torrent's files are deleted when playback stops.
+Play a magnet or `.torrent` from Library → Torrent, drop a `.torrent` on the window, or paste a magnet with no text field focused (dragging magnet links doesn't work). Settings sets the torrent folder, a cache size, a connection profile (Soft 40 / Default 128 / Fast 300 peers), and download/upload speed limits. With no cache (the default), a torrent's files are deleted when playback stops.
 
 ### `stremio://` links
 
