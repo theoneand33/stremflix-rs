@@ -56,7 +56,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Remote/LAN streaming server | P2 | L | Stremio serves the library to other devices; casting is a separate item. |
-| Per-type addon ordering | P3 | S | One global priority list today. |
 
 ### Accounts and sync
 
