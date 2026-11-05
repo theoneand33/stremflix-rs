@@ -254,6 +254,35 @@ struct Row {
     exhausted: bool,
 }
 
+/// Stable id of a Home row: `<addon url>|<type>|<catalog id>`.
+fn row_key(src: &(String, String, String)) -> String {
+    format!("{}|{}|{}", src.0, src.1, src.2)
+}
+
+/// Indices into `keys` with the keys in `order` first (unknown or repeated ones skipped), the rest in their own order.
+fn arrange_rows(keys: &[String], order: &[String]) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for k in order {
+        if let Some(i) = keys.iter().position(|x| x == k)
+            && !out.contains(&i)
+        {
+            out.push(i);
+        }
+    }
+    let rest: Vec<usize> = (0..keys.len()).filter(|i| !out.contains(i)).collect();
+    out.extend(rest);
+    out
+}
+
+/// Keys contain `|` and URLs, so settings hold them as a JSON array.
+fn encode_keys(keys: &[String]) -> String {
+    serde_json::to_string(keys).unwrap_or_default()
+}
+
+fn decode_keys(s: &str) -> Vec<String> {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
 /// How far back an episode's release date still counts as new.
 const NEW_EPISODE_DAYS: i64 = 14;
 
@@ -921,6 +950,8 @@ struct Playing {
     hold: Option<f64>,
     /// The last click on the video was a hold release, so the next one must not pair with it into a double-click.
     after_hold: bool,
+    /// Wheel scroll not yet turned into volume steps (points).
+    wheel: f32,
     /// The up-next card was dismissed.
     next_dismissed: bool,
     search: SubSearch,
@@ -1036,6 +1067,11 @@ struct App {
     external_player: String,
     /// mpv hardware decoding.
     hwdec: bool,
+    /// Custom Home row order and hidden rows (row keys).
+    home_order: Vec<String>,
+    home_hidden: Vec<String>,
+    /// Every Home row as (key, title) in display order, hidden ones included.
+    home_all: Vec<(String, String)>,
     light: bool,
     /// Play the next episode when one ends.
     autoplay_next: bool,
@@ -1130,6 +1166,9 @@ impl App {
             torrent_profile: Profile::from_label(&db.setting("torrent_profile")?.unwrap_or_default()),
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
+            home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
+            home_hidden: decode_keys(&db.setting("home_hidden")?.unwrap_or_default()),
+            home_all: Vec::new(),
             light: db.setting("theme")?.as_deref() == Some("light"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
             volume: db.setting("volume")?.and_then(|v| v.parse().ok()).filter(|v| (0.0..=130.0).contains(v)).unwrap_or(100.0),
@@ -1685,7 +1724,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -1876,13 +1915,18 @@ impl App {
             let suffix = if name.to_lowercase().contains(&kind.to_lowercase()) { String::new() } else { format!(" ({kind})") };
             rows.push((format!("{addon} - {name}{suffix}"), i));
         }
-        self.rows = rows
+        let rows: Vec<Row> = rows
             .into_iter()
             .map(|(title, i)| {
                 let (u, _, c) = cats[i];
                 Row { title, src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: c.supports("skip"), fetched: 0, loading_more: false, exhausted: false }
             })
             .collect();
+        let keys: Vec<String> = rows.iter().map(|r| row_key(&r.src)).collect();
+        let mut rows: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
+        let ordered: Vec<Row> = arrange_rows(&keys, &self.home_order).into_iter().filter_map(|i| rows[i].take()).collect();
+        self.home_all = ordered.iter().map(|r| (row_key(&r.src), r.title.clone())).collect();
+        self.rows = ordered.into_iter().filter(|r| !self.home_hidden.contains(&row_key(&r.src))).collect();
         for src in self.rows.iter().map(|r| r.src.clone()).collect::<Vec<_>>() {
             let client = self.client.clone();
             self.spawn(ctx, async move {
@@ -2931,6 +2975,7 @@ impl App {
             p.after_hold = long;
         }
         let focused = ctx.memory(|m| m.focused());
+        let line = ctx.options(|o| o.input_options.line_scroll_speed); // read outside ctx.input to avoid nested locking
         let mut new_vol = None;
         ctx.input(|i| {
             use egui::Key::*;
@@ -2947,6 +2992,13 @@ impl App {
             // mpv pauses on its own after a frame step.
             if k(Period) { cmd(&["frame-step"]) }
             if k(Comma) { cmd(&["frame-back-step"]) }
+            // Wheel over the bare video only: `hovered` is false under a popover or a control.
+            if bg.hovered() && p.menu.is_none() {
+                let n = wheel_steps(&mut p.wheel, i.smooth_scroll_delta.y, line);
+                if n != 0 { cmd(&["add", "volume", &(n * 5).to_string()]); new_vol = Some(st.volume + f64::from(n * 5)) }
+            } else {
+                p.wheel = 0.0;
+            }
             toggle_fs |= k(F);
             if k(Escape) {
                 if fs { toggle_fs = true } else { back = true }
@@ -3877,6 +3929,58 @@ impl App {
                 }
             });
         }
+        ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(Color32::from_gray(170)));
+        ui.add_space(16.0);
+        ui.label(RichText::new("Customize Home").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        let (mut swap, mut toggle, mut reset) = (None, None, false);
+        let n = self.home_all.len();
+        for (i, (key, title)) in self.home_all.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.add_enabled_ui(i > 0, |ui| small_button(ui, "Up")).inner.clicked() {
+                    swap = Some(i - 1);
+                }
+                if ui.add_enabled_ui(i + 1 < n, |ui| small_button(ui, "Down")).inner.clicked() {
+                    swap = Some(i);
+                }
+                let hidden = self.home_hidden.contains(key);
+                if small_button(ui, if hidden { "Show" } else { "Hide" }).clicked() {
+                    toggle = Some(key.clone());
+                }
+                ui.label(if hidden { RichText::new(title).weak() } else { RichText::new(title) });
+            });
+        }
+        if self.home_all.is_empty() {
+            ui.label(RichText::new("No catalog rows yet.").weak());
+        }
+        if small_button(ui, "Reset").on_hover_text("Addon order, nothing hidden").clicked() {
+            reset = true;
+        }
+        if swap.is_some() || toggle.is_some() || reset {
+            // Show and Reset need a fetch, so they rebuild. Up, Down and Hide reorder or filter the loaded rows.
+            let rebuild = reset || toggle.as_ref().is_some_and(|k| self.home_hidden.contains(k));
+            if let Some(i) = swap {
+                self.home_all.swap(i, i + 1);
+                self.home_order = self.home_all.iter().map(|(k, _)| k.clone()).collect();
+            }
+            if let Some(k) = toggle {
+                match self.home_hidden.iter().position(|x| *x == k) {
+                    Some(p) => drop(self.home_hidden.remove(p)),
+                    None => self.home_hidden.push(k),
+                }
+            }
+            if reset {
+                (self.home_order, self.home_hidden) = (Vec::new(), Vec::new());
+            }
+            save.push(("home_order", encode_keys(&self.home_order)));
+            save.push(("home_hidden", encode_keys(&self.home_hidden)));
+            if rebuild {
+                self.build_rows(&ctx);
+            } else {
+                let order = &self.home_all;
+                self.rows.sort_by_key(|r| order.iter().position(|(k, _)| *k == row_key(&r.src)));
+                self.rows.retain(|r| !self.home_hidden.contains(&row_key(&r.src)));
+            }
+        }
         ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(ui.visuals().weak_text_color()));
         for (k, v) in save {
             if let Err(e) = self.db.set_setting(k, &v) {
@@ -4377,6 +4481,15 @@ mod mac_links {
     }
 }
 
+/// Turn wheel scroll (points) into whole volume steps, keeping the remainder; one wheel line is one step.
+fn wheel_steps(acc: &mut f32, dy: f32, line: f32) -> i32 {
+    if dy * *acc < 0.0 { *acc = 0.0; } // a direction change starts fresh
+    *acc += dy;
+    let n = (*acc / line).trunc();
+    *acc -= n * line;
+    n as i32
+}
+
 const SEEK_STEP_RANGE: std::ops::RangeInclusive<u32> = 1..=600;
 
 /// Saved seek step in seconds; a missing, unparsable or out-of-range value falls back to `default`.
@@ -4387,6 +4500,20 @@ fn seek_step(v: Option<String>, default: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_accumulates_to_steps() {
+        let mut acc = 0.0;
+        // egui's native line_scroll_speed: one real notch is 40 pt.
+        assert_eq!(wheel_steps(&mut acc, 40.0, 40.0), 1);
+        assert_eq!((0..5).map(|_| wheel_steps(&mut acc, 40.0, 40.0)).sum::<i32>(), 5);
+        assert_eq!(wheel_steps(&mut acc, -80.0, 40.0), -2);
+        assert_eq!((0..4).map(|_| wheel_steps(&mut acc, 10.0, 40.0)).sum::<i32>(), 1);
+        assert_eq!(wheel_steps(&mut acc, 0.0, 40.0), 0);
+        // A +30 leftover must not cancel a fresh -40 notch.
+        acc = 30.0;
+        assert_eq!(wheel_steps(&mut acc, -40.0, 40.0), -1);
+    }
 
     #[test]
     fn accent_name_decodes_with_fallback() {
@@ -4688,6 +4815,18 @@ mod tests {
         })
         .await;
         assert_eq!(out.into_iter().map(Result::unwrap).collect::<Vec<_>>(), [30, 0, 10]);
+    }
+
+    #[test]
+    fn home_rows_order_and_keys() {
+        let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let keys = k(&["a", "b", "c", "d"]);
+        assert_eq!(arrange_rows(&keys, &k(&["c", "zz", "a", "c"])), [2, 0, 1, 3], "stale and repeated keys ignored, rest keep priority");
+        assert_eq!(arrange_rows(&keys, &[]), [0, 1, 2, 3]);
+        let odd = k(&["http://h/m.json|movie|top \"x\"", "b"]);
+        assert_eq!(decode_keys(&encode_keys(&odd)), odd);
+        assert!(decode_keys("garbage").is_empty());
+        assert_eq!(row_key(&("u".into(), "movie".into(), "top".into())), "u|movie|top");
     }
 
     #[test]
