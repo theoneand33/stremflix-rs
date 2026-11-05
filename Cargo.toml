@@ -20,15 +20,28 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 rusty-leveldb = "4"
 serde = { version = "1.0.229", features = ["derive"] }
+# OS media keys and now-playing (MPRIS / SMTC / MPNowPlaying); zbus (pure Rust, already in the tree) avoids libdbus.
+souvlaki = { version = "0.9.3", default-features = false, features = ["use_zbus"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["full"] }
 url = "2.5.8"
 walkdir = "2.5.0"
 
+# Windows media controls (SMTC) need the window's HWND.
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+
 # macOS delivers stremio:// links as Apple events: the app runs winit's loop itself to hook them.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 winit = { version = "0.30.13", default-features = false }
+
+# Tray: StatusNotifierItem over D-Bus, on the async-io zbus accesskit already uses (no GTK, unlike tray-icon there).
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.7", default-features = false, features = ["async-io"] }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.27.0"

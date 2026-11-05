@@ -42,8 +42,8 @@ fn data_survives_reopen() {
 fn saved_titles_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("app.db");
-    let movie = SavedTitle { key: "movie:tt1".into(), title: "One".into(), kind: "movie".into(), poster: Some("https://x.example/p.jpg".into()) };
-    let show = SavedTitle { key: "series:tt2".into(), title: "Two".into(), kind: "series".into(), poster: None };
+    let movie = SavedTitle { key: "movie:tt1".into(), title: "One".into(), kind: "movie".into(), poster: Some("https://x.example/p.jpg".into()), year: Some(2020), rating: Some(7.5), last_watched: None };
+    let show = SavedTitle { key: "series:tt2".into(), title: "Two".into(), kind: "series".into(), poster: None, year: None, rating: None, last_watched: None };
     {
         let db = Db::open(&path).unwrap();
         db.add_saved_title(&movie).unwrap();
@@ -54,13 +54,60 @@ fn saved_titles_round_trip() {
     let db = Db::open(&path).unwrap();
     let saved = db.saved_titles().unwrap();
     assert_eq!(saved, vec![show.clone(), SavedTitle { title: "One (2020)".into(), ..movie.clone() }]);
+    // Episode progress counts as the series being watched; an unwatched title stays None.
+    db.save_progress(&Progress { key: "series:tt2:1:1".into(), title: "T".into(), source: "s".into(), position: 1.0, duration: 2.0, poster: None }).unwrap();
+    let saved = db.saved_titles().unwrap();
+    assert!(saved[0].last_watched.is_some() && saved[1].last_watched.is_none());
+    db.set_saved_facts("series:tt2", Some(2001), Some(9.1)).unwrap();
+    assert_eq!((db.saved_titles().unwrap()[0].year, db.saved_titles().unwrap()[0].rating), (Some(2001), Some(9.1)));
     // A malformed key or type is skipped instead of breaking the list.
-    db.add_saved_title(&SavedTitle { key: "bad/key".into(), title: "Bad".into(), kind: "movie".into(), poster: None }).unwrap();
+    db.add_saved_title(&SavedTitle { key: "bad/key".into(), title: "Bad".into(), kind: "movie".into(), poster: None, year: None, rating: None, last_watched: None }).unwrap();
     assert_eq!(db.saved_titles().unwrap().len(), 2);
     assert_eq!(show.preview().map(|m| (m.kind, m.id, m.name)), Some(("series".to_string(), "tt2".to_string(), "Two".to_string())));
     assert_eq!(SavedTitle { key: "nocolon".into(), ..show.clone() }.preview(), None);
     db.remove_saved_title("movie:tt1").unwrap();
+    assert_eq!(db.saved_titles().unwrap().into_iter().map(|t| t.key).collect::<Vec<_>>(), ["series:tt2"]);
+}
+
+#[test]
+fn custom_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let movie = SavedTitle { key: "movie:tt1".into(), title: "One".into(), kind: "movie".into(), poster: None, year: None, rating: None, last_watched: None };
+    let show = SavedTitle { key: "series:tt2".into(), title: "Two".into(), kind: "series".into(), poster: None, year: None, rating: None, last_watched: None };
+    drop(Db::open(&path).unwrap()); // the migration runs again below without error
+    let db = Db::open(&path).unwrap();
+    let a = db.create_list("  Faves ").unwrap();
+    let b = db.create_list("Later").unwrap();
+    assert!(db.create_list("faves").is_err(), "unique ignoring case");
+    assert!(db.create_list("   ").is_err());
+    assert!(db.create_list(&"x".repeat(61)).is_err());
+    db.create_list(&"é".repeat(60)).unwrap();
+    db.rename_list(b, "Weekend").unwrap();
+    assert!(db.rename_list(b, "FAVES").is_err());
+    // Adding to a list saves the title too.
+    db.set_in_list(a, &movie, true).unwrap();
+    db.set_in_list(a, &movie, true).unwrap(); // idempotent
+    db.set_in_list(a, &show, true).unwrap();
+    db.set_in_list(b, &movie, true).unwrap();
+    assert_eq!(db.saved_titles().unwrap().len(), 2);
+    let lists = db.lists().unwrap();
+    assert_eq!(lists.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["Faves", "Weekend", &"é".repeat(60)]);
+    assert_eq!(lists[0].keys.len(), 2);
+    db.set_in_list(a, &show, false).unwrap();
+    assert_eq!(db.saved_titles().unwrap().len(), 2, "leaving a list keeps the title saved");
+    // Unsaving removes the title from every list.
+    db.remove_saved_title("movie:tt1").unwrap();
+    assert!(db.lists().unwrap().iter().all(|l| l.keys.is_empty()));
+    // Deleting a list cascades to its items but keeps saved titles.
+    db.set_in_list(a, &show, true).unwrap();
+    db.delete_list(a).unwrap();
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.lists().unwrap().len(), 2);
     assert_eq!(db.saved_titles().unwrap(), vec![show]);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(conn.query_row("SELECT count(*) FROM list_items", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
 }
 
 #[test]
@@ -104,6 +151,22 @@ fn watched_round_trip() {
     db.save_watched(&w, "2024-01-01T00:00:00Z").unwrap();
     assert!(db.watched_keys().unwrap().contains("movie:tt9"));
     db.set_watched("movie:tt9", false).unwrap();
+    assert!(db.watched_keys().unwrap().is_empty());
+}
+
+#[test]
+fn set_watched_many_marks_all_and_clears_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("m.db")).unwrap();
+    let keys: Vec<String> = (1..=3).map(|n| format!("series:tt1:1:{n}")).collect();
+    let prog = Progress { key: keys[1].clone(), title: "T".into(), source: "s".into(), position: 10.0, duration: 100.0, poster: None };
+    db.save_progress(&prog).unwrap();
+
+    db.set_watched_many(&keys, true).unwrap();
+    assert!(keys.iter().all(|k| db.watched_keys().unwrap().contains(k)));
+    assert!(db.progress(&keys[1]).unwrap().is_none()); // left Continue Watching
+
+    db.set_watched_many(&keys, false).unwrap();
     assert!(db.watched_keys().unwrap().is_empty());
 }
 

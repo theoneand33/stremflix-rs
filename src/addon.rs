@@ -148,6 +148,24 @@ fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<
     Ok(ManifestHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired") })
 }
 
+/// Whether `new` is strictly newer than `old`. Compares the numeric dot parts of the core;
+/// a `-` or `+` suffix is ignored, and non-numeric versions are never offered.
+pub fn is_newer(new: &str, old: &str) -> bool {
+    let core = |v: &str| {
+        let v = v.trim().trim_start_matches('v');
+        v.split(['-', '+']).next()?.split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>()
+    };
+    match (core(new), core(old)) {
+        (Some(mut a), Some(mut b)) => {
+            let n = a.len().max(b.len());
+            a.resize(n, 0);
+            b.resize(n, 0);
+            a > b
+        }
+        _ => false,
+    }
+}
+
 impl Manifest {
     pub fn has_resource(&self, name: &str) -> bool {
         self.resources.iter().any(|r| r.name() == name)
@@ -300,6 +318,11 @@ pub struct BehaviorHints {
     pub binge_group: Option<String>,
     /// `proxyHeaders.request`: headers the stream URL needs (e.g. a debrid User-Agent), each passing [`valid_header`].
     pub request_headers: Vec<(String, String)>,
+    /// `proxyHeaders.response` `Content-Type` naming a streaming manifest: the mpv demuxer to force (`hls`/`dash`).
+    /// Other response headers are ignored: mpv sniffs content and has no use for them.
+    pub demuxer: Option<&'static str>,
+    /// `notWebReady`: Stremio-web needs the streaming server's proxy for it; mpv plays it directly.
+    pub not_web_ready: bool,
     pub filename: Option<String>,
     /// `videoSize` in bytes.
     pub video_size: Option<u64>,
@@ -326,7 +349,18 @@ fn behavior_hints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BehaviorHint
     let v = serde_json::Value::deserialize(d)?;
     let text = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
     let headers = v.pointer("/proxyHeaders/request").and_then(|h| h.as_object()).into_iter().flatten();
+    let content_type = v
+        .pointer("/proxyHeaders/response")
+        .and_then(|h| h.as_object())
+        .and_then(|h| h.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")))
+        .and_then(|(k, x)| Some(x.as_str()?.trim().split(';').next()?.trim().to_ascii_lowercase()).filter(|t| valid_header(k, t)));
     Ok(BehaviorHints {
+        demuxer: match content_type.as_deref() {
+            Some("application/vnd.apple.mpegurl" | "application/x-mpegurl" | "audio/mpegurl" | "audio/x-mpegurl") => Some("hls"),
+            Some("application/dash+xml") => Some("dash"),
+            _ => None,
+        },
+        not_web_ready: v.get("notWebReady").and_then(|x| x.as_bool()).unwrap_or(false),
         binge_group: text("bingeGroup"),
         request_headers: headers
             .filter_map(|(k, x)| Some((k.clone(), x.as_str()?.trim().to_string())))
@@ -920,7 +954,7 @@ impl AddonClient {
 
     async fn get(&self, url: Url) -> Result<Vec<u8>> {
         let mut resp = self.http()?.get(url.clone()).send().await.with_context(|| format!("GET {url}"))?;
-        ensure!(resp.status().is_success(), "GET {url}: HTTP {}", resp.status());
+        ensure!(resp.status().is_success(), "HTTP {}", resp.status());
         ensure!(resp.content_length().unwrap_or(0) <= MAX_BODY as u64, "response too large");
         let mut body = Vec::new();
         while let Some(chunk) = resp.chunk().await? {
@@ -1016,6 +1050,11 @@ impl AddonClient {
     /// `extra`: Stremio subtitle extras such as `videoHash`, `videoSize` and `filename`.
     pub async fn subtitles(&self, transport_url: &str, kind: &str, id: &str, extra: &[(&str, String)]) -> Result<Vec<Subtitle>> {
         parse_subtitles(&self.get(addon_base(transport_url)?.join(&subtitles_path(kind, id, extra))?).await?)
+    }
+
+    /// Body of a subtitle file: an http(s) URL, capped at `MAX_BODY`.
+    pub async fn subtitle_file(&self, url: &str) -> Result<Vec<u8>> {
+        self.get(safe_http_url(url).context("not an http(s) URL")?).await
     }
 
     /// Up to `HASH_CHUNK` bytes of `url` from `start`, and the file size from `Content-Range` (or a 200's length).
