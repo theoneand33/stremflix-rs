@@ -11,6 +11,11 @@ use std::time::Duration;
 use crate::addon::{magnet_peers, parse_magnet_hash};
 use crate::library::MEDIA_EXTS;
 
+/// A magnet link in any scheme case, even an invalid one (so it reports "invalid magnet link" and is never read as a file).
+fn is_magnet(s: &str) -> bool {
+    s.trim_start().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("magnet:"))
+}
+
 /// How long to wait for peers to send a magnet's metadata.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -132,7 +137,7 @@ impl TorrentEngine {
 
     /// Add a magnet or local `.torrent` file; returns its handle and the file index chosen by `file_idx` or a magnet's `so=`.
     async fn add(&self, magnet: &str, file_idx: Option<usize>) -> Result<(Arc<librqbit::ManagedTorrent>, Option<usize>)> {
-        let (add, peers, file_idx) = if magnet.starts_with("magnet:") {
+        let (add, peers, file_idx) = if is_magnet(magnet) {
             parse_magnet_hash(magnet).context("invalid magnet link")?;
             // `so=<idx>` (BEP 53 select-only) carries the addon's fileIdx through saved progress.
             let so = url::Url::parse(magnet).ok().and_then(|u| u.query_pairs().find(|(k, _)| k == "so").and_then(|(_, v)| v.parse().ok()));
@@ -210,14 +215,14 @@ impl TorrentEngine {
         let stopped: Vec<_> = self.session.with_torrents(|it| it.filter(|(id, _)| Some(*id) != keep && !pinned.contains(id)).map(|(id, h)| (id, h.clone())).collect());
         for (_, h) in stopped.iter().filter(|(_, h)| !h.is_paused()) {
             if let Err(e) = self.session.pause(h).await {
-                eprintln!("pause torrent {}: {e:#}", h.id());
+                crate::elog!("pause torrent {}: {e:#}", h.id());
             }
         }
         // shortcut: counts downloaded bytes, not on-disk size (sparse files make them close); use file lengths if they drift.
         let sizes: Vec<(usize, u64)> = stopped.iter().map(|(id, h)| (*id, h.stats().progress_bytes)).collect();
         for id in evict(&sizes, self.cache) {
             if let Err(e) = self.session.delete(id.into(), true).await {
-                eprintln!("delete torrent {id}: {e:#}");
+                crate::elog!("delete torrent {id}: {e:#}");
             }
         }
     }
@@ -232,6 +237,16 @@ pub fn magnet_chooses_file(magnet: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn magnet_classification() {
+        for yes in ["magnet:?xt=bad", "MAGNET:?xt=bad", "  Magnet:?xt=bad"] {
+            assert!(is_magnet(yes), "{yes}");
+        }
+        for no in ["/m/magnet.torrent", "C:\\m\\a.torrent", "mag"] {
+            assert!(!is_magnet(no), "{no}");
+        }
+    }
 
     #[test]
     fn formats_rates() {
