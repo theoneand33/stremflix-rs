@@ -4,9 +4,23 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
-use crate::addon::{Manifest, MetaPreview, addon_base, parse_manifest, parse_magnet_hash, safe_http_url, valid_id};
-use serde_json::{Value, json};
+use crate::addon::{Manifest, MetaPreview, addon_base, parse_magnet_hash, parse_manifest, safe_http_url, valid_id};
+use crate::download::State;
 use crate::library::LibraryItem;
+use serde_json::{Value, json};
+
+/// An unfinished download: where it comes from and what a resume needs.
+#[derive(Debug, PartialEq)]
+pub struct QueuedDownload {
+    pub d: Download,
+    /// http URL or magnet.
+    pub source: String,
+    pub headers: Vec<(String, String)>,
+    pub state: State,
+    /// ETag or Last-Modified of the file when it started; empty if unknown.
+    pub validator: String,
+    pub total: u64,
+}
 
 /// Settings an export carries. Not secrets (`stremio_auth`), local paths, or `external_player` (a command to run).
 const EXPORT_SETTINGS: [&str; 9] = ["autoplay_next", "hwdec", "sub_style", "sub_off", "torrent_cache", "torrent_profile", "default_speed", "alang", "slang"];
@@ -149,6 +163,10 @@ impl Db {
         let _ = conn.execute("ALTER TABLE saved_titles ADD COLUMN rating REAL", []);
         // Addon priority (streams and catalogs follow it); older rows share 0 and keep install order.
         let _ = conn.execute("ALTER TABLE addons ADD COLUMN position INTEGER NOT NULL DEFAULT 0", []);
+        // Download queue: finished rows keep the default 'done'; queued, active, paused and failed ones carry what a resume needs.
+        for col in ["status TEXT NOT NULL DEFAULT 'done'", "source TEXT NOT NULL DEFAULT ''", "headers TEXT NOT NULL DEFAULT '[]'", "validator TEXT NOT NULL DEFAULT ''", "total INTEGER NOT NULL DEFAULT 0"] {
+            let _ = conn.execute(&format!("ALTER TABLE downloads ADD COLUMN {col}"), []);
+        }
         Ok(Self { conn })
     }
 
@@ -341,6 +359,37 @@ impl Db {
         Ok(())
     }
 
+    /// A download waiting, running or stopped: `source` (URL or magnet) and request `headers` let it resume after a restart.
+    pub fn queue_download(&self, d: &Download, source: &str, headers: &[(String, String)], state: State) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO downloads (path, kind, meta_id, video_id, title, status, source, headers) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![d.path.to_string_lossy(), d.kind, d.meta_id, d.video_id, d.title, state.as_str(), source, serde_json::to_string(headers)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_download_state(&self, d: &Download, state: State) -> Result<()> {
+        self.conn.execute("UPDATE downloads SET status = ?1 WHERE path = ?2", params![state.as_str(), d.path.to_string_lossy()])?;
+        Ok(())
+    }
+
+    /// The file's validator and size seen when a transfer started; a resume is only safe if they still match.
+    pub fn set_download_meta(&self, d: &Download, validator: &str, total: u64) -> Result<()> {
+        self.conn.execute("UPDATE downloads SET validator = ?1, total = ?2 WHERE path = ?3", params![validator, total as i64, d.path.to_string_lossy()])?;
+        Ok(())
+    }
+
+    /// Unfinished downloads, oldest first.
+    pub fn download_queue(&self) -> Result<Vec<QueuedDownload>> {
+        let mut st = self.conn.prepare("SELECT path, kind, meta_id, video_id, title, source, headers, status, validator, total FROM downloads WHERE status != 'done' ORDER BY added_at, rowid")?;
+        let rows = st.query_map([], |r| {
+            let d = Download { path: PathBuf::from(r.get::<_, String>(0)?), kind: r.get(1)?, meta_id: r.get(2)?, video_id: r.get(3)?, title: r.get(4)? };
+            let headers = serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default();
+            Ok(QueuedDownload { d, source: r.get(5)?, headers, state: State::from_db(&r.get::<_, String>(7)?), validator: r.get(8)?, total: r.get::<_, i64>(9)? as u64 })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// Also drops its resume point if that plays the file, so Continue Watching doesn't open a missing file.
     pub fn remove_download(&self, d: &Download) -> Result<()> {
         let path = d.path.to_string_lossy();
@@ -353,7 +402,7 @@ impl Db {
 
     /// Downloads, newest first.
     pub fn downloads(&self) -> Result<Vec<Download>> {
-        let mut st = self.conn.prepare("SELECT path, kind, meta_id, video_id, title FROM downloads ORDER BY added_at DESC, rowid DESC")?;
+        let mut st = self.conn.prepare("SELECT path, kind, meta_id, video_id, title FROM downloads WHERE status = 'done' ORDER BY added_at DESC, rowid DESC")?;
         let rows = st.query_map([], |r| {
             Ok(Download { path: PathBuf::from(r.get::<_, String>(0)?), kind: r.get(1)?, meta_id: r.get(2)?, video_id: r.get(3)?, title: r.get(4)? })
         })?;

@@ -1,5 +1,6 @@
 use stremflix_rs::addon::parse_manifest;
-use stremflix_rs::db::{Db, Download, Progress, SavedTitle, Watched};
+use stremflix_rs::download::State;
+use stremflix_rs::db::{Db, Download, QueuedDownload, Progress, SavedTitle, Watched};
 use stremflix_rs::library::LibraryItem;
 
 #[test]
@@ -223,6 +224,17 @@ fn downloads_round_trip() {
     let prog = |key: String, source: &str| Progress { key, title: "t".into(), source: source.into(), position: 1.0, duration: 2.0, poster: None };
     db.save_progress(&prog(movie.key(), "/d/One.mp4")).unwrap();
     db.save_progress(&prog(ep.key(), "https://x/ep.mkv")).unwrap();
+    let q = Download { path: "/d/Q.mkv".into(), ..movie.clone() };
+    let h = vec![("Cookie".to_string(), "a=b".to_string())];
+    db.queue_download(&q, "https://x/q.mkv", &h, State::Active).unwrap();
+    assert_eq!(db.downloads().unwrap().len(), 2, "the queue is not in finished downloads");
+    let want = QueuedDownload { d: q.clone(), source: "https://x/q.mkv".into(), headers: h, state: State::Paused, validator: "\"v1\"".into(), total: 99 };
+    db.set_download_meta(&q, &want.validator, want.total).unwrap();
+    assert_eq!(db.download_queue().unwrap(), [want], "active comes back paused, with its validator");
+    db.set_download_state(&q, State::Failed).unwrap();
+    assert_eq!(db.download_queue().unwrap()[0].state, State::Failed);
+    db.remove_download(&q).unwrap();
+    assert!(db.download_queue().unwrap().is_empty());
     db.remove_download(&movie).unwrap();
     db.remove_download(&ep).unwrap();
     assert_eq!(db.downloads().unwrap(), []);
