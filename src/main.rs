@@ -4569,7 +4569,8 @@ impl App {
         ui.separator();
         let mut cal_open = None;
         egui::CollapsingHeader::new(RichText::new("Calendar").size(20.0).strong().family(bold())).id_salt("calendar").show(ui, |ui| {
-            let groups = calendar_groups(&self.upcoming, unix_days());
+            let live: Vec<_> = self.upcoming.iter().filter(|(m, _)| self.saved.iter().any(|t| t.key == format!("series:{}", m.id))).cloned().collect();
+            let groups = calendar_groups(&live, unix_days());
             if groups.is_empty() {
                 ui.label(RichText::new("No upcoming episodes for saved series in the next 30 days (or still loading).").color(ui.visuals().weak_text_color()));
             }
