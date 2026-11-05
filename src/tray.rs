@@ -82,7 +82,7 @@ pub fn spawn(rt: &tokio::runtime::Runtime, png: &[u8], on: impl Fn(Action) + Sen
     rt.spawn(async move {
         match sni.spawn().await {
             Ok(_handle) => flag.store(true, Ordering::Relaxed), // the service runs on after the handle drops
-            Err(e) => eprintln!("tray: {e}"),
+            Err(e) => crate::elog!("tray: {e}"),
         }
     });
     Some(Tray { up })
@@ -99,7 +99,7 @@ pub fn spawn(_rt: &tokio::runtime::Runtime, png: &[u8], on: impl Fn(Action) + Se
         let item = MenuItem::new(label, true, None);
         ids.push((item.id().clone(), a));
         if let Err(e) = menu.append(&item) {
-            eprintln!("tray menu: {e}");
+            crate::elog!("tray menu: {e}");
         }
     }
     let on = Arc::new(on);
@@ -118,7 +118,7 @@ pub fn spawn(_rt: &tokio::runtime::Runtime, png: &[u8], on: impl Fn(Action) + Se
     if let Some(icon) = pixels(png).and_then(|p| tray_icon::Icon::from_rgba(p, SIZE, SIZE).ok()) {
         b = b.with_icon(icon);
     }
-    b.build().inspect_err(|e| eprintln!("tray: {e}")).ok().map(|icon| Tray { up: Arc::new(AtomicBool::new(true)), _icon: icon })
+    b.build().inspect_err(|e| crate::elog!("tray: {e}")).ok().map(|icon| Tray { up: Arc::new(AtomicBool::new(true)), _icon: icon })
 }
 
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]

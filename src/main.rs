@@ -352,7 +352,7 @@ fn upsert_by_id(list: &mut Vec<(MetaPreview, Vec<Video>)>, meta: MetaPreview, vi
 fn os_notify(title: String, body: String) {
     std::thread::spawn(move || {
         if let Err(e) = notify_rust::Notification::new().appname("Stremflix-rs").summary(&title).body(&body).show() {
-            eprintln!("notification: {e}");
+            stremflix_rs::elog!("notification: {e}");
         }
     });
 }
@@ -1013,21 +1013,21 @@ fn media_controls(cc: &eframe::CreationContext, tx: Sender<Msg>) -> Option<souvl
     let hwnd = match raw_window_handle::HasWindowHandle::window_handle(cc).map(|h| h.as_raw()) {
         Ok(raw_window_handle::RawWindowHandle::Win32(h)) => Some(h.hwnd.get() as *mut std::ffi::c_void),
         _ => {
-            eprintln!("media controls: no window handle");
+            stremflix_rs::elog!("media controls: no window handle");
             return None;
         }
     };
     #[cfg(not(windows))]
     let hwnd = None;
     let config = souvlaki::PlatformConfig { display_name: "Stremflix-rs", dbus_name: "stremflix_rs", hwnd };
-    let mut controls = souvlaki::MediaControls::new(config).inspect_err(|e| eprintln!("media controls: {e:?}")).ok()?;
+    let mut controls = souvlaki::MediaControls::new(config).inspect_err(|e| stremflix_rs::elog!("media controls: {e:?}")).ok()?;
     let ctx = cc.egui_ctx.clone();
     // shortcut: without a D-Bus session souvlaki's MPRIS thread panics (logged on stderr) and the app runs on without controls; pre-check the bus if that noise matters.
     let attached = controls.attach(move |e| {
         let _ = tx.send(Msg::Media(e));
         ctx.request_repaint();
     });
-    attached.inspect_err(|e| eprintln!("media controls: {e:?}")).ok().map(|()| controls)
+    attached.inspect_err(|e| stremflix_rs::elog!("media controls: {e:?}")).ok().map(|()| controls)
 }
 
 struct Playing {
@@ -1271,7 +1271,7 @@ fn wayland() -> bool {
 
 /// Show `e` in the UI and on stderr (headless runs, CI).
 fn report(slot: &mut Option<String>, e: impl std::fmt::Display) {
-    eprintln!("error: {e:#}");
+    stremflix_rs::elog!("error: {e:#}");
     *slot = Some(format!("{e:#}"));
 }
 
@@ -4271,7 +4271,7 @@ impl App {
                             (self.account, self.account_busy, self.confirm_upload, self.account_note) = (None, false, false, None);
                             let client = self.client.clone();
                             // Best effort: the key is already forgotten locally.
-                            self.rt.spawn(async move { client.stremio_logout(&key).await.inspect_err(|e| eprintln!("Stremio sign-out: {e:#}")) });
+                            self.rt.spawn(async move { client.stremio_logout(&key).await.inspect_err(|e| stremflix_rs::elog!("Stremio sign-out: {e:#}")) });
                         }
                         Err(e) => report(&mut self.error, format!("signing out: {e:#}")),
                     }
@@ -4335,6 +4335,25 @@ impl App {
         }
         if let Some(m) = &self.data_msg {
             ui.label(RichText::new(m).size(13.0).color(Color32::from_gray(170)));
+        }
+        ui.label(RichText::new("Diagnostics").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        let out = self.data_dir.join("diagnostics.txt");
+        if ui.button("Export diagnostics").on_hover_text(format!("Version, OS and recent log without secrets, saved to {}", out.display())).clicked() {
+            let summary = format!("addons: {}\nsigned in: {}", self.addons.len(), self.account.is_some());
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+            let res = o.open(&out).and_then(|mut f| {
+                // `mode` only applies to a new file: tighten an older one.
+                #[cfg(unix)]
+                f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+                std::io::Write::write_all(&mut f, stremflix_rs::diag::bundle(&summary).as_bytes())
+            });
+            match res {
+                Ok(()) => self.data_msg = Some(format!("Diagnostics saved to {}", out.display())),
+                Err(e) => report(&mut self.error, format!("diagnostics export: {e}")),
+            }
         }
         ui.add_space(8.0);
         ui.label(RichText::new("Torrents").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
@@ -5086,6 +5105,7 @@ fn main() -> eframe::Result {
     if instance::forward(&dir, arg.as_deref().unwrap_or("")) {
         return Ok(());
     }
+    stremflix_rs::diag::init(&dir);
     let mut app = App::new(dir.clone()).expect("failed to initialise app data");
     let ctx_cell: Arc<std::sync::OnceLock<egui::Context>> = Default::default();
     let sink = {
@@ -5101,7 +5121,7 @@ fn main() -> eframe::Result {
         sink(a);
     }
     if let Err(e) = instance::listen(&dir, sink.clone()) {
-        eprintln!("error: links from later launches won't reach this window: {e}");
+        stremflix_rs::elog!("error: links from later launches won't reach this window: {e}");
     }
     #[cfg(windows)]
     std::thread::spawn(instance::register_scheme);
@@ -5130,7 +5150,7 @@ fn main() -> eframe::Result {
         // A failed check (offline, rate limit) only logs: it shouldn't show as an error.
         app.spawn(&cc.egui_ctx, async move {
             Ok(Msg::Update(client.check_update().await.unwrap_or_else(|e| {
-                eprintln!("update check: {e:#}");
+                stremflix_rs::elog!("update check: {e:#}");
                 None
             })))
         });
@@ -5188,7 +5208,7 @@ mod mac_links {
     pub fn install(sink: Box<dyn Fn(String) + Send + Sync>) {
         let _ = SINK.set(sink);
         let Some(cls) = AnyClass::get(c"WinitApplicationDelegate") else {
-            return eprintln!("error: stremio:// links unavailable: winit's app delegate not found");
+            return stremflix_rs::elog!("error: stremio:// links unavailable: winit's app delegate not found");
         };
         // SAFETY: the signature matches the "v@:@@" encoding of -application:openURLs:.
         let added = unsafe {
@@ -5196,7 +5216,7 @@ mod mac_links {
             objc2::ffi::class_addMethod(std::ptr::from_ref(cls).cast_mut(), sel!(application:openURLs:), imp, c"v@:@@".as_ptr())
         };
         if !added.as_bool() {
-            return eprintln!("error: stremio:// links unavailable: delegate already has application:openURLs:");
+            return stremflix_rs::elog!("error: stremio:// links unavailable: delegate already has application:openURLs:");
         }
         // AppKit can cache which selectors a delegate answers when it is set: set it again so the new one counts.
         // SAFETY: plain messages to the shared NSApplication on the main thread.

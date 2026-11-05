@@ -132,7 +132,7 @@ impl Db {
             if let Err(e) = std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o600))
                 && e.kind() != std::io::ErrorKind::NotFound
             {
-                eprintln!("making {} owner-only: {e}", PathBuf::from(f).display());
+                crate::elog!("making {} owner-only: {e}", PathBuf::from(f).display());
             }
         }
         conn.execute_batch(
