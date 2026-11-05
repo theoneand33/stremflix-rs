@@ -17,7 +17,7 @@ use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
 use stremflix_rs::player::{self, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
-use stremflix_rs::torrent::{Profile, TorrentEngine};
+use stremflix_rs::torrent::{NetStats, Profile, TorrentEngine, fmt_rate};
 use stremflix_rs::tray::{self, Tray};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -966,6 +966,10 @@ struct Playing {
     wheel: f32,
     /// The up-next card was dismissed.
     next_dismissed: bool,
+    /// Stats overlay shown; `net` is its torrent line, refreshed by a task about once per second (`net_next`, egui clock).
+    stats: bool,
+    net: Arc<std::sync::Mutex<Option<NetStats>>>,
+    net_next: f64,
     search: SubSearch,
     /// Per-session picture scaling: aspect override index into `ASPECTS`, fill (crop) instead of fit, zoom in tenths.
     aspect: usize,
@@ -1774,7 +1778,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), awake: None, hidden_vid: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -3098,6 +3102,7 @@ impl App {
             if k(ArrowUp) { cmd(&["add", "volume", "5"]); new_vol = Some(st.volume + 5.0) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]); new_vol = Some(st.volume - 5.0) }
             if k(M) { cmd(&["cycle", "mute"]) }
+            if k(I) && focused.is_none() { p.stats = !p.stats }
             // mpv pauses on its own after a frame step.
             if k(Period) { cmd(&["frame-step"]) }
             if k(Comma) { cmd(&["frame-back-step"]) }
@@ -3422,12 +3427,46 @@ impl App {
                                     report(&mut self.error, format!("saving hwdec: {e:#}"));
                                 }
                             }
+                            switch_row(ui, "Playback stats (I)", &mut p.stats);
                             ui.add_space(8.0);
-                            external = ui.add(egui::Button::new(RichText::new("Open in external player").size(14.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(16)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0))).on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
+                            external =ui.add(egui::Button::new(RichText::new("Open in external player").size(14.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(16)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0))).on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
                         }
                     });
                 });
             }
+        }
+        // Stats overlay: mpv values arrive through observed properties; the torrent line is polled off the UI thread.
+        if p.stats {
+            if let (Some(id), Some(engine), true) = (p.torrent, self.torrent.get(), now >= p.net_next) {
+                p.net_next = now + 1.0;
+                let (engine, net, ctx) = (engine.clone(), p.net.clone(), ctx.clone());
+                self.rt.spawn(async move {
+                    *net.lock().unwrap() = engine.net_stats(id);
+                    ctx.request_repaint();
+                });
+            }
+            ctx.request_repaint_after(Duration::from_secs(1));
+            let net = *p.net.lock().unwrap();
+            let mut rows = vec![
+                ("Video", format!("{} {}x{} @ {:.2} fps", if st.codec.is_empty() { "?" } else { &st.codec }, vw, vh, st.fps)),
+                ("Hwdec", if st.hwdec.is_empty() { "no".into() } else { st.hwdec.clone() }),
+                ("Dropped", format!("{} output, {} decoder", st.dropped[0], st.dropped[1])),
+                ("Buffer", format!("{:.1} s", st.cache)),
+            ];
+            if p.torrent.is_some() {
+                rows.push(("Peers", net.map_or("-".into(), |n| n.peers.to_string())));
+                rows.push(("Speed", net.map_or("-".into(), |n| format!("{} down, {} up", fmt_rate(n.down), fmt_rate(n.up)))));
+            }
+            egui::Area::new(ui.scope_id().with("stats")).order(egui::Order::Foreground).fixed_pos(pos2(rect.left() + 16.0, rect.top() + 72.0)).interactable(false).show(&ctx, |ui| {
+                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(24, 24, 28, 230)).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+                    for (k, v) in rows {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{k:<8}")).size(13.0).monospace().color(Color32::from_gray(150)));
+                            ui.label(RichText::new(v).size(13.0).monospace().color(Color32::WHITE));
+                        });
+                    }
+                });
+            });
         }
         // Up next: in an episode's last 30 s, a card slides in from the right to play the next one.
         if let Some((series, label, img)) = up_next {
