@@ -38,7 +38,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| Seeding limits (ratio/time) and a torrent manager UI | P3 | S | Torrents are stopped and deleted automatically now. |
 | Custom listen port / UPnP / NAT-PMP | P3 | M | |
 
 ### Settings and streaming server

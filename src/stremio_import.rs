@@ -166,7 +166,10 @@ fn copy_to(src: &Path, dir: &Path) -> Result<PathBuf> {
 /// localStorage key/values of the origin that holds a Stremio `profile`.
 pub fn read_storage(src: &Path) -> Result<HashMap<String, String>> {
     let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
-    let dir = std::env::temp_dir().join(format!("stremflix-rs-import-{}-{nanos}", std::process::id()));
+    // A counter, since macOS clocks are coarse and parallel reads in one process can share a timestamp.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("stremflix-rs-import-{}-{nanos}-{seq}", std::process::id()));
     // Owner-only and must not exist yet: the copy holds Stremio's auth key.
     let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
