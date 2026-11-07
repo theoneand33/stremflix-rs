@@ -48,7 +48,67 @@ const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000),
 
 /// A local `.torrent` file path (not a URL or magnet).
 fn is_torrent_file(s: &str) -> bool {
-    !s.contains("://") && !s.starts_with("magnet:") && std::path::Path::new(s).extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+    !s.contains("://") && !s.starts_with("magnet:") && parse_magnet_hash(s).is_none() && std::path::Path::new(s).extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+}
+
+/// Played through the torrent engine: a valid magnet (any scheme case, padding trimmed like `Url::parse`) or a `.torrent` file.
+fn is_torrent_source(s: &str) -> bool {
+    parse_magnet_hash(s).is_some() || is_torrent_file(s)
+}
+
+/// What to play or open from a magnet, `stremio://` link or local file: valid magnet, or an existing file.
+fn is_open_input(s: &str) -> bool {
+    parse_magnet_hash(s).is_some() || (!s.contains("://") && std::path::Path::new(s).is_file())
+}
+
+const USAGE: &str = "usage: stremflix-rs [--help] [<stremio:// link | magnet link | .torrent file | media file>]";
+
+enum Cli {
+    /// Optional link to hand to the (running or new) window; files are made absolute.
+    Open(Option<String>),
+    Help,
+    Bad(String),
+}
+
+/// Parse the command line (without argv[0]). Reads the filesystem only to check that a file exists.
+fn parse_cli(args: &[String]) -> Cli {
+    // macOS Finder adds `-psn_…`.
+    // Only before `--`: after it, every argument is a file name.
+    let mut seen_end = false;
+    let mut args = args.iter().filter(|a| {
+        let drop = !seen_end && a.starts_with("-psn_");
+        seen_end |= a.as_str() == "--";
+        !drop
+    });
+    let Some(a) = args.next() else { return Cli::Open(None) };
+    if matches!(a.as_str(), "-h" | "--help") {
+        return Cli::Help;
+    }
+    // `--` ends the flags so a file named `-movie.mkv` can be opened.
+    let end_of_flags = a == "--";
+    let Some(a) = (if end_of_flags { args.next() } else { Some(a) }) else { return Cli::Open(None) };
+    if args.next().is_some() {
+        return Cli::Bad("only one argument is accepted".into());
+    }
+    if a.starts_with('-') && !end_of_flags {
+        return Cli::Bad(format!("unknown flag: {}", sanitize_text(a, 100)));
+    }
+    if a.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("stremio://")) {
+        return Cli::Open(Some(a.clone()));
+    }
+    if parse_magnet_hash(a).is_some() {
+        return Cli::Open(Some(a.clone()));
+    }
+    if a.contains("://") || a.trim_start().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("magnet:")) {
+        return Cli::Bad(format!("unsupported link: {}", sanitize_text(a, 100)));
+    }
+    match std::path::absolute(a) {
+        Ok(p) if p.is_file() => match p.to_str() {
+            Some(p) => Cli::Open(Some(p.into())),
+            None => Cli::Bad("file path is not valid UTF-8".into()),
+        },
+        _ => Cli::Bad(format!("no such file: {}", sanitize_text(a, 100))),
+    }
 }
 
 /// Splits a command line on whitespace; double quotes group words with spaces (e.g. a Windows path).
@@ -1577,7 +1637,7 @@ impl App {
         self.nav += 1;
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
-        let torrent = source.starts_with("magnet:") || is_torrent_file(&source);
+        let torrent = is_torrent_source(&source);
         let mut subs = subs;
         if !torrent {
             subs.extend(player::sidecar_subs(std::path::Path::new(&source))); // empty for URLs and missing paths
@@ -1591,7 +1651,7 @@ impl App {
             let (url, id) = match torrent {
                 true => {
                     let engine = start.await?;
-                    if source.starts_with("magnet:") {
+                    if parse_magnet_hash(&source).is_some() {
                         let files = engine.media_choices(&source).await?;
                         if !files.is_empty() {
                             return Ok(Msg::PickFile(key, title, source, subs, files, nav));
@@ -1942,8 +2002,13 @@ impl App {
                 self.quit = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            Msg::Link(s) => match stremflix_rs::addon::parse_deep_link(&s) {
-                Some(link) => {
+            Msg::Link(s) => {
+                let link = stremflix_rs::addon::parse_deep_link(&s);
+                if s.is_empty() {
+                    self.show_window(ctx, true);
+                } else if link.is_none() && !is_open_input(&s) {
+                    report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200)));
+                } else {
                     self.show_window(ctx, true);
                     // Leave the player like its Back button does, or the link opens behind it.
                     if self.player.is_some() {
@@ -1951,11 +2016,16 @@ impl App {
                         self.stop_player();
                         self.release_torrents(None);
                     }
-                    self.open_link(ctx, link);
+                    match link {
+                        Some(link) => self.open_link(ctx, link),
+                        None if is_torrent_source(&s) => self.play_torrent(ctx, &s),
+                        None => {
+                            let name = std::path::Path::new(&s).file_stem().map_or("Video".into(), |n| n.to_string_lossy().into_owned());
+                            self.play(ctx, format!("file:{s}"), name, s, vec![]);
+                        }
+                    }
                 }
-                None if s.is_empty() => self.show_window(ctx, true),
-                None => report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200))),
-            },
+            }
             Msg::NewEpisodes(epoch, meta, mut videos) => {
                 if epoch == self.new_eps_gen {
                     sort_episodes(&mut videos);
@@ -5315,8 +5385,19 @@ impl Geo {
 }
 
 fn main() -> eframe::Result {
-    // Only links count: macOS Finder adds `-psn_…`. A launch without one just focuses the open window.
-    let arg = std::env::args_os().nth(1).and_then(|a| a.into_string().ok()).filter(|a| a.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("stremio://")));
+    // A launch without an argument just focuses the open window.
+    let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    let arg = match parse_cli(&args) {
+        Cli::Open(a) => a,
+        Cli::Help => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Cli::Bad(e) => {
+            eprintln!("error: {e}\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
     let dir = data_dir();
     if instance::forward(&dir, arg.as_deref().unwrap_or("")) {
         return Ok(());
@@ -6054,6 +6135,40 @@ mod tests {
         let (_d, mut app) = test_app();
         app.handle(&egui::Context::default(), Msg::Link("stremio://example.com/manifest.json".into()));
         assert!(app.tab == Tab::Addons && app.addon_url == "https://example.com/manifest.json");
+    }
+
+    #[test]
+    fn cli_args() {
+        let cli = |a: &[&str]| parse_cli(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let magnet = format!("magnet:?xt=urn:btih:{}", "a".repeat(40));
+        let file = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert!(matches!(cli(&[]), Cli::Open(None)) && matches!(cli(&["-psn_0_1"]), Cli::Open(None)));
+        assert!(matches!(cli(&["--help"]), Cli::Help));
+        assert!(matches!(cli(&["stremio:///detail/movie/tt1"]), Cli::Open(Some(_))));
+        assert!(matches!(cli(&["-h"]), Cli::Help));
+        assert!(matches!(cli(&["--", "-psn_0_1"]), Cli::Bad(m) if m.starts_with("no such file")));
+        assert!(matches!(cli(&["--", &magnet]), Cli::Open(Some(m)) if m == magnet));
+        assert!(matches!(cli(&["--"]), Cli::Open(None)) && matches!(cli(&["--", "-no-such.mkv"]), Cli::Bad(m) if m.starts_with("no such file")));
+        assert!(matches!(cli(&["MAGNET:?xt=bad"]), Cli::Bad(m) if m.starts_with("unsupported link")));
+        assert!(matches!(cli(&[&magnet]), Cli::Open(Some(m)) if m == magnet));
+        assert!(matches!(cli(&[file]), Cli::Open(Some(p)) if std::path::Path::new(&p) == std::path::absolute(file).unwrap()));
+        // Url::parse accepts an upper-case scheme; Msg::Link routing uses the same predicate.
+        let upper = magnet.replacen("magnet", "MAGNET", 1);
+        assert!(matches!(cli(&[&upper]), Cli::Open(Some(_))) && parse_magnet_hash(&upper).is_some());
+        for bad in [&["--nope"][..], &["magnet:?xt=bad"], &["https://x.example/a.torrent"], &["/no/such.mkv"], &[file, file]] {
+            assert!(matches!(cli(bad), Cli::Bad(_)), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn torrent_source_routing() {
+        let m = format!("magnet:?xt=urn:btih:{}", "a".repeat(40));
+        for yes in [m.clone(), m.replacen("magnet", "MAGNET", 1), format!("  {m}"), "/m/a.torrent".into()] {
+            assert!(is_torrent_source(&yes), "{yes}");
+        }
+        for no in ["magnet:?xt=bad", "/m/a.mkv", "https://x.example/a.torrent"] {
+            assert!(!is_torrent_source(no), "{no}");
+        }
     }
 
     #[test]
