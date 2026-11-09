@@ -2,6 +2,7 @@
 //! runtime; results come back to the UI thread over a channel.
 
 use eframe::egui;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -290,8 +291,8 @@ enum Msg {
     Details(Meta),
     /// `new_eps_gen`, a saved series and its recently released episodes.
     NewEpisodes(u64, MetaPreview, Vec<Video>),
-    /// poster URL, image bytes (empty on failure)
-    Poster(String, Vec<u8>),
+    /// Cache key, the scale its size was chosen for, and the decoded image (`None` on failure).
+    Poster(String, f32, Option<egui::ColorImage>),
     /// key, title, resumable source, playable URL/path, subtitle URLs, torrent id, the `nav` it was requested at
     Play(String, String, String, String, Subs, Option<usize>, u64),
     /// key, title, magnet, subtitle URLs, the media files `(index, name, size)` to choose from, the `nav` it was requested at
@@ -511,8 +512,61 @@ fn calendar_groups(entries: &[(MetaPreview, Vec<Video>)], today: i64) -> Vec<(St
 
 /// Max items kept per catalog row.
 const ROW_CAP: usize = 1000;
-/// Posters kept in memory (bytes and decoded textures) before the cache is cleared.
+/// Poster cache limits; the least recently drawn go first once either is passed.
 const POSTER_CACHE: usize = 1500;
+const POSTER_BYTES: usize = 384 << 20;
+/// Cache key prefix of a poster shrunk to card size; other keys are plain URLs, kept at full size.
+const CARD_KEY: &str = "card:";
+
+/// A fetched image. `tex` is `None` while first loading and after a failure (`failed`); a card poster being resized keeps its old texture until the new one lands.
+struct Poster {
+    tex: Option<egui::TextureHandle>,
+    failed: bool,
+    bytes: usize,
+    /// A fetch is in flight.
+    loading: bool,
+    /// Scale the latest fetch was sized for; below the current one, a card poster is refetched.
+    asked: f32,
+    /// Frame it was last drawn on.
+    used: Cell<u64>,
+}
+
+/// Keys to drop, least recently used first, to get 10% under the limits. Entries drawn on `frame` stay, so what is on screen never thrashes.
+fn posters_to_evict(mut entries: Vec<(u64, usize, String)>, frame: u64, max_len: usize, max_bytes: usize) -> Vec<String> {
+    let (mut len, mut bytes) = (entries.len(), entries.iter().map(|e| e.1).sum::<usize>());
+    if len <= max_len && bytes <= max_bytes {
+        return Vec::new();
+    }
+    entries.retain(|e| e.0 < frame);
+    entries.sort_unstable_by_key(|e| e.0);
+    let mut out = Vec::new();
+    for (_, b, key) in entries {
+        if len <= max_len / 10 * 9 && bytes <= max_bytes / 10 * 9 {
+            break;
+        }
+        (len, bytes) = (len - 1, bytes - b);
+        out.push(key);
+    }
+    out
+}
+
+/// Decode an image, shrunk to just cover `target` pixels if given and smaller. CPU-heavy: call off the UI thread.
+fn decode_poster(body: &[u8], target: Option<[u32; 2]>) -> anyhow::Result<egui::ColorImage> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(body)).with_guessed_format()?.into_decoder()?;
+    let orientation = decoder.orientation()?;
+    let mut img = image::DynamicImage::from_decoder(decoder)?;
+    img.apply_orientation(orientation);
+    if let Some([w, h]) = target {
+        let scale = (w as f32 / img.width() as f32).max(h as f32 / img.height() as f32);
+        if scale < 1.0 {
+            let size = |side: u32| ((side as f32 * scale).ceil() as u32).max(1);
+            img = img.resize_exact(size(img.width()), size(img.height()), image::imageops::FilterType::CatmullRom);
+        }
+    }
+    let rgba = img.to_rgba8();
+    Ok(egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
+}
 
 impl Row {
     /// Request the next page when the row is scrolled near its end.
@@ -588,11 +642,12 @@ fn apply_theme(ctx: &egui::Context, light: bool) {
     ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
 }
 const CARD: egui::Vec2 = egui::Vec2::new(150.0, 225.0);
+/// A hovered or focused card's scale.
+const GROW: f32 = 1.06;
 
 /// Netflix-style card: no border, grows on hover/focus, shrinks while pressed.
 /// Returns the click response and the animated rect to paint into.
 fn card(ui: &mut egui::Ui, size: egui::Vec2, label: &str) -> (egui::Response, egui::Rect) {
-    const GROW: f32 = 1.06;
     // Reserve room for the grown card so the scroll area doesn't clip it.
     let (slot, r) = ui.allocate_exact_size(size * GROW, Sense::click());
     r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
@@ -1336,8 +1391,14 @@ struct App {
     search: String,
     /// Recent submitted queries, newest first; persisted in settings as `search_history`.
     search_history: Vec<String>,
-    /// Poster bytes by URL; `None` while loading, empty if the fetch failed.
-    posters: HashMap<String, Option<Arc<[u8]>>>,
+    /// Fetched images by URL, or `CARD_KEY` + URL for card-sized ones; a missing key has not been requested.
+    posters: HashMap<String, Poster>,
+    /// Frame being drawn, stamped on the posters it uses.
+    poster_frame: u64,
+    /// Highest scale so far: card posters are sized for it, so zooming back in stays sharp.
+    poster_ppp: f32,
+    /// Limits concurrent poster decodes; a screenful arrives at once.
+    poster_slots: Arc<tokio::sync::Semaphore>,
     folder: String,
     /// Preferred audio / subtitle languages (mpv `alang` / `slang`), as edited; saved to the settings table only when valid.
     langs: [String; 2],
@@ -1650,6 +1711,9 @@ impl App {
             search: String::new(),
             search_history,
             posters: HashMap::new(),
+            poster_frame: 0,
+            poster_ppp: 0.0,
+            poster_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             player: None,
             pill: None,
             last_poll: Instant::now(),
@@ -2320,8 +2384,28 @@ impl App {
                     Err(e) => report(&mut self.error, e),
                 }
             }
-            Msg::Poster(url, bytes) => {
-                self.posters.insert(url, Some(bytes.into()));
+            Msg::Poster(key, ppp, image) => {
+                // Sized for a scale we have since passed (zoom, new monitor): drop it, keep drawing the old texture, and let the next draw ask again.
+                if key.starts_with(CARD_KEY) && ppp != self.poster_ppp.max(1.0) {
+                    if let Some(p) = self.posters.get_mut(&key).filter(|p| p.asked != self.poster_ppp.max(1.0)) {
+                        p.loading = false;
+                    }
+                    return;
+                }
+                // A failed resize keeps the old texture, which is still a fine picture.
+                let (old, old_bytes) = self.posters.remove(&key).map_or((None, 0), |p| (p.tex, p.bytes));
+                let failed = image.is_none() && old.is_none();
+                // The kept texture still occupies memory, so it still counts against the budget.
+                let bytes = image.as_ref().map_or(old_bytes, |i| i.pixels.len() * 4);
+                let tex = image.map(|i| ctx.load_texture(&key, i, egui::TextureOptions::LINEAR)).or(old);
+                self.posters.insert(key, Poster { tex, failed, bytes, loading: false, asked: ppp, used: Cell::new(self.poster_frame) });
+                // Cheap check first: building the list clones every key, and a screenful of replies arrives at once.
+                if self.posters.len() > POSTER_CACHE || self.posters.values().map(|p| p.bytes).sum::<usize>() > POSTER_BYTES {
+                    let entries = self.posters.iter().map(|(k, p)| (p.used.get(), p.bytes, k.clone())).collect();
+                    for k in posters_to_evict(entries, self.poster_frame, POSTER_CACHE, POSTER_BYTES) {
+                        self.posters.remove(&k);
+                    }
+                }
             }
             Msg::PickFile(key, title, source, subs, files, nav) => {
                 if nav == self.nav {
@@ -2705,17 +2789,27 @@ impl App {
         self.nav += 1;
     }
 
-    fn fetch_poster(&mut self, ctx: &egui::Context, url: String) {
-        if self.posters.len() >= POSTER_CACHE {
-            // shortcut: drops every poster at once, not the least recently used; on-screen ones reload next frame.
-            self.posters.clear();
-            ctx.forget_all_images();
+    fn fetch_poster(&mut self, ctx: &egui::Context, key: String) {
+        // Several cards can ask for one image in the same frame.
+        if self.posters.get(&key).is_some_and(|p| p.loading) {
+            return;
         }
-        self.posters.insert(url.clone(), None);
-        let client = self.client.clone();
+        let ppp = self.poster_ppp.max(1.0);
+        // A resize keeps the old texture on screen until the sharper one arrives.
+        let old = self.posters.remove(&key);
+        let (tex, bytes) = old.map_or((None, 0), |p| (p.tex, p.bytes));
+        self.posters.insert(key.clone(), Poster { tex, failed: false, bytes, loading: true, asked: ppp, used: Cell::new(self.poster_frame) });
+        let (client, slots) = (self.client.clone(), self.poster_slots.clone());
+        let px = |side: f32| (side * GROW * ppp).ceil() as u32;
+        let target = key.starts_with(CARD_KEY).then(|| [px(CARD.x), px(CARD.y)]);
         self.spawn(ctx, async move {
-            let bytes = client.poster(&url).await.unwrap_or_default();
-            Ok(Msg::Poster(url, bytes))
+            let image = async {
+                let body = client.poster(key.strip_prefix(CARD_KEY).unwrap_or(&key)).await?;
+                let _slot = slots.acquire_owned().await?;
+                tokio::task::spawn_blocking(move || decode_poster(&body, target)).await?
+            };
+            let image = image.await.ok();
+            Ok(Msg::Poster(key, ppp, image))
         });
     }
 
@@ -3038,17 +3132,27 @@ impl App {
         });
     }
 
-    /// Poster/background bytes if loaded; queues a fetch on first sight.
-    fn image(&self, url: &Option<String>, want: &mut Vec<String>) -> Option<(String, Arc<[u8]>)> {
-        let u = url.as_ref()?;
-        match self.posters.get(u) {
-            Some(Some(b)) if !b.is_empty() => Some((u.clone(), b.clone())),
-            None => {
-                want.push(u.clone());
-                None
-            }
-            _ => None,
+    /// Full-size poster/background if loaded; queues a fetch on first sight.
+    fn image(&self, url: &Option<String>, want: &mut Vec<String>) -> Option<egui::load::SizedTexture> {
+        self.texture(url.as_ref()?, want)
+    }
+
+    /// Like [`Self::image`], shrunk to card size.
+    fn card_image(&self, url: &Option<String>, want: &mut Vec<String>) -> Option<egui::load::SizedTexture> {
+        self.texture(&format!("{CARD_KEY}{}", url.as_ref()?), want)
+    }
+
+    fn texture(&self, key: &str, want: &mut Vec<String>) -> Option<egui::load::SizedTexture> {
+        let Some(p) = self.posters.get(key) else {
+            want.push(key.to_owned());
+            return None;
+        };
+        p.used.set(self.poster_frame);
+        // Sized for a lower scale: ask for a sharper one, and draw this meanwhile.
+        if !p.loading && key.starts_with(CARD_KEY) && p.asked < self.poster_ppp.max(1.0) {
+            want.push(key.to_owned());
         }
+        p.tex.as_ref().map(egui::load::SizedTexture::from_handle)
     }
 
     /// Search results: one row per searched catalog, filled in as replies arrive.
@@ -3492,11 +3596,29 @@ impl App {
     /// Horizontally scrolling poster cards; a click selects the title.
     /// Returns true when one of the last 3 cards is on screen.
     fn ui_cards(&self, ui: &mut egui::Ui, salt: &str, items: &[MetaPreview], want: &mut Vec<String>, open: &mut Option<(MetaPreview, bool)>, quick: &mut Option<MetaPreview>) -> bool {
+        if items.is_empty() {
+            return false;
+        }
+        // Cards past the viewport are not built at all; the spare ones keep Tab able to walk into the next card.
+        const SPARE: usize = 2;
         let mut near_end = false;
-        egui::ScrollArea::horizontal().id_salt(salt).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (i, m) in items.iter().enumerate() {
+        let slot = CARD * GROW;
+        let step = slot.x + ui.spacing().item_spacing.x;
+        egui::ScrollArea::horizontal().id_salt(salt).show_viewport(ui, |ui, view| {
+            ui.set_width((step * items.len() as f32 - ui.spacing().item_spacing.x).max(0.0));
+            ui.set_height(slot.y);
+            let origin = ui.max_rect().min;
+            let first = ((view.min.x / step).floor() as usize).saturating_sub(SPARE).min(items.len());
+            let last = ((view.max.x / step).ceil() as usize + SPARE).min(items.len());
+            // A child's widget ids depend on how many siblings came before it: count the skipped cards so focus and hover animations survive scrolling.
+            ui.skip_ahead_auto_ids(first);
+            for (i, m) in items[first..last].iter().enumerate().map(|(i, m)| (i + first, m)) {
+                let at = egui::Rect::from_min_size(origin + vec2(i as f32 * step, 0.0), slot);
+                ui.scope_builder(UiBuilder::new().max_rect(at), |ui| {
                     let (r, rect) = card(ui, CARD, &m.name);
+                    if r.gained_focus() {
+                        r.scroll_to_me(None);
+                    }
                     // The scroll viewport clips, so a visible third-to-last card means near the end.
                     near_end |= i + 3 >= items.len() && ui.is_rect_visible(r.rect);
                     self.paint_poster(ui, &r, rect, &m.poster, &m.name, want);
@@ -3506,8 +3628,8 @@ impl App {
                     if r.on_hover_text(card_tip(m)).clicked() {
                         *open = Some((m.clone(), false));
                     }
-                }
-            });
+                });
+            }
         });
         near_end
     }
@@ -3516,10 +3638,10 @@ impl App {
     fn paint_poster(&self, ui: &egui::Ui, r: &egui::Response, rect: egui::Rect, poster: &Option<String>, name: &str, want: &mut Vec<String>) {
         // Only fetch posters of cards that are on screen.
         let mut lazy = Vec::new();
-        let img = if ui.is_rect_visible(r.rect) { self.image(poster, &mut lazy) } else { None };
+        let img = if ui.is_rect_visible(r.rect) { self.card_image(poster, &mut lazy) } else { None };
         want.extend(lazy);
         match img {
-            Some((u, b)) => egui::Image::from_bytes(format!("bytes://{u}"), b).alt_text(name).corner_radius(6).paint_at(ui, rect),
+            Some(t) => egui::Image::from_texture(t).alt_text(name).corner_radius(6).paint_at(ui, rect),
             None => card_text(ui, rect, name),
         }
     }
@@ -3544,16 +3666,13 @@ impl App {
         // Background first; fall back to the poster when it is missing or rejected.
         let bg = self.image(&background, want);
         let poster = if bg.is_none() { self.image(&meta.poster, want) } else { None };
-        if let Some((u, b)) = bg {
-            let img = egui::Image::from_bytes(format!("bytes://{u}"), b).corner_radius(12);
-            if let Ok(egui::load::TexturePoll::Ready { texture }) = img.load_for_size(ui.ctx(), rect.size()) {
-                img.uv(cover_uv(rect, texture.size)).paint_at(ui, rect);
-                ui.painter().rect_filled(rect, 12, Color32::from_black_alpha(120));
-            }
-        } else if let Some((u, b)) = poster {
+        if let Some(t) = bg {
+            egui::Image::from_texture(t).corner_radius(12).uv(cover_uv(rect, t.size)).paint_at(ui, rect);
+            ui.painter().rect_filled(rect, 12, Color32::from_black_alpha(120));
+        } else if let Some(t) = poster {
             let pw = rect.height() * 2.0 / 3.0;
             let prect = egui::Rect::from_min_max(pos2(rect.right() - pw, rect.top()), rect.max);
-            egui::Image::from_bytes(format!("bytes://{u}"), b).alt_text(&meta.name).corner_radius(12).paint_at(ui, prect);
+            egui::Image::from_texture(t).alt_text(&meta.name).corner_radius(12).paint_at(ui, prect);
         }
         let inner = rect.shrink(36.0);
         let col = egui::Rect::from_min_max(inner.min, pos2(inner.left() + (inner.width() * 0.55).min(620.0), inner.bottom()));
@@ -3597,7 +3716,7 @@ impl App {
             };
             ui.label(RichText::new(kind).size(15.0).strong().family(bold()).color(Color32::from_gray(220)));
             match self.image(&logo, want) {
-                Some((u, b)) => ui.add(egui::Image::from_bytes(format!("bytes://{u}"), b).alt_text(&meta.name).max_height(120.0).max_width(col.width())),
+                Some(t) => ui.add(egui::Image::from_texture(t).alt_text(&meta.name).max_height(120.0).max_width(col.width())),
                 None => ui.add(egui::Label::new(RichText::new(&meta.name).size(46.0).strong().family(bold()).color(Color32::WHITE)).wrap()),
             };
         });
@@ -3660,8 +3779,8 @@ impl App {
                     (Some(s), Some(e)) => format!("{title} (S{s}E{e})"),
                     _ => title,
                 };
-                // First source whose fetch hasn't failed (failed ones are cached as empty bytes).
-                let failed = |u: &String| matches!(self.posters.get(u), Some(Some(b)) if b.is_empty());
+                // First source whose fetch hasn't failed.
+                let failed = |u: &String| self.posters.get(u).is_some_and(|p| p.failed);
                 let url = [v.thumbnail.clone(), m.background.clone(), self.selected_details().and_then(|d| d.background.clone()), m.poster.clone()].into_iter().flatten().find(|u| !failed(u));
                 (m.name.clone(), label, self.image(&url, &mut want))
             });
@@ -4217,11 +4336,8 @@ impl App {
                 let thumb = egui::Rect::from_min_size(card.min, vec2((size.x - 316.0).clamp(0.0, size.y * 1.05), size.y));
                 let left = egui::CornerRadius { nw: 12, sw: 12, ne: 0, se: 0 };
                 paint.rect_filled(thumb, left, Color32::from_gray(40));
-                if let (true, Some((u, b))) = (thumb.width() > 0.0, img) {
-                    let img = egui::Image::from_bytes(format!("bytes://{u}"), b).corner_radius(left);
-                    if let Ok(egui::load::TexturePoll::Ready { texture }) = img.load_for_size(&ctx, thumb.size()) {
-                        img.uv(cover_uv(thumb, texture.size)).paint_at(ui, thumb);
-                    }
+                if let (true, Some(t)) = (thumb.width() > 0.0, img) {
+                    egui::Image::from_texture(t).corner_radius(left).uv(cover_uv(thumb, t.size)).paint_at(ui, thumb);
                 }
                 let x = thumb.right() + 28.0;
                 let w = (card.right() - 20.0 - x).max(0.0);
@@ -5388,6 +5504,13 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poster_frame = ctx.cumulative_frame_nr();
+        // Card posters sized for a lower scale (zoom, or a new monitor) are refetched sharp as they are drawn.
+        // From the zoom the UI will settle on (the clamp below lands next pass), floored at 1 and rounded up to half steps so a zoom sweep refetches a few times, not once per step.
+        let want_ppp = ((ctx.pixels_per_point() / ctx.zoom_factor() * clamp_scale(ctx.zoom_factor())).max(1.0) * 2.0).ceil() / 2.0;
+        if want_ppp > self.poster_ppp {
+            self.poster_ppp = want_ppp;
+        }
         // egui's built-in zoom keys change the factor too: bound it, then persist any change.
         let zoom = clamp_scale(ctx.zoom_factor());
         if zoom != ctx.zoom_factor() {
@@ -5688,7 +5811,6 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     let creator: eframe::AppCreator = Box::new(move |cc| {
-        egui_extras::install_image_loaders(&cc.egui_ctx);
         install_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx, app.light);
         cc.egui_ctx.set_zoom_factor(app.ui_scale);
@@ -6072,6 +6194,36 @@ mod tests {
         g.track(&vp(Some(false), None, 10.0, 99999.0));
         assert!(!g.maximized && g.size == [200.0, 16384.0] && g.pos.is_none());
         assert_eq!(g.to_string().parse(), Ok(g));
+    }
+
+    #[test]
+    fn evicts_least_recent_posters_but_not_this_frames() {
+        let e = |used, bytes, k: &str| (used, bytes, k.to_string());
+        // Under both limits: nothing goes.
+        assert!(posters_to_evict(vec![e(1, 10, "a")], 5, 10, 100).is_empty());
+        // Over bytes: oldest first, stopping 10% under the limit.
+        let got = posters_to_evict(vec![e(3, 60, "c"), e(1, 60, "a"), e(2, 60, "b")], 5, 10, 100);
+        assert_eq!(got, ["a", "b"]);
+        // Everything on screen this frame stays even past the limit.
+        assert!(posters_to_evict(vec![e(5, 200, "a")], 5, 10, 100).is_empty());
+        // Over count, with empty (failed or loading) entries.
+        let got = posters_to_evict((0..12).map(|i| e(i, 0, &format!("{i:02}"))).collect(), 99, 10, 100);
+        assert_eq!(got, ["00", "01", "02"]);
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(w, h).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn decode_shrinks_to_cover_the_target_only() {
+        assert_eq!(decode_poster(&png(400, 600), Some([100, 100])).unwrap().size, [100, 150], "keeps the aspect ratio, covers both sides");
+        assert_eq!(decode_poster(&png(50, 75), Some([100, 100])).unwrap().size, [50, 75], "never upscales");
+        assert_eq!(decode_poster(&png(400, 600), None).unwrap().size, [400, 600], "no target keeps full size");
+        assert_eq!(decode_poster(&png(4000, 1), Some([100, 1])).unwrap().size, [4000, 1], "covers the tighter side");
+        assert!(decode_poster(b"not an image", None).is_err());
     }
 
     #[test]
