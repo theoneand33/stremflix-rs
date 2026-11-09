@@ -29,6 +29,17 @@ enum Tab {
     Settings,
 }
 
+impl Tab {
+    fn name(self) -> &'static str {
+        match self { Tab::Home => "home", Tab::Discover => "discover", Tab::Addons => "addons", Tab::Library => "library", Tab::Settings => "settings" }
+    }
+
+    /// Stored value to tab; missing or unknown falls back to Home.
+    fn from_name(s: Option<&str>) -> Tab {
+        [Tab::Home, Tab::Discover, Tab::Addons, Tab::Library, Tab::Settings].into_iter().find(|t| Some(t.name()) == s).unwrap_or(Tab::Home)
+    }
+}
+
 /// Speed limit choices in bytes/s; 0 is unlimited.
 const SPEED_LIMITS: [(&str, u32); 6] = [("Unlimited", 0), ("500 KB/s", 500_000), ("1 MB/s", 1_000_000), ("2 MB/s", 2_000_000), ("5 MB/s", 5_000_000), ("10 MB/s", 10_000_000)];
 
@@ -288,6 +299,14 @@ fn arrange_rows(keys: &[String], order: &[String]) -> Vec<usize> {
     out
 }
 
+/// `urls` (global priority) with those in `order` first; stale ids in `order` are ignored, unlisted urls keep global order after.
+fn order_urls(urls: Vec<String>, order: &[String]) -> Vec<String> {
+    arrange_rows(&urls, order).into_iter().map(|i| urls[i].clone()).collect()
+}
+
+/// Content types that can have their own addon order.
+const ADDON_ORDER_KINDS: [&str; 2] = ["movie", "series"];
+
 /// Keys contain `|` and URLs, so settings hold them as a JSON array.
 fn encode_keys(keys: &[String]) -> String {
     serde_json::to_string(keys).unwrap_or_default()
@@ -356,7 +375,7 @@ fn upsert_by_id(list: &mut Vec<(MetaPreview, Vec<Video>)>, meta: MetaPreview, vi
 fn os_notify(title: String, body: String) {
     std::thread::spawn(move || {
         if let Err(e) = notify_rust::Notification::new().appname("Stremflix-rs").summary(&title).body(&body).show() {
-            eprintln!("notification: {e}");
+            stremflix_rs::elog!("notification: {e}");
         }
     });
 }
@@ -721,6 +740,16 @@ fn same_addon(installed: &Manifest, fetched: &Manifest) -> bool {
     installed.id == fetched.id
 }
 
+/// Health label for a failed addon check, classified from the typed error: only a transport
+/// failure is "unreachable"; HTTP status and manifest parse errors mean the host answered.
+fn health_error(e: &anyhow::Error) -> String {
+    match e.chain().find_map(|c| c.downcast_ref::<reqwest::Error>()) {
+        Some(r) if r.is_timeout() => "Timed out".into(),
+        Some(_) => format!("Unreachable: {}", e.root_cause()),
+        None => format!("Error: {}", e.root_cause()),
+    }
+}
+
 /// Small secondary pill for toolbar actions (Uninstall, Clear, Stop …).
 fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     pill_button(ui, text, 14.0, vec2(0.0, 32.0), gray_fill(), Color32::WHITE)
@@ -908,6 +937,35 @@ fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
     paused && dur > 0.0 && pos >= dur - 1.0
 }
 
+/// Sets loop point `i` (0 = A, 1 = B) to `t`, keeping A before B; true if the points were swapped.
+fn set_ab(ab: &mut [Option<f64>; 2], i: usize, t: f64) -> bool {
+    ab[i] = Some(t);
+    let swap = matches!(*ab, [Some(a), Some(b)] if a > b);
+    if swap {
+        ab.swap(0, 1);
+    }
+    swap
+}
+
+/// mpv loops only with Repeat on or both A-B points set.
+fn looping(repeat: bool, ab: [Option<f64>; 2]) -> bool {
+    repeat || (ab[0].is_some() && ab[1].is_some())
+}
+
+/// `timer_paused` bookkeeping: confirmed once mpv reports paused, dropped when the user resumes.
+fn timer_pause_step(state: Option<bool>, paused: bool) -> Option<bool> {
+    match (state, paused) {
+        (Some(false), true) => Some(true),
+        (Some(true), false) => None,
+        (s, _) => s,
+    }
+}
+
+/// End-of-episode autoplay; never after the sleep timer's own pause.
+fn autoplay_due(autoplay_next: bool, timer_paused: Option<bool>, at_end: bool) -> bool {
+    autoplay_next && timer_paused.is_none() && at_end
+}
+
 /// Fraction of the seek bar the cache covers, never behind the playhead.
 fn buffered_frac(pos: f64, cached_to: f64, dur: f64) -> f32 {
     if dur > 0.0 { (cached_to.max(pos) / dur).clamp(0.0, 1.0) as f32 } else { 0.0 }
@@ -1017,21 +1075,21 @@ fn media_controls(cc: &eframe::CreationContext, tx: Sender<Msg>) -> Option<souvl
     let hwnd = match raw_window_handle::HasWindowHandle::window_handle(cc).map(|h| h.as_raw()) {
         Ok(raw_window_handle::RawWindowHandle::Win32(h)) => Some(h.hwnd.get() as *mut std::ffi::c_void),
         _ => {
-            eprintln!("media controls: no window handle");
+            stremflix_rs::elog!("media controls: no window handle");
             return None;
         }
     };
     #[cfg(not(windows))]
     let hwnd = None;
     let config = souvlaki::PlatformConfig { display_name: "Stremflix-rs", dbus_name: "stremflix_rs", hwnd };
-    let mut controls = souvlaki::MediaControls::new(config).inspect_err(|e| eprintln!("media controls: {e:?}")).ok()?;
+    let mut controls = souvlaki::MediaControls::new(config).inspect_err(|e| stremflix_rs::elog!("media controls: {e:?}")).ok()?;
     let ctx = cc.egui_ctx.clone();
     // shortcut: without a D-Bus session souvlaki's MPRIS thread panics (logged on stderr) and the app runs on without controls; pre-check the bus if that noise matters.
     let attached = controls.attach(move |e| {
         let _ = tx.send(Msg::Media(e));
         ctx.request_repaint();
     });
-    attached.inspect_err(|e| eprintln!("media controls: {e:?}")).ok().map(|()| controls)
+    attached.inspect_err(|e| stremflix_rs::elog!("media controls: {e:?}")).ok().map(|()| controls)
 }
 
 struct Playing {
@@ -1072,6 +1130,10 @@ struct Playing {
     /// Per-session picture scaling: aspect override index into `ASPECTS`, fill (crop) instead of fit, zoom in tenths.
     aspect: usize,
     fill: bool,
+    /// A-B loop points in seconds, as set from the menu.
+    ab: [Option<f64>; 2],
+    /// Repeat the current file.
+    repeat: bool,
     zoom: i32,
     /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
     awake: Option<Option<keepawake::KeepAwake>>,
@@ -1148,6 +1210,8 @@ struct App {
     folder: String,
     /// Preferred audio / subtitle languages (mpv `alang` / `slang`), as edited; saved to the settings table only when valid.
     langs: [String; 2],
+    /// Custom User-Agent as edited; saved and applied only when valid.
+    user_agent: String,
     library: Vec<LibraryItem>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
@@ -1212,6 +1276,10 @@ struct App {
     hwdec: bool,
     /// Custom Home row order and hidden rows (row keys).
     home_order: Vec<String>,
+    /// Addon priority per content type (movie, series): addon URLs, first = highest; a type without one follows the global order.
+    addon_orders: HashMap<String, Vec<String>>,
+    /// Type whose order the Addons tab edits; empty = the global order.
+    addon_order_kind: String,
     home_hidden: Vec<String>,
     /// Every Home row as (key, title) in display order, hidden ones included.
     home_all: Vec<(String, String)>,
@@ -1242,6 +1310,14 @@ struct App {
     pill: Option<(Tab, egui::Rect, egui::Rect, f64)>,
     player: Option<Playing>,
     last_poll: Instant,
+    /// Sleep timer: pause at this time; the minutes chosen. Survives autoplay-next, cleared when the player is left.
+    sleep: Option<(Instant, u64)>,
+    /// Timer handed from play_next to the next autoplay-started player; consumed once by Msg::Play.
+    /// Every other navigation (`play`, `open_*`, Back) and every error clears it.
+    sleep_carry: Option<(Instant, u64)>,
+    /// The sleep timer paused playback: `Some(false)` until mpv reports paused, then `Some(true)` until resumed.
+    /// Autoplay must not fire while set (see `timer_pause_step`).
+    timer_paused: Option<bool>,
     /// GL function loader of eframe's context, for libmpv's OpenGL renderer.
     gl_proc: Option<GlProc>,
     window: Geo,
@@ -1250,6 +1326,12 @@ struct App {
     media: Option<souvlaki::MediaControls>,
     /// Title, paused and duration (s) last published to the media controls.
     media_shown: Option<(String, bool, u64)>,
+}
+
+/// `<data>/screenshots/<title>-<unix secs>.png`, with the title reduced to filename-safe characters.
+fn screenshot_path(dir: &std::path::Path, title: &str, secs: u64) -> PathBuf {
+    let t: String = title.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).take(60).collect();
+    dir.join("screenshots").join(format!("{t}-{secs}.png"))
 }
 
 fn data_dir() -> PathBuf {
@@ -1270,7 +1352,7 @@ fn wayland() -> bool {
 
 /// Show `e` in the UI and on stderr (headless runs, CI).
 fn report(slot: &mut Option<String>, e: impl std::fmt::Display) {
-    eprintln!("error: {e:#}");
+    stremflix_rs::elog!("error: {e:#}");
     *slot = Some(format!("{e:#}"));
 }
 
@@ -1326,8 +1408,11 @@ impl App {
         let queue: Vec<Job> = db.download_queue()?.into_iter().map(|q| Job::new(q.d, q.source, q.headers, q.state, q.validator, q.total)).collect();
         download::clear_partial(&data_dir.join("downloads"), &queue.iter().map(|j| j.d.path.clone()).collect::<Vec<_>>());
         let search_history = db.setting("search_history")?.map(|s| db::decode_history(&s)).unwrap_or_default();
+        let tab = db.setting("tab")?;
         let (tx, rx) = channel();
         ACCENT_IDX.store(accent_index(db.setting("accent")?.as_deref()), std::sync::atomic::Ordering::Relaxed);
+        let ua = db.setting("user_agent")?.unwrap_or_default();
+        stremflix_rs::addon::set_user_agent(&stremflix_rs::addon::valid_user_agent(&ua).unwrap_or_default());
         let mut app = Self {
             sub_style: db.setting("sub_style")?.map(|s| SubStyle::decode(&s)).unwrap_or_default(),
             rt: tokio::runtime::Runtime::new()?,
@@ -1377,6 +1462,8 @@ impl App {
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
+            addon_orders: ADDON_ORDER_KINDS.iter().map(|k| Ok((k.to_string(), decode_keys(&db.setting(&format!("addon_order:{k}"))?.unwrap_or_default())))).collect::<anyhow::Result<_>>()?,
+            addon_order_kind: String::new(),
             home_hidden: decode_keys(&db.setting("home_hidden")?.unwrap_or_default()),
             home_all: Vec::new(),
             light: db.setting("theme")?.as_deref() == Some("light"),
@@ -1394,13 +1481,14 @@ impl App {
             update: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
+            user_agent: ua,
             db,
             data_dir,
             client: AddonClient::new(),
             torrent: Default::default(),
             tx,
             rx,
-            tab: Tab::Home,
+            tab: Tab::from_name(tab.as_deref()),
             addon_url: String::new(),
             addon_updates: Vec::new(),
             checking_updates: false,
@@ -1426,6 +1514,9 @@ impl App {
             player: None,
             pill: None,
             last_poll: Instant::now(),
+            sleep: None,
+            sleep_carry: None,
+            timer_paused: None,
             gl_proc: None,
             window: Geo::default(),
             video: None,
@@ -1434,6 +1525,15 @@ impl App {
         };
         if app.addons.is_empty() {
             app.tab = Tab::Addons;
+        }
+        // Neither check may block startup: a failure here only skips the notice.
+        match app.db.quick_check() {
+            Ok(Some(e)) => report(&mut app.error, format!("database check failed: {e}")),
+            Ok(None) => {}
+            Err(e) => eprintln!("database check: {e:#}"),
+        }
+        if app.db.begin_session().unwrap_or(false) {
+            app.notice = Some("Stremflix did not exit cleanly last time. Playback progress is saved every second.".into());
         }
         let [kind, addr, user, pass] = &app.proxy;
         match stremflix_rs::addon::proxy_url(kind, addr, user, pass) {
@@ -1490,6 +1590,8 @@ impl App {
     /// Resolve `source` (http URL, magnet, or local path) and start playback.
     fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
         self.clear_file_pick();
+        self.sleep_carry = None;
+        self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
@@ -1674,7 +1776,10 @@ impl App {
 
     fn handle(&mut self, ctx: &egui::Context, msg: Msg) {
         match msg {
-            Msg::Error(e) => report(&mut self.error, e),
+            Msg::Error(e) => {
+                self.sleep_carry = None;
+                report(&mut self.error, e);
+            }
             Msg::Installed(url, m, replaces) => {
                 let saved = self.db.add_addon(&url, &m);
                 if let Err(e) = &saved {
@@ -1779,9 +1884,19 @@ impl App {
                 // `Only` autoplays when there's no choice to make; otherwise show the stream picker.
                 if autoplay != Autoplay::Off {
                     match (src, self.play_key()) {
-                        (Some(src), Some((key, title))) => self.play(ctx, key, title, src, subs),
-                        _ => self.show_streams = true,
+                        (Some(src), Some((key, title))) => {
+                            // The autoplay chain: `play` clears the carry like any other navigation, so hand it through.
+                            let carry = self.sleep_carry.take();
+                            self.play(ctx, key, title, src, subs);
+                            self.sleep_carry = carry;
+                        }
+                        _ => {
+                            self.show_streams = true;
+                            self.sleep_carry = None;
+                        }
                     }
+                } else {
+                    self.sleep_carry = None;
                 }
             }
             Msg::Episodes(mut meta, mut m, nav) => {
@@ -2061,7 +2176,9 @@ impl App {
                     }
                     return;
                 }
+                let carry = self.sleep_carry.take();
                 self.stop_player();
+                self.sleep = carry;
                 self.release_torrents(torrent);
                 let prev = self.db.progress(&key).ok().flatten();
                 let start = match &prev {
@@ -2105,7 +2222,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), skips, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -2175,6 +2292,9 @@ impl App {
     }
 
     fn stop_player(&mut self) {
+        self.sleep = None;
+        self.sleep_carry = None;
+        self.timer_paused = None;
         self.save_progress();
         self.player = None;
     }
@@ -2235,8 +2355,17 @@ impl App {
             self.release_torrents(None);
             return;
         }
+        if self.sleep.is_some_and(|(t, _)| Instant::now() >= t) {
+            self.sleep = None;
+            self.timer_paused = Some(false);
+            if let Err(e) = p.player.command(&["set", "pause", "yes"]) {
+                report(&mut self.error, e);
+            }
+            return;
+        }
         let st = &p.player.state;
-        if self.autoplay_next && at_end(st.pos, st.dur, st.paused) && self.playing_episode() {
+        self.timer_paused = timer_pause_step(self.timer_paused, st.paused);
+        if autoplay_due(self.autoplay_next, self.timer_paused, at_end(st.pos, st.dur, st.paused)) && !looping(p.repeat, p.ab) && self.playing_episode() {
             return self.play_next(ctx);
         }
         let Some(p) = &mut self.player else { return };
@@ -2425,7 +2554,8 @@ impl App {
         let matches = |m: &Manifest| {
             m.has_resource(res) && m.types.iter().any(|t| t == kind) && m.id_prefixes.as_ref().is_none_or(|ps| ps.iter().any(|p| id.starts_with(p.as_str())))
         };
-        self.addons.iter().filter(|(_, m)| matches(m)).map(|(u, _)| u.clone()).collect()
+        let urls: Vec<String> = self.addons.iter().filter(|(_, m)| matches(m)).map(|(u, _)| u.clone()).collect();
+        order_urls(urls, self.addon_orders.get(kind).map_or(&[][..], |o| o))
     }
 
     /// Fetch a movie's full meta for the detail page from the first addon that serves it.
@@ -2583,9 +2713,13 @@ impl App {
         let binge = (self.selected.as_ref()).and_then(|(_, streams, _)| streams.iter().find(|s| s.source() == src)?.hints.binge_group.clone());
         let next = (self.selected.as_ref().zip(self.episode.as_ref()))
             .and_then(|((m, ..), cur)| Some((m.clone(), next_episode(&self.episodes, &cur.id)?.clone())));
+        let sleep = self.sleep;
         self.stop_player();
         match next {
-            Some((m, v)) => self.open_streams(ctx, m, Some(v), Autoplay::Only, binge),
+            Some((m, v)) => {
+                self.open_streams(ctx, m, Some(v), Autoplay::Only, binge);
+                self.sleep_carry = sleep;
+            }
             None => {
                 self.release_torrents(None);
             }
@@ -2603,6 +2737,7 @@ impl App {
         let client = self.client.clone();
         let addons = self.addons_for("meta", &meta.kind, &meta.id);
         self.clear_file_pick();
+        self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -2682,6 +2817,7 @@ impl App {
         let names: Vec<String> = stream_addons.iter().map(|u| self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default()).collect();
         let sub_addons = self.addons_for("subtitles", &meta.kind, &id);
         self.clear_file_pick();
+        self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
         self.spawn(ctx, async move {
@@ -3430,6 +3566,12 @@ impl App {
             if k(ArrowUp) { cmd(&["add", "volume", "5"]); new_vol = Some(st.volume + 5.0) }
             if k(ArrowDown) { cmd(&["add", "volume", "-5"]); new_vol = Some(st.volume - 5.0) }
             if k(M) { cmd(&["cycle", "mute"]) }
+            if k(S) && focused.is_none() {
+                let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                let path = screenshot_path(&self.data_dir, &p.title, secs);
+                let _ = path.parent().map(std::fs::create_dir_all);
+                cmd(&["screenshot-to-file", &path.to_string_lossy(), "video"]);
+            }
             if k(I) && focused.is_none() { p.stats = !p.stats }
             // mpv pauses on its own after a frame step.
             if k(Period) { cmd(&["frame-step"]) }
@@ -3727,6 +3869,21 @@ impl App {
                                     }
                                 }
                             });
+                            menu_heading(ui, &match self.sleep {
+                                Some((t, _)) => format!("Sleep timer ({} min left)", t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60)),
+                                None => "Sleep timer".into(),
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                if pill(ui, "Off", self.sleep.is_none(), egui::Role::RadioButton).clicked() {
+                                    self.sleep = None;
+                                }
+                                for m in [15u64, 30, 60, 90] {
+                                    if pill(ui, &format!("{m} min"), self.sleep.is_some_and(|(_, c)| c == m), egui::Role::RadioButton).clicked() {
+                                        self.sleep = Some((Instant::now() + Duration::from_secs(m * 60), m));
+                                    }
+                                }
+                            });
                             menu_heading(ui, "Video");
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
@@ -3749,6 +3906,29 @@ impl App {
                                 p.zoom = 0;
                                 cmd(&["set", "video-zoom", "0"]);
                             }
+                            if switch_row(ui, "Repeat file", &mut p.repeat).changed() {
+                                cmd(&["set", "loop-file", if p.repeat { "inf" } else { "no" }]);
+                            }
+                            menu_heading(ui, "A-B loop");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                for (i, (name, prop)) in [("A", "ab-loop-a"), ("B", "ab-loop-b")].into_iter().enumerate() {
+                                    let label = p.ab[i].map_or(format!("Set {name}"), |t| format!("{name} {t:.0}s"));
+                                    if pill(ui, &label, p.ab[i].is_some(), egui::Role::Button).clicked() {
+                                        cmd(&["set", prop, &st.pos.to_string()]);
+                                        // Keep A before B so the labels match the loop mpv plays.
+                                        if set_ab(&mut p.ab, i, st.pos) {
+                                            cmd(&["set", "ab-loop-a", &p.ab[0].unwrap_or_default().to_string()]);
+                                            cmd(&["set", "ab-loop-b", &p.ab[1].unwrap_or_default().to_string()]);
+                                        }
+                                    }
+                                }
+                                if pill(ui, "Clear", false, egui::Role::Button).clicked() {
+                                    p.ab = [None; 2];
+                                    cmd(&["set", "ab-loop-a", "no"]);
+                                    cmd(&["set", "ab-loop-b", "no"]);
+                                }
+                            });
                             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                                 cmd(&["set", "hwdec", hwdec_value(self.hwdec)]);
                                 if let Err(e) = self.db.set_setting("hwdec", if self.hwdec { "1" } else { "0" }) {
@@ -3799,7 +3979,7 @@ impl App {
         // Up next: in an episode's last 30 s, a card slides in from the right to play the next one.
         if let Some((series, label, img)) = up_next {
             // Needs a duration over 60 s so a short or still-loading stream doesn't show the card at once.
-            let open = !p.next_dismissed && rect.width() >= 362.0 && st.dur > 60.0 && st.dur - st.pos <= 30.0;
+            let open = !p.next_dismissed && !looping(p.repeat, p.ab) && rect.width() >= 362.0 && st.dur > 60.0 && st.dur - st.pos <= 30.0;
             let t = ctx.animate_bool_with_time(ui.scope_id().with("up_next"), open, 0.4);
             if t > 0.0 {
                 let ease = 1.0 - (1.0 - t).powi(3);
@@ -3995,7 +4175,7 @@ impl App {
                 for chunk in urls.chunks(4) {
                     let res = concurrently(chunk.to_vec(), |u| {
                         let c = client.clone();
-                        async move { Ok((u.clone(), c.fetch_manifest(&u).await.map_err(|e| e.root_cause().to_string()))) }
+                        async move { Ok((u.clone(), c.fetch_manifest(&u).await.map_err(|e| health_error(&e)))) }
                     })
                     .await;
                     out.extend(res.into_iter().flatten());
@@ -4010,15 +4190,29 @@ impl App {
         let mut replace = None;
         let mut swap = None;
         let mut details = None;
+        let mut reset_order = false;
+        ui.horizontal(|ui| {
+            ui.label("Order for:");
+            for (k, label) in [("", "All"), ("movie", "Movies"), ("series", "Series")] {
+                ui.selectable_value(&mut self.addon_order_kind, k.to_string(), label);
+            }
+            if !self.addon_order_kind.is_empty() && self.addon_orders.get(&self.addon_order_kind).is_some_and(|o| !o.is_empty()) && small_button(ui, "Reset to global").clicked() {
+                reset_order = true;
+            }
+            ui.label("Per-type order applies to metadata, streams and subtitles; catalog rows and search keep the global order.");
+        });
         let n = self.addons.len();
-        for (i, (url, m)) in self.addons.iter().enumerate() {
+        let urls: Vec<String> = self.addons.iter().map(|(u, _)| u.clone()).collect();
+        let view = arrange_rows(&urls, self.addon_orders.get(&self.addon_order_kind).map_or(&[][..], |o| o));
+        for (pos, &i) in view.iter().enumerate() {
+            let (url, m) = &self.addons[i];
             ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
                 // Order is priority: streams and catalogs of higher addons come first.
-                if ui.add_enabled_ui(i > 0, |ui| small_button(ui, "Up")).inner.on_hover_text("Higher priority").clicked() {
-                    swap = Some(i - 1);
+                if ui.add_enabled_ui(pos > 0, |ui| small_button(ui, "Up")).inner.on_hover_text("Higher priority").clicked() {
+                    swap = Some(pos - 1);
                 }
-                if ui.add_enabled_ui(i + 1 < n, |ui| small_button(ui, "Down")).inner.on_hover_text("Lower priority").clicked() {
-                    swap = Some(i);
+                if ui.add_enabled_ui(pos + 1 < n, |ui| small_button(ui, "Down")).inner.on_hover_text("Lower priority").clicked() {
+                    swap = Some(pos);
                 }
                 ui.label(format!("{} {} ({})", m.name, m.version, url));
                 let open = self.addon_details.as_ref() == Some(url);
@@ -4045,15 +4239,21 @@ impl App {
                     });
                 }
                 Some(Err(e)) => {
-                    ui.label(RichText::new(format!("Unreachable: {e}")).weak());
+                    ui.label(RichText::new(e).weak());
                 }
-                _ => {}
+                Some(Ok(_)) => {
+                    ui.label(RichText::new("Reachable").weak());
+                }
+                None => {}
             }
             if m.behavior_hints.configuration_required {
                 ui.label(RichText::new("Needs configuration before use. Press Configure.").weak());
             }
             if self.addon_details.as_ref() == Some(url) {
                 Self::ui_addon_details(ui, m);
+            }
+            if let Some(link) = stremflix_rs::addon::install_link(url) {
+                ui.collapsing("Install on phone (QR)", |ui| qr_ui(ui, &link));
             }
             if let Some((old, pasted)) = self.configuring.as_mut().filter(|(o, _)| o == url)
                 && form_row(ui, "Configured URL:", pasted, "https://.../manifest.json", "Replace", None, false)
@@ -4086,10 +4286,30 @@ impl App {
         if let Some(d) = details {
             self.addon_details = d;
         }
-        if let Some(i) = swap {
-            self.addons.swap(i, i + 1);
-            let urls: Vec<String> = self.addons.iter().map(|(u, _)| u.clone()).collect();
-            if let Err(e) = self.db.reorder_addons(&urls) {
+        if reset_order {
+            match self.db.set_setting(&format!("addon_order:{}", self.addon_order_kind), "") {
+                Ok(()) => {
+                    self.addon_orders.remove(&self.addon_order_kind);
+                    self.build_rows(&ctx);
+                }
+                Err(e) => report(&mut self.error, format!("saving addon order: {e:#}")),
+            }
+        }
+        if let Some(p) = swap {
+            let mut ordered: Vec<String> = view.iter().map(|&i| urls[i].clone()).collect();
+            ordered.swap(p, p + 1);
+            let kind = self.addon_order_kind.clone();
+            let saved = if kind.is_empty() {
+                self.addons.sort_by_key(|(u, _)| ordered.iter().position(|o| o == u));
+                self.db.reorder_addons(&ordered)
+            } else {
+                let r = self.db.set_setting(&format!("addon_order:{kind}"), &encode_keys(&ordered));
+                if r.is_ok() {
+                    self.addon_orders.insert(kind, ordered);
+                }
+                r
+            };
+            if let Err(e) = saved {
                 report(&mut self.error, format!("saving addon order: {e:#}"));
             }
             self.build_rows(&ctx);
@@ -4265,7 +4485,7 @@ impl App {
                             (self.account, self.account_busy, self.confirm_upload, self.account_note) = (None, false, false, None);
                             let client = self.client.clone();
                             // Best effort: the key is already forgotten locally.
-                            self.rt.spawn(async move { client.stremio_logout(&key).await.inspect_err(|e| eprintln!("Stremio sign-out: {e:#}")) });
+                            self.rt.spawn(async move { client.stremio_logout(&key).await.inspect_err(|e| stremflix_rs::elog!("Stremio sign-out: {e:#}")) });
                         }
                         Err(e) => report(&mut self.error, format!("signing out: {e:#}")),
                     }
@@ -4329,6 +4549,25 @@ impl App {
         }
         if let Some(m) = &self.data_msg {
             ui.label(RichText::new(m).size(13.0).color(Color32::from_gray(170)));
+        }
+        ui.label(RichText::new("Diagnostics").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        let out = self.data_dir.join("diagnostics.txt");
+        if ui.button("Export diagnostics").on_hover_text(format!("Version, OS and recent log without secrets, saved to {}", out.display())).clicked() {
+            let summary = format!("addons: {}\nsigned in: {}", self.addons.len(), self.account.is_some());
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+            let res = o.open(&out).and_then(|mut f| {
+                // `mode` only applies to a new file: tighten an older one.
+                #[cfg(unix)]
+                f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+                std::io::Write::write_all(&mut f, stremflix_rs::diag::bundle(&summary).as_bytes())
+            });
+            match res {
+                Ok(()) => self.data_msg = Some(format!("Diagnostics saved to {}", out.display())),
+                Err(e) => report(&mut self.error, format!("diagnostics export: {e}")),
+            }
         }
         ui.add_space(8.0);
         ui.label(RichText::new("Torrents").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
@@ -4559,6 +4798,24 @@ impl App {
             });
         }
         ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(Color32::from_gray(170)));
+        ui.add_space(16.0);
+        ui.label(RichText::new("Network").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.horizontal(|ui| {
+            let l = ui.label("User-Agent:");
+            ui.add_space((150.0 - l.rect.width()).max(0.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut self.user_agent).hint_text("stremflix-rs").desired_width(400.0)).labelled_by(l.id);
+            match stremflix_rs::addon::valid_user_agent(&self.user_agent) {
+                Some(v) if r.changed() => {
+                    stremflix_rs::addon::set_user_agent(&v);
+                    save.push(("user_agent", v));
+                }
+                None => {
+                    ui.label(RichText::new(format!("Printable ASCII only, max {} characters", stremflix_rs::addon::MAX_UA_LEN)).size(13.0).color(Color32::from_rgb(230, 90, 90)));
+                }
+                _ => {}
+            }
+        });
+        ui.label(RichText::new("Sent to addons and for downloads. Empty uses the default. Torrent (librqbit) traffic is not covered.").size(13.0).color(Color32::from_gray(170)));
         ui.add_space(16.0);
         ui.label(RichText::new("Customize Home").size(20.0).strong().family(bold()).color(Color32::WHITE));
         let (mut swap, mut toggle, mut reset) = (None, None, false);
@@ -5025,6 +5282,7 @@ impl eframe::App for App {
                     (self.episodes, self.episode) = (Vec::new(), None);
                     self.scroll_top = true;
                     self.clear_file_pick();
+                    self.sleep_carry = None;
                     self.nav += 1;
                 }
                 ui.add_space(6.0);
@@ -5041,7 +5299,9 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
         let _ = self.db.set_setting("window", &self.window.to_string());
+        let _ = self.db.set_setting("tab", self.tab.name());
         self.stop_player();
+        let _ = self.db.end_session();
     }
 }
 
@@ -5109,6 +5369,7 @@ fn main() -> eframe::Result {
     if instance::forward(&dir, arg.as_deref().unwrap_or("")) {
         return Ok(());
     }
+    stremflix_rs::diag::init(&dir);
     let mut app = App::new(dir.clone()).expect("failed to initialise app data");
     let ctx_cell: Arc<std::sync::OnceLock<egui::Context>> = Default::default();
     let sink = {
@@ -5124,7 +5385,7 @@ fn main() -> eframe::Result {
         sink(a);
     }
     if let Err(e) = instance::listen(&dir, sink.clone()) {
-        eprintln!("error: links from later launches won't reach this window: {e}");
+        stremflix_rs::elog!("error: links from later launches won't reach this window: {e}");
     }
     #[cfg(windows)]
     std::thread::spawn(instance::register_scheme);
@@ -5153,7 +5414,7 @@ fn main() -> eframe::Result {
         // A failed check (offline, rate limit) only logs: it shouldn't show as an error.
         app.spawn(&cc.egui_ctx, async move {
             Ok(Msg::Update(client.check_update().await.unwrap_or_else(|e| {
-                eprintln!("update check: {e:#}");
+                stremflix_rs::elog!("update check: {e:#}");
                 None
             })))
         });
@@ -5211,7 +5472,7 @@ mod mac_links {
     pub fn install(sink: Box<dyn Fn(String) + Send + Sync>) {
         let _ = SINK.set(sink);
         let Some(cls) = AnyClass::get(c"WinitApplicationDelegate") else {
-            return eprintln!("error: stremio:// links unavailable: winit's app delegate not found");
+            return stremflix_rs::elog!("error: stremio:// links unavailable: winit's app delegate not found");
         };
         // SAFETY: the signature matches the "v@:@@" encoding of -application:openURLs:.
         let added = unsafe {
@@ -5219,7 +5480,7 @@ mod mac_links {
             objc2::ffi::class_addMethod(std::ptr::from_ref(cls).cast_mut(), sel!(application:openURLs:), imp, c"v@:@@".as_ptr())
         };
         if !added.as_bool() {
-            return eprintln!("error: stremio:// links unavailable: delegate already has application:openURLs:");
+            return stremflix_rs::elog!("error: stremio:// links unavailable: delegate already has application:openURLs:");
         }
         // AppKit can cache which selectors a delegate answers when it is set: set it again so the new one counts.
         // SAFETY: plain messages to the shared NSApplication on the main thread.
@@ -5248,9 +5509,51 @@ fn seek_step(v: Option<String>, default: u32) -> u32 {
     v.and_then(|v| v.parse().ok()).filter(|v| SEEK_STEP_RANGE.contains(v)).unwrap_or(default)
 }
 
+/// Draw `text` as a QR code of egui rects (no image files); dark on white so phones scan it in any theme.
+fn qr_ui(ui: &mut egui::Ui, text: &str) {
+    let Ok(code) = qrcode::QrCode::new(text) else {
+        ui.label(RichText::new("Link too long for a QR code").weak());
+        return;
+    };
+    let (w, quiet, px) = (code.width(), 2, 4.0);
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat((w + 2 * quiet) as f32 * px), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
+    for (i, c) in code.to_colors().into_iter().enumerate() {
+        if c == qrcode::Color::Dark {
+            let p = rect.min + vec2(((i % w) + quiet) as f32, ((i / w) + quiet) as f32) * px;
+            ui.painter().rect_filled(egui::Rect::from_min_size(p, egui::Vec2::splat(px)), 0.0, Color32::BLACK);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_name_round_trip() {
+        for t in [Tab::Home, Tab::Discover, Tab::Addons, Tab::Library, Tab::Settings] {
+            assert!(Tab::from_name(Some(t.name())) == t);
+        }
+        assert!(Tab::from_name(Some("bogus")) == Tab::Home && Tab::from_name(None) == Tab::Home);
+    }
+
+    #[test]
+    fn health_error_classifies_by_type() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (refused, t) = rt.block_on(async {
+            let c = reqwest::Client::new();
+            // A listener that never answers makes the deadline fire, not a refusal.
+            let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/", silent.local_addr().unwrap());
+            (c.get("http://127.0.0.1:1/").send().await.unwrap_err(), c.get(url).timeout(std::time::Duration::from_millis(50)).send().await.unwrap_err())
+        });
+        // Port 1 on localhost refuses at once: a transport error that is not a timeout.
+        assert_eq!(health_error(&anyhow::Error::new(refused)).split(':').next(), Some("Unreachable"));
+        assert!(health_error(&anyhow::anyhow!("HTTP 404 Not Found")).starts_with("Error: HTTP 404"));
+        assert!(t.is_timeout());
+        assert_eq!(health_error(&anyhow::Error::new(t).context("GET x")), "Timed out");
+    }
 
     #[test]
     fn fresh_episodes_seeds_dedupes_and_roundtrips() {
@@ -5321,6 +5624,7 @@ mod tests {
         // An empty refetch (episodes aged out of the window) removes the old row.
         upsert_by_id(&mut list, meta("a"), vec![]);
         assert_eq!(list.iter().map(|(m, _)| m.id.as_str()).collect::<Vec<_>>(), ["b"]);
+
     }
 
     #[test]
@@ -5559,6 +5863,10 @@ mod tests {
         assert_eq!(binge_source(&streams, "hd").as_deref(), Some("https://a/3"), "skips unplayable");
         assert_eq!(binge_source(&streams, "4k"), None);
         assert!(at_end(99.5, 100.0, true) && !at_end(99.5, 100.0, false) && !at_end(50.0, 100.0, true) && !at_end(0.0, 0.0, true));
+        let mut ab = [None; 2];
+        assert!(!set_ab(&mut ab, 1, 10.0) && ab == [None, Some(10.0)]);
+        assert!(set_ab(&mut ab, 0, 20.0) && ab == [Some(10.0), Some(20.0)], "A after B swaps");
+        assert!(!looping(false, [None, Some(1.0)]) && looping(false, ab) && looping(true, [None; 2]));
     }
 
     #[test]
@@ -5595,6 +5903,43 @@ mod tests {
         assert!(app.player.is_none());
         app.handle(&ctx, Msg::Streams(m("b"), None, vec![], vec![], Autoplay::Off, None, 2));
         assert_eq!(app.selected.as_ref().map(|(m, ..)| m.id.as_str()), Some("b"), "current reply applies");
+    }
+
+    #[test]
+    fn sleep_carry_survives_autoplay_chain_only() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
+        let one = Stream { url: Some("https://x.example/a".into()), ..Default::default() };
+        let carry = (Instant::now() + Duration::from_secs(600), 30);
+        // Successful autoplay: play advances nav, the carry rides along and Msg::Play consumes it exactly once.
+        app.nav = 3;
+        app.sleep_carry = Some(carry);
+        app.handle(&ctx, Msg::Streams(m.clone(), None, vec![one.clone()], vec![], Autoplay::Only, None, 3));
+        assert_eq!(app.sleep_carry, Some(carry), "survives play");
+        // Picker fallback, a failure, or any other navigation drops it.
+        app.handle(&ctx, Msg::Streams(m.clone(), None, vec![], vec![], Autoplay::Only, None, app.nav));
+        assert!(app.sleep_carry.is_none() && app.show_streams);
+        app.sleep_carry = Some(carry);
+        app.handle(&ctx, Msg::Error("boom".into()));
+        assert!(app.sleep_carry.is_none());
+        // A user-started play never inherits a stale carry.
+        app.sleep_carry = Some(carry);
+        app.play(&ctx, "movie:a".into(), "a".into(), "https://x.example/a".into(), vec![]);
+        assert!(app.sleep_carry.is_none());
+    }
+
+    #[test]
+    fn timer_pause_blocks_autoplay_until_resumed() {
+        assert!(autoplay_due(true, None, true));
+        assert!(!autoplay_due(true, Some(false), true), "pause not yet confirmed");
+        assert!(!autoplay_due(true, Some(true), true));
+        assert!(!autoplay_due(false, None, true));
+        let s = timer_pause_step(Some(false), false);
+        assert_eq!(s, Some(false), "mpv has not reported the pause yet");
+        let s = timer_pause_step(s, true);
+        assert_eq!(s, Some(true));
+        assert_eq!(timer_pause_step(s, false), None, "user resumed");
     }
 
     #[test]
@@ -5664,11 +6009,21 @@ mod tests {
     }
 
     #[test]
+    fn per_type_addon_order() {
+        let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let global = k(&["a", "b", "c"]);
+        assert_eq!(order_urls(global.clone(), &k(&["c", "a", "b"])), k(&["c", "a", "b"]), "per-type order applied");
+        assert_eq!(order_urls(global.clone(), &[]), global, "type without an order follows global");
+        assert_eq!(order_urls(global.clone(), &k(&["gone", "b"])), k(&["b", "a", "c"]), "stale ids ignored");
+        assert_eq!(order_urls(k(&["a", "b", "c", "new"]), &k(&["c", "a", "b"])), k(&["c", "a", "b", "new"]), "new addons appended");
+    }
+
+    #[test]
     fn home_rows_order_and_keys() {
         let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let keys = k(&["a", "b", "c", "d"]);
         assert_eq!(arrange_rows(&keys, &k(&["c", "zz", "a", "c"])), [2, 0, 1, 3], "stale and repeated keys ignored, rest keep priority");
-        assert_eq!(arrange_rows(&keys, &[]), [0, 1, 2, 3]);
+        assert_eq!(arrange_rows(&keys, &[]), [0, 1, 2, 3], "no per-type order falls back to the global one");
         let odd = k(&["http://h/m.json|movie|top \"x\"", "b"]);
         assert_eq!(decode_keys(&encode_keys(&odd)), odd);
         assert!(decode_keys("garbage").is_empty());
@@ -5755,6 +6110,12 @@ mod tests {
         for not in ["https://x.example/a.torrent", "magnet:?xt=urn:btih:a.torrent", "/m/a.mkv", "/m/torrent"] {
             assert!(!is_torrent_file(not), "{not}");
         }
+    }
+
+    #[test]
+    fn screenshot_path_is_filename_safe() {
+        let p = screenshot_path(std::path::Path::new("/d"), "A/B: c", 7);
+        assert_eq!(p, std::path::Path::new("/d/screenshots/A_B__c-7.png"));
     }
 
     #[test]

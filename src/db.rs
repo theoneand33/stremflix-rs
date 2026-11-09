@@ -132,7 +132,7 @@ impl Db {
             if let Err(e) = std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o600))
                 && e.kind() != std::io::ErrorKind::NotFound
             {
-                eprintln!("making {} owner-only: {e}", PathBuf::from(f).display());
+                crate::elog!("making {} owner-only: {e}", PathBuf::from(f).display());
             }
         }
         conn.execute_batch(
@@ -535,6 +535,23 @@ impl Db {
         Ok(())
     }
 
+    /// Mark this run as live; true if the previous run never cleared the mark (crash, kill, power loss).
+    pub fn begin_session(&self) -> Result<bool> {
+        let crashed = self.setting("running")?.is_some();
+        self.set_setting("running", "1")?;
+        Ok(crashed)
+    }
+
+    pub fn end_session(&self) -> Result<()> {
+        self.remove_setting("running")
+    }
+
+    /// `PRAGMA quick_check`: None when the database is intact, else the first problem it reports.
+    pub fn quick_check(&self) -> Result<Option<String>> {
+        let r: String = self.conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        Ok((r != "ok").then_some(r))
+    }
+
     pub fn remove_setting(&self, key: &str) -> Result<()> {
         self.conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
         Ok(())
@@ -714,6 +731,23 @@ pub fn decode_history(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unclean_exit_detected_and_cleared() {
+        let dir = std::env::temp_dir().join(format!("stremflix-session-{}", std::process::id()));
+        let path = dir.join("t.db");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&path).unwrap();
+        assert!(!db.begin_session().unwrap());
+        assert_eq!(db.quick_check().unwrap(), None);
+        drop(db); // no end_session: simulates a crash
+        let db = Db::open(&path).unwrap();
+        assert!(db.begin_session().unwrap());
+        db.end_session().unwrap();
+        assert!(!db.begin_session().unwrap());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn history_push_dedupe_cap_roundtrip() {

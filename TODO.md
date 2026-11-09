@@ -28,9 +28,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Chromecast / DLNA casting | P3 | XL | |
-| Sleep timer | P3 | S | |
-| Screenshot capture | P3 | S | mpv `screenshot-to-file`. |
-| A-B loop / repeat | P3 | S | |
 | Frame-by-frame stepping | P3 | S | |
 | Picture-in-picture / mini player | P3 | M | egui viewport or a second native window. |
 | Audio output device selection | P3 | M | mpv `audio-device`. |
@@ -48,19 +45,14 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Transcoding for formats the player can't handle | P3 | L | mpv already plays almost everything, so this is mostly irrelevant. |
-| Configurable User-Agent | P3 | S | Some addons and streams reject the default. |
 | Pause playback when the window is minimized | P3 | S | Stremio setting. |
 | Launch playback in a separate window | P3 | M | Stremio setting; egui multi-viewport. |
-| Log file and diagnostics export | P3 | S | |
 
 ### Addons
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Remote/LAN streaming server | P2 | L | Stremio serves the library to other devices; casting is a separate item. |
-| Addon health indicator (unreachable / timeout) | P3 | S | |
-| QR code to install an addon | P3 | S | |
-| Per-type addon ordering | P3 | S | One global priority list today. |
 
 ### Accounts and sync
 
@@ -76,7 +68,5 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | UI translations (i18n) | P3 | M | |
 | Auto-install updates | P3 | M | Release builds already show a download link for a newer build; downloading and replacing the binary is still missing. |
 | Android, iOS, TV clients | P3 | XL | Out of scope for an egui desktop app. |
-| Remember last tab and window state on launch | P3 | S | |
 | Command-line flags for play/open | P3 | S | Only `stremio://` links are parsed now. |
 | Screen-reader labels and focus-order polish | P3 | M | AccessKit is enabled; coverage is partial. |
-| Crash-safe recovery / resume after unexpected exit | P3 | S | WAL is on; no explicit recovery UI. |

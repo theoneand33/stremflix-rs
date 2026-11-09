@@ -308,14 +308,14 @@ impl TorrentEngine {
         };
         for (_, h) in stopped.iter().filter(|(_, h)| !h.is_paused()) {
             if let Err(e) = self.session.pause(h).await {
-                eprintln!("pause torrent {}: {e:#}", h.id());
+                crate::elog!("pause torrent {}: {e:#}", h.id());
             }
         }
         // shortcut: counts downloaded bytes, not on-disk size (sparse files make them close); use file lengths if they drift.
         let sizes: Vec<(usize, u64)> = stopped.iter().map(|(id, h)| (*id, h.stats().progress_bytes)).collect();
         for id in evict(&sizes, self.cache) {
             if let Err(e) = self.session.delete(id.into(), true).await {
-                eprintln!("delete torrent {id}: {e:#}");
+                crate::elog!("delete torrent {id}: {e:#}");
             }
         }
     }
