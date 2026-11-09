@@ -1267,6 +1267,8 @@ struct App {
     /// (download, upload) in bytes/s; 0 is unlimited.
     torrent_limits: (u32, u32),
     torrent_seed: SeedLimit,
+    /// Torrent row in the manager awaiting a delete confirmation.
+    confirm_delete: Option<usize>,
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
     /// Settings > Data: path typed for an import, and the last export/import result.
@@ -1457,6 +1459,7 @@ impl App {
                 ratio: db.setting("seed_ratio")?.and_then(|v| v.parse().ok()).unwrap_or(0.0),
                 secs: db.setting("seed_secs")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             },
+            confirm_delete: None,
             data_import: String::new(),
             data_msg: None,
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
@@ -4618,7 +4621,7 @@ impl App {
                 });
             });
         }
-        for (label, id, choices) in [("Seed to ratio:", "seed_ratio", &SEED_RATIOS), ("Seed for:", "seed_secs", &SEED_TIMES)] {
+        for (label, id, choices) in [("Seed to ratio:", "seed_ratio", &SEED_RATIOS), ("Seed for (after playback):", "seed_secs", &SEED_TIMES)] {
             ui.horizontal(|ui| {
                 let l = ui.label(label);
                 ui.add_space((150.0 - l.rect.width()).max(0.0));
@@ -4633,18 +4636,29 @@ impl App {
                 });
             });
         }
-        let note = "Finished torrents keep seeding after playback until a seeding limit is reached (both Off: stop at once). Stopped torrents stay on disk up to the cache size, and are cleared when the app starts.";
+        let note = "Finished torrents keep seeding after playback ends (the \"Seed for\" timer starts then, not when the download completes) until a seeding limit is reached (both Off: stop at once). Seeding torrents are exempt from the cache size: they stay on disk until their limit is reached and the next release. Other stopped torrents stay on disk up to the cache size, and are cleared when the app starts.";
         ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
         if self.torrent.get().is_some() {
             ui.label(RichText::new("A torrent has already played: restart the app to apply changes.").size(13.0).color(ui.visuals().weak_text_color()));
         }
         if let Some(engine) = self.torrent.get() {
             ui.ctx().request_repaint_after(Duration::from_secs(2));
+            let playing = self.player.as_ref().and_then(|p| p.torrent);
             for t in engine.list() {
                 ui.horizontal(|ui| {
-                    if ui.small_button("Delete").on_hover_text("Stop and delete its files").clicked() {
-                        let e = engine.clone();
-                        self.rt.spawn(async move { e.remove(t.id).await });
+                    if self.confirm_delete == Some(t.id) {
+                        ui.label("Delete files?");
+                        if ui.small_button("Yes").clicked() {
+                            self.confirm_delete = None;
+                            if let Err(e) = self.rt.block_on(engine.remove(t.id)) {
+                                report(&mut self.error, e);
+                            }
+                        }
+                        if ui.small_button("No").clicked() {
+                            self.confirm_delete = None;
+                        }
+                    } else if playing != Some(t.id) && ui.small_button("Delete").on_hover_text("Stop and delete its files").clicked() {
+                        self.confirm_delete = Some(t.id);
                     }
                     let state = if t.paused { "stopped" } else { "running" };
                     let (done, total) = t.progress;

@@ -66,7 +66,7 @@ impl SeedLimit {
 
     /// Whether a torrent that uploaded `up` of `size` bytes over `elapsed` has hit a limit.
     pub fn reached(self, up: u64, size: u64, elapsed: Duration) -> bool {
-        (self.ratio > 0.0 && up as f64 >= self.ratio * size as f64) || (self.secs > 0 && elapsed.as_secs() >= self.secs)
+        (self.ratio > 0.0 && size > 0 && up as f64 >= self.ratio * size as f64) || (self.secs > 0 && elapsed.as_secs() >= self.secs)
     }
 }
 
@@ -204,12 +204,13 @@ impl TorrentEngine {
         })
     }
 
-    /// Stop torrent `id` and delete its files.
-    pub async fn remove(&self, id: usize) {
+    /// Stop torrent `id` and delete its files; refuses a torrent a download or stream holds.
+    pub async fn remove(&self, id: usize) -> Result<()> {
+        // Held through the delete so stream_url can't pin the torrent in between.
+        let pinned = self.pinned.lock().await;
+        anyhow::ensure!(!pinned.contains(&id), "torrent {id} is in use");
         self.seeding.lock().unwrap().remove(&id);
-        if let Err(e) = self.session.delete(id.into(), true).await {
-            eprintln!("delete torrent {id}: {e:#}");
-        }
+        self.session.delete(id.into(), true).await.with_context(|| format!("delete torrent {id}"))
     }
 
     /// Add a magnet or local `.torrent` file; returns its handle and the file index chosen by `file_idx` or a magnet's `so=`.
@@ -371,6 +372,7 @@ mod tests {
         assert!(!l.reached(99, 100, s(59)) && l.reached(100, 100, s(0)) && l.reached(0, 100, s(60)));
         assert!(!SeedLimit { ratio: 0.0, secs: 0 }.reached(u64::MAX, 1, s(u64::MAX)), "no limit never trips");
         assert!(!SeedLimit { ratio: 2.0, secs: 0 }.reached(150, 100, s(9999)));
+        assert!(!SeedLimit { ratio: 1.0, secs: 0 }.reached(0, 0, s(0)), "empty torrent is not instantly done");
     }
 
     #[tokio::test]
@@ -387,11 +389,12 @@ mod tests {
         let paused = || engine.session.get(id.into()).unwrap().is_paused();
         engine.release_except(None).await;
         assert!(!paused(), "pinned: kept running");
+        assert!(engine.remove(id).await.is_err(), "pinned: delete refused");
         engine.unpin(id).await;
         engine.release_except(None).await;
         assert!(paused(), "unpinned: stopped");
         assert_eq!(engine.list().len(), 1);
-        engine.remove(id).await;
+        engine.remove(id).await.unwrap();
         assert!(engine.list().is_empty());
     }
 }
