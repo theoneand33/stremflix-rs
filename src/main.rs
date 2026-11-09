@@ -572,6 +572,8 @@ fn apply_theme(ctx: &egui::Context, light: bool) {
             // Keep the old dark palette: egui's defaults are dimmer than the grays used before theming.
             v.widgets.noninteractive.fg_stroke.color = Color32::from_gray(200);
             v.weak_text_color = Some(Color32::from_gray(170));
+        } else {
+            v.weak_text_color = Some(Color32::from_gray(95));
         }
         // Netflix-style flat buttons: no outline or grow on hover, gray that dims when hovered.
         let w = &mut v.widgets;
@@ -613,7 +615,7 @@ fn card_play(ui: &mut egui::Ui, card: &egui::Response, rect: egui::Rect, label: 
         let c = b.center();
         p.add(egui::Shape::convex_polygon(vec![c + vec2(-7.0, -11.0), c + vec2(14.0, 0.0), c + vec2(-7.0, 11.0)], Color32::WHITE, egui::Stroke::NONE));
     }
-    r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+    r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(label).clicked()
 }
 
 /// Phosphor Fill weight (same codepoints as Regular); used for play and pause.
@@ -783,20 +785,27 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(f);
 }
 
+fn pill_style(ui: &mut egui::Ui, fill: [Color32; 2], fg: Color32) {
+    let w = &mut ui.visuals_mut().widgets;
+    for (st, f) in [(&mut w.inactive, fill[0]), (&mut w.hovered, fill[1]), (&mut w.active, fill[1])] {
+        (st.weak_bg_fill, st.bg_stroke, st.fg_stroke.color) = (f, egui::Stroke::NONE, fg);
+    }
+}
+
+fn pill_widget<'a>(text: &str, size: f32) -> egui::Button<'a> {
+    let rt = |s: &str, family| RichText::new(s).size(size).strong().family(family);
+    // A leading icon ("<icon>  Label") is drawn in Phosphor, not Inter; see `phosphor`.
+    match text.split_once("  ") {
+        Some((i, t)) if !i.is_empty() && i.chars().all(|c| ('\u{E000}'..='\u{F8FF}').contains(&c)) => egui::Button::new((rt(i, phosphor()), rt(t, bold()))),
+        _ => egui::Button::new(rt(text, bold())),
+    }
+}
+
 /// Netflix flat pill: `fill` = [normal, hovered], no outline; fully rounded ends.
 fn pill_button(ui: &mut egui::Ui, text: &str, size: f32, min: egui::Vec2, fill: [Color32; 2], fg: Color32) -> egui::Response {
     ui.scope(|ui| {
-        let w = &mut ui.visuals_mut().widgets;
-        for (st, f) in [(&mut w.inactive, fill[0]), (&mut w.hovered, fill[1]), (&mut w.active, fill[1])] {
-            (st.weak_bg_fill, st.bg_stroke, st.fg_stroke.color) = (f, egui::Stroke::NONE, fg);
-        }
-        let rt = |s: &str, family| RichText::new(s).size(size).strong().family(family);
-        // A leading icon ("<icon>  Label") is drawn in Phosphor, not Inter; see `phosphor`.
-        let button = match text.split_once("  ") {
-            Some((i, t)) if !i.is_empty() && i.chars().all(|c| ('\u{E000}'..='\u{F8FF}').contains(&c)) => egui::Button::new((rt(i, phosphor()), rt(t, bold()))),
-            _ => egui::Button::new(rt(text, bold())),
-        };
-        ui.add(button.min_size(min).corner_radius((min.y / 2.0) as u8))
+        pill_style(ui, fill, fg);
+        ui.add(pill_widget(text, size).min_size(min).corner_radius((min.y / 2.0) as u8))
     })
     .inner
 }
@@ -830,12 +839,15 @@ fn health_error(e: &anyhow::Error) -> String {
 
 /// Small secondary pill for toolbar actions (Uninstall, Clear, Stop …).
 fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    pill_button(ui, text, 14.0, vec2(0.0, 32.0), gray_fill(), Color32::WHITE)
+    let (fill, fg) = if ui.visuals().dark_mode { (gray_fill(), Color32::WHITE) } else { ([tint(ui, 34), tint(ui, 20)], ui.visuals().strong_text_color()) };
+    pill_button(ui, text, 14.0, vec2(0.0, 32.0), fill, fg)
 }
 
 /// Small white pill for the main action in a row (Install, Play …).
 fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    pill_button(ui, text, 14.0, vec2(0.0, 32.0), white_fill(), Color32::BLACK)
+    // A white pill vanishes on the light panel.
+    let (fill, fg) = if ui.visuals().dark_mode { (white_fill(), Color32::BLACK) } else { ([Color32::BLACK, Color32::from_gray(60)], Color32::WHITE) };
+    pill_button(ui, text, 14.0, vec2(0.0, 32.0), fill, fg)
 }
 
 /// Labeled text field and its action button on one centered line; fields of consecutive rows start at the same x.
@@ -855,6 +867,11 @@ fn form_row(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str, actio
         (b.clicked() || enter) && (allow_blank || !text.trim().is_empty())
     })
     .inner
+}
+
+/// Poster art rarely has readable text at card size, so the tooltip leads with the title.
+fn card_tip(m: &MetaPreview) -> String {
+    m.description.as_ref().map_or_else(|| m.name.clone(), |d| format!("{}\n\n{d}", m.name))
 }
 
 /// Gray card with centered, wrapped text (used when there's no poster).
@@ -2809,7 +2826,7 @@ impl App {
     /// "Add to list" menu: a checkbox per list, plus a new list that gets `meta`.
     fn list_menu(&mut self, ui: &mut egui::Ui, meta: &MetaPreview) {
         let t = SavedTitle { key: format!("{}:{}", meta.kind, meta.id), title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone(), year: None, rating: None, last_watched: None };
-        ui.menu_button(format!("{}  Add to list", icons::PLUS), |ui| {
+        egui::containers::menu::MenuButton::from_button(pill_widget(&format!("{}  Add to list", icons::PLUS), 18.0).min_size(vec2(130.0, 46.0)).corner_radius(23)).ui(ui, |ui| {
             let mut change = None;
             for l in &self.lists {
                 let mut on = l.keys.contains(&t.key);
@@ -3409,10 +3426,10 @@ impl App {
             });
             for e in cur.2.pickers() {
                 let at = d.extras.iter().position(|(n, _)| *n == e.name);
-                let text = at.map_or_else(|| format!("All {}", e.name), |i| d.extras[i].1.clone());
+                let text = at.map_or_else(|| format!("Any {}", e.name), |i| d.extras[i].1.clone());
                 egui::ComboBox::from_id_salt(("discover_extra", &e.name)).selected_text(text).show_ui(ui, |ui| {
                     let mut pick = None;
-                    if !cur.2.is_required(&e.name) && ui.selectable_label(at.is_none(), format!("All {}", e.name)).clicked() {
+                    if !cur.2.is_required(&e.name) && ui.selectable_label(at.is_none(), format!("Any {}", e.name)).clicked() {
                         pick = Some(None);
                     }
                     for o in &e.options {
@@ -3444,7 +3461,7 @@ impl App {
                         if card_play(ui, &r, rect, &m.name) {
                             quick = Some(m.clone());
                         }
-                        if r.on_hover_text(m.description.as_deref().unwrap_or(&m.name)).clicked() {
+                        if r.on_hover_text(card_tip(m)).clicked() {
                             open = Some(m.clone());
                         }
                     }
@@ -3486,7 +3503,7 @@ impl App {
                     if card_play(ui, &r, rect, &m.name) {
                         *quick = Some(m.clone());
                     }
-                    if r.on_hover_text(m.description.as_deref().unwrap_or(&m.name)).clicked() {
+                    if r.on_hover_text(card_tip(m)).clicked() {
                         *open = Some((m.clone(), false));
                     }
                 }
@@ -3564,7 +3581,7 @@ impl App {
                 if hero_button(ui, &label, [gray(179), gray(102)], Color32::WHITE).clicked() {
                     self.toggle_saved(meta);
                 }
-                self.list_menu(ui, meta);
+                ui.scope(|ui| { pill_style(ui, gray_fill(), Color32::WHITE); self.list_menu(ui, meta) });
             });
             ui.add_space(12.0);
             if let Some(d) = &meta.description {
@@ -4110,12 +4127,14 @@ impl App {
                                 p.zoom = 0;
                                 cmd(&["set", "video-zoom", "0"]);
                             }
-                            if switch_row(ui, "Repeat file", &mut p.repeat).changed() {
-                                cmd(&["set", "loop-file", if p.repeat { "inf" } else { "no" }]);
-                            }
-                            menu_heading(ui, "A-B loop");
+                            menu_heading(ui, "Loop");
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                // A pill, not a switch row: the panel must stay short enough to clear the seek bar at 700 px.
+                                if pill(ui, "Repeat", p.repeat, egui::Role::CheckBox).clicked() {
+                                    p.repeat = !p.repeat;
+                                    cmd(&["set", "loop-file", if p.repeat { "inf" } else { "no" }]);
+                                }
                                 for (i, (name, prop)) in [("A", "ab-loop-a"), ("B", "ab-loop-b")].into_iter().enumerate() {
                                     let label = p.ab[i].map_or(format!("Set {name}"), |t| format!("{name} {t:.0}s"));
                                     if pill(ui, &label, p.ab[i].is_some(), egui::Role::Button).clicked() {
@@ -4133,6 +4152,7 @@ impl App {
                                     cmd(&["set", "ab-loop-b", "no"]);
                                 }
                             });
+                            menu_heading(ui, "Advanced");
                             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                                 cmd(&["set", "hwdec", hwdec_value(self.hwdec)]);
                                 if let Err(e) = self.db.set_setting("hwdec", if self.hwdec { "1" } else { "0" }) {
@@ -4382,7 +4402,7 @@ impl App {
                 Ok(Msg::Imported(imp))
             });
         }
-        if ui.add_enabled(!self.checking_updates && !self.addons.is_empty(), egui::Button::new(if self.checking_updates { "Checking..." } else { "Check for updates" })).clicked() {
+        if ui.add_enabled_ui(!self.checking_updates && !self.addons.is_empty(), |ui| small_button(ui, if self.checking_updates { "Checking..." } else { "Check for updates" })).inner.clicked() {
             self.checking_updates = true;
             let (client, urls) = (self.client.clone(), self.addons.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>());
             self.spawn(&ctx, async move {
@@ -4408,15 +4428,18 @@ impl App {
         let mut details = None;
         let mut reset_order = false;
         ui.horizontal(|ui| {
+            ui.set_min_height(32.0);
             ui.label("Order for:");
             for (k, label) in [("", "All"), ("movie", "Movies"), ("series", "Series")] {
-                ui.selectable_value(&mut self.addon_order_kind, k.to_string(), label);
+                if pill(ui, label, self.addon_order_kind == k, egui::Role::RadioButton).clicked() {
+                    self.addon_order_kind = k.to_string();
+                }
             }
             if !self.addon_order_kind.is_empty() && self.addon_orders.get(&self.addon_order_kind).is_some_and(|o| !o.is_empty()) && small_button(ui, "Reset to global").clicked() {
                 reset_order = true;
             }
-            ui.label("Per-type order applies to metadata, streams and subtitles; catalog rows and search keep the global order.");
         });
+        ui.label(RichText::new("Per-type order applies to metadata, streams and subtitles; catalog rows and search keep the global order.").size(13.0).color(ui.visuals().weak_text_color()));
         let n = self.addons.len();
         let urls: Vec<String> = self.addons.iter().map(|(u, _)| u.clone()).collect();
         let view = arrange_rows(&urls, self.addon_orders.get(&self.addon_order_kind).map_or(&[][..], |o| o));
@@ -4430,7 +4453,7 @@ impl App {
                 if ui.add_enabled_ui(pos + 1 < n, |ui| small_button(ui, "Down")).inner.on_hover_text("Lower priority").clicked() {
                     swap = Some(pos);
                 }
-                ui.label(format!("{} {} ({})", m.name, m.version, url));
+                ui.label(format!("{} {}", m.name, m.version)).on_hover_text(url);
                 let open = self.addon_details.as_ref() == Some(url);
                 if small_button(ui, if open { "Hide details" } else { "Details" }).clicked() {
                     details = Some((!open).then(|| url.clone()));
@@ -4648,6 +4671,7 @@ impl App {
         ui.add_space(8.0);
         ui.label(RichText::new("Appearance").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
         ui.horizontal(|ui| {
+            ui.set_min_height(32.0);
             ui.label(RichText::new("Theme").size(15.0).color(ui.visuals().text_color()));
             for (name, light) in [("Dark", false), ("Light", true)] {
                 if pill(ui, name, self.light == light, egui::Role::RadioButton).clicked() && self.light != light {
@@ -4676,8 +4700,7 @@ impl App {
         if !save.is_empty() {
             apply_theme(ui.ctx(), self.light);
         }
-        ui.add_space(16.0);
-        ui.label(RichText::new("Stremio account").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        Self::row_title(ui, "Stremio account");
         let ctx = ui.ctx().clone();
         if let Some(email) = self.account.clone() {
             ui.horizontal(|ui| {
@@ -4709,7 +4732,7 @@ impl App {
             });
             if self.confirm_upload {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Overwrites the account's addon list with this order (addons only on the account are kept, last). Saved titles missing on the account are added (ones it has, even removed, stay as they are), and progress is updated only where it is newer there. Nothing is deleted.").size(13.0).color(Color32::from_gray(170)));
+                    ui.label(RichText::new("Overwrites the account's addon list with this order (addons only on the account are kept, last). Saved titles missing on the account are added (ones it has, even removed, stay as they are), and progress is updated only where it is newer there. Nothing is deleted.").size(13.0).color(ui.visuals().weak_text_color()));
                     if primary_button(ui, "Upload").clicked() {
                         self.confirm_upload = false;
                         self.upload_account(&ctx);
@@ -4720,11 +4743,12 @@ impl App {
                 });
             }
             if let Some(note) = &self.account_note {
-                ui.label(RichText::new(note).size(13.0).color(Color32::from_gray(170)));
+                ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
             }
         } else {
             let mut go = false;
             ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
                 let l = ui.label("Email:");
                 ui.add_space((150.0 - l.rect.width()).max(0.0));
                 ui.add(egui::TextEdit::singleline(&mut self.login.0).desired_width(260.0)).labelled_by(l.id);
@@ -4748,27 +4772,26 @@ impl App {
                 });
             }
         }
-        ui.add_space(8.0);
-        ui.label(RichText::new("Data").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
-        if small_button(ui, "Export data…").on_hover_text("Write addons, saved titles, progress and settings to a JSON file in the data folder").clicked() {
+        Self::row_title(ui, "Data");
+        if small_button(ui, "Export data").on_hover_text("Write addons, saved titles, progress and settings to a JSON file in the data folder").clicked() {
             match self.db.export_file(&self.data_dir.join("exports")) {
                 Ok(p) => self.data_msg = Some(format!("Exported to {}", p.display())),
                 Err(e) => report(&mut self.error, format!("exporting: {e:#}")),
             }
         }
-        ui.label(RichText::new("The export includes addon URLs, which can hold account tokens. Keep it private.").size(13.0).color(Color32::from_gray(170)));
-        if form_row(ui, "Import data…:", &mut self.data_import, "/path/to/stremflix-rs-export.json", "Import", Some("Merges the file into your data; nothing is deleted"), false) {
+        ui.label(RichText::new("The export includes addon URLs, which can hold account tokens. Keep it private.").size(13.0).color(ui.visuals().weak_text_color()));
+        if form_row(ui, "Import file:", &mut self.data_import, "/path/to/stremflix-rs-export.json", "Import", Some("Merges the file into your data; nothing is deleted"), false) {
             match self.db.import_file(std::path::Path::new(self.data_import.trim())) {
                 Ok(m) => self.data_msg = Some(format!("{m}. Restart the app to apply.")),
                 Err(e) => report(&mut self.error, format!("importing: {e:#}")),
             }
         }
         if let Some(m) = &self.data_msg {
-            ui.label(RichText::new(m).size(13.0).color(Color32::from_gray(170)));
+            ui.label(RichText::new(m).size(13.0).color(ui.visuals().weak_text_color()));
         }
-        ui.label(RichText::new("Diagnostics").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        Self::row_title(ui, "Diagnostics");
         let out = self.data_dir.join("diagnostics.txt");
-        if ui.button("Export diagnostics").on_hover_text(format!("Version, OS and recent log without secrets, saved to {}", out.display())).clicked() {
+        if small_button(ui, "Export diagnostics").on_hover_text(format!("Version, OS and recent log without secrets, saved to {}", out.display())).clicked() {
             let summary = format!("addons: {}\nsigned in: {}", self.addons.len(), self.account.is_some());
             let mut o = std::fs::OpenOptions::new();
             o.write(true).create(true).truncate(true);
@@ -4785,8 +4808,7 @@ impl App {
                 Err(e) => report(&mut self.error, format!("diagnostics export: {e}")),
             }
         }
-        ui.add_space(8.0);
-        ui.label(RichText::new("Torrents").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        Self::row_title(ui, "Torrents");
         let hint = self.data_dir.join("torrents").display().to_string();
         if form_row(ui, "Cache location:", &mut self.torrent_dir, &hint, "Save", Some("Empty: the app's data folder"), true) {
             let d = self.torrent_dir.trim().to_string();
@@ -4798,6 +4820,7 @@ impl App {
             }
         }
         ui.horizontal(|ui| {
+            ui.set_min_height(32.0);
             let l = ui.label("Cache size:");
             ui.add_space((150.0 - l.rect.width()).max(0.0));
             let label = CACHE_SIZES.iter().find(|c| c.1 == self.torrent_cache).map_or("Custom", |c| c.0);
@@ -4810,6 +4833,7 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
+            ui.set_min_height(32.0);
             let l = ui.label("Connections:");
             ui.add_space((150.0 - l.rect.width()).max(0.0));
             egui::ComboBox::from_id_salt("torrent_profile").selected_text(self.torrent_profile.label()).show_ui(ui, |ui| {
@@ -4822,6 +4846,7 @@ impl App {
         });
         for (title, key, val) in [("Download limit:", "torrent_down_limit", &mut self.torrent_limits.0), ("Upload limit:", "torrent_up_limit", &mut self.torrent_limits.1)] {
             ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
                 let l = ui.label(title);
                 ui.add_space((150.0 - l.rect.width()).max(0.0));
                 let label = SPEED_LIMITS.iter().find(|c| c.1 == *val).map_or("Custom", |c| c.0);
@@ -4881,10 +4906,10 @@ impl App {
                 });
             }
         }
-        ui.add_space(16.0);
-        ui.label(RichText::new("Proxy").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        Self::row_title(ui, "Proxy");
         let kinds = [("", "Off"), ("http", "HTTP"), ("socks5", "SOCKS5")];
         ui.horizontal(|ui| {
+            ui.set_min_height(32.0);
             let l = ui.label("Type:");
             ui.add_space((150.0 - l.rect.width()).max(0.0));
             let shown = kinds.iter().find(|k| k.0 == self.proxy[0]).map_or("Off", |k| k.1);
@@ -4897,11 +4922,13 @@ impl App {
         let mut apply = false;
         if !self.proxy[0].is_empty() {
             ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
                 let l = ui.label("Address:");
                 ui.add_space((150.0 - l.rect.width()).max(0.0));
                 ui.add(egui::TextEdit::singleline(&mut self.proxy[1]).hint_text("host:port").desired_width(260.0)).labelled_by(l.id);
             });
             ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
                 let l = ui.label("Username:");
                 ui.add_space((150.0 - l.rect.width()).max(0.0));
                 ui.add(egui::TextEdit::singleline(&mut self.proxy[2]).hint_text("optional").desired_width(160.0)).labelled_by(l.id);
@@ -4925,8 +4952,7 @@ impl App {
             SOCKS5 covers addons, downloads, the update check and torrent peers and HTTP trackers, but not mpv's direct HTTP streams \
             (mpv has no SOCKS support) or DHT. The password is stored unencrypted in the app's database.";
         ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
-        ui.add_space(16.0);
-        ui.label(RichText::new("Player").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        Self::row_title(ui, "Player");
         if form_row(ui, "External player:", &mut self.external_player, "vlc", "Save", Some("Command run with the stream URL; no shell"), true) {
             save.push(("external_player", self.external_player.trim().to_string()));
         }
@@ -4957,6 +4983,7 @@ impl App {
                 style.scale = (style.scale * 10.0).round() / 10.0 + step as f64 * 0.1;
             }
             ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
                 ui.label(RichText::new("Subtitle color").size(15.0).color(ui.visuals().weak_text_color()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     for (i, (name, hex)) in SUB_COLORS.iter().enumerate().rev() {
@@ -4967,6 +4994,7 @@ impl App {
                 });
             });
             ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
                 ui.label(RichText::new("Subtitle outline").size(15.0).color(ui.visuals().weak_text_color()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     for (i, (name, hex)) in SUB_OUTLINES.iter().enumerate().rev() {
@@ -4987,6 +5015,7 @@ impl App {
                 save.push(("sub_off", if off { "1" } else { "0" }.into()));
             }
             ui.horizontal_wrapped(|ui| {
+                ui.set_min_height(32.0);
                 ui.label(RichText::new("Default speed").size(15.0).color(ui.visuals().weak_text_color()));
                 ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
                 for sp in SPEEDS {
@@ -5003,6 +5032,7 @@ impl App {
             save.push(("sub_style", style.encode()));
         }
         ui.horizontal(|ui| {
+            ui.set_min_height(32.0);
             for (i, key, label) in [(0, "seek_step", "Arrow-key seek"), (1, "seek_step_shift", "Shift + arrow seek")] {
                 ui.label(label);
                 if ui.add(egui::DragValue::new(&mut self.seek_steps[i]).range(SEEK_STEP_RANGE).suffix(" s")).changed() {
@@ -5010,10 +5040,10 @@ impl App {
                 }
             }
         });
-        ui.add_space(16.0);
-        ui.label(RichText::new("Languages").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        Self::row_title(ui, "Languages");
         for (i, key, label) in [(0, "alang", "Audio:"), (1, "slang", "Subtitles:")] {
             ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
                 let l = ui.label(label);
                 ui.add_space((150.0 - l.rect.width()).max(0.0));
                 let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("en,eng").desired_width(400.0)).labelled_by(l.id);
@@ -5032,10 +5062,10 @@ impl App {
                 }
             });
         }
-        ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(Color32::from_gray(170)));
-        ui.add_space(16.0);
-        ui.label(RichText::new("Network").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(ui.visuals().weak_text_color()));
+        Self::row_title(ui, "Network");
         ui.horizontal(|ui| {
+            ui.set_min_height(32.0);
             let l = ui.label("User-Agent:");
             ui.add_space((150.0 - l.rect.width()).max(0.0));
             let r = ui.add(egui::TextEdit::singleline(&mut self.user_agent).hint_text("stremflix-rs").desired_width(400.0)).labelled_by(l.id);
@@ -5050,9 +5080,8 @@ impl App {
                 _ => {}
             }
         });
-        ui.label(RichText::new("Sent to addons and for downloads. Empty uses the default. Torrent (librqbit) traffic is not covered.").size(13.0).color(Color32::from_gray(170)));
-        ui.add_space(16.0);
-        ui.label(RichText::new("Customize Home").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.label(RichText::new("Sent to addons and for downloads. Empty uses the default. Torrent (librqbit) traffic is not covered.").size(13.0).color(ui.visuals().weak_text_color()));
+        Self::row_title(ui, "Customize Home");
         let (mut swap, mut toggle, mut reset) = (None, None, false);
         let n = self.home_all.len();
         for (i, (key, title)) in self.home_all.iter().enumerate() {
@@ -5102,7 +5131,6 @@ impl App {
                 self.rows.retain(|r| !self.home_hidden.contains(&row_key(&r.src)));
             }
         }
-        ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(ui.visuals().weak_text_color()));
         for (k, v) in save {
             if let Err(e) = self.db.set_setting(k, &v) {
                 report(&mut self.error, format!("saving {k}: {e:#}"));
@@ -5114,8 +5142,8 @@ impl App {
         let ctx = ui.ctx().clone();
         let (mut want, mut open, mut quick) = (Vec::new(), None, None);
         ui.horizontal(|ui| {
+            ui.set_min_height(32.0);
             ui.label(RichText::new("Saved titles").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
-            ui.label(RichText::new("Saved titles").size(20.0).strong().family(bold()).color(Color32::WHITE));
             let before = self.lib_sort;
             egui::ComboBox::from_id_salt("lib_sort").selected_text(self.lib_sort.label()).show_ui(ui, |ui| {
                 for s in [LibSort::Added, LibSort::Title, LibSort::Watched, LibSort::Rating, LibSort::Year] {
@@ -5140,14 +5168,14 @@ impl App {
             });
             ui.add(egui::TextEdit::singleline(&mut self.list_name).hint_text("List name").char_limit(60).desired_width(140.0));
             let mut res = None;
-            if ui.button("New list").clicked() {
+            if small_button(ui, "New list").clicked() {
                 res = Some(self.db.create_list(&self.list_name).map(|id| self.lib_list = Some(id)));
             }
             if let Some(id) = self.lib_list {
-                if ui.button("Rename").clicked() {
+                if small_button(ui, "Rename").clicked() {
                     res = Some(self.db.rename_list(id, &self.list_name));
                 }
-                if ui.button("Delete list").on_hover_text("Its titles stay saved").clicked() {
+                if small_button(ui, "Delete list").on_hover_text("Its titles stay saved").clicked() {
                     res = Some(self.db.delete_list(id));
                 }
             }
@@ -5527,7 +5555,7 @@ impl eframe::App for App {
             ui.add_space(8.0);
             // Back lives outside the scroll area, so it stays put while the detail page scrolls.
             if self.selected.is_some() && self.tab == Tab::Home {
-                if pill_button(ui, &format!("{}  Back", icons::ARROW_LEFT), 16.0, vec2(0.0, 40.0), white_fill(), Color32::BLACK).on_hover_text("Back to browse").clicked() {
+                if small_button(ui, &format!("{}  Back", icons::ARROW_LEFT)).on_hover_text("Back to browse").clicked() {
                     self.close_details();
                 }
                 ui.add_space(6.0);
