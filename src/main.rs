@@ -202,6 +202,8 @@ enum Autoplay {
 
 enum Msg {
     Error(String),
+    /// Play key and its TheIntroDB spans.
+    IntroDb(String, Vec<Skip>),
     Installed(String, Manifest, Option<String>),
     /// Fresh manifest (or error) per installed addon URL, from "Check for updates".
     UpdateCheck(Vec<(String, Result<Manifest, String>)>),
@@ -1118,6 +1120,8 @@ struct Playing {
     next_dismissed: bool,
     /// Addon-marked spans of the playing stream (`behaviorHints.skip`).
     skips: Vec<Skip>,
+    /// TheIntroDB spans; `None` until requested.
+    db_skips: Option<Vec<Skip>>,
     /// Stats overlay shown; `net` is its torrent line, refreshed by a task about once per second (`net_next`, egui clock).
     stats: bool,
     net: Arc<std::sync::Mutex<Option<NetStats>>>,
@@ -1281,6 +1285,7 @@ struct App {
     light: bool,
     /// Play the next episode when one ends.
     autoplay_next: bool,
+    introdb: bool,
     /// Closing the window hides it to the tray instead of quitting.
     tray_on_close: bool,
     tray: Option<Tray>,
@@ -1459,6 +1464,7 @@ impl App {
             home_all: Vec::new(),
             light: db.setting("theme")?.as_deref() == Some("light"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
+            introdb: db.setting("introdb")?.as_deref() != Some("0"),
             tray_on_close: db.setting("tray_on_close")?.as_deref() == Some("1"),
             tray: None,
             hidden: false,
@@ -1790,6 +1796,11 @@ impl App {
                 }
                 self.build_rows(ctx);
                 self.fetch_recent_posters(ctx);
+            }
+            Msg::IntroDb(key, skips) => {
+                if let Some(p) = self.player.as_mut().filter(|p| p.key == key) {
+                    p.db_skips = Some(skips);
+                }
             }
             Msg::UpdateCheck(res) => {
                 self.checking_updates = false;
@@ -2204,7 +2215,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, db_skips: None, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -2367,6 +2378,18 @@ impl App {
         if let Some((pos, dur)) = p.player.position() {
             (p.pos, p.dur) = (pos, dur);
             self.save_progress();
+        }
+        // Asked once the duration is known: it selects the release and closes open-ended credits.
+        if self.introdb
+            && let Some(p) = self.player.as_mut().filter(|p| p.db_skips.is_none() && p.dur > 0.0)
+        {
+            p.db_skips = Some(vec![]);
+            let (key, dur, client) = (p.key.clone(), p.dur, self.client.clone());
+            self.spawn(ctx, async move {
+                // No entry (a 4xx) or no network just means no button, so it is not shown as an error.
+                let skips = client.introdb_skips(&key, dur).await.unwrap_or_default();
+                Ok(Msg::IntroDb(key, skips))
+            });
         }
     }
 
@@ -4017,9 +4040,9 @@ impl App {
                 }
             }
         }
-        // Skip button while the playhead is in an addon-marked or chapter-named intro/recap/credits span.
+        // Skip button while the playhead is in an addon-marked, chapter-named or TheIntroDB intro/recap/credits span.
         // Credits of a series episode with a next one are left to the up-next card.
-        let spans = p.skips.iter().copied().chain(chapter_skips(&st.chapters, st.dur));
+        let spans = p.skips.iter().copied().chain(chapter_skips(&st.chapters, st.dur)).chain(p.db_skips.iter().flatten().copied());
         if let Some(sk) = spans.filter(|s| !(has_next && s.kind == SkipKind::Credits)).find(|s| s.start <= st.pos && st.pos < s.end)
             && rect.width() >= 250.0
         {
@@ -4660,6 +4683,9 @@ impl App {
             ui.set_max_width(550.0);
             if switch_row(ui, "Play next episode automatically", &mut self.autoplay_next).changed() {
                 save.push(("autoplay_next", on(self.autoplay_next)));
+            }
+            if switch_row(ui, "Get skip times from TheIntroDB (sends what you watch)", &mut self.introdb).changed() {
+                save.push(("introdb", on(self.introdb)));
             }
             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                 save.push(("hwdec", on(self.hwdec)));
