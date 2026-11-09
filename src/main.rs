@@ -205,8 +205,8 @@ enum Msg {
     Installed(String, Manifest, Option<String>),
     /// Fresh manifest (or error) per installed addon URL, from "Check for updates".
     UpdateCheck(Vec<(String, Result<Manifest, String>)>),
-    /// Search title and results.
-    Catalog(String, Vec<MetaPreview>),
+    /// Query, the catalog searched (addon URL, type, catalog id), and its results or error.
+    Search(String, (String, String, String), Result<Vec<MetaPreview>, String>),
     /// Row source (addon URL, type, catalog id) and its items or error.
     Row((String, String, String), Result<Vec<MetaPreview>, String>),
     /// Row source, the `skip` it was requested with, and the next page or error.
@@ -260,7 +260,7 @@ enum Msg {
     Media(souvlaki::MediaControlEvent),
 }
 
-/// One horizontal catalog row on the home screen.
+/// One horizontal catalog row on Home or the search page.
 struct Row {
     title: String,
     src: (String, String, String),
@@ -273,6 +273,22 @@ struct Row {
     loading_more: bool,
     /// Last page was empty, had nothing new, or failed.
     exhausted: bool,
+}
+
+/// What the search results page shows.
+struct SearchPage {
+    query: String,
+    /// One row per searched catalog; empty rows are hidden.
+    rows: Vec<Row>,
+    /// Errors from the catalogs that failed; only reported if all of them did.
+    failed: Vec<String>,
+}
+
+/// Row title of an addon's catalog.
+fn catalog_title(addon: &str, c: &CatalogDef) -> String {
+    let (name, kind) = (c.name.as_deref().unwrap_or(&c.id), kind_label(&c.kind));
+    let suffix = if name.to_lowercase().contains(&kind.to_lowercase()) { String::new() } else { format!(" ({kind})") };
+    format!("{addon} - {name}{suffix}")
 }
 
 /// Stable id of a Home row: `<addon url>|<type>|<catalog id>`.
@@ -1177,7 +1193,8 @@ struct App {
     /// Addon catalog picked in the Addons tab (addon URL, type, catalog id) and its addons (`None` while loading).
     browse: Option<(AddonCatalogSrc, Option<Vec<AddonEntry>>)>,
     rows: Vec<Row>,
-    search_results: Option<(String, Vec<MetaPreview>)>,
+    /// Set while the search results page is up (it lives on Home, under any open title).
+    search_page: Option<SearchPage>,
     discover: Discover,
     selected: Option<(MetaPreview, Vec<Stream>, Subs)>,
     /// Episodes of the selected series (in `sort_episodes` order), the season shown,
@@ -1486,7 +1503,7 @@ impl App {
             configuring: None,
             browse: None,
             rows: Vec::new(),
-            search_results: None,
+            search_page: None,
             discover: Discover::default(),
             selected: None,
             episodes: Vec::new(),
@@ -1795,8 +1812,17 @@ impl App {
                 self.checking_updates = false;
                 self.addon_updates = res;
             }
-            Msg::Catalog(name, items) => {
-                self.search_results = Some((name, items));
+            Msg::Search(query, src, res) => {
+                // Ignore replies for a search that was replaced or closed since the request.
+                let Some(page) = self.search_page.as_mut().filter(|p| p.query == query) else { return };
+                let Some(row) = page.rows.iter_mut().find(|r| r.src == src && r.items.is_none()) else { return };
+                row.items = Some(res.unwrap_or_else(|e| {
+                    page.failed.push(e);
+                    Vec::new()
+                }));
+                if page.failed.len() == page.rows.len() {
+                    report(&mut self.error, format!("search failed: {}", page.failed.join("; ")));
+                }
             }
             Msg::Row(src, res) => {
                 let Some(row) = self.rows.iter_mut().find(|r| r.src == src) else { return };
@@ -2418,9 +2444,7 @@ impl App {
         }
         for i in (0..cats.len()).filter(|i| !used.contains(i)) {
             let (_, addon, c) = cats[i];
-            let (name, kind) = (c.name.as_deref().unwrap_or(&c.id), kind_label(&c.kind));
-            let suffix = if name.to_lowercase().contains(&kind.to_lowercase()) { String::new() } else { format!(" ({kind})") };
-            rows.push((format!("{addon} - {name}{suffix}"), i));
+            rows.push((catalog_title(addon, c), i));
         }
         let rows: Vec<Row> = rows
             .into_iter()
@@ -2486,35 +2510,38 @@ impl App {
             return;
         }
         self.remember_search(&query);
-        let targets: Vec<(String, String, String)> = self
+        let rows: Vec<Row> = self
             .addons
             .iter()
             .filter(|(_, m)| m.has_resource("catalog"))
-            .flat_map(|(u, m)| m.catalogs.iter().filter(|c| c.searchable()).map(move |c| (u.clone(), c.kind.clone(), c.id.clone())))
+            .flat_map(|(u, m)| {
+                m.catalogs.iter().filter(|c| c.searchable()).map(move |c| Row { title: catalog_title(&m.name, c), src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false })
+            })
             .collect();
-        if targets.is_empty() {
+        if rows.is_empty() {
             report(&mut self.error, "no installed addon supports search");
             return;
         }
-        let client = self.client.clone();
-        self.spawn(ctx, async move {
-            let (mut items, mut errors) = (Vec::new(), Vec::new());
-            let n = targets.len();
-            let ask = |(u, kind, id): (String, String, String)| {
-                let (client, query) = (client.clone(), query.clone());
-                async move { client.search(&u, &kind, &id, &query).await }
-            };
-            for res in concurrently(targets, ask).await {
-                match res {
-                    Ok(ms) => items.extend(ms),
-                    Err(e) => errors.push(format!("{e:#}")),
-                }
-            }
-            if errors.len() == n {
-                anyhow::bail!("search failed: {}", errors.join("; "));
-            }
-            Ok(Msg::Catalog(format!("Results for \"{query}\""), items))
-        });
+        for src in rows.iter().map(|r| r.src.clone()) {
+            let (client, query) = (self.client.clone(), query.clone());
+            self.spawn(ctx, async move {
+                let res = client.search(&src.0, &src.1, &src.2, &query).await.map_err(|e| format!("{e:#}"));
+                Ok(Msg::Search(query, src, res))
+            });
+        }
+        self.close_details();
+        self.tab = Tab::Home;
+        self.search_page = Some(SearchPage { query, rows, failed: Vec::new() });
+    }
+
+    /// Leave the open title's page, dropping replies still on their way to it.
+    fn close_details(&mut self) {
+        (self.selected, self.details) = (None, None);
+        (self.episodes, self.episode) = (Vec::new(), None);
+        self.scroll_top = true;
+        self.clear_file_pick();
+        self.sleep_carry = None;
+        self.nav += 1;
     }
 
     fn fetch_poster(&mut self, ctx: &egui::Context, url: String) {
@@ -2845,7 +2872,50 @@ impl App {
         }
     }
 
+    /// Search results: one row per searched catalog, filled in as replies arrive.
+    fn ui_search(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let (mut want, mut open, mut quick) = (Vec::new(), None, None);
+        let scroll = std::mem::take(&mut self.scroll_top);
+        let Some(page) = &self.search_page else { return };
+        let heading = ui.label(RichText::new(format!("Results for \"{}\"", page.query)).size(26.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        if scroll {
+            ui.scroll_to_rect(heading.rect, Some(Align::TOP));
+        }
+        for row in &page.rows {
+            match &row.items {
+                Some(items) if items.is_empty() => continue,
+                Some(items) => {
+                    Self::row_title(ui, &row.title);
+                    self.ui_cards(ui, &row.title, items, &mut want, &mut open, &mut quick);
+                }
+                None => {
+                    Self::row_title(ui, &row.title);
+                    ui.spinner();
+                }
+            }
+        }
+        if page.rows.iter().all(|r| r.items.as_ref().is_some_and(Vec::is_empty)) {
+            ui.add_space(22.0);
+            ui.label("No results.");
+        }
+        want.sort();
+        want.dedup();
+        for u in want {
+            self.fetch_poster(&ctx, u);
+        }
+        if let Some((m, autoplay)) = open {
+            self.open_meta(&ctx, m, autoplay);
+        }
+        if let Some(m) = quick {
+            self.quick_play(&ctx, m);
+        }
+    }
+
     fn ui_home(&mut self, ui: &mut egui::Ui) {
+        if self.selected.is_none() && self.search_page.is_some() {
+            return self.ui_search(ui);
+        }
         let ctx = ui.ctx().clone();
         let (mut want, mut open, mut play, mut quick, mut resume) = (Vec::new(), None, None, None, None);
         let mut remove: Option<String> = None;
@@ -3051,21 +3121,6 @@ impl App {
                     }
                 });
             });
-        }
-        let mut clear = false;
-        if let Some((title, items)) = &self.search_results {
-            ui.add_space(18.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(title).size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
-                clear = small_button(ui, "Clear").clicked();
-            });
-            if items.is_empty() {
-                ui.label("No results.");
-            }
-            self.ui_cards(ui, "search", items, &mut want, &mut open, &mut quick);
-        }
-        if clear {
-            self.search_results = None;
         }
         let mut more = Vec::new();
         for row in &self.rows {
@@ -5096,6 +5151,10 @@ impl eframe::App for App {
             return;
         }
 
+        // The search page lives on Home; any other tab (also set by links) closes it.
+        if self.tab != Tab::Home {
+            self.search_page = None;
+        }
         egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(40, 14)).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             // Fixed-height row so the nav and search pills share one center line.
@@ -5106,16 +5165,19 @@ impl eframe::App for App {
                 let pill_slot = ui.painter().add(egui::Shape::Noop);
                 let mut sel_rect = None;
                 for (tab, name) in [(Tab::Home, "Home"), (Tab::Discover, "Discover"), (Tab::Addons, "Addons"), (Tab::Library, "Library"), (Tab::Settings, "Settings")] {
+                    // The search page is not a tab, so nothing is current while it is up.
+                    let current = self.tab == tab && self.search_page.is_none();
                     let text = RichText::new(name).size(15.0);
-                    let text = if self.tab == tab { text.strong().family(bold()).color(ui.visuals().strong_text_color()) } else { text.color(ui.visuals().weak_text_color()) };
+                    let text = if current { text.strong().family(bold()).color(ui.visuals().strong_text_color()) } else { text.color(ui.visuals().weak_text_color()) };
                     // Width of the bold label, so selecting a tab doesn't shift the ones after it.
                     let w = ui.painter().layout_no_wrap(name.into(), egui::FontId::new(15.0, bold()), Color32::WHITE).size().x + 2.0 * ui.spacing().button_padding.x;
                     let r = ui.add(egui::Button::new(text).fill(Color32::TRANSPARENT).min_size(vec2(w, 34.0))).on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if self.tab == tab {
+                    if current {
                         sel_rect = Some(r.rect);
                     }
                     if r.clicked() {
                         self.tab = tab;
+                        self.search_page = None;
                     }
                 }
                 if let Some(target) = sel_rect {
@@ -5136,7 +5198,6 @@ impl eframe::App for App {
                     ui.painter().set(bg, egui::epaint::RectShape::filled(egui::Rect::from_center_size(pos2(pill.center().x, icon.center().y), vec2(pill.width() + 24.0, 34.0)), 17, tint(ui, 34)));
                     let r = r.labelled_by(b.id);
                     if b.clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                        self.tab = Tab::Home;
                         self.search(&ctx);
                     }
                     // Recent searches under the empty, focused box. The popup stays up while the pointer is on it,
@@ -5176,7 +5237,6 @@ impl eframe::App for App {
                         }
                         if let Some(q) = pick {
                             self.search = q;
-                            self.tab = Tab::Home;
                             self.search(&ctx);
                         }
                     } else {
@@ -5231,12 +5291,7 @@ impl eframe::App for App {
             // Back lives outside the scroll area, so it stays put while the detail page scrolls.
             if self.selected.is_some() && self.tab == Tab::Home {
                 if pill_button(ui, &format!("{}  Back", icons::ARROW_LEFT), 16.0, vec2(0.0, 40.0), white_fill(), Color32::BLACK).on_hover_text("Back to browse").clicked() {
-                    (self.selected, self.details) = (None, None);
-                    (self.episodes, self.episode) = (Vec::new(), None);
-                    self.scroll_top = true;
-                    self.clear_file_pick();
-                    self.sleep_carry = None;
-                    self.nav += 1;
+                    self.close_details();
                 }
                 ui.add_space(6.0);
             }
@@ -5892,6 +5947,26 @@ mod tests {
         let s = timer_pause_step(s, true);
         assert_eq!(s, Some(true));
         assert_eq!(timer_pause_step(s, false), None, "user resumed");
+    }
+
+    #[test]
+    fn search_replies_fill_their_rows() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let src = |id: &str| ("https://a.example/manifest.json".to_string(), "movie".to_string(), id.to_string());
+        let row = |id: &str| Row { title: id.into(), src: src(id), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false };
+        let hit = MetaPreview { id: "x".into(), kind: "movie".into(), name: "x".into(), poster: None, background: None, description: None };
+        app.search_page = Some(SearchPage { query: "new".into(), rows: vec![row("a"), row("b")], failed: vec![] });
+        app.handle(&ctx, Msg::Search("old".into(), src("a"), Ok(vec![hit.clone()])));
+        assert!(app.search_page.as_ref().unwrap().rows[0].items.is_none(), "reply for a replaced search");
+        app.handle(&ctx, Msg::Search("new".into(), src("a"), Ok(vec![hit])));
+        app.handle(&ctx, Msg::Search("new".into(), src("b"), Err("boom".into())));
+        let page = app.search_page.as_ref().unwrap();
+        assert_eq!(page.rows[0].items.as_ref().map(Vec::len), Some(1));
+        assert!(page.rows[1].items.as_ref().is_some_and(Vec::is_empty) && app.error.is_none(), "one failed catalog is not an error");
+        app.search_page = Some(SearchPage { query: "new".into(), rows: vec![row("a")], failed: vec![] });
+        app.handle(&ctx, Msg::Search("new".into(), src("a"), Err("boom".into())));
+        assert!(app.error.as_deref().is_some_and(|e| e.contains("boom")), "every catalog failed");
     }
 
     #[test]
