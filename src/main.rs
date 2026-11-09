@@ -1224,6 +1224,8 @@ struct Playing {
     next_dismissed: bool,
     /// Addon-marked spans of the playing stream (`behaviorHints.skip`).
     skips: Vec<Skip>,
+    /// End of the span whose skip button was pressed; hidden until the playhead leaves it.
+    skip_done: Option<f64>,
     /// Stats overlay shown; `net` is its torrent line, refreshed by a task about once per second (`net_next`, egui clock).
     stats: bool,
     net: Arc<std::sync::Mutex<Option<NetStats>>>,
@@ -2352,7 +2354,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None, auto_pause: AutoPause::Off };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, skip_done: None, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None, auto_pause: AutoPause::Off };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -4198,8 +4200,11 @@ impl App {
         }
         // Skip button while the playhead is in an addon-marked or chapter-named intro/recap/credits span.
         // Credits of a series episode with a next one are left to the up-next card.
+        if p.skip_done.is_some_and(|e| st.pos >= e) {
+            p.skip_done = None;
+        }
         let spans = p.skips.iter().copied().chain(chapter_skips(&st.chapters, st.dur));
-        if let Some(sk) = spans.filter(|s| !(has_next && s.kind == SkipKind::Credits)).find(|s| s.start <= st.pos && st.pos < s.end)
+        if let Some(sk) = spans.filter(|s| !(has_next && s.kind == SkipKind::Credits) && p.skip_done != Some(s.end)).find(|s| s.start <= st.pos && st.pos < s.end)
             && rect.width() >= 250.0
         {
             let r = egui::Rect::from_min_size(pos2(rect.right() - 32.0 - 200.0, rect.bottom() - 130.0 - 50.0), vec2(200.0, 50.0));
@@ -4214,6 +4219,7 @@ impl App {
             paint.text(r.center(), egui::Align2::CENTER_CENTER, sk.kind.label(), egui::FontId::proportional(17.0), Color32::WHITE);
             if resp.clicked() {
                 seek = Some((sk.end, false));
+                p.skip_done = Some(sk.end);
             }
         }
         let style = style.clamped();
