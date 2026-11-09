@@ -2393,8 +2393,10 @@ impl App {
                     return;
                 }
                 // A failed resize keeps the old texture, which is still a fine picture.
-                let old = self.posters.remove(&key).and_then(|p| p.tex);
-                let (failed, bytes) = (image.is_none() && old.is_none(), image.as_ref().map_or(0, |i| i.pixels.len() * 4));
+                let (old, old_bytes) = self.posters.remove(&key).map_or((None, 0), |p| (p.tex, p.bytes));
+                let failed = image.is_none() && old.is_none();
+                // The kept texture still occupies memory, so it still counts against the budget.
+                let bytes = image.as_ref().map_or(old_bytes, |i| i.pixels.len() * 4);
                 let tex = image.map(|i| ctx.load_texture(&key, i, egui::TextureOptions::LINEAR)).or(old);
                 self.posters.insert(key, Poster { tex, failed, bytes, loading: false, asked: ppp, used: Cell::new(self.poster_frame) });
                 // Cheap check first: building the list clones every key, and a screenful of replies arrives at once.
