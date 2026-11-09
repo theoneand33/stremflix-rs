@@ -11,6 +11,17 @@ use std::time::Duration;
 use crate::addon::{magnet_peers, parse_magnet_hash};
 use crate::library::MEDIA_EXTS;
 
+/// What librqbit accepts: it only recognises a lower-case `magnet:` prefix, so trim and lower-case just the scheme.
+fn normalize_magnet(s: &str) -> String {
+    let s = s.trim();
+    if is_magnet(s) { format!("magnet:{}", &s[7..]) } else { s.into() }
+}
+
+/// A magnet link in any scheme case, even an invalid one (so it reports "invalid magnet link" and is never read as a file).
+fn is_magnet(s: &str) -> bool {
+    s.trim_start().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("magnet:"))
+}
+
 /// How long to wait for peers to send a magnet's metadata.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -132,11 +143,13 @@ impl TorrentEngine {
 
     /// Add a magnet or local `.torrent` file; returns its handle and the file index chosen by `file_idx` or a magnet's `so=`.
     async fn add(&self, magnet: &str, file_idx: Option<usize>) -> Result<(Arc<librqbit::ManagedTorrent>, Option<usize>)> {
-        let (add, peers, file_idx) = if magnet.starts_with("magnet:") {
+        let (add, peers, file_idx) = if is_magnet(magnet) {
+            let magnet = normalize_magnet(magnet);
+            let magnet = magnet.as_str();
             parse_magnet_hash(magnet).context("invalid magnet link")?;
             // `so=<idx>` (BEP 53 select-only) carries the addon's fileIdx through saved progress.
             let so = url::Url::parse(magnet).ok().and_then(|u| u.query_pairs().find(|(k, _)| k == "so").and_then(|(_, v)| v.parse().ok()));
-            (AddTorrent::from_url(magnet), magnet_peers(magnet), file_idx.or(so))
+            (AddTorrent::from_url(magnet.to_string()), magnet_peers(magnet), file_idx.or(so))
         } else {
             let len = tokio::fs::metadata(magnet).await.with_context(|| format!("open {magnet}"))?.len();
             anyhow::ensure!(len <= MAX_TORRENT_FILE, "{magnet} is too large for a .torrent file");
@@ -232,6 +245,24 @@ pub fn magnet_chooses_file(magnet: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn magnet_normalization() {
+        assert_eq!(normalize_magnet("MAGNET:?xt=urn:btih:AbC&dn=X"), "magnet:?xt=urn:btih:AbC&dn=X");
+        assert_eq!(normalize_magnet("  magnet:?xt=a \n"), "magnet:?xt=a");
+        assert_eq!(normalize_magnet("magnet:?xt=a"), "magnet:?xt=a");
+        assert_eq!(normalize_magnet("/m/a.torrent"), "/m/a.torrent");
+    }
+
+    #[test]
+    fn magnet_classification() {
+        for yes in ["magnet:?xt=bad", "MAGNET:?xt=bad", "  Magnet:?xt=bad"] {
+            assert!(is_magnet(yes), "{yes}");
+        }
+        for no in ["/m/magnet.torrent", "C:\\m\\a.torrent", "mag"] {
+            assert!(!is_magnet(no), "{no}");
+        }
+    }
 
     #[test]
     fn formats_rates() {
