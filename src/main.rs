@@ -992,6 +992,32 @@ fn cover_uv(rect: egui::Rect, size: egui::Vec2) -> egui::Rect {
     }
 }
 
+/// Our own pause from minimizing: `Sent` until mpv reports it, `Held` while it stays paused,
+/// `Yielded` once the user or the sleep timer changes the pause while minimized (left alone until restore).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AutoPause {
+    Off,
+    Sent,
+    Held,
+    Yielded,
+}
+
+/// Whether to pause (`Some(true)`) or resume (`Some(false)`) for a minimize change, and the new bookkeeping; only resumes what it paused.
+fn pause_step(enabled: bool, away: bool, paused: bool, auto: AutoPause) -> (Option<bool>, AutoPause) {
+    // A resume only counts as the user's once mpv has confirmed our pause.
+    let auto = match auto {
+        AutoPause::Sent if paused => AutoPause::Held,
+        AutoPause::Held if !paused => AutoPause::Yielded,
+        other => other,
+    };
+    match (enabled && away, auto) {
+        (true, AutoPause::Off) if !paused => (Some(true), AutoPause::Sent),
+        (true, _) => (None, auto),
+        (false, AutoPause::Sent | AutoPause::Held) => (Some(false), AutoPause::Off),
+        (false, _) => (None, AutoPause::Off),
+    }
+}
+
 /// mpv's `keep-open` pauses on the last frame at end of file.
 fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
     paused && dur > 0.0 && pos >= dur - 1.0
@@ -1021,9 +1047,9 @@ fn timer_pause_step(state: Option<bool>, paused: bool) -> Option<bool> {
     }
 }
 
-/// End-of-episode autoplay; never after the sleep timer's own pause.
-fn autoplay_due(autoplay_next: bool, timer_paused: Option<bool>, at_end: bool) -> bool {
-    autoplay_next && timer_paused.is_none() && at_end
+/// End-of-episode autoplay; never after the sleep timer's own pause or while our minimize pause holds.
+fn autoplay_due(autoplay_next: bool, timer_paused: Option<bool>, auto: AutoPause, at_end: bool) -> bool {
+    autoplay_next && timer_paused.is_none() && matches!(auto, AutoPause::Off | AutoPause::Yielded) && at_end
 }
 
 /// Fraction of the seek bar the cache covers, never behind the playhead.
@@ -1199,6 +1225,8 @@ struct Playing {
     awake: Option<Option<keepawake::KeepAwake>>,
     /// Video track to restore once the window is shown again; video is off while hidden.
     hidden_vid: Option<String>,
+    /// Paused by the pause-on-minimize setting, so only then resume on restore.
+    auto_pause: AutoPause,
 }
 
 impl Drop for Playing {
@@ -1350,6 +1378,8 @@ struct App {
     autoplay_next: bool,
     /// Closing the window hides it to the tray instead of quitting.
     tray_on_close: bool,
+    /// Pause playback while the window is minimized or hidden.
+    pause_on_minimize: bool,
     tray: Option<Tray>,
     /// Window hidden to the tray.
     hidden: bool,
@@ -1532,6 +1562,7 @@ impl App {
             light: db.setting("theme")?.as_deref() == Some("light"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
             tray_on_close: db.setting("tray_on_close")?.as_deref() == Some("1"),
+            pause_on_minimize: db.setting("pause_on_minimize")?.as_deref() == Some("1"),
             tray: None,
             hidden: false,
             quit: false,
@@ -2295,7 +2326,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None, auto_pause: AutoPause::Off };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -2431,6 +2462,8 @@ impl App {
         if self.sleep.is_some_and(|(t, _)| Instant::now() >= t) {
             self.sleep = None;
             self.timer_paused = Some(false);
+            // The sleep timer's pause is not ours: minimize neither resumes nor re-pauses it.
+            p.auto_pause = AutoPause::Yielded;
             if let Err(e) = p.player.command(&["set", "pause", "yes"]) {
                 report(&mut self.error, e);
             }
@@ -2438,7 +2471,7 @@ impl App {
         }
         let st = &p.player.state;
         self.timer_paused = timer_pause_step(self.timer_paused, st.paused);
-        if autoplay_due(self.autoplay_next, self.timer_paused, at_end(st.pos, st.dur, st.paused)) && !looping(p.repeat, p.ab) && self.playing_episode() {
+        if autoplay_due(self.autoplay_next, self.timer_paused, p.auto_pause, at_end(st.pos, st.dur, st.paused)) && !looping(p.repeat, p.ab) && self.playing_episode() {
             return self.play_next(ctx);
         }
         let Some(p) = &mut self.player else { return };
@@ -4803,6 +4836,9 @@ impl App {
             if switch_row(ui, "Minimize to tray on close", &mut self.tray_on_close).changed() {
                 save.push(("tray_on_close", on(self.tray_on_close)));
             }
+            if switch_row(ui, "Pause when minimized", &mut self.pause_on_minimize).changed() {
+                save.push(("pause_on_minimize", on(self.pause_on_minimize)));
+            }
             let step = stepper(ui, "Subtitle size", &format!("{:.1}x", style.scale));
             if step != 0 {
                 style.scale = (style.scale * 10.0).round() / 10.0 + step as f64 * 0.1;
@@ -5190,6 +5226,16 @@ impl eframe::App for App {
                 "no".into()
             });
             if let Err(e) = p.player.command(&["set", "vid", &v]) {
+                report(&mut self.error, e);
+            }
+        }
+        let away = self.hidden || ctx.input(|i| i.viewport().minimized) == Some(true);
+        if let Some(p) = &mut self.player {
+            let (pause, auto) = pause_step(self.pause_on_minimize, away, p.player.state.paused, p.auto_pause);
+            p.auto_pause = auto;
+            if let Some(pause) = pause
+                && let Err(e) = p.player.command(&["set", "pause", if pause { "yes" } else { "no" }])
+            {
                 report(&mut self.error, e);
             }
         }
@@ -5628,6 +5674,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pause_on_minimize_only_resumes_own_pause() {
+        use AutoPause::*;
+        assert_eq!(pause_step(true, true, false, Off), (Some(true), Sent));
+        assert_eq!(pause_step(true, true, true, Off), (None, Off)); // user paused: leave alone
+        assert_eq!(pause_step(true, false, true, Held), (Some(false), Off));
+        assert_eq!(pause_step(false, true, false, Off), (None, Off));
+        assert_eq!(pause_step(false, true, true, Held), (Some(false), Off)); // setting turned off
+        assert_eq!(pause_step(true, true, true, Held), (None, Held)); // our pause, still minimized: hold
+    }
+
+    #[test]
+    fn sleep_timer_pause_survives_minimize() {
+        use AutoPause::*;
+        // The sleep timer paused while minimized: no re-pause, and restore does not resume it.
+        assert_eq!(pause_step(true, true, true, Yielded), (None, Yielded));
+        assert_eq!(pause_step(true, false, true, Yielded), (None, Off));
+        assert_eq!(pause_step(true, false, true, Sent), (Some(false), Off), "our own pause still resumes");
+    }
+
+    #[test]
+    fn user_pause_while_minimized_is_kept() {
+        // Auto-pause, media-key Play, then Pause again, all while minimized: the user's state wins until restore.
+        let mut auto = AutoPause::Off;
+        let mut step = |paused, away| {
+            let (pause, next) = pause_step(true, away, paused, auto);
+            auto = next;
+            pause
+        };
+        assert_eq!(step(false, true), Some(true)); // auto-pause sent
+        assert_eq!(step(false, true), None); // mpv not paused yet: still ours
+        assert_eq!(step(true, true), None); // mpv confirms the pause
+        assert_eq!(step(false, true), None); // user Play: not re-paused
+        assert_eq!(step(true, true), None); // user Pause: kept
+        assert_eq!(step(true, false), None); // restore: user's pause stays
+        assert_eq!(auto, AutoPause::Off);
+    }
+
+    #[test]
     fn tab_name_round_trip() {
         for t in [Tab::Home, Tab::Discover, Tab::Addons, Tab::Library, Tab::Settings] {
             assert!(Tab::from_name(Some(t.name())) == t);
@@ -6028,10 +6112,13 @@ mod tests {
 
     #[test]
     fn timer_pause_blocks_autoplay_until_resumed() {
-        assert!(autoplay_due(true, None, true));
-        assert!(!autoplay_due(true, Some(false), true), "pause not yet confirmed");
-        assert!(!autoplay_due(true, Some(true), true));
-        assert!(!autoplay_due(false, None, true));
+        use AutoPause::*;
+        assert!(autoplay_due(true, None, Off, true));
+        assert!(!autoplay_due(true, Some(false), Off, true), "pause not yet confirmed");
+        assert!(!autoplay_due(true, Some(true), Off, true));
+        assert!(!autoplay_due(false, None, Off, true));
+        assert!(!autoplay_due(true, None, Held, true), "our minimize pause holds");
+        assert!(autoplay_due(true, None, Yielded, true), "user took over while minimized");
         let s = timer_pause_step(Some(false), false);
         assert_eq!(s, Some(false), "mpv has not reported the pause yet");
         let s = timer_pause_step(s, true);
