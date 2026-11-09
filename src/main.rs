@@ -4650,7 +4650,9 @@ impl App {
                         ui.label("Delete files?");
                         if ui.small_button("Yes").clicked() {
                             self.confirm_delete = None;
-                            if let Err(e) = self.rt.block_on(engine.remove(t.id)) {
+                            // The engine also refuses the torrent being streamed; this covers a play that started after the prompt.
+                            let res = if playing == Some(t.id) { Err(anyhow::anyhow!("torrent is playing")) } else { self.rt.block_on(engine.remove(t.id)) };
+                            if let Err(e) = res {
                                 report(&mut self.error, e);
                             }
                         }

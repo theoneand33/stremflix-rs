@@ -66,7 +66,7 @@ impl SeedLimit {
 
     /// Whether a torrent that uploaded `up` of `size` bytes over `elapsed` has hit a limit.
     pub fn reached(self, up: u64, size: u64, elapsed: Duration) -> bool {
-        (self.ratio > 0.0 && size > 0 && up as f64 >= self.ratio * size as f64) || (self.secs > 0 && elapsed.as_secs() >= self.secs)
+        (self.ratio > 0.0 && up as f64 >= self.ratio * size as f64) || (self.secs > 0 && elapsed.as_secs() >= self.secs)
     }
 }
 
@@ -128,6 +128,8 @@ pub struct TorrentEngine {
     /// Held across a whole release and across [`stream_url`](Self::stream_url)'s unpause+pin, so neither interleaves.
     pinned: tokio::sync::Mutex<Vec<usize>>,
     seed: SeedLimit,
+    /// The torrent being played (set by an unpinned `stream_url`, reset by `release_except`): `remove` refuses it.
+    active: std::sync::Mutex<Option<usize>>,
     /// Released, finished torrents still seeding, with when they started.
     seeding: std::sync::Mutex<std::collections::HashMap<usize, Instant>>,
 }
@@ -158,7 +160,7 @@ impl TorrentEngine {
         let api = Api::new(session.clone(), None, None);
         let server = librqbit::http_api::HttpApi::new(api, Some(librqbit::http_api::HttpApiOptions { read_only: true, ..Default::default() }));
         tokio::spawn(server.make_http_api_and_run(listener, None));
-        let engine = Arc::new(Self { session, http, cache, pinned: Default::default(), seed, seeding: Default::default() });
+        let engine = Arc::new(Self { session, http, cache, pinned: Default::default(), seed, active: Default::default(), seeding: Default::default() });
         // Weak: the sweep must not keep a dropped engine alive.
         let weak = Arc::downgrade(&engine);
         tokio::spawn(async move {
@@ -184,12 +186,15 @@ impl TorrentEngine {
             }
             // Held through the pause so stream_url can't unpause and pin this torrent in between.
             let pinned = self.pinned.lock().await;
-            if pinned.contains(&id) || self.seeding.lock().unwrap().remove(&id).is_none() {
+            if pinned.contains(&id) || !self.seeding.lock().unwrap().contains_key(&id) {
                 continue;
             }
+            // Untracked only once paused, so a failed pause is retried by the next sweep.
             if !h.is_paused() && let Err(e) = self.session.pause(&h).await {
                 eprintln!("pause torrent {id}: {e:#}");
+                continue;
             }
+            self.seeding.lock().unwrap().remove(&id);
         }
     }
 
@@ -208,7 +213,7 @@ impl TorrentEngine {
     pub async fn remove(&self, id: usize) -> Result<()> {
         // Held through the delete so stream_url can't pin the torrent in between.
         let pinned = self.pinned.lock().await;
-        anyhow::ensure!(!pinned.contains(&id), "torrent {id} is in use");
+        anyhow::ensure!(!pinned.contains(&id) && *self.active.lock().unwrap() != Some(id), "torrent {id} is in use");
         self.seeding.lock().unwrap().remove(&id);
         self.session.delete(id.into(), true).await.with_context(|| format!("delete torrent {id}"))
     }
@@ -269,6 +274,8 @@ impl TorrentEngine {
         }
         if pin {
             pinned.push(handle.id());
+        } else {
+            *self.active.lock().unwrap() = Some(handle.id());
         }
         Ok((format!("http://{}/torrents/{}/stream/{idx}", self.http, handle.id()), handle.id()))
     }
@@ -291,6 +298,7 @@ impl TorrentEngine {
     /// while they fit in the cache; the oldest are deleted with their files first.
     pub async fn release_except(&self, keep: Option<usize>) {
         let pinned = self.pinned.lock().await;
+        *self.active.lock().unwrap() = keep;
         let candidates: Vec<_> = self.session.with_torrents(|it| it.filter(|(id, _)| Some(*id) != keep && !pinned.contains(id)).map(|(id, h)| (id, h.clone())).collect());
         // A finished torrent keeps seeding under the limit; its files stay, so it is not evicted.
         let keep_seeding = |id: usize, h: &Arc<librqbit::ManagedTorrent>, seeding: &mut std::collections::HashMap<usize, Instant>| {
@@ -372,7 +380,7 @@ mod tests {
         assert!(!l.reached(99, 100, s(59)) && l.reached(100, 100, s(0)) && l.reached(0, 100, s(60)));
         assert!(!SeedLimit { ratio: 0.0, secs: 0 }.reached(u64::MAX, 1, s(u64::MAX)), "no limit never trips");
         assert!(!SeedLimit { ratio: 2.0, secs: 0 }.reached(150, 100, s(9999)));
-        assert!(!SeedLimit { ratio: 1.0, secs: 0 }.reached(0, 0, s(0)), "empty torrent is not instantly done");
+        assert!(SeedLimit { ratio: 1.0, secs: 0 }.reached(0, 0, s(0)), "zero-byte torrent has nothing to seed: done, not seeding forever");
     }
 
     #[tokio::test]
