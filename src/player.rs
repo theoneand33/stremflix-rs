@@ -131,7 +131,7 @@ const FORMAT_INT64: c_int = 4;
 const FORMAT_DOUBLE: c_int = 5;
 
 /// Observed properties, in `reply_userdata` order.
-const PROPS: [(&str, c_int); 19] = [
+const PROPS: [(&str, c_int); 20] = [
     ("time-pos", FORMAT_DOUBLE),
     ("duration", FORMAT_DOUBLE),
     ("pause", FORMAT_FLAG),
@@ -151,6 +151,7 @@ const PROPS: [(&str, c_int); 19] = [
     ("decoder-frame-drop-count", FORMAT_INT64),
     ("demuxer-cache-duration", FORMAT_DOUBLE),
     ("chapter-list", FORMAT_STRING),
+    ("eof-reached", FORMAT_FLAG),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,6 +173,8 @@ pub struct State {
     pub muted: bool,
     pub buffering: bool,
     pub seeking: bool,
+    /// mpv reached the end of the file (`keep-open` then holds the last frame).
+    pub eof: bool,
     /// Absolute time in seconds the demuxer cache reaches; 0 until known.
     pub cached_to: f64,
     /// Display size of the video in pixels; 0 until known.
@@ -641,6 +644,7 @@ impl Player {
                 8 => s.tracks.clear(),
                 11 => s.cached_to = 0.0,
                 18 => s.chapters.clear(),
+                19 => s.eof = false,
                 _ => {}
             }
             return;
@@ -669,6 +673,7 @@ impl Player {
                 16 => s.dropped[1] = int(),
                 17 => s.cache = f(),
                 18 => s.chapters = parse_chapters(&CStr::from_ptr(*(p.data as *const *const c_char)).to_string_lossy()),
+                19 => s.eof = flag(),
                 _ => {}
             }
         }
