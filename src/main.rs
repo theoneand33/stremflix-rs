@@ -17,7 +17,7 @@ use stremflix_rs::library::{LibraryItem, scan};
 use eframe::glow::{self, HasContext};
 use stremflix_rs::player::{self, chapter_skips, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
-use stremflix_rs::torrent::{NetStats, Profile, TorrentEngine, fmt_rate};
+use stremflix_rs::torrent::{NetStats, Profile, SeedLimit, TorrentEngine, fmt_rate};
 use stremflix_rs::tray::{self, Tray};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -46,9 +46,73 @@ const SPEED_LIMITS: [(&str, u32); 6] = [("Unlimited", 0), ("500 KB/s", 500_000),
 /// Torrent cache size choices: label and bytes kept (0 = delete a torrent when its playback stops).
 const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000), ("5 GB", 5_000_000_000), ("10 GB", 10_000_000_000), ("Unlimited", u64::MAX)];
 
+/// Seeding limit choices (0 = no limit of that kind): upload ratio, and seconds.
+const SEED_RATIOS: [(&str, f64); 4] = [("Off", 0.0), ("1.0", 1.0), ("2.0", 2.0), ("5.0", 5.0)];
+const SEED_TIMES: [(&str, f64); 4] = [("Off", 0.0), ("1 hour", 3600.0), ("6 hours", 21600.0), ("24 hours", 86400.0)];
+
 /// A local `.torrent` file path (not a URL or magnet).
 fn is_torrent_file(s: &str) -> bool {
-    !s.contains("://") && !s.starts_with("magnet:") && std::path::Path::new(s).extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+    !s.contains("://") && !s.starts_with("magnet:") && parse_magnet_hash(s).is_none() && std::path::Path::new(s).extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+}
+
+/// Played through the torrent engine: a valid magnet (any scheme case, padding trimmed like `Url::parse`) or a `.torrent` file.
+fn is_torrent_source(s: &str) -> bool {
+    parse_magnet_hash(s).is_some() || is_torrent_file(s)
+}
+
+/// What to play or open from a magnet, `stremio://` link or local file: valid magnet, or an existing file.
+fn is_open_input(s: &str) -> bool {
+    parse_magnet_hash(s).is_some() || (!s.contains("://") && std::path::Path::new(s).is_file())
+}
+
+const USAGE: &str = "usage: stremflix-rs [--help] [<stremio:// link | magnet link | .torrent file | media file>]";
+
+enum Cli {
+    /// Optional link to hand to the (running or new) window; files are made absolute.
+    Open(Option<String>),
+    Help,
+    Bad(String),
+}
+
+/// Parse the command line (without argv[0]). Reads the filesystem only to check that a file exists.
+fn parse_cli(args: &[String]) -> Cli {
+    // macOS Finder adds `-psn_…`.
+    // Only before `--`: after it, every argument is a file name.
+    let mut seen_end = false;
+    let mut args = args.iter().filter(|a| {
+        let drop = !seen_end && a.starts_with("-psn_");
+        seen_end |= a.as_str() == "--";
+        !drop
+    });
+    let Some(a) = args.next() else { return Cli::Open(None) };
+    if matches!(a.as_str(), "-h" | "--help") {
+        return Cli::Help;
+    }
+    // `--` ends the flags so a file named `-movie.mkv` can be opened.
+    let end_of_flags = a == "--";
+    let Some(a) = (if end_of_flags { args.next() } else { Some(a) }) else { return Cli::Open(None) };
+    if args.next().is_some() {
+        return Cli::Bad("only one argument is accepted".into());
+    }
+    if a.starts_with('-') && !end_of_flags {
+        return Cli::Bad(format!("unknown flag: {}", sanitize_text(a, 100)));
+    }
+    if a.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("stremio://")) {
+        return Cli::Open(Some(a.clone()));
+    }
+    if parse_magnet_hash(a).is_some() {
+        return Cli::Open(Some(a.clone()));
+    }
+    if a.contains("://") || a.trim_start().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("magnet:")) {
+        return Cli::Bad(format!("unsupported link: {}", sanitize_text(a, 100)));
+    }
+    match std::path::absolute(a) {
+        Ok(p) if p.is_file() => match p.to_str() {
+            Some(p) => Cli::Open(Some(p.into())),
+            None => Cli::Bad("file path is not valid UTF-8".into()),
+        },
+        _ => Cli::Bad(format!("no such file: {}", sanitize_text(a, 100))),
+    }
 }
 
 /// Splits a command line on whitespace; double quotes group words with spaces (e.g. a Windows path).
@@ -928,6 +992,32 @@ fn cover_uv(rect: egui::Rect, size: egui::Vec2) -> egui::Rect {
     }
 }
 
+/// Our own pause from minimizing: `Sent` until mpv reports it, `Held` while it stays paused,
+/// `Yielded` once the user or the sleep timer changes the pause while minimized (left alone until restore).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AutoPause {
+    Off,
+    Sent,
+    Held,
+    Yielded,
+}
+
+/// Whether to pause (`Some(true)`) or resume (`Some(false)`) for a minimize change, and the new bookkeeping; only resumes what it paused.
+fn pause_step(enabled: bool, away: bool, paused: bool, auto: AutoPause) -> (Option<bool>, AutoPause) {
+    // A resume only counts as the user's once mpv has confirmed our pause.
+    let auto = match auto {
+        AutoPause::Sent if paused => AutoPause::Held,
+        AutoPause::Held if !paused => AutoPause::Yielded,
+        other => other,
+    };
+    match (enabled && away, auto) {
+        (true, AutoPause::Off) if !paused => (Some(true), AutoPause::Sent),
+        (true, _) => (None, auto),
+        (false, AutoPause::Sent | AutoPause::Held) => (Some(false), AutoPause::Off),
+        (false, _) => (None, AutoPause::Off),
+    }
+}
+
 /// mpv's `keep-open` pauses on the last frame at end of file.
 fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
     paused && dur > 0.0 && pos >= dur - 1.0
@@ -957,9 +1047,9 @@ fn timer_pause_step(state: Option<bool>, paused: bool) -> Option<bool> {
     }
 }
 
-/// End-of-episode autoplay; never after the sleep timer's own pause.
-fn autoplay_due(autoplay_next: bool, timer_paused: Option<bool>, at_end: bool) -> bool {
-    autoplay_next && timer_paused.is_none() && at_end
+/// End-of-episode autoplay; never after the sleep timer's own pause or while our minimize pause holds.
+fn autoplay_due(autoplay_next: bool, timer_paused: Option<bool>, auto: AutoPause, at_end: bool) -> bool {
+    autoplay_next && timer_paused.is_none() && matches!(auto, AutoPause::Off | AutoPause::Yielded) && at_end
 }
 
 /// Fraction of the seek bar the cache covers, never behind the playhead.
@@ -1137,6 +1227,8 @@ struct Playing {
     awake: Option<Option<keepawake::KeepAwake>>,
     /// Video track to restore once the window is shown again; video is off while hidden.
     hidden_vid: Option<String>,
+    /// Paused by the pause-on-minimize setting, so only then resume on restore.
+    auto_pause: AutoPause,
 }
 
 impl Drop for Playing {
@@ -1264,6 +1356,9 @@ struct App {
     proxy: [String; 4],
     /// (download, upload) in bytes/s; 0 is unlimited.
     torrent_limits: (u32, u32),
+    torrent_seed: SeedLimit,
+    /// Torrent row in the manager awaiting a delete confirmation.
+    confirm_delete: Option<usize>,
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
     /// Settings > Data: path typed for an import, and the last export/import result.
@@ -1285,6 +1380,8 @@ struct App {
     autoplay_next: bool,
     /// Closing the window hides it to the tray instead of quitting.
     tray_on_close: bool,
+    /// Pause playback while the window is minimized or hidden.
+    pause_on_minimize: bool,
     tray: Option<Tray>,
     /// Window hidden to the tray.
     hidden: bool,
@@ -1450,6 +1547,11 @@ impl App {
                 db.setting("torrent_down_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
                 db.setting("torrent_up_limit")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             ),
+            torrent_seed: SeedLimit {
+                ratio: db.setting("seed_ratio")?.and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                secs: db.setting("seed_secs")?.and_then(|v| v.parse().ok()).unwrap_or(0),
+            },
+            confirm_delete: None,
             data_import: String::new(),
             data_msg: None,
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
@@ -1462,6 +1564,7 @@ impl App {
             light: db.setting("theme")?.as_deref() == Some("light"),
             autoplay_next: db.setting("autoplay_next")?.as_deref() != Some("0"),
             tray_on_close: db.setting("tray_on_close")?.as_deref() == Some("1"),
+            pause_on_minimize: db.setting("pause_on_minimize")?.as_deref() == Some("1"),
             tray: None,
             hidden: false,
             quit: false,
@@ -1518,6 +1621,15 @@ impl App {
         };
         if app.addons.is_empty() {
             app.tab = Tab::Addons;
+        }
+        // Neither check may block startup: a failure here only skips the notice.
+        match app.db.quick_check() {
+            Ok(Some(e)) => report(&mut app.error, format!("database check failed: {e}")),
+            Ok(None) => {}
+            Err(e) => eprintln!("database check: {e:#}"),
+        }
+        if app.db.begin_session().unwrap_or(false) {
+            app.notice = Some("Stremflix did not exit cleanly last time. Playback progress is saved every second.".into());
         }
         let [kind, addr, user, pass] = &app.proxy;
         match stremflix_rs::addon::proxy_url(kind, addr, user, pass) {
@@ -1579,7 +1691,7 @@ impl App {
         self.nav += 1;
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
-        let torrent = source.starts_with("magnet:") || is_torrent_file(&source);
+        let torrent = is_torrent_source(&source);
         let mut subs = subs;
         if !torrent {
             subs.extend(player::sidecar_subs(std::path::Path::new(&source))); // empty for URLs and missing paths
@@ -1593,7 +1705,7 @@ impl App {
             let (url, id) = match torrent {
                 true => {
                     let engine = start.await?;
-                    if source.starts_with("magnet:") {
+                    if parse_magnet_hash(&source).is_some() {
                         let files = engine.media_choices(&source).await?;
                         if !files.is_empty() {
                             return Ok(Msg::PickFile(key, title, source, subs, files, nav));
@@ -1619,9 +1731,9 @@ impl App {
             Some(d) => PathBuf::from(d).join("stremflix-rs-torrents"),
             None => self.data_dir.join("torrents"),
         };
-        let (cell, cache, profile, limits) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile, self.torrent_limits);
+        let (cell, cache, profile, limits, seed) = (self.torrent.clone(), self.torrent_cache, self.torrent_profile, self.torrent_limits, self.torrent_seed);
         let dht = std::env::var_os("STREMFLIX_RS_NO_DHT").is_none();
-        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile, limits).await.map(Arc::new) }).await.cloned() }
+        async move { cell.get_or_try_init(|| async move { TorrentEngine::start(dir, dht, cache, profile, limits, seed).await }).await.cloned() }
     }
 
     /// What a hash-matched subtitle query needs for the selected title's stream `source`;
@@ -1944,8 +2056,13 @@ impl App {
                 self.quit = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            Msg::Link(s) => match stremflix_rs::addon::parse_deep_link(&s) {
-                Some(link) => {
+            Msg::Link(s) => {
+                let link = stremflix_rs::addon::parse_deep_link(&s);
+                if s.is_empty() {
+                    self.show_window(ctx, true);
+                } else if link.is_none() && !is_open_input(&s) {
+                    report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200)));
+                } else {
                     self.show_window(ctx, true);
                     // Leave the player like its Back button does, or the link opens behind it.
                     if self.player.is_some() {
@@ -1953,11 +2070,16 @@ impl App {
                         self.stop_player();
                         self.release_torrents(None);
                     }
-                    self.open_link(ctx, link);
+                    match link {
+                        Some(link) => self.open_link(ctx, link),
+                        None if is_torrent_source(&s) => self.play_torrent(ctx, &s),
+                        None => {
+                            let name = std::path::Path::new(&s).file_stem().map_or("Video".into(), |n| n.to_string_lossy().into_owned());
+                            self.play(ctx, format!("file:{s}"), name, s, vec![]);
+                        }
+                    }
                 }
-                None if s.is_empty() => self.show_window(ctx, true),
-                None => report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200))),
-            },
+            }
             Msg::NewEpisodes(epoch, meta, mut videos) => {
                 if epoch == self.new_eps_gen {
                     sort_episodes(&mut videos);
@@ -2206,7 +2328,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, skip_done: None, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, skip_done: None, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None, auto_pause: AutoPause::Off };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -2342,6 +2464,8 @@ impl App {
         if self.sleep.is_some_and(|(t, _)| Instant::now() >= t) {
             self.sleep = None;
             self.timer_paused = Some(false);
+            // The sleep timer's pause is not ours: minimize neither resumes nor re-pauses it.
+            p.auto_pause = AutoPause::Yielded;
             if let Err(e) = p.player.command(&["set", "pause", "yes"]) {
                 report(&mut self.error, e);
             }
@@ -2349,7 +2473,7 @@ impl App {
         }
         let st = &p.player.state;
         self.timer_paused = timer_pause_step(self.timer_paused, st.paused);
-        if autoplay_due(self.autoplay_next, self.timer_paused, at_end(st.pos, st.dur, st.paused)) && !looping(p.repeat, p.ab) && self.playing_episode() {
+        if autoplay_due(self.autoplay_next, self.timer_paused, p.auto_pause, at_end(st.pos, st.dur, st.paused)) && !looping(p.repeat, p.ab) && self.playing_episode() {
             return self.play_next(ctx);
         }
         let Some(p) = &mut self.player else { return };
@@ -4606,10 +4730,52 @@ impl App {
                 });
             });
         }
-        let note = "Stopped torrents stay on disk up to the cache size, and are cleared when the app starts.";
+        for (label, id, choices) in [("Seed to ratio:", "seed_ratio", &SEED_RATIOS), ("Seed for (after playback):", "seed_secs", &SEED_TIMES)] {
+            ui.horizontal(|ui| {
+                let l = ui.label(label);
+                ui.add_space((150.0 - l.rect.width()).max(0.0));
+                let cur = if id == "seed_ratio" { self.torrent_seed.ratio } else { self.torrent_seed.secs as f64 };
+                egui::ComboBox::from_id_salt(id).selected_text(choices.iter().find(|c| c.1 == cur).map_or("Custom", |c| c.0)).show_ui(ui, |ui| {
+                    for &(name, v) in choices {
+                        if ui.selectable_label(cur == v, name).clicked() {
+                            if id == "seed_ratio" { self.torrent_seed.ratio = v } else { self.torrent_seed.secs = v as u64 }
+                            save.push((id, v.to_string()));
+                        }
+                    }
+                });
+            });
+        }
+        let note = "Finished torrents keep seeding after playback ends (the \"Seed for\" timer starts then, not when the download completes) until a seeding limit is reached (both Off: stop at once). Seeding torrents are exempt from the cache size: they stay on disk until their limit is reached and the next release. Other stopped torrents stay on disk up to the cache size, and are cleared when the app starts.";
         ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
         if self.torrent.get().is_some() {
             ui.label(RichText::new("A torrent has already played: restart the app to apply changes.").size(13.0).color(ui.visuals().weak_text_color()));
+        }
+        if let Some(engine) = self.torrent.get() {
+            ui.ctx().request_repaint_after(Duration::from_secs(2));
+            let playing = self.player.as_ref().and_then(|p| p.torrent);
+            for t in engine.list() {
+                ui.horizontal(|ui| {
+                    if self.confirm_delete == Some(t.id) {
+                        ui.label("Delete files?");
+                        if ui.small_button("Yes").clicked() {
+                            self.confirm_delete = None;
+                            // The engine also refuses the torrent being streamed; this covers a play that started after the prompt.
+                            let res = if playing == Some(t.id) { Err(anyhow::anyhow!("torrent is playing")) } else { self.rt.block_on(engine.remove(t.id)) };
+                            if let Err(e) = res {
+                                report(&mut self.error, e);
+                            }
+                        }
+                        if ui.small_button("No").clicked() {
+                            self.confirm_delete = None;
+                        }
+                    } else if playing != Some(t.id) && ui.small_button("Delete").on_hover_text("Stop and delete its files").clicked() {
+                        self.confirm_delete = Some(t.id);
+                    }
+                    let state = if t.paused { "stopped" } else { "running" };
+                    let (done, total) = t.progress;
+                    ui.label(format!("{} - {state}, {}% of {}, uploaded {}", t.name, done * 100 / total.max(1), fmt_size(total), fmt_size(t.uploaded)));
+                });
+            }
         }
         ui.add_space(16.0);
         ui.label(RichText::new("Proxy").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
@@ -4675,6 +4841,9 @@ impl App {
             }
             if switch_row(ui, "Minimize to tray on close", &mut self.tray_on_close).changed() {
                 save.push(("tray_on_close", on(self.tray_on_close)));
+            }
+            if switch_row(ui, "Pause when minimized", &mut self.pause_on_minimize).changed() {
+                save.push(("pause_on_minimize", on(self.pause_on_minimize)));
             }
             let step = stepper(ui, "Subtitle size", &format!("{:.1}x", style.scale));
             if step != 0 {
@@ -5066,6 +5235,16 @@ impl eframe::App for App {
                 report(&mut self.error, e);
             }
         }
+        let away = self.hidden || ctx.input(|i| i.viewport().minimized) == Some(true);
+        if let Some(p) = &mut self.player {
+            let (pause, auto) = pause_step(self.pause_on_minimize, away, p.player.state.paused, p.auto_pause);
+            p.auto_pause = auto;
+            if let Some(pause) = pause
+                && let Err(e) = p.player.command(&["set", "pause", if pause { "yes" } else { "no" }])
+            {
+                report(&mut self.error, e);
+            }
+        }
         ctx.request_repaint_after(Duration::from_millis(500));
     }
 
@@ -5260,6 +5439,7 @@ impl eframe::App for App {
         let _ = self.db.set_setting("window", &self.window.to_string());
         let _ = self.db.set_setting("tab", self.tab.name());
         self.stop_player();
+        let _ = self.db.end_session();
     }
 }
 
@@ -5321,8 +5501,19 @@ impl Geo {
 }
 
 fn main() -> eframe::Result {
-    // Only links count: macOS Finder adds `-psn_…`. A launch without one just focuses the open window.
-    let arg = std::env::args_os().nth(1).and_then(|a| a.into_string().ok()).filter(|a| a.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("stremio://")));
+    // A launch without an argument just focuses the open window.
+    let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    let arg = match parse_cli(&args) {
+        Cli::Open(a) => a,
+        Cli::Help => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Cli::Bad(e) => {
+            eprintln!("error: {e}\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
     let dir = data_dir();
     if instance::forward(&dir, arg.as_deref().unwrap_or("")) {
         return Ok(());
@@ -5487,6 +5678,44 @@ fn qr_ui(ui: &mut egui::Ui, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pause_on_minimize_only_resumes_own_pause() {
+        use AutoPause::*;
+        assert_eq!(pause_step(true, true, false, Off), (Some(true), Sent));
+        assert_eq!(pause_step(true, true, true, Off), (None, Off)); // user paused: leave alone
+        assert_eq!(pause_step(true, false, true, Held), (Some(false), Off));
+        assert_eq!(pause_step(false, true, false, Off), (None, Off));
+        assert_eq!(pause_step(false, true, true, Held), (Some(false), Off)); // setting turned off
+        assert_eq!(pause_step(true, true, true, Held), (None, Held)); // our pause, still minimized: hold
+    }
+
+    #[test]
+    fn sleep_timer_pause_survives_minimize() {
+        use AutoPause::*;
+        // The sleep timer paused while minimized: no re-pause, and restore does not resume it.
+        assert_eq!(pause_step(true, true, true, Yielded), (None, Yielded));
+        assert_eq!(pause_step(true, false, true, Yielded), (None, Off));
+        assert_eq!(pause_step(true, false, true, Sent), (Some(false), Off), "our own pause still resumes");
+    }
+
+    #[test]
+    fn user_pause_while_minimized_is_kept() {
+        // Auto-pause, media-key Play, then Pause again, all while minimized: the user's state wins until restore.
+        let mut auto = AutoPause::Off;
+        let mut step = |paused, away| {
+            let (pause, next) = pause_step(true, away, paused, auto);
+            auto = next;
+            pause
+        };
+        assert_eq!(step(false, true), Some(true)); // auto-pause sent
+        assert_eq!(step(false, true), None); // mpv not paused yet: still ours
+        assert_eq!(step(true, true), None); // mpv confirms the pause
+        assert_eq!(step(false, true), None); // user Play: not re-paused
+        assert_eq!(step(true, true), None); // user Pause: kept
+        assert_eq!(step(true, false), None); // restore: user's pause stays
+        assert_eq!(auto, AutoPause::Off);
+    }
 
     #[test]
     fn tab_name_round_trip() {
@@ -5889,10 +6118,13 @@ mod tests {
 
     #[test]
     fn timer_pause_blocks_autoplay_until_resumed() {
-        assert!(autoplay_due(true, None, true));
-        assert!(!autoplay_due(true, Some(false), true), "pause not yet confirmed");
-        assert!(!autoplay_due(true, Some(true), true));
-        assert!(!autoplay_due(false, None, true));
+        use AutoPause::*;
+        assert!(autoplay_due(true, None, Off, true));
+        assert!(!autoplay_due(true, Some(false), Off, true), "pause not yet confirmed");
+        assert!(!autoplay_due(true, Some(true), Off, true));
+        assert!(!autoplay_due(false, None, Off, true));
+        assert!(!autoplay_due(true, None, Held, true), "our minimize pause holds");
+        assert!(autoplay_due(true, None, Yielded, true), "user took over while minimized");
         let s = timer_pause_step(Some(false), false);
         assert_eq!(s, Some(false), "mpv has not reported the pause yet");
         let s = timer_pause_step(s, true);
@@ -6060,6 +6292,40 @@ mod tests {
         let (_d, mut app) = test_app();
         app.handle(&egui::Context::default(), Msg::Link("stremio://example.com/manifest.json".into()));
         assert!(app.tab == Tab::Addons && app.addon_url == "https://example.com/manifest.json");
+    }
+
+    #[test]
+    fn cli_args() {
+        let cli = |a: &[&str]| parse_cli(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let magnet = format!("magnet:?xt=urn:btih:{}", "a".repeat(40));
+        let file = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert!(matches!(cli(&[]), Cli::Open(None)) && matches!(cli(&["-psn_0_1"]), Cli::Open(None)));
+        assert!(matches!(cli(&["--help"]), Cli::Help));
+        assert!(matches!(cli(&["stremio:///detail/movie/tt1"]), Cli::Open(Some(_))));
+        assert!(matches!(cli(&["-h"]), Cli::Help));
+        assert!(matches!(cli(&["--", "-psn_0_1"]), Cli::Bad(m) if m.starts_with("no such file")));
+        assert!(matches!(cli(&["--", &magnet]), Cli::Open(Some(m)) if m == magnet));
+        assert!(matches!(cli(&["--"]), Cli::Open(None)) && matches!(cli(&["--", "-no-such.mkv"]), Cli::Bad(m) if m.starts_with("no such file")));
+        assert!(matches!(cli(&["MAGNET:?xt=bad"]), Cli::Bad(m) if m.starts_with("unsupported link")));
+        assert!(matches!(cli(&[&magnet]), Cli::Open(Some(m)) if m == magnet));
+        assert!(matches!(cli(&[file]), Cli::Open(Some(p)) if std::path::Path::new(&p) == std::path::absolute(file).unwrap()));
+        // Url::parse accepts an upper-case scheme; Msg::Link routing uses the same predicate.
+        let upper = magnet.replacen("magnet", "MAGNET", 1);
+        assert!(matches!(cli(&[&upper]), Cli::Open(Some(_))) && parse_magnet_hash(&upper).is_some());
+        for bad in [&["--nope"][..], &["magnet:?xt=bad"], &["https://x.example/a.torrent"], &["/no/such.mkv"], &[file, file]] {
+            assert!(matches!(cli(bad), Cli::Bad(_)), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn torrent_source_routing() {
+        let m = format!("magnet:?xt=urn:btih:{}", "a".repeat(40));
+        for yes in [m.clone(), m.replacen("magnet", "MAGNET", 1), format!("  {m}"), "/m/a.torrent".into()] {
+            assert!(is_torrent_source(&yes), "{yes}");
+        }
+        for no in ["magnet:?xt=bad", "/m/a.mkv", "https://x.example/a.torrent"] {
+            assert!(!is_torrent_source(no), "{no}");
+        }
     }
 
     #[test]
