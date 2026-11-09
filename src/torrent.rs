@@ -6,10 +6,21 @@ use librqbit::{AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, Session, 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::addon::{magnet_peers, parse_magnet_hash};
 use crate::library::MEDIA_EXTS;
+
+/// What librqbit accepts: it only recognises a lower-case `magnet:` prefix, so trim and lower-case just the scheme.
+fn normalize_magnet(s: &str) -> String {
+    let s = s.trim();
+    if is_magnet(s) { format!("magnet:{}", &s[7..]) } else { s.into() }
+}
+
+/// A magnet link in any scheme case, even an invalid one (so it reports "invalid magnet link" and is never read as a file).
+fn is_magnet(s: &str) -> bool {
+    s.trim_start().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("magnet:"))
+}
 
 /// How long to wait for peers to send a magnet's metadata.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
@@ -49,6 +60,34 @@ impl Profile {
             Profile::Fast => Some(300),
         }
     }
+}
+
+/// How long a finished torrent keeps seeding once released: until the upload ratio or the time is reached.
+/// Zero means no limit of that kind; both zero stops it at once.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SeedLimit {
+    pub ratio: f64,
+    pub secs: u64,
+}
+
+impl SeedLimit {
+    fn enabled(self) -> bool {
+        self.ratio > 0.0 || self.secs > 0
+    }
+
+    /// Whether a torrent that uploaded `up` of `size` bytes over `elapsed` has hit a limit.
+    pub fn reached(self, up: u64, size: u64, elapsed: Duration) -> bool {
+        (self.ratio > 0.0 && up as f64 >= self.ratio * size as f64) || (self.secs > 0 && elapsed.as_secs() >= self.secs)
+    }
+}
+
+/// One torrent for the manager list.
+pub struct TorrentRow {
+    pub id: usize,
+    pub name: String,
+    pub progress: (u64, u64),
+    pub uploaded: u64,
+    pub paused: bool,
 }
 
 /// Torrent ids (oldest first, with their downloaded bytes) to delete so the rest fit in `cache` bytes.
@@ -99,12 +138,17 @@ pub struct TorrentEngine {
     /// Torrents being downloaded, once per download: never stopped by [`release_except`](Self::release_except).
     /// Held across a whole release and across [`stream_url`](Self::stream_url)'s unpause+pin, so neither interleaves.
     pinned: tokio::sync::Mutex<Vec<usize>>,
+    seed: SeedLimit,
+    /// The torrent being played (set by an unpinned `stream_url`, reset by `release_except`): `remove` refuses it.
+    active: std::sync::Mutex<Option<usize>>,
+    /// Released, finished torrents still seeding, with when they started.
+    seeding: std::sync::Mutex<std::collections::HashMap<usize, Instant>>,
 }
 
 impl TorrentEngine {
     /// Must be called inside a tokio runtime. `dht=false` is for offline/CI use. `limits` is (download, upload) in bytes/s; 0 is unlimited.
     /// Clears `download_dir` first: without session persistence, leftover files belong to no torrent.
-    pub async fn start(download_dir: PathBuf, dht: bool, cache: u64, profile: Profile, limits: (u32, u32)) -> Result<Self> {
+    pub async fn start(download_dir: PathBuf, dht: bool, cache: u64, profile: Profile, limits: (u32, u32), seed: SeedLimit) -> Result<Arc<Self>> {
         let _ = std::fs::remove_dir_all(&download_dir);
         std::fs::create_dir_all(&download_dir)?;
         let mut opts = SessionOptions { persistence: None, fastresume: false, peer_limit: profile.peer_limit(), ..Default::default() };
@@ -127,16 +171,73 @@ impl TorrentEngine {
         let api = Api::new(session.clone(), None, None);
         let server = librqbit::http_api::HttpApi::new(api, Some(librqbit::http_api::HttpApiOptions { read_only: true, ..Default::default() }));
         tokio::spawn(server.make_http_api_and_run(listener, None));
-        Ok(Self { session, http, cache, pinned: Default::default() })
+        let engine = Arc::new(Self { session, http, cache, pinned: Default::default(), seed, active: Default::default(), seeding: Default::default() });
+        // Weak: the sweep must not keep a dropped engine alive.
+        let weak = Arc::downgrade(&engine);
+        tokio::spawn(async move {
+            while let Some(e) = weak.upgrade() {
+                e.stop_seeded().await;
+                drop(e);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+        Ok(engine)
+    }
+
+    /// Pause seeding torrents that reached the limit. shortcut: they stay on disk until the next release evicts them.
+    async fn stop_seeded(&self) {
+        let due: Vec<_> = {
+            let seeding = self.seeding.lock().unwrap();
+            self.session.with_torrents(|it| it.filter_map(|(id, h)| seeding.get(&id).map(|t| (id, h.clone(), t.elapsed()))).collect())
+        };
+        for (id, h, elapsed) in due {
+            let st = h.stats();
+            if !(h.is_paused() || self.seed.reached(st.uploaded_bytes, st.total_bytes, elapsed)) {
+                continue;
+            }
+            // Held through the pause so stream_url can't unpause and pin this torrent in between.
+            let pinned = self.pinned.lock().await;
+            if pinned.contains(&id) || !self.seeding.lock().unwrap().contains_key(&id) {
+                continue;
+            }
+            // Untracked only once paused, so a failed pause is retried by the next sweep.
+            if !h.is_paused() && let Err(e) = self.session.pause(&h).await {
+                eprintln!("pause torrent {id}: {e:#}");
+                continue;
+            }
+            self.seeding.lock().unwrap().remove(&id);
+        }
+    }
+
+    /// Every torrent in the session, for the manager list.
+    pub fn list(&self) -> Vec<TorrentRow> {
+        self.session.with_torrents(|it| {
+            it.map(|(id, h)| {
+                let st = h.stats();
+                TorrentRow { id, name: h.name().unwrap_or_else(|| format!("torrent {id}")), progress: (st.progress_bytes, st.total_bytes), uploaded: st.uploaded_bytes, paused: h.is_paused() }
+            })
+            .collect()
+        })
+    }
+
+    /// Stop torrent `id` and delete its files; refuses a torrent a download or stream holds.
+    pub async fn remove(&self, id: usize) -> Result<()> {
+        // Held through the delete so stream_url can't pin the torrent in between.
+        let pinned = self.pinned.lock().await;
+        anyhow::ensure!(!pinned.contains(&id) && *self.active.lock().unwrap() != Some(id), "torrent {id} is in use");
+        self.seeding.lock().unwrap().remove(&id);
+        self.session.delete(id.into(), true).await.with_context(|| format!("delete torrent {id}"))
     }
 
     /// Add a magnet or local `.torrent` file; returns its handle and the file index chosen by `file_idx` or a magnet's `so=`.
     async fn add(&self, magnet: &str, file_idx: Option<usize>) -> Result<(Arc<librqbit::ManagedTorrent>, Option<usize>)> {
-        let (add, peers, file_idx) = if magnet.starts_with("magnet:") {
+        let (add, peers, file_idx) = if is_magnet(magnet) {
+            let magnet = normalize_magnet(magnet);
+            let magnet = magnet.as_str();
             parse_magnet_hash(magnet).context("invalid magnet link")?;
             // `so=<idx>` (BEP 53 select-only) carries the addon's fileIdx through saved progress.
             let so = url::Url::parse(magnet).ok().and_then(|u| u.query_pairs().find(|(k, _)| k == "so").and_then(|(_, v)| v.parse().ok()));
-            (AddTorrent::from_url(magnet), magnet_peers(magnet), file_idx.or(so))
+            (AddTorrent::from_url(magnet.to_string()), magnet_peers(magnet), file_idx.or(so))
         } else {
             let len = tokio::fs::metadata(magnet).await.with_context(|| format!("open {magnet}"))?.len();
             anyhow::ensure!(len <= MAX_TORRENT_FILE, "{magnet} is too large for a .torrent file");
@@ -180,11 +281,14 @@ impl TorrentEngine {
         };
         // A cached torrent was paused when its playback stopped. Last, so a pin can't leak on an error above.
         let mut pinned = self.pinned.lock().await;
+        self.seeding.lock().unwrap().remove(&handle.id());
         if handle.is_paused() {
             self.session.unpause(&handle).await?;
         }
         if pin {
             pinned.push(handle.id());
+        } else {
+            *self.active.lock().unwrap() = Some(handle.id());
         }
         Ok((format!("http://{}/torrents/{}/stream/{idx}", self.http, handle.id()), handle.id()))
     }
@@ -207,7 +311,23 @@ impl TorrentEngine {
     /// while they fit in the cache; the oldest are deleted with their files first.
     pub async fn release_except(&self, keep: Option<usize>) {
         let pinned = self.pinned.lock().await;
-        let stopped: Vec<_> = self.session.with_torrents(|it| it.filter(|(id, _)| Some(*id) != keep && !pinned.contains(id)).map(|(id, h)| (id, h.clone())).collect());
+        *self.active.lock().unwrap() = keep;
+        let candidates: Vec<_> = self.session.with_torrents(|it| it.filter(|(id, _)| Some(*id) != keep && !pinned.contains(id)).map(|(id, h)| (id, h.clone())).collect());
+        // A finished torrent keeps seeding under the limit; its files stay, so it is not evicted.
+        let keep_seeding = |id: usize, h: &Arc<librqbit::ManagedTorrent>, seeding: &mut std::collections::HashMap<usize, Instant>| {
+            let st = h.stats();
+            if !self.seed.enabled() || !st.finished || h.is_paused() && !seeding.contains_key(&id) {
+                return false;
+            }
+            !self.seed.reached(st.uploaded_bytes, st.total_bytes, seeding.entry(id).or_insert_with(Instant::now).elapsed())
+        };
+        // Sync guard, dropped before the first await: edits the shared map in place so concurrent `remove` isn't lost.
+        let stopped: Vec<_> = {
+            let mut seeding = self.seeding.lock().unwrap();
+            let stopped: Vec<_> = candidates.into_iter().filter(|(id, h)| !keep_seeding(*id, h, &mut seeding)).collect();
+            seeding.retain(|id, _| !stopped.iter().any(|(s, _)| s == id));
+            stopped
+        };
         for (_, h) in stopped.iter().filter(|(_, h)| !h.is_paused()) {
             if let Err(e) = self.session.pause(h).await {
                 crate::elog!("pause torrent {}: {e:#}", h.id());
@@ -232,6 +352,24 @@ pub fn magnet_chooses_file(magnet: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn magnet_normalization() {
+        assert_eq!(normalize_magnet("MAGNET:?xt=urn:btih:AbC&dn=X"), "magnet:?xt=urn:btih:AbC&dn=X");
+        assert_eq!(normalize_magnet("  magnet:?xt=a \n"), "magnet:?xt=a");
+        assert_eq!(normalize_magnet("magnet:?xt=a"), "magnet:?xt=a");
+        assert_eq!(normalize_magnet("/m/a.torrent"), "/m/a.torrent");
+    }
+
+    #[test]
+    fn magnet_classification() {
+        for yes in ["magnet:?xt=bad", "MAGNET:?xt=bad", "  Magnet:?xt=bad"] {
+            assert!(is_magnet(yes), "{yes}");
+        }
+        for no in ["/m/magnet.torrent", "C:\\m\\a.torrent", "mag"] {
+            assert!(!is_magnet(no), "{no}");
+        }
+    }
 
     #[test]
     fn formats_rates() {
@@ -266,6 +404,16 @@ mod tests {
         assert_eq!((Profile::from_label("Fast"), Profile::from_label("junk")), (Profile::Fast, Profile::Default));
     }
 
+    #[test]
+    fn seed_limit_reached_by_ratio_or_time() {
+        let l = SeedLimit { ratio: 1.0, secs: 60 };
+        let s = Duration::from_secs;
+        assert!(!l.reached(99, 100, s(59)) && l.reached(100, 100, s(0)) && l.reached(0, 100, s(60)));
+        assert!(!SeedLimit { ratio: 0.0, secs: 0 }.reached(u64::MAX, 1, s(u64::MAX)), "no limit never trips");
+        assert!(!SeedLimit { ratio: 2.0, secs: 0 }.reached(150, 100, s(9999)));
+        assert!(SeedLimit { ratio: 1.0, secs: 0 }.reached(0, 0, s(0)), "zero-byte torrent has nothing to seed: done, not seeding forever");
+    }
+
     #[tokio::test]
     async fn pinned_torrent_survives_release() {
         let dir = tempfile::tempdir().unwrap();
@@ -275,13 +423,17 @@ mod tests {
         let t = librqbit::create_torrent(&src.join("a.mkv"), Default::default(), &librqbit::spawn_utils::BlockingSpawner::new(1)).await.unwrap();
         let file = dir.path().join("a.torrent");
         std::fs::write(&file, t.as_bytes().unwrap()).unwrap();
-        let engine = TorrentEngine::start(dir.path().join("dl"), false, u64::MAX, Profile::Default, (0, 0)).await.unwrap();
+        let engine = TorrentEngine::start(dir.path().join("dl"), false, u64::MAX, Profile::Default, (0, 0), Default::default()).await.unwrap();
         let (_, id) = engine.stream_url(file.to_str().unwrap(), None, true).await.unwrap();
         let paused = || engine.session.get(id.into()).unwrap().is_paused();
         engine.release_except(None).await;
         assert!(!paused(), "pinned: kept running");
+        assert!(engine.remove(id).await.is_err(), "pinned: delete refused");
         engine.unpin(id).await;
         engine.release_except(None).await;
         assert!(paused(), "unpinned: stopped");
+        assert_eq!(engine.list().len(), 1);
+        engine.remove(id).await.unwrap();
+        assert!(engine.list().is_empty());
     }
 }
