@@ -10,7 +10,6 @@ anyhow = "1.0.104"
 base64 = "0.23"
 # glow (OpenGL) instead of the default wgpu: libmpv renders through OpenGL into our framebuffer.
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "system_fonts", "wayland", "x11"] }
-egui_extras = { version = "0.37", features = ["image"] }
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 keepawake = "0.6"
@@ -54,6 +53,11 @@ test-addon = { path = "test-addon" }
 # smaller debug info: faster linking and smaller target dir; backtraces keep file:line (CARGO_PROFILE_DEV_DEBUG=true for a debugger)
 [profile.dev]
 debug = "line-tables-only"
+
+# Measured: binary 52.0 -> 42.8 MB, UI build time per frame about 9% lower, for a slower release build.
+[profile.release]
+lto = "thin"
+codegen-units = 1
 
 [workspace]
 members = ["test-addon"]
