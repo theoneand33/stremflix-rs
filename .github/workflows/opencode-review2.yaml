@@ -31,9 +31,15 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Record review start time
+        id: start
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code (subscription, Haiku)
         id: claude
         continue-on-error: true
+        # Leaves the job time for the fallback when the action hangs.
+        timeout-minutes: 6
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -46,8 +52,21 @@ jobs:
             --model claude-haiku-5-5
             --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Read,Grep,Glob"
 
+      # Gate on a comment actually posted since the Claude step started, not on exit status.
+      # A failed check leaves posted unset, so no fallback runs and no second comment is posted.
+      - name: Check whether Claude posted a review
+        id: check
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.start.outputs.at }}
+        run: |
+          count=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --jq ".[] | select(.created_at >= \"$SINCE\") | .id" | wc -l)
+          echo "posted=$([ "$count" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
       - name: Fallback to opencode (OpenRouter)
-        if: steps.claude.outcome == 'failure'
+        if: steps.check.outputs.posted == 'false'
         uses: anomalyco/opencode/github@latest
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
