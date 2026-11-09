@@ -291,7 +291,6 @@ enum Msg {
     Details(Meta),
     /// `new_eps_gen`, a saved series and its recently released episodes.
     NewEpisodes(u64, MetaPreview, Vec<Video>),
-    /// poster URL, image bytes (empty on failure)
     /// Cache key, the scale its size was chosen for, and the decoded image (`None` on failure).
     Poster(String, f32, Option<egui::ColorImage>),
     /// key, title, resumable source, playable URL/path, subtitle URLs, torrent id, the `nav` it was requested at
@@ -2383,15 +2382,18 @@ impl App {
             }
             Msg::Poster(key, ppp, image) => {
                 // Sized for a scale we have since passed (zoom, new monitor): the card was refetched, and this must not overwrite it.
-                if key.starts_with(CARD_KEY) && ppp != self.poster_ppp {
+                if key.starts_with(CARD_KEY) && ppp != self.poster_ppp.max(1.0) {
                     return;
                 }
                 let (failed, bytes) = (image.is_none(), image.as_ref().map_or(0, |i| i.pixels.len() * 4));
                 let tex = image.map(|i| ctx.load_texture(&key, i, egui::TextureOptions::LINEAR));
                 self.posters.insert(key, Poster { tex, failed, bytes, used: Cell::new(self.poster_frame) });
-                let entries = self.posters.iter().map(|(k, p)| (p.used.get(), p.bytes, k.clone())).collect();
-                for k in posters_to_evict(entries, self.poster_frame, POSTER_CACHE, POSTER_BYTES) {
-                    self.posters.remove(&k);
+                // Cheap check first: building the list clones every key, and a screenful of replies arrives at once.
+                if self.posters.len() > POSTER_CACHE || self.posters.values().map(|p| p.bytes).sum::<usize>() > POSTER_BYTES {
+                    let entries = self.posters.iter().map(|(k, p)| (p.used.get(), p.bytes, k.clone())).collect();
+                    for k in posters_to_evict(entries, self.poster_frame, POSTER_CACHE, POSTER_BYTES) {
+                        self.posters.remove(&k);
+                    }
                 }
             }
             Msg::PickFile(key, title, source, subs, files, nav) => {
@@ -2779,9 +2781,8 @@ impl App {
     fn fetch_poster(&mut self, ctx: &egui::Context, key: String) {
         self.posters.insert(key.clone(), Poster { tex: None, failed: false, bytes: 0, used: Cell::new(self.poster_frame) });
         let (client, slots) = (self.client.clone(), self.poster_slots.clone());
-        let ppp = self.poster_ppp;
-        // Floored at 1: below it (zoomed out) the card would shrink to a thumbnail the next zoom-in can't use.
-        let px = |side: f32| (side * GROW * ppp.max(1.0)).ceil() as u32;
+        let ppp = self.poster_ppp.max(1.0);
+        let px = |side: f32| (side * GROW * ppp).ceil() as u32;
         let target = key.starts_with(CARD_KEY).then(|| [px(CARD.x), px(CARD.y)]);
         self.spawn(ctx, async move {
             let image = async {
@@ -3573,6 +3574,9 @@ impl App {
     /// Horizontally scrolling poster cards; a click selects the title.
     /// Returns true when one of the last 3 cards is on screen.
     fn ui_cards(&self, ui: &mut egui::Ui, salt: &str, items: &[MetaPreview], want: &mut Vec<String>, open: &mut Option<(MetaPreview, bool)>, quick: &mut Option<MetaPreview>) -> bool {
+        if items.is_empty() {
+            return false;
+        }
         // Cards past the viewport are not built at all; the spare ones keep Tab able to walk into the next card.
         const SPARE: usize = 2;
         let mut near_end = false;
@@ -5480,8 +5484,10 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poster_frame = ctx.cumulative_frame_nr();
         // Card posters were sized for a lower scale (zoom, or a new monitor): refetch them sharp.
-        if ctx.pixels_per_point() > self.poster_ppp {
-            self.poster_ppp = ctx.pixels_per_point();
+        // From the zoom the UI will settle on (the clamp below lands next pass), floored at 1 and rounded up to half steps so a zoom sweep refetches a few times, not once per step.
+        let want_ppp = ((ctx.pixels_per_point() / ctx.zoom_factor() * clamp_scale(ctx.zoom_factor())).max(1.0) * 2.0).ceil() / 2.0;
+        if want_ppp > self.poster_ppp {
+            self.poster_ppp = want_ppp;
             self.posters.retain(|k, _| !k.starts_with(CARD_KEY));
         }
         // egui's built-in zoom keys change the factor too: bound it, then persist any change.
