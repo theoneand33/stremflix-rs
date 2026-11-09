@@ -2895,7 +2895,7 @@ impl App {
                 }
             }
         }
-        if page.rows.iter().all(|r| r.items.as_ref().is_some_and(Vec::is_empty)) {
+        if page.rows.iter().all(|r| r.items.as_ref().is_some_and(Vec::is_empty)) && page.failed.len() < page.rows.len() {
             ui.add_space(22.0);
             ui.label("No results.");
         }
@@ -5166,7 +5166,7 @@ impl eframe::App for App {
                 let mut sel_rect = None;
                 for (tab, name) in [(Tab::Home, "Home"), (Tab::Discover, "Discover"), (Tab::Addons, "Addons"), (Tab::Library, "Library"), (Tab::Settings, "Settings")] {
                     // The search page is not a tab, so nothing is current while it is up.
-                    let current = self.tab == tab && self.search_page.is_none();
+                    let current = self.tab == tab && (self.search_page.is_none() || self.selected.is_some());
                     let text = RichText::new(name).size(15.0);
                     let text = if current { text.strong().family(bold()).color(ui.visuals().strong_text_color()) } else { text.color(ui.visuals().weak_text_color()) };
                     // Width of the bold label, so selecting a tab doesn't shift the ones after it.
