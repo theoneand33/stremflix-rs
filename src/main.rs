@@ -518,11 +518,15 @@ const POSTER_BYTES: usize = 384 << 20;
 /// Cache key prefix of a poster shrunk to card size; other keys are plain URLs, kept at full size.
 const CARD_KEY: &str = "card:";
 
-/// A fetched image. `tex` is `None` while loading and after a failure (`failed`).
+/// A fetched image. `tex` is `None` while first loading and after a failure (`failed`); a card poster being resized keeps its old texture until the new one lands.
 struct Poster {
     tex: Option<egui::TextureHandle>,
     failed: bool,
     bytes: usize,
+    /// A fetch is in flight.
+    loading: bool,
+    /// Scale the latest fetch was sized for; below the current one, a card poster is refetched.
+    asked: f32,
     /// Frame it was last drawn on.
     used: Cell<u64>,
 }
@@ -2381,13 +2385,18 @@ impl App {
                 }
             }
             Msg::Poster(key, ppp, image) => {
-                // Sized for a scale we have since passed (zoom, new monitor): the card was refetched, and this must not overwrite it.
+                // Sized for a scale we have since passed (zoom, new monitor): drop it, keep drawing the old texture, and let the next draw ask again.
                 if key.starts_with(CARD_KEY) && ppp != self.poster_ppp.max(1.0) {
+                    if let Some(p) = self.posters.get_mut(&key).filter(|p| p.asked != self.poster_ppp.max(1.0)) {
+                        p.loading = false;
+                    }
                     return;
                 }
-                let (failed, bytes) = (image.is_none(), image.as_ref().map_or(0, |i| i.pixels.len() * 4));
-                let tex = image.map(|i| ctx.load_texture(&key, i, egui::TextureOptions::LINEAR));
-                self.posters.insert(key, Poster { tex, failed, bytes, used: Cell::new(self.poster_frame) });
+                // A failed resize keeps the old texture, which is still a fine picture.
+                let old = self.posters.remove(&key).and_then(|p| p.tex);
+                let (failed, bytes) = (image.is_none() && old.is_none(), image.as_ref().map_or(0, |i| i.pixels.len() * 4));
+                let tex = image.map(|i| ctx.load_texture(&key, i, egui::TextureOptions::LINEAR)).or(old);
+                self.posters.insert(key, Poster { tex, failed, bytes, loading: false, asked: ppp, used: Cell::new(self.poster_frame) });
                 // Cheap check first: building the list clones every key, and a screenful of replies arrives at once.
                 if self.posters.len() > POSTER_CACHE || self.posters.values().map(|p| p.bytes).sum::<usize>() > POSTER_BYTES {
                     let entries = self.posters.iter().map(|(k, p)| (p.used.get(), p.bytes, k.clone())).collect();
@@ -2779,9 +2788,16 @@ impl App {
     }
 
     fn fetch_poster(&mut self, ctx: &egui::Context, key: String) {
-        self.posters.insert(key.clone(), Poster { tex: None, failed: false, bytes: 0, used: Cell::new(self.poster_frame) });
-        let (client, slots) = (self.client.clone(), self.poster_slots.clone());
+        // Several cards can ask for one image in the same frame.
+        if self.posters.get(&key).is_some_and(|p| p.loading) {
+            return;
+        }
         let ppp = self.poster_ppp.max(1.0);
+        // A resize keeps the old texture on screen until the sharper one arrives.
+        let old = self.posters.remove(&key);
+        let (tex, bytes) = old.map_or((None, 0), |p| (p.tex, p.bytes));
+        self.posters.insert(key.clone(), Poster { tex, failed: false, bytes, loading: true, asked: ppp, used: Cell::new(self.poster_frame) });
+        let (client, slots) = (self.client.clone(), self.poster_slots.clone());
         let px = |side: f32| (side * GROW * ppp).ceil() as u32;
         let target = key.starts_with(CARD_KEY).then(|| [px(CARD.x), px(CARD.y)]);
         self.spawn(ctx, async move {
@@ -3130,6 +3146,10 @@ impl App {
             return None;
         };
         p.used.set(self.poster_frame);
+        // Sized for a lower scale: ask for a sharper one, and draw this meanwhile.
+        if !p.loading && key.starts_with(CARD_KEY) && p.asked < self.poster_ppp.max(1.0) {
+            want.push(key.to_owned());
+        }
         p.tex.as_ref().map(egui::load::SizedTexture::from_handle)
     }
 
@@ -5483,12 +5503,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poster_frame = ctx.cumulative_frame_nr();
-        // Card posters were sized for a lower scale (zoom, or a new monitor): refetch them sharp.
+        // Card posters sized for a lower scale (zoom, or a new monitor) are refetched sharp as they are drawn.
         // From the zoom the UI will settle on (the clamp below lands next pass), floored at 1 and rounded up to half steps so a zoom sweep refetches a few times, not once per step.
         let want_ppp = ((ctx.pixels_per_point() / ctx.zoom_factor() * clamp_scale(ctx.zoom_factor())).max(1.0) * 2.0).ceil() / 2.0;
         if want_ppp > self.poster_ppp {
             self.poster_ppp = want_ppp;
-            self.posters.retain(|k, _| !k.starts_with(CARD_KEY));
         }
         // egui's built-in zoom keys change the factor too: bound it, then persist any change.
         let zoom = clamp_scale(ctx.zoom_factor());
