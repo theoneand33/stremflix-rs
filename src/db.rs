@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
-use crate::addon::{Manifest, MetaPreview, addon_base, parse_magnet_hash, parse_manifest, safe_http_url, valid_id};
+use crate::addon::{Manifest, MetaPreview, addon_base, parse_magnet_hash, parse_manifest, safe_http_url, sanitize_text, valid_id};
 use crate::download::State;
 use crate::library::LibraryItem;
 use serde_json::{Value, json};
@@ -448,7 +448,9 @@ impl Db {
         anyhow::ensure!(doc["version"] == 1, "unsupported export version {}", doc["version"]);
         let list = |k: &str| doc[k].as_array().map(Vec::as_slice).unwrap_or_default();
         let text = |v: &Value, k: &str| v[k].as_str().map(str::to_owned);
-        let poster = |v: &Value| text(v, "poster").filter(|p| safe_http_url(p).is_some());
+        // Titles are shown as is, so they get the same cleaning and cap as addon text.
+        let title = |v: &Value| text(v, "title").map(|t| sanitize_text(&t, 300));
+        let poster = |v: &Value| text(v, "poster").filter(|p| p.len() <= 2048 && safe_http_url(p).is_some());
         let int = |v: &Value, k: &str| v[k].as_i64().unwrap_or(0).max(0);
         let (mut addons, mut saved, mut progress, mut watched, mut settings) = (0, 0, 0, 0, 0);
         let total = list("addons").len() + list("saved").len() + list("progress").len() + list("watched").len() + list("watched_marks").len();
@@ -461,7 +463,7 @@ impl Db {
                 }
             }
             for t in list("saved") {
-                let (Some(key), Some(title), Some(kind)) = (text(t, "key"), text(t, "title"), text(t, "kind")) else { continue };
+                let (Some(key), Some(title), Some(kind)) = (text(t, "key"), title(t), text(t, "kind")) else { continue };
                 if valid_id(&key) && valid_id(&kind) && !title.trim().is_empty() {
                     self.conn.execute(
                         "INSERT INTO saved_titles (key, title, kind, poster, saved_at) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -472,7 +474,7 @@ impl Db {
                 }
             }
             for p in list("progress") {
-                let (Some(key), Some(title), Some(source)) = (text(p, "key"), text(p, "title"), text(p, "source")) else { continue };
+                let (Some(key), Some(title), Some(source)) = (text(p, "key"), title(p), text(p, "source")) else { continue };
                 let (pos, dur) = (p["position"].as_f64().unwrap_or(-1.0), p["duration"].as_f64().unwrap_or(-1.0));
                 if valid_id(&key) && resumable_source(&key, &source) && pos.is_finite() && dur.is_finite() && pos >= 0.0 && dur >= 0.0 {
                     self.conn.execute(
@@ -486,7 +488,7 @@ impl Db {
                 }
             }
             for w in list("watched") {
-                let (Some(key), Some(title)) = (text(w, "key"), text(w, "title")) else { continue };
+                let (Some(key), Some(title)) = (text(w, "key"), title(w)) else { continue };
                 if valid_id(&key) && !title.trim().is_empty() {
                     self.conn.execute(
                         "INSERT INTO watched (key, title, poster, episodes, watched_at) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -711,7 +713,7 @@ pub fn push_history(h: &mut Vec<String>, q: &str) {
     if q.is_empty() {
         return;
     }
-    h.retain(|x| !x.eq_ignore_ascii_case(&q) && x.to_lowercase() != q.to_lowercase());
+    h.retain(|x| x.to_lowercase() != q.to_lowercase());
     h.insert(0, q);
     h.truncate(HISTORY_MAX);
 }

@@ -328,3 +328,16 @@ fn import_rejects_local_and_bad_magnet_progress() {
     assert!(db.progress("movie:tt6").unwrap().is_some());
     assert!(db.progress("movie:tt7").unwrap().is_some());
 }
+
+#[test]
+fn import_cleans_and_caps_titles() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("t.db")).unwrap();
+    let long = "x".repeat(100_000);
+    let doc = serde_json::json!({"format": "stremflix-rs-export", "version": 1,
+        "saved": [{"key": "movie:tt1", "title": format!("a\u{202e}b\n{long}"), "kind": "movie", "poster": format!("https://p.example/{long}")}]});
+    db.import_json(&doc.to_string()).unwrap();
+    let t = &db.saved_titles().unwrap()[0];
+    assert!(t.title.chars().count() <= 300 && !t.title.contains('\u{202e}'));
+    assert_eq!(t.poster, None, "oversized poster URL is dropped");
+}

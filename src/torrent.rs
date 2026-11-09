@@ -202,7 +202,7 @@ impl TorrentEngine {
             }
             // Untracked only once paused, so a failed pause is retried by the next sweep.
             if !h.is_paused() && let Err(e) = self.session.pause(&h).await {
-                eprintln!("pause torrent {id}: {e:#}");
+                crate::elog!("pause torrent {id}: {e:#}");
                 continue;
             }
             self.seeding.lock().unwrap().remove(&id);
