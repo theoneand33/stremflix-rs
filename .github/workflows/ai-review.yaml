@@ -1,4 +1,4 @@
-name: opencode-review
+name: ai-review
 
 on:
   pull_request:
@@ -10,10 +10,10 @@ on:
       - "Cargo.lock"
 
 jobs:
-  opencode-review:
+  ai-review:
     # Job-level so a skipped draft run cannot cancel an in-flight review.
     concurrency:
-      group: opencode-review-${{ github.event.pull_request.number }}
+      group: ai-review-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     # Fork PRs get no secrets, so the review would only fail.
     if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
@@ -47,7 +47,7 @@ jobs:
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
-            Follow .github/opencode-review.md. Post one review comment with `gh pr comment`.
+            Follow .github/review-guidelines.md. Post one review comment with `gh pr comment`.
           claude_args: >-
             --model claude-haiku-5-5
             --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Read,Grep,Glob"
@@ -65,12 +65,12 @@ jobs:
           count=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --jq ".[] | select(.created_at >= \"$SINCE\") | .id" | wc -l)
           echo "posted=$([ "$count" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
-      - name: Fallback to opencode (OpenRouter)
+      - name: Fallback reviewer (Opencode)
         if: steps.check.outputs.posted == 'false'
         uses: anomalyco/opencode/github@latest
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           # check.yml already builds/tests on 3 OSes; cold cargo runs here cost 1.5-3.5 min per review
-          OPENCODE_CONFIG_CONTENT: '{"instructions":[".github/opencode-review.md"],"permission":{"*":"allow","edit":"deny","write":"deny","webfetch":"deny","websearch":"deny","task":"deny","bash":{"*":"allow","cargo *":"deny","*=* cargo *":"deny"}}}'
+          OPENCODE_CONFIG_CONTENT: '{"instructions":[".github/review-guidelines.md"],"permission":{"*":"allow","edit":"deny","write":"deny","webfetch":"deny","websearch":"deny","task":"deny","bash":{"*":"allow","cargo *":"deny","*=* cargo *":"deny"}}}'
         with:
           model: openrouter/deepseek/deepseek-v4.1-flash-1017
