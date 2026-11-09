@@ -38,7 +38,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| Seeding limits (ratio/time) and a torrent manager UI | P3 | S | Torrents are stopped and deleted automatically now. |
 | Custom listen port / UPnP / NAT-PMP | P3 | M | |
 
 ### Settings and streaming server
@@ -46,7 +45,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Transcoding for formats the player can't handle | P3 | L | mpv already plays almost everything, so this is mostly irrelevant. |
-| Pause playback when the window is minimized | P3 | S | Stremio setting. |
 | Launch playback in a separate window | P3 | M | Stremio setting; egui multi-viewport. |
 
 ### Addons
@@ -69,6 +67,4 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | UI translations (i18n) | P3 | M | |
 | Auto-install updates | P3 | M | Release builds already show a download link for a newer build; downloading and replacing the binary is still missing. |
 | Android, iOS, TV clients | P3 | XL | Out of scope for an egui desktop app. |
-| Command-line flags for play/open | P3 | S | Only `stremio://` links are parsed now. |
 | Screen-reader labels and focus-order polish | P3 | M | AccessKit is enabled; coverage is partial. |
-| Crash-safe recovery / resume after unexpected exit | P3 | S | WAL is on; no explicit recovery UI. |
