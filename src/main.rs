@@ -1222,6 +1222,8 @@ struct Playing {
     after_hold: bool,
     /// Wheel scroll not yet turned into volume steps (points).
     wheel: f32,
+    /// Volume the user asked for; the controls draw this because mpv's reported value lags behind.
+    volume: f64,
     /// The up-next card was dismissed.
     next_dismissed: bool,
     /// Addon-marked spans of the playing stream (`behaviorHints.skip`).
@@ -1591,7 +1593,7 @@ impl App {
             tray: None,
             hidden: false,
             quit: false,
-            volume: db.setting("volume")?.and_then(|v| v.parse().ok()).filter(|v| (0.0..=130.0).contains(v)).unwrap_or(100.0),
+            volume: db.setting("volume")?.and_then(|v| v.parse().ok()).filter(|v| (0.0..=VOLUME_MAX).contains(v)).unwrap_or(100.0),
             ui_scale: clamp_scale(db.setting("ui_scale")?.and_then(|v| v.parse().ok()).unwrap_or(1.0)),
             default_speed: db.setting("default_speed")?.and_then(|v| v.parse().ok()).filter(|v| SPEEDS.contains(v)).unwrap_or(1.0),
             seek_steps: [seek_step(db.setting("seek_step")?, 10), seek_step(db.setting("seek_step_shift")?, 30)],
@@ -2365,7 +2367,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, db_skips: None, skip_done: None, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None, auto_pause: AutoPause::Off };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, volume: self.volume, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, db_skips: None, skip_done: None, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None, auto_pause: AutoPause::Off };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -3739,7 +3741,9 @@ impl App {
         }
         let focused = ctx.memory(|m| m.focused());
         let line = ctx.options(|o| o.input_options.line_scroll_speed); // read outside ctx.input to avoid nested locking
-        let mut new_vol = None;
+        let vol_id = ui.scope_id().with("volume");
+        let over_vol = ctx.read_response(vol_id).is_some_and(|r| r.hovered()); // also outside ctx.input
+        let (old_vol, mut vol_held) = (p.volume, false);
         ctx.input(|i| {
             use egui::Key::*;
             let k = |key| i.key_pressed(key);
@@ -3749,8 +3753,8 @@ impl App {
             let step = self.seek_steps[i.modifiers.shift as usize] as f64;
             if k(ArrowLeft) { seek = Some((-step, true)) }
             if k(ArrowRight) { seek = Some((step, true)) }
-            if k(ArrowUp) { cmd(&["add", "volume", "5"]); new_vol = Some(st.volume + 5.0) }
-            if k(ArrowDown) { cmd(&["add", "volume", "-5"]); new_vol = Some(st.volume - 5.0) }
+            if k(ArrowUp) { p.volume += 5.0 }
+            if k(ArrowDown) { p.volume -= 5.0 }
             if k(M) { cmd(&["cycle", "mute"]) }
             if k(S) && focused.is_none() {
                 let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -3762,10 +3766,9 @@ impl App {
             // mpv pauses on its own after a frame step.
             if k(Period) { cmd(&["frame-step"]) }
             if k(Comma) { cmd(&["frame-back-step"]) }
-            // Wheel over the bare video only: `hovered` is false under a popover or a control.
-            if bg.hovered() && p.menu.is_none() {
-                let n = wheel_steps(&mut p.wheel, i.smooth_scroll_delta.y, line);
-                if n != 0 { cmd(&["add", "volume", &(n * 5).to_string()]); new_vol = Some(st.volume + f64::from(n * 5)) }
+            // Wheel over the bare video or the volume slider: `hovered` is false under a popover or another control.
+            if (bg.hovered() || over_vol) && p.menu.is_none() {
+                p.volume += f64::from(wheel_steps(&mut p.wheel, i.smooth_scroll_delta.y, line) * 5);
             } else {
                 p.wheel = 0.0;
             }
@@ -3867,25 +3870,29 @@ impl App {
             }
             next = has_next && icon(ui, pos2(x(1.0), y), icons::SKIP_FORWARD, "Next episode").clicked();
             let vx = x(if has_next { 2.0 } else { 1.0 });
-            let vol = icon(ui, pos2(vx, y), if st.muted || st.volume <= 0.0 { icons::SPEAKER_X } else { icons::SPEAKER_HIGH }, "Mute");
+            let vol = icon(ui, pos2(vx, y), if st.muted || p.volume <= 0.0 { icons::SPEAKER_X } else { icons::SPEAKER_HIGH }, "Mute");
             if vol.clicked() {
                 cmd(&["cycle", "mute"]);
             }
             // Volume slider next to the speaker.
             let vbar = egui::Rect::from_min_size(pos2(vx + 36.0, y - 12.0), vec2(150.0, 24.0));
-            let vr = ui.interact(vbar, ui.scope_id().with("volume"), Sense::CLICK | Sense::DRAG);
-            vr.widget_info(|| egui::WidgetInfo::slider(true, st.volume, "Volume"));
-            if let Some(q) = vr.interact_pointer_pos().filter(|_| vr.dragged() || vr.clicked()) {
-                let v = ((q.x - vbar.left()) / vbar.width()).clamp(0.0, 1.0) * 100.0;
-                cmd(&["set", "volume", &format!("{v:.0}")]);
-                new_vol = Some(v.round().into());
-                // The slider shows 0 while muted, so setting a volume also unmutes.
+            let vr = ui.interact(vbar, vol_id, Sense::CLICK | Sense::DRAG);
+            vr.widget_info(|| egui::WidgetInfo::slider(true, p.volume, "Volume"));
+            // Not `dragged`: that waits for egui's click-or-drag decision, so a press did nothing until release or 6 px.
+            vol_held = vr.is_pointer_button_down_on();
+            // `clicked` too: a tap can press and release within one frame.
+            if vol_held || vr.clicked() {
+                p.osd_until = now + 3.0;
+                if let Some(q) = vr.interact_pointer_pos() {
+                    p.volume = volume_at((q.x - vbar.left()) / vbar.width());
+                }
+                // The slider shows 0 while muted, so setting a volume also unmutes, even to the value it already had.
                 if st.muted {
                     cmd(&["set", "mute", "no"]);
                 }
             }
             let vt = egui::Rect::from_center_size(vbar.center(), vec2(vbar.width(), 4.0));
-            let vf = if st.muted { 0.0 } else { (st.volume / 100.0).clamp(0.0, 1.0) as f32 };
+            let vf = if st.muted { 0.0 } else { (p.volume / VOLUME_MAX).clamp(0.0, 1.0) as f32 };
             paint.rect_filled(vt, 2, Color32::from_gray(128).gamma_multiply(a * 0.5));
             paint.rect_filled(egui::Rect::from_min_size(vt.min, vec2(vt.width() * vf, 4.0)), 2, white);
             paint.circle_filled(pos2(vt.left() + vt.width() * vf, vt.center().y), 7.0, white);
@@ -4253,9 +4260,17 @@ impl App {
             }
             let _ = p.player.apply_sub_style(&style);
         }
-        if let Some(v) = new_vol.map(|v| v.clamp(0.0, 130.0)).filter(|v| *v != self.volume) {
-            self.volume = v;
-            if let Err(e) = self.db.set_setting("volume", &v.to_string()) {
+        p.volume = p.volume.clamp(0.0, VOLUME_MAX);
+        if p.volume != old_vol {
+            cmd(&["set", "volume", &p.volume.to_string()]);
+            if st.muted {
+                cmd(&["set", "mute", "no"]);
+            }
+        }
+        // Saved on release: a write per step of a drag would stall the UI thread.
+        if !vol_held && p.volume != self.volume {
+            self.volume = p.volume;
+            if let Err(e) = self.db.set_setting("volume", &p.volume.to_string()) {
                 report(&mut self.error, format!("saving volume: {e:#}"));
             }
         }
@@ -5732,6 +5747,14 @@ fn wheel_steps(acc: &mut f32, dy: f32, line: f32) -> i32 {
     n as i32
 }
 
+/// mpv's default `volume-max`.
+const VOLUME_MAX: f64 = 130.0;
+
+/// Whole-number volume at a fraction of the slider's width.
+fn volume_at(frac: f32) -> f64 {
+    (f64::from(frac.clamp(0.0, 1.0)) * VOLUME_MAX).round()
+}
+
 const SEEK_STEP_RANGE: std::ops::RangeInclusive<u32> = 1..=600;
 
 /// Saved seek step in seconds; a missing, unparsable or out-of-range value falls back to `default`.
@@ -5893,6 +5916,16 @@ mod tests {
         upsert_by_id(&mut list, meta("a"), vec![]);
         assert_eq!(list.iter().map(|(m, _)| m.id.as_str()).collect::<Vec<_>>(), ["b"]);
 
+    }
+
+    #[test]
+    fn volume_at_spans_the_whole_range() {
+        assert_eq!(volume_at(0.0), 0.0);
+        assert_eq!(volume_at(0.5), 65.0);
+        assert_eq!(volume_at(1.0), VOLUME_MAX);
+        // Dragging past either end of the slider.
+        assert_eq!(volume_at(-0.2), 0.0);
+        assert_eq!(volume_at(1.2), VOLUME_MAX);
     }
 
     #[test]
