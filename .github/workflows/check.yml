@@ -14,8 +14,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       STREMFLIX_RS_NO_DHT: "1"
-      # smaller debug info: faster linking (worst on Windows) and smaller caches; backtraces keep file:line
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # lld-link is much faster than MSVC link.exe; only read when targeting Windows MSVC
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld.exe
     steps:

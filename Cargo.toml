@@ -51,5 +51,9 @@ tray-icon = { version = "0.26.1", default-features = false }
 tempfile = "3.27.0"
 test-addon = { path = "test-addon" }
 
+# smaller debug info: faster linking and smaller target dir; backtraces keep file:line (CARGO_PROFILE_DEV_DEBUG=true for a debugger)
+[profile.dev]
+debug = "line-tables-only"
+
 [workspace]
 members = ["test-addon"]
