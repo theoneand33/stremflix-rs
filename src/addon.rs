@@ -381,6 +381,39 @@ pub fn parse_skips(v: &serde_json::Value) -> Vec<Skip> {
         .collect()
 }
 
+/// TheIntroDB query for a play key (`movie:tt1` or `series:tt1:<season>:<episode>`); only IMDb ids are looked up.
+pub fn introdb_query(key: &str, dur: f64) -> Option<Vec<(&'static str, String)>> {
+    let parts: Vec<&str> = key.split(':').collect();
+    let (id, episode) = match parts[..] {
+        ["movie", id] => (id, None),
+        ["series", id, s, e] => (id, Some((s.parse::<u32>().ok()?, e.parse::<u32>().ok()?))),
+        _ => return None,
+    };
+    let digits = id.strip_prefix("tt")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // The duration picks the matching release (theatrical, extended, ...).
+    let mut query = vec![("imdb_id", id.to_string()), ("duration_ms", ((dur * 1000.0) as u64).to_string())];
+    if let Some((s, e)) = episode {
+        query.extend([("season", s.to_string()), ("episode", e.to_string())]);
+    }
+    Some(query)
+}
+
+/// Spans of a TheIntroDB `/media` body, checked like addon ones. A null start is the beginning, a null end the
+/// end of the file; `end` is capped at `dur` so a timestamp from a longer release can't seek past the end.
+pub fn parse_introdb(v: &serde_json::Value, dur: f64) -> Vec<Skip> {
+    let spans = ["intro", "recap", "credits"].iter().flat_map(|kind| {
+        let items = v.get(kind).and_then(|a| a.as_array()).map(|a| a.as_slice()).unwrap_or_default();
+        items.iter().map(move |x| {
+            let end = x.get("end_ms").and_then(|e| e.as_f64()).map_or(dur, |e| (e / 1000.0).min(dur));
+            serde_json::json!({"type": kind, "start": x.get("start_ms").and_then(|s| s.as_f64()).unwrap_or(0.0) / 1000.0, "end": end})
+        })
+    });
+    parse_skips(&serde_json::Value::Array(spans.collect()))
+}
+
 const MAX_HEADERS: usize = 32;
 
 /// Addon request header check: the name is an RFC 7230 token, the value printable ASCII (so no CR/LF/NUL
@@ -916,6 +949,28 @@ mod configure_tests {
     }
 
     #[test]
+    fn introdb_query_needs_an_imdb_id() {
+        let q = introdb_query("series:tt0903747:1:2", 3000.5).unwrap();
+        assert_eq!(q, [("imdb_id", "tt0903747".into()), ("duration_ms", "3000500".into()), ("season", "1".into()), ("episode", "2".into())]);
+        assert_eq!(introdb_query("movie:tt1", 60.0).unwrap().len(), 2);
+        for bad in ["movie:kitsu1", "movie:tt", "movie:tt1x", "series:tt1", "series:tt1:a:1", "series:kitsu:1:2", "trailer:abc", "channel:tt1"] {
+            assert_eq!(introdb_query(bad, 60.0), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn introdb_nulls_mean_file_edges() {
+        let s = |j: &str| parse_introdb(&serde_json::from_str(j).unwrap(), 3000.0);
+        let body = r#"{"tvdb_id":1,"type":"tv","intro":[{"start_ms":null,"end_ms":40000}],"recap":[{"start_ms":50000,"end_ms":60000}],"credits":[{"start_ms":2900000,"end_ms":null}],"preview":[{"start_ms":1,"end_ms":2}]}"#;
+        assert_eq!(s(body), [Skip { kind: SkipKind::Intro, start: 0.0, end: 40.0 }, Skip { kind: SkipKind::Recap, start: 50.0, end: 60.0 }, Skip { kind: SkipKind::Credits, start: 2900.0, end: 3000.0 }]);
+        assert_eq!(s(r#"{"credits":[{"start_ms":2990000,"end_ms":9000000}]}"#), [Skip { kind: SkipKind::Credits, start: 2990.0, end: 3000.0 }]);
+        // Past the end of this file, or an open end too long to be credits: another release's timestamps.
+        assert_eq!(s(r#"{"credits":[{"start_ms":3100000,"end_ms":null}]}"#), []);
+        assert_eq!(s(r#"{"credits":[{"start_ms":1000000,"end_ms":null}]}"#), []);
+        assert_eq!(s(r#"{"episodes":[]}"#), []);
+    }
+
+    #[test]
     fn skip_markers_are_validated() {
         let s = |j: &str| parse_skips(&serde_json::from_str(j).unwrap());
         let ok = s(r#"[{"type":"intro","start":5,"end":65.5},{"type":"recap","start":0,"end":900},{"type":"credits","start":1200,"end":1300}]"#);
@@ -1108,6 +1163,13 @@ impl AddonClient {
             ensure!(body.len() <= MAX_BODY, "response too large");
         }
         Ok(body)
+    }
+
+    /// Community intro/recap/credits spans for a play key; empty for ids TheIntroDB can't look up.
+    pub async fn introdb_skips(&self, key: &str, dur: f64) -> Result<Vec<Skip>> {
+        let Some(query) = introdb_query(key, dur) else { return Ok(vec![]) };
+        let url = Url::parse_with_params("https://api.theintrodb.org/v4/media", query)?;
+        Ok(parse_introdb(&serde_json::from_slice(&self.get(url).await?)?, dur))
     }
 
     /// Release page of a newer build than this one, or `None` (also for source builds).
