@@ -138,7 +138,7 @@ pub fn resume_start(have: u64, status: u16, content_range: Option<&str>, total: 
 /// drops) the written bytes are flushed first, so the `.part` length is the resume offset.
 pub async fn fetch(url: &str, headers: &[(String, String)], dest: &Path, prev: (&str, u64), cancel: &mut tokio::sync::oneshot::Receiver<()>, mut progress: impl FnMut(u64, u64, &str)) -> Result<()> {
     // No total timeout: a movie can take hours. A stalled connection still fails.
-    let client = crate::addon::with_proxy(reqwest::Client::builder().user_agent("stremflix-rs").connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(120)))?.build()?;
+    let client = crate::addon::with_proxy(reqwest::Client::builder().user_agent(crate::addon::user_agent()).connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(120)))?.build()?;
     let tmp = part(dest);
     let mut have = tokio::fs::metadata(&tmp).await.map_or(0, |m| m.len());
     if prev.0.is_empty() || prev.1 == 0 {

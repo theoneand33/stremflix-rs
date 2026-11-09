@@ -993,6 +993,21 @@ fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
     paused && dur > 0.0 && pos >= dur - 1.0
 }
 
+/// Sets loop point `i` (0 = A, 1 = B) to `t`, keeping A before B; true if the points were swapped.
+fn set_ab(ab: &mut [Option<f64>; 2], i: usize, t: f64) -> bool {
+    ab[i] = Some(t);
+    let swap = matches!(*ab, [Some(a), Some(b)] if a > b);
+    if swap {
+        ab.swap(0, 1);
+    }
+    swap
+}
+
+/// mpv loops only with Repeat on or both A-B points set.
+fn looping(repeat: bool, ab: [Option<f64>; 2]) -> bool {
+    repeat || (ab[0].is_some() && ab[1].is_some())
+}
+
 /// `timer_paused` bookkeeping: confirmed once mpv reports paused, dropped when the user resumes.
 fn timer_pause_step(state: Option<bool>, paused: bool) -> Option<bool> {
     match (state, paused) {
@@ -1171,6 +1186,10 @@ struct Playing {
     /// Per-session picture scaling: aspect override index into `ASPECTS`, fill (crop) instead of fit, zoom in tenths.
     aspect: usize,
     fill: bool,
+    /// A-B loop points in seconds, as set from the menu.
+    ab: [Option<f64>; 2],
+    /// Repeat the current file.
+    repeat: bool,
     zoom: i32,
     /// Screen/idle inhibit, attempted once per unpaused stretch (inner `None`: unavailable); embedded mpv can't do it itself.
     awake: Option<Option<keepawake::KeepAwake>>,
@@ -1247,6 +1266,8 @@ struct App {
     folder: String,
     /// Preferred audio / subtitle languages (mpv `alang` / `slang`), as edited; saved to the settings table only when valid.
     langs: [String; 2],
+    /// Custom User-Agent as edited; saved and applied only when valid.
+    user_agent: String,
     library: Vec<LibraryItem>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
@@ -1445,6 +1466,8 @@ impl App {
         let tab = db.setting("tab")?;
         let (tx, rx) = channel();
         ACCENT_IDX.store(accent_index(db.setting("accent")?.as_deref()), std::sync::atomic::Ordering::Relaxed);
+        let ua = db.setting("user_agent")?.unwrap_or_default();
+        stremflix_rs::addon::set_user_agent(&stremflix_rs::addon::valid_user_agent(&ua).unwrap_or_default());
         let mut app = Self {
             sub_style: db.setting("sub_style")?.map(|s| SubStyle::decode(&s)).unwrap_or_default(),
             rt: tokio::runtime::Runtime::new()?,
@@ -1509,6 +1532,7 @@ impl App {
             update: None,
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
+            user_agent: ua,
             db,
             data_dir,
             client: AddonClient::new(),
@@ -2250,7 +2274,7 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, zoom: 0, search: SubSearch::default(), skips, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -2393,7 +2417,7 @@ impl App {
         }
         let st = &p.player.state;
         self.timer_paused = timer_pause_step(self.timer_paused, st.paused);
-        if autoplay_due(self.autoplay_next, self.timer_paused, at_end(st.pos, st.dur, st.paused)) && self.playing_episode() {
+        if autoplay_due(self.autoplay_next, self.timer_paused, at_end(st.pos, st.dur, st.paused)) && !looping(p.repeat, p.ab) && self.playing_episode() {
             return self.play_next(ctx);
         }
         let Some(p) = &mut self.player else { return };
@@ -3934,6 +3958,29 @@ impl App {
                                 p.zoom = 0;
                                 cmd(&["set", "video-zoom", "0"]);
                             }
+                            if switch_row(ui, "Repeat file", &mut p.repeat).changed() {
+                                cmd(&["set", "loop-file", if p.repeat { "inf" } else { "no" }]);
+                            }
+                            menu_heading(ui, "A-B loop");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                for (i, (name, prop)) in [("A", "ab-loop-a"), ("B", "ab-loop-b")].into_iter().enumerate() {
+                                    let label = p.ab[i].map_or(format!("Set {name}"), |t| format!("{name} {t:.0}s"));
+                                    if pill(ui, &label, p.ab[i].is_some(), egui::Role::Button).clicked() {
+                                        cmd(&["set", prop, &st.pos.to_string()]);
+                                        // Keep A before B so the labels match the loop mpv plays.
+                                        if set_ab(&mut p.ab, i, st.pos) {
+                                            cmd(&["set", "ab-loop-a", &p.ab[0].unwrap_or_default().to_string()]);
+                                            cmd(&["set", "ab-loop-b", &p.ab[1].unwrap_or_default().to_string()]);
+                                        }
+                                    }
+                                }
+                                if pill(ui, "Clear", false, egui::Role::Button).clicked() {
+                                    p.ab = [None; 2];
+                                    cmd(&["set", "ab-loop-a", "no"]);
+                                    cmd(&["set", "ab-loop-b", "no"]);
+                                }
+                            });
                             if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
                                 cmd(&["set", "hwdec", hwdec_value(self.hwdec)]);
                                 if let Err(e) = self.db.set_setting("hwdec", if self.hwdec { "1" } else { "0" }) {
@@ -3984,7 +4031,7 @@ impl App {
         // Up next: in an episode's last 30 s, a card slides in from the right to play the next one.
         if let Some((series, label, img)) = up_next {
             // Needs a duration over 60 s so a short or still-loading stream doesn't show the card at once.
-            let open = !p.next_dismissed && rect.width() >= 362.0 && st.dur > 60.0 && st.dur - st.pos <= 30.0;
+            let open = !p.next_dismissed && !looping(p.repeat, p.ab) && rect.width() >= 362.0 && st.dur > 60.0 && st.dur - st.pos <= 30.0;
             let t = ctx.animate_bool_with_time(ui.scope_id().with("up_next"), open, 0.4);
             if t > 0.0 {
                 let ease = 1.0 - (1.0 - t).powi(3);
@@ -4774,6 +4821,24 @@ impl App {
             });
         }
         ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(Color32::from_gray(170)));
+        ui.add_space(16.0);
+        ui.label(RichText::new("Network").size(20.0).strong().family(bold()).color(Color32::WHITE));
+        ui.horizontal(|ui| {
+            let l = ui.label("User-Agent:");
+            ui.add_space((150.0 - l.rect.width()).max(0.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut self.user_agent).hint_text("stremflix-rs").desired_width(400.0)).labelled_by(l.id);
+            match stremflix_rs::addon::valid_user_agent(&self.user_agent) {
+                Some(v) if r.changed() => {
+                    stremflix_rs::addon::set_user_agent(&v);
+                    save.push(("user_agent", v));
+                }
+                None => {
+                    ui.label(RichText::new(format!("Printable ASCII only, max {} characters", stremflix_rs::addon::MAX_UA_LEN)).size(13.0).color(Color32::from_rgb(230, 90, 90)));
+                }
+                _ => {}
+            }
+        });
+        ui.label(RichText::new("Sent to addons and for downloads. Empty uses the default. Torrent (librqbit) traffic is not covered.").size(13.0).color(Color32::from_gray(170)));
         ui.add_space(16.0);
         ui.label(RichText::new("Customize Home").size(20.0).strong().family(bold()).color(Color32::WHITE));
         let (mut swap, mut toggle, mut reset) = (None, None, false);
@@ -5831,6 +5896,10 @@ mod tests {
         assert_eq!(binge_source(&streams, "hd").as_deref(), Some("https://a/3"), "skips unplayable");
         assert_eq!(binge_source(&streams, "4k"), None);
         assert!(at_end(99.5, 100.0, true) && !at_end(99.5, 100.0, false) && !at_end(50.0, 100.0, true) && !at_end(0.0, 0.0, true));
+        let mut ab = [None; 2];
+        assert!(!set_ab(&mut ab, 1, 10.0) && ab == [None, Some(10.0)]);
+        assert!(set_ab(&mut ab, 0, 20.0) && ab == [Some(10.0), Some(20.0)], "A after B swaps");
+        assert!(!looping(false, [None, Some(1.0)]) && looping(false, ab) && looping(true, [None; 2]));
     }
 
     #[test]
