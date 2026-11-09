@@ -1517,6 +1517,15 @@ impl App {
         if app.addons.is_empty() {
             app.tab = Tab::Addons;
         }
+        // Neither check may block startup: a failure here only skips the notice.
+        match app.db.quick_check() {
+            Ok(Some(e)) => report(&mut app.error, format!("database check failed: {e}")),
+            Ok(None) => {}
+            Err(e) => eprintln!("database check: {e:#}"),
+        }
+        if app.db.begin_session().unwrap_or(false) {
+            app.notice = Some("Stremflix did not exit cleanly last time. Playback progress is saved every second.".into());
+        }
         let [kind, addr, user, pass] = &app.proxy;
         match stremflix_rs::addon::proxy_url(kind, addr, user, pass) {
             Ok(Some(p)) => {
@@ -5254,6 +5263,7 @@ impl eframe::App for App {
         let _ = self.db.set_setting("window", &self.window.to_string());
         let _ = self.db.set_setting("tab", self.tab.name());
         self.stop_player();
+        let _ = self.db.end_session();
     }
 }
 
