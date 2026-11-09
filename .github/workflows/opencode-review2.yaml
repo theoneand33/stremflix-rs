@@ -7,6 +7,7 @@ on:
       - "**.md"
       - "public/images/**"
       - "public/flash/**"
+      - "Cargo.lock"
 
 jobs:
   opencode-review:
@@ -14,9 +15,10 @@ jobs:
     concurrency:
       group: opencode-review-${{ github.event.pull_request.number }}
       cancel-in-progress: true
-    if: github.event.pull_request.draft == false
+    # Fork PRs get no secrets, so the review would only fail.
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     permissions:
       id-token: write
       contents: read
@@ -34,6 +36,6 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           # check.yml already builds/tests on 3 OSes; cold cargo runs here cost 1.5-3.5 min per review
-          OPENCODE_CONFIG_CONTENT: '{"instructions":[".github/opencode-review.md"],"permission":{"*":"allow","bash":{"*":"allow","cargo *":"deny","*=* cargo *":"deny"}}}'
+          OPENCODE_CONFIG_CONTENT: '{"instructions":[".github/opencode-review.md"],"permission":{"*":"allow","edit":"deny","write":"deny","webfetch":"deny","websearch":"deny","task":"deny","bash":{"*":"allow","cargo *":"deny","*=* cargo *":"deny"}}}'
         with:
           model: openrouter/deepseek/deepseek-v4.1-flash-1017
