@@ -70,4 +70,3 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Auto-install updates | P3 | M | Release builds already show a download link for a newer build; downloading and replacing the binary is still missing. |
 | Android, iOS, TV clients | P3 | XL | Out of scope for an egui desktop app. |
 | Screen-reader labels and focus-order polish | P3 | M | AccessKit is enabled; coverage is partial. |
-| Crash-safe recovery / resume after unexpected exit | P3 | S | WAL is on; no explicit recovery UI. |
