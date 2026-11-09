@@ -1730,7 +1730,6 @@ impl App {
     fn play(&mut self, ctx: &egui::Context, key: String, title: String, source: String, subs: Subs) {
         self.clear_file_pick();
         self.sleep_carry = None;
-        self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
         let lookup = self.sub_lookup(&key, &source);
@@ -2285,8 +2284,9 @@ impl App {
             Msg::Downloaded(path, run, res) => {
                 let Some(i) = self.queue.iter().position(|j| j.d.path == path && j.run == run) else { return };
                 self.queue[i].running = false;
-                // A paused download's result only frees its slot; it was flushed, so Resume continues from the `.part` length.
-                if self.queue[i].state != State::Active {
+                // A paused download's error only frees its slot; it was flushed, so Resume continues from the `.part` length.
+                // A finished one (paused as it completed) is already renamed into place, so it is kept.
+                if self.queue[i].state != State::Active && res.is_err() {
                     self.queue[i].got = std::fs::metadata(download::part(&path)).map_or(0, |m| m.len());
                     return self.pump_downloads(ctx);
                 }
@@ -5354,6 +5354,7 @@ impl eframe::App for App {
             self.notify_check = Instant::now();
             self.fetch_new_episodes(ctx);
         }
+        // Wake for the next check; with a player (or sleep timer) running, the 500 ms tick below is sooner.
         ctx.request_repaint_after(NOTIFY_EVERY.saturating_sub(self.notify_check.elapsed()));
         self.poll_player(ctx);
         self.publish_media();
@@ -5380,7 +5381,9 @@ impl eframe::App for App {
                 report(&mut self.error, e);
             }
         }
-        ctx.request_repaint_after(Duration::from_millis(500));
+        if self.player.is_some() || self.sleep.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {

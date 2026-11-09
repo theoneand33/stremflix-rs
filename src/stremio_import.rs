@@ -274,7 +274,8 @@ fn decode_bitfield(field: &str) -> Option<(&str, usize, Vec<u8>)> {
     let mut bits = Vec::new();
     // Cap: the bitfield is one bit per episode, so even huge shows stay tiny.
     flate2::read::ZlibDecoder::new(&z[..]).take(1 << 20).read_to_end(&mut bits).ok()?;
-    Some((anchor, len, bits))
+    // A length beyond the bits is bogus; unchecked it would make callers loop `len` times.
+    (len <= bits.len() * 8).then_some((anchor, len, bits))
 }
 
 fn bit(bits: &[u8], i: usize) -> bool {
@@ -482,7 +483,8 @@ pub fn library_changes(up: &Upload, remote: &Value) -> Vec<Value> {
     }
     for (p, at) in &up.progress {
         // The title it belongs to: an episode's key is `<series key>:<season>:<episode>`.
-        let known = items.keys().filter(|k| p.key == **k || p.key.starts_with(&format!("{k}:"))).max_by_key(|k| k.len()).cloned();
+        // Longest prefix of the progress key (cut at a `:`) that is a title.
+        let known = p.key.match_indices(':').map(|(i, _)| &p.key[..i]).chain([p.key.as_str()]).rfind(|k| items.contains_key(*k)).map(String::from);
         let key = match known {
             Some(k) => k,
             // An episode's progress title is the episode's, so only movies are added from progress.

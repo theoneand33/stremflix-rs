@@ -342,3 +342,53 @@ fn local_install() {
     let dir = tempfile::tempdir().unwrap();
     imp.save(&Db::open(&dir.path().join("a.db")).unwrap()).unwrap();
 }
+
+#[test]
+fn bogus_bitfield_length_is_rejected_not_looped() {
+    let s = storage();
+    let field = s["library_recent"].split(r#""watched":""#).nth(1).unwrap().split('"').next().unwrap().to_string();
+    // Same bits, but a length no bit data could back: 10^14 loop iterations if it were trusted.
+    let bogus = field.replacen(":5:", ":99999999999999:", 1);
+    assert_ne!(bogus, field);
+    assert_eq!(watched_episodes(&bogus), 0);
+    assert!(watched_videos(&bogus, &[]).is_empty());
+}
+
+/// What the account push may and may not send: it never deletes, never revives removed titles, never regresses progress.
+#[test]
+fn account_push_never_deletes_or_regresses() {
+    use serde_json::json;
+    use stremflix_rs::db::{Progress, SavedTitle};
+    use stremflix_rs::stremio_import::{Upload, addon_collection, library_changes};
+    let manifest: stremflix_rs::addon::Manifest =
+        stremflix_rs::addon::parse_manifest(br#"{"id":"a","version":"1","name":"A","resources":["stream"],"types":["movie"]}"#).unwrap();
+    let remote_addons = json!({"addons": [
+        {"transportUrl": "https://only-remote.example/manifest.json", "manifest": {"id": "r"}, "flags": {"official": true}},
+        {"transportUrl": "https://both.example/manifest.json", "manifest": {"id": "kept"}, "flags": {"protected": true}}]});
+    let local = vec![("https://new.example/manifest.json".to_string(), manifest.clone()), ("https://both.example/manifest.json".to_string(), manifest)];
+    let out = addon_collection(&local, &remote_addons).unwrap();
+    let urls: Vec<_> = out.iter().map(|a| a["transportUrl"].as_str().unwrap()).collect();
+    assert_eq!(urls, ["https://new.example/manifest.json", "https://both.example/manifest.json", "https://only-remote.example/manifest.json"], "local order, then account-only last");
+    assert_eq!(out[1]["manifest"]["id"], "kept", "the account's manifest wins");
+    assert_eq!(out[1]["flags"], json!({"protected": true}));
+
+    let item = |id: &str, removed: bool, last: &str| {
+        json!({"_id": id, "type": "movie", "name": id, "removed": removed, "temp": false, "_mtime": "t",
+               "state": {"lastWatched": last, "timeOffset": 1000, "duration": 9000, "flaggedWatched": 0, "timesWatched": 0}})
+    };
+    let remote = json!([item("tt1", false, "2026-02-01T00:00:00.000Z"), item("tt2", true, "2026-01-01T00:00:00.000Z"), item("tt9", false, "")]);
+    let saved = |id: &str| SavedTitle { key: format!("movie:{id}"), title: id.into(), kind: "movie".into(), poster: None, year: None, rating: None, last_watched: None };
+    let prog = |id: &str, pos: f64| Progress { key: format!("movie:{id}"), title: id.into(), source: "https://s.example/v.mp4".into(), position: pos, duration: 100.0, poster: None };
+    let up = Upload {
+        saved: vec![saved("tt2"), saved("tt3")],
+        // tt1: older than the account's lastWatched; tt3: new here and newer.
+        progress: vec![(prog("tt1", 50.0), "2026-01-15T00:00:00.000Z".into()), (prog("tt3", 20.0), "2026-03-01T00:00:00.000Z".into())],
+        now: "2026-04-01T00:00:00.000Z".into(),
+        ..Default::default()
+    };
+    let changes = library_changes(&up, &remote);
+    let ids: Vec<_> = changes.iter().map(|c| c["_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["tt3"], "tt1 older progress, tt2 removed on the account, tt9 account-only: none sent");
+    assert_eq!(changes[0]["state"]["timeOffset"], 20000);
+    assert_eq!(changes[0]["_mtime"], "2026-04-01T00:00:00.000Z");
+}

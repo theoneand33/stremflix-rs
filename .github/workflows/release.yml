@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  checks: read # the nightly gate reads check.yml's results
 
 env:
   TAG: ${{ inputs.version && format('v{0}', inputs.version) || 'nightly' }}
@@ -28,7 +29,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           last=$(gh api "repos/$GITHUB_REPOSITORY/commits/nightly" --jq .sha 2>/dev/null || true)
-          echo "changed=$([ "$last" = "$GITHUB_SHA" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+          changed=$([ "$last" = "$GITHUB_SHA" ] && echo false || echo true)
+          # A scheduled nightly waits for check.yml (3 `test (<os>)` runs) to pass on this commit; pending or failed skips this run.
+          if [ "$changed" = true ] && [ "${{ github.event_name }}" = schedule ]; then
+            ok=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" --jq '[.check_runs[] | select(.name | startswith("test ("))] | length == 3 and all(.conclusion == "success")' || echo false)
+            [ "$ok" = true ] || changed=false
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
 
   build:
     needs: changes

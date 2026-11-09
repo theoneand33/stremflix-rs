@@ -1111,15 +1111,14 @@ pub fn newer_release(release: &str, commit: &str, body: &[u8]) -> Result<Option<
     }
     let r: Rel = serde_json::from_slice(body)?;
     // shortcut: pre-release suffixes are ignored when ordering tags (release.yml keeps `-` tags out of /latest), so a beta user is offered neither its own final nor later betas; upgrade if that matters.
-    let core = |t: &str| t.trim_start_matches('v').split('-').next().unwrap_or("").split('.').map(|n| n.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
+    let numeric = |t: &str| t.trim_start_matches('v').split('-').next().unwrap_or("").split('.').all(|n| n.parse::<u64>().is_ok());
     let newer = if release == "nightly" {
         // target_commitish can also be a branch name; only a full SHA is comparable
         is_info_hash(&r.target_commitish) && r.target_commitish != commit
+    } else if numeric(&r.tag_name) && numeric(release) {
+        is_newer(&r.tag_name, release)
     } else {
-        match (core(&r.tag_name), core(release)) {
-            (Some(latest), Some(cur)) => latest > cur,
-            _ => r.tag_name != release,
-        }
+        r.tag_name != release
     };
     Ok(newer.then(|| safe_http_url(&r.html_url).map(String::from)).flatten())
 }
