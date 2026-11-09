@@ -1036,9 +1036,10 @@ fn pause_step(enabled: bool, away: bool, paused: bool, auto: AutoPause) -> (Opti
     }
 }
 
-/// mpv's `keep-open` pauses on the last frame at end of file.
-fn at_end(pos: f64, dur: f64, paused: bool) -> bool {
-    paused && dur > 0.0 && pos >= dur - 1.0
+/// mpv's `keep-open` pauses on the last frame at end of file. That frame can sit well before the declared
+/// duration, so trust `eof`; the 90% floor keeps a stream that died mid-episode from skipping to the next one.
+fn at_end(pos: f64, dur: f64, paused: bool, eof: bool) -> bool {
+    paused && eof && dur > 0.0 && pos >= dur * 0.9
 }
 
 /// Sets loop point `i` (0 = A, 1 = B) to `t`, keeping A before B; true if the points were swapped.
@@ -2081,7 +2082,7 @@ impl App {
                 };
                 let Some(v) = v.cloned() else { return };
                 self.season = v.season;
-                let binge = self.db.setting(&format!("binge:{}:{}", meta.kind, meta.id)).ok().flatten().filter(|g| !g.is_empty());
+                let binge = self.saved_binge(&meta);
                 let autoplay = if show.is_some() { Autoplay::Off } else { Autoplay::Top };
                 self.open_streams(ctx, meta, Some(v), autoplay, binge);
             }
@@ -2349,15 +2350,7 @@ impl App {
                 let subs_off = self.subs_off();
                 let headers = self.selected.as_ref().map(|(_, streams, _)| request_headers(streams, &source, &url)).unwrap_or_default();
                 let demuxer = self.selected.as_ref().and_then(|(_, streams, _)| own_stream(streams, &source, &url)).and_then(|s| s.hints.demuxer);
-                // Remember the episode's series (its key holds only the video id) and the stream's binge group
-                // (empty if none), so the series' play button and Continue Watching can find them later.
-                if let (Some((m, streams, _)), Some(_)) = (&self.selected, &self.episode)
-                    && self.play_key().is_some_and(|(k, _)| k == key)
-                {
-                    let group = streams.iter().find(|s| s.source().as_ref() == Some(&source)).and_then(|s| s.hints.binge_group.clone());
-                    let _ = self.db.set_setting(&format!("series:{key}"), &m.id);
-                    let _ = self.db.set_setting(&format!("binge:{}:{}", m.kind, m.id), &group.unwrap_or_default());
-                }
+                self.remember_episode_stream(&key, &source);
                 match Player::launch(&url, &title, start, &subs, [&lang("alang"), &lang("slang")], subs_off, &headers, demuxer, self.hwdec, gl_proc, Box::new(move || wake.request_repaint())) {
                     Ok(player) => {
                         let _ = player.apply_sub_style(&self.sub_style);
@@ -2512,7 +2505,7 @@ impl App {
         }
         let st = &p.player.state;
         self.timer_paused = timer_pause_step(self.timer_paused, st.paused);
-        if autoplay_due(self.autoplay_next, self.timer_paused, p.auto_pause, at_end(st.pos, st.dur, st.paused)) && !looping(p.repeat, p.ab) && self.playing_episode() {
+        if autoplay_due(self.autoplay_next, self.timer_paused, p.auto_pause, at_end(st.pos, st.dur, st.paused, st.eof)) && !looping(p.repeat, p.ab) && self.playing_episode() {
             return self.play_next(ctx);
         }
         let Some(p) = &mut self.player else { return };
@@ -2862,6 +2855,25 @@ impl App {
         self.episode.is_some() && self.player.as_ref().zip(self.play_key()).is_some_and(|(p, (k, _))| p.key == k)
     }
 
+    /// Remember the episode's series (its key holds only the video id) and the stream's binge group
+    /// (empty if none), so the series' play button and Continue Watching can find them later.
+    fn remember_episode_stream(&self, key: &str, source: &str) {
+        let (Some((m, streams, _)), Some(_)) = (&self.selected, &self.episode) else { return };
+        if !self.play_key().is_some_and(|(k, _)| k == key) {
+            return;
+        }
+        let _ = self.db.set_setting(&format!("series:{key}"), &m.id);
+        // A resume has no stream list; it must not erase the group it is still playing from.
+        if let Some(s) = streams.iter().find(|s| s.source().as_deref() == Some(source)) {
+            let _ = self.db.set_setting(&format!("binge:{}:{}", m.kind, m.id), s.hints.binge_group.as_deref().unwrap_or_default());
+        }
+    }
+
+    /// The binge group this series last played from.
+    fn saved_binge(&self, m: &MetaPreview) -> Option<String> {
+        self.db.setting(&format!("binge:{}:{}", m.kind, m.id)).ok().flatten().filter(|g| !g.is_empty())
+    }
+
     /// Stop the playing episode and open the next one, autoplaying a stream from the same `bingeGroup`
     /// (else the only stream, else the picker). Without a next episode, just stop.
     fn play_next(&mut self, ctx: &egui::Context) {
@@ -2869,8 +2881,7 @@ impl App {
         if let Some((pos, dur)) = p.player.position() {
             (p.pos, p.dur) = (pos, dur);
         }
-        let src = Some(p.source.clone());
-        let binge = (self.selected.as_ref()).and_then(|(_, streams, _)| streams.iter().find(|s| s.source() == src)?.hints.binge_group.clone());
+        let binge = self.selected.as_ref().and_then(|(m, ..)| self.saved_binge(m));
         let next = (self.selected.as_ref().zip(self.episode.as_ref()))
             .and_then(|((m, ..), cur)| Some((m.clone(), next_episode(&self.episodes, &cur.id)?.clone())));
         let sleep = self.sleep;
@@ -6163,7 +6174,9 @@ mod tests {
         let streams = [s("https://a/1", None), s("javascript:x", Some("hd")), s("https://a/2", Some("sd")), s("https://a/3", Some("hd"))];
         assert_eq!(binge_source(&streams, "hd").as_deref(), Some("https://a/3"), "skips unplayable");
         assert_eq!(binge_source(&streams, "4k"), None);
-        assert!(at_end(99.5, 100.0, true) && !at_end(99.5, 100.0, false) && !at_end(50.0, 100.0, true) && !at_end(0.0, 0.0, true));
+        assert!(at_end(99.5, 100.0, true, true) && at_end(95.0, 100.0, true, true), "last frame before the declared duration");
+        assert!(!at_end(99.5, 100.0, false, true) && !at_end(99.5, 100.0, true, false), "user pause near the end");
+        assert!(!at_end(50.0, 100.0, true, true) && !at_end(0.0, 0.0, true, true), "stream died early, no duration");
         let mut ab = [None; 2];
         assert!(!set_ab(&mut ab, 1, 10.0) && ab == [None, Some(10.0)]);
         assert!(set_ab(&mut ab, 0, 20.0) && ab == [Some(10.0), Some(20.0)], "A after B swaps");
@@ -6204,6 +6217,25 @@ mod tests {
         assert!(app.player.is_none());
         app.handle(&ctx, Msg::Streams(m("b"), None, vec![], vec![], Autoplay::Off, None, 2));
         assert_eq!(app.selected.as_ref().map(|(m, ..)| m.id.as_str()), Some("b"), "current reply applies");
+    }
+
+    #[test]
+    fn resuming_keeps_the_saved_binge_group() {
+        let (_dir, mut app) = test_app();
+        let m = MetaPreview { id: "s".into(), kind: "series".into(), name: "S".into(), poster: None, background: None, description: None };
+        let v: Video = serde_json::from_str(r#"{"id":"s:1:1","season":1,"episode":1}"#).unwrap();
+        let hd = Stream { url: Some("https://x.example/a".into()), hints: stremflix_rs::addon::BehaviorHints { binge_group: Some("hd".into()), ..Default::default() }, ..Default::default() };
+        let plain = Stream { url: Some("https://x.example/b".into()), ..Default::default() };
+        app.episode = Some(v);
+        app.selected = Some((m.clone(), vec![hd, plain], vec![]));
+        app.remember_episode_stream("series:s:1:1", "https://x.example/a");
+        assert_eq!(app.saved_binge(&m).as_deref(), Some("hd"));
+        app.selected = Some((m.clone(), vec![], vec![]));
+        app.remember_episode_stream("series:s:1:1", "https://x.example/a");
+        assert_eq!(app.saved_binge(&m).as_deref(), Some("hd"), "resume has no stream list");
+        app.selected.as_mut().unwrap().1 = vec![Stream { url: Some("https://x.example/b".into()), ..Default::default() }];
+        app.remember_episode_stream("series:s:1:1", "https://x.example/b");
+        assert_eq!(app.saved_binge(&m), None, "a known stream without a group clears it");
     }
 
     #[test]
