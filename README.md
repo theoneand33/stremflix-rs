@@ -7,6 +7,7 @@
 <small> Screenshot titles are the Blender Foundation's open movies (CC BY 3.0): Big Buck Bunny, Sintel, Tears of Steel, Elephants Dream, Cosmos Laundromat. </small>
 
 </div>
+
 A Rust desktop client for [Stremio addons](https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/protocol.md). Install addons by manifest URL, browse and search their catalogs, and play their HTTP and torrent streams or local video files. Playback progress is saved in SQLite.
 
 The client ships with no content sources; you install every addon yourself. Design: [ARCHITECTURE.md](ARCHITECTURE.md) (egui, libmpv, librqbit). Planned work: [TODO.md](TODO.md).
