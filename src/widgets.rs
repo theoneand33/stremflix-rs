@@ -352,13 +352,64 @@ pub fn combo_row<T: Clone + PartialEq>(ui: &mut egui::Ui, label: &str, value: &m
     field_row(ui, label, |ui, _| {
         let shown = choices.iter().find(|c| c.1 == *value).map_or("Custom", |c| c.0);
         let mut changed = false;
-        egui::ComboBox::from_id_salt(label).selected_text(shown).show_ui(ui, |ui| {
+        dropdown(ui, label, shown, |ui| {
             for (name, v) in choices {
                 changed |= ui.selectable_value(value, v.clone(), *name).changed();
             }
         });
         changed
     })
+}
+
+/// The app's dropdown: a field-styled button with a chevron over a rounded, shadowed menu
+/// whose picked row is an accent wash instead of a solid fill.
+pub fn dropdown<'a, R>(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    text: impl egui::IntoAtoms<'a>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    ui.scope(|ui| {
+        let v = ui.visuals_mut();
+        let (field, edge, edge_hover) = if v.dark_mode { (v.extreme_bg_color, Color32::from_gray(60), Color32::from_gray(110)) } else { (v.extreme_bg_color, Color32::from_gray(205), Color32::from_gray(150)) };
+        let w = &mut v.widgets;
+        for (st, edge) in [(&mut w.inactive, edge), (&mut w.hovered, edge_hover), (&mut w.active, edge_hover), (&mut w.open, accent())] {
+            (st.weak_bg_fill, st.bg_stroke, st.corner_radius) = (field, egui::Stroke::new(1.0, edge), 6.into());
+        }
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(text)
+            .icon(|ui, rect, vis, open| {
+                // Thin chevron that flips up while the menu is open.
+                let (c, s) = (rect.center(), rect.height().min(rect.width()) * 0.3);
+                let dy = if open { -s / 2.0 } else { s / 2.0 };
+                let tip = pos2(c.x, c.y + dy);
+                let stroke = egui::Stroke::new(1.5, vis.fg_stroke.color);
+                ui.painter().line(vec![pos2(c.x - s, c.y - dy), tip, pos2(c.x + s, c.y - dy)], stroke);
+            })
+            .popup_style(egui::style::StyleModifier::from(|s: &mut egui::Style| {
+                let dark = s.visuals.dark_mode;
+                let v = &mut s.visuals;
+                v.window_fill = if dark { Color32::from_gray(30) } else { Color32::WHITE };
+                v.window_stroke = egui::Stroke::new(1.0, Color32::from_gray(if dark { 52 } else { 215 }));
+                v.menu_corner_radius = 10.into();
+                v.popup_shadow = egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(if dark { 140 } else { 45 }) };
+                let a = accent();
+                v.selection.bg_fill = Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), if dark { 100 } else { 55 });
+                v.selection.stroke.color = v.strong_text_color();
+                let hover = if dark { Color32::from_gray(48) } else { Color32::from_gray(236) };
+                for st in [&mut v.widgets.hovered, &mut v.widgets.active] {
+                    st.weak_bg_fill = hover;
+                }
+                for st in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+                    st.corner_radius = 6.into();
+                }
+                s.spacing.menu_margin = egui::Margin::same(6);
+                s.spacing.button_padding = vec2(12.0, 7.0);
+                s.spacing.item_spacing.y = 2.0;
+            }))
+            .show_ui(ui, add)
+    })
+    .inner
 }
 
 /// Labeled text field and its action button on one centered line.
@@ -528,5 +579,22 @@ mod tests {
         .drop_without_applying_deltas();
         assert_eq!(xs[0], xs[1]);
         assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn open_dropdown_menu_gets_the_accent_wash() {
+        let ctx = egui::Context::default();
+        let (mut id, mut fill) = (None, None);
+        for _ in 0..2 {
+            ctx.run_ui(Default::default(), |ui| {
+                let r = dropdown(ui, "d", "Pick", |ui| ui.visuals().selection.bg_fill);
+                id = Some(r.response.id);
+                fill = r.inner;
+            })
+            .drop_without_applying_deltas();
+            egui::Popup::open_id(&ctx, id.unwrap().with("popup"));
+        }
+        let fill = fill.expect("menu should render once opened");
+        assert!(fill.a() < 255 && fill != accent());
     }
 }
