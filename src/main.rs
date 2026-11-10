@@ -2946,7 +2946,7 @@ impl App {
                 }
                 let mut seasons: Vec<Option<u32>> = self.episodes.iter().map(|v| v.season).collect();
                 seasons.dedup();
-                egui::ComboBox::from_id_salt("season").selected_text(season_label(self.season)).show_ui(ui, |ui| {
+                dropdown(ui, "season", season_label(self.season), |ui| {
                     for s in seasons {
                         ui.selectable_value(&mut self.season, s, season_label(s));
                     }
@@ -3171,13 +3171,13 @@ impl App {
         let d = &mut self.discover;
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("discover_kind").selected_text(kind_label(&d.kind)).show_ui(ui, |ui| {
+            dropdown(ui, "discover_kind", kind_label(&d.kind).to_owned(), |ui| {
                 for k in &kinds {
                     ui.selectable_value(&mut d.kind, k.to_string(), kind_label(k));
                 }
             });
             let cat_label = |addon: &str, c: &CatalogDef| format!("{addon} - {}", c.name.as_deref().unwrap_or(&c.id));
-            egui::ComboBox::from_id_salt("discover_cat").selected_text(cat_label(cur.1, cur.2)).show_ui(ui, |ui| {
+            dropdown(ui, "discover_cat", cat_label(cur.1, cur.2), |ui| {
                 for (u, addon, c) in &in_kind {
                     ui.selectable_value(&mut d.cat, ((*u).clone(), c.id.clone()), cat_label(addon, c));
                 }
@@ -3185,7 +3185,7 @@ impl App {
             for e in cur.2.pickers() {
                 let at = d.extras.iter().position(|(n, _)| *n == e.name);
                 let text = at.map_or_else(|| format!("Any {}", e.name), |i| d.extras[i].1.clone());
-                egui::ComboBox::from_id_salt(("discover_extra", &e.name)).selected_text(text).show_ui(ui, |ui| {
+                dropdown(ui, ("discover_extra", &e.name), text, |ui| {
                     let mut pick = None;
                     if !cur.2.is_required(&e.name) && ui.selectable_label(at.is_none(), format!("Any {}", e.name)).clicked() {
                         pick = Some(None);
@@ -4319,7 +4319,7 @@ impl App {
         }
         let mut pick = self.browse.as_ref().map(|b| b.0.clone()).filter(|s| sources.iter().any(|(x, _)| x == s));
         let shown = pick.as_ref().and_then(|p| sources.iter().find(|(x, _)| x == p)).map_or("Pick a catalog", |(_, l)| l.as_str());
-        egui::ComboBox::from_id_salt("addon_catalog").selected_text(shown).show_ui(ui, |ui| {
+        dropdown(ui, "addon_catalog", shown, |ui| {
             for (src, l) in &sources {
                 ui.selectable_value(&mut pick, Some(src.clone()), l);
             }
@@ -4802,7 +4802,7 @@ impl App {
             ui.set_min_height(32.0);
             section_heading(ui, "Saved titles");
             let before = self.lib_sort;
-            egui::ComboBox::from_id_salt("lib_sort").selected_text(self.lib_sort.label()).show_ui(ui, |ui| {
+            dropdown(ui, "lib_sort", self.lib_sort.label(), |ui| {
                 for s in [LibSort::Added, LibSort::Title, LibSort::Watched, LibSort::Rating, LibSort::Year] {
                     ui.selectable_value(&mut self.lib_sort, s, s.label());
                 }
@@ -4811,13 +4811,13 @@ impl App {
             if self.lib_sort != before {
                 self.saved = self.db.saved_titles().unwrap_or_default();
             }
-            egui::ComboBox::from_id_salt("lib_kind").selected_text(self.lib_kind.label()).show_ui(ui, |ui| {
+            dropdown(ui, "lib_kind", self.lib_kind.label(), |ui| {
                 for k in [LibKind::All, LibKind::Movie, LibKind::Series] {
                     ui.selectable_value(&mut self.lib_kind, k, k.label());
                 }
             });
             let list = self.lists.iter().find(|l| Some(l.id) == self.lib_list);
-            egui::ComboBox::from_id_salt("lib_list").selected_text(list.map_or("All saved", |l| l.name.as_str())).show_ui(ui, |ui| {
+            dropdown(ui, "lib_list", list.map_or("All saved", |l| l.name.as_str()), |ui| {
                 ui.selectable_value(&mut self.lib_list, None, "All saved");
                 for l in &self.lists {
                     ui.selectable_value(&mut self.lib_list, Some(l.id), &l.name);
