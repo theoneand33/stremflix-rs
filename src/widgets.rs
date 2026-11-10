@@ -5,12 +5,11 @@ use eframe::egui;
 use egui::{Align, Color32, Layout, RichText, Sense, pos2, vec2};
 use std::sync::Arc;
 
-pub const RED: Color32 = Color32::from_rgb(229, 9, 20);
 /// Validation and failure text.
 pub const ERROR: Color32 = Color32::from_rgb(230, 90, 90);
-/// Selectable accent colors; the first is Stremio's purple.
+/// Selectable accent colors; the first is the logo's purple.
 pub const ACCENTS: [(&str, Color32); 4] = [
-    ("Purple", Color32::from_rgb(123, 91, 245)),
+    ("Purple", Color32::from_rgb(124, 58, 237)),
     ("Blue", Color32::from_rgb(37, 120, 235)),
     ("Green", Color32::from_rgb(30, 160, 90)),
     ("Orange", Color32::from_rgb(230, 120, 20)),
@@ -22,6 +21,17 @@ pub fn accent() -> Color32 {
 /// Index of the saved accent name; unknown or missing falls back to the default.
 pub fn accent_index(name: Option<&str>) -> usize {
     ACCENTS.iter().position(|a| Some(a.0) == name).unwrap_or(0)
+}
+/// The app logo as a texture, decoded and downscaled once per context (the source PNG is 512px).
+pub fn logo(ctx: &egui::Context) -> egui::TextureHandle {
+    let id = egui::Id::unique("app-logo");
+    if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return t;
+    }
+    let img = image::load_from_memory(include_bytes!("../assets/icon.png")).expect("bundled icon is a valid PNG").resize(128, 128, image::imageops::FilterType::Lanczos3).to_rgba8();
+    let tex = ctx.load_texture("app-logo", egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()), egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+    tex
 }
 /// Strong text color at `alpha`: a hover/fill wash that reads on both themes.
 pub fn tint(ui: &egui::Ui, alpha: u8) -> Color32 {

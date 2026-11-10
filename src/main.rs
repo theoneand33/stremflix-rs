@@ -2966,7 +2966,7 @@ impl App {
                 let r = episode_row(ui, v, seen);
                 if self.episode.as_ref() == Some(v) {
                     // Same inset and radius as the row's hover fill.
-                    ui.painter().rect_stroke(r.rect.shrink(4.0), 8, (2.0, RED), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(r.rect.shrink(4.0), 8, (2.0, accent()), egui::StrokeKind::Inside);
                 }
                 // Overlaid left of the play circle; the topmost widget wins the click.
                 let b = egui::Rect::from_min_size(pos2(r.rect.right() - 80.0 - EPISODE_BUTTON.x, r.rect.center().y - EPISODE_BUTTON.y / 2.0), EPISODE_BUTTON);
@@ -2995,7 +2995,7 @@ impl App {
                             let frac = (p.position / p.duration).clamp(0.0, 1.0) as f32;
                             let bar = egui::Rect::from_min_max(pos2(rect.left() + 10.0, rect.bottom() - 10.0), pos2(rect.right() - 10.0, rect.bottom() - 6.0));
                             ui.painter().rect_filled(bar, 2, Color32::from_gray(90));
-                            ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, bar.height())), 2, RED);
+                            ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, bar.height())), 2, accent());
                         }
                         // Corner X, shown like the play button; registered after the card so it takes the click.
                         let x = egui::Rect::from_center_size(rect.right_top() + vec2(-18.0, 18.0), vec2(28.0, 28.0));
@@ -3498,7 +3498,7 @@ impl App {
         }
         let st = p.player.state.clone();
         if st.buffering || vw == 0 {
-            egui::Spinner::new().size(56.0).color(RED).paint_at(ui, egui::Rect::from_center_size(rect.center(), vec2(56.0, 56.0)));
+            egui::Spinner::new().size(56.0).color(accent()).paint_at(ui, egui::Rect::from_center_size(rect.center(), vec2(56.0, 56.0)));
         }
 
         // Click toggles pause, double-click fullscreen; registered first so controls on top win.
@@ -5091,7 +5091,7 @@ impl eframe::App for App {
             ui.set_min_size(ui.available_size());
             // Fixed-height row so the nav and search pills share one center line.
             ui.allocate_ui_with_layout(vec2(ui.available_width(), 44.0), Layout::left_to_right(Align::Center), |ui| {
-                ui.add(egui::Label::new(RichText::new("STREMFLIX-RS").size(26.0).strong().family(bold()).color(RED)).selectable(false));
+                ui.add(egui::Image::new((logo(ui.ctx()).id(), vec2(40.0, 40.0))).alt_text("Stremflix-rs"));
                 ui.add_space(20.0);
                 // Netflix nav: current tab is bold white on a dark gray pill that slides between tabs.
                 let pill_slot = ui.painter().add(egui::Shape::Noop);
