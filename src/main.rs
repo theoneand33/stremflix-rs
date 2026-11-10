@@ -21,6 +21,9 @@ use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{NetStats, Profile, SeedLimit, TorrentEngine, fmt_rate};
 use stremflix_rs::tray::{self, Tray};
 
+mod widgets;
+use widgets::*;
+
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Home,
@@ -593,121 +596,6 @@ struct Discover {
     items: Option<Vec<MetaPreview>>,
 }
 
-const RED: Color32 = Color32::from_rgb(229, 9, 20);
-/// Selectable accent colors; the first is Stremio's purple.
-const ACCENTS: [(&str, Color32); 4] = [
-    ("Purple", Color32::from_rgb(123, 91, 245)),
-    ("Blue", Color32::from_rgb(37, 120, 235)),
-    ("Green", Color32::from_rgb(30, 160, 90)),
-    ("Orange", Color32::from_rgb(230, 120, 20)),
-];
-static ACCENT_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-fn accent() -> Color32 {
-    ACCENTS[ACCENT_IDX.load(std::sync::atomic::Ordering::Relaxed)].1
-}
-/// Index of the saved accent name; unknown or missing falls back to the default.
-fn accent_index(name: Option<&str>) -> usize {
-    ACCENTS.iter().position(|a| Some(a.0) == name).unwrap_or(0)
-}
-/// Strong text color at `alpha`: a hover/fill wash that reads on both themes.
-fn tint(ui: &egui::Ui, alpha: u8) -> Color32 {
-    let c = ui.visuals().strong_text_color();
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
-}
-/// Applies the theme and accent to egui; the player menu keeps the dark visuals.
-fn apply_theme(ctx: &egui::Context, light: bool) {
-    for (theme, is_light) in [(egui::Theme::Dark, false), (egui::Theme::Light, true)] {
-        let mut v = if is_light { egui::Visuals::light() } else { egui::Visuals::dark() };
-        v.panel_fill = if is_light { Color32::from_gray(245) } else { Color32::from_rgb(20, 20, 20) };
-        v.window_fill = v.panel_fill;
-        v.extreme_bg_color = if is_light { Color32::WHITE } else { Color32::from_gray(32) };
-        v.selection.bg_fill = accent();
-        if !is_light {
-            // Keep the old dark palette: egui's defaults are dimmer than the grays used before theming.
-            v.widgets.noninteractive.fg_stroke.color = Color32::from_gray(200);
-            v.weak_text_color = Some(Color32::from_gray(170));
-        } else {
-            v.weak_text_color = Some(Color32::from_gray(95));
-        }
-        // Netflix-style flat buttons: no outline or grow on hover, gray that dims when hovered.
-        let w = &mut v.widgets;
-        let grays = if is_light { [215, 200, 185, 200] } else { [82, 56, 45, 56] };
-        for (st, gray) in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open].into_iter().zip(grays) {
-            (st.weak_bg_fill, st.bg_stroke, st.corner_radius, st.expansion) = (Color32::from_gray(gray), egui::Stroke::NONE, 4.into(), 0.0);
-            st.fg_stroke.color = if is_light { Color32::BLACK } else { Color32::WHITE };
-        }
-        ctx.set_visuals_of(theme, v);
-        ctx.style_mut_of(theme, |s| s.spacing.button_padding = vec2(14.0, 6.0));
-    }
-    ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
-}
-const CARD: egui::Vec2 = egui::Vec2::new(150.0, 225.0);
-/// A hovered or focused card's scale.
-const GROW: f32 = 1.06;
-
-/// Netflix-style card: no border, grows on hover/focus, shrinks while pressed.
-/// Returns the click response and the animated rect to paint into.
-fn card(ui: &mut egui::Ui, size: egui::Vec2, label: &str) -> (egui::Response, egui::Rect) {
-    // Reserve room for the grown card so the scroll area doesn't clip it.
-    let (slot, r) = ui.allocate_exact_size(size * GROW, Sense::click());
-    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
-    let target = if r.is_pointer_button_down_on() { 0.96 } else if r.contains_pointer() || r.has_focus() { GROW } else { 1.0 };
-    let s = ui.ctx().animate_value_with_time(r.id, target, 0.15);
-    (r, egui::Rect::from_center_size(slot.center(), size * s))
-}
-
-/// Round play button in the middle of a card, shown while the card is hovered or the button focused.
-/// Registered after the card, so it takes the click.
-fn card_play(ui: &mut egui::Ui, card: &egui::Response, rect: egui::Rect, label: &str) -> bool {
-    let b = egui::Rect::from_center_size(rect.center(), vec2(56.0, 56.0));
-    let r = ui.interact(b, card.id.with("play"), Sense::click());
-    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Play {label}")));
-    if card.contains_pointer() || r.has_focus() {
-        let p = ui.painter();
-        p.circle_filled(b.center(), 28.0, Color32::from_black_alpha(if r.hovered() { 210 } else { 140 }));
-        p.circle_stroke(b.center(), 27.0, (2.0, Color32::WHITE));
-        // Triangle centroid on the circle center; a font glyph centers on its line box, not its ink.
-        let c = b.center();
-        p.add(egui::Shape::convex_polygon(vec![c + vec2(-7.0, -11.0), c + vec2(14.0, 0.0), c + vec2(-7.0, 11.0)], Color32::WHITE, egui::Stroke::NONE));
-    }
-    r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(label).clicked()
-}
-
-/// Phosphor Fill weight (same codepoints as Regular); used for play and pause.
-fn fill() -> egui::FontFamily {
-    egui::FontFamily::Name("Phosphor-Fill".into())
-}
-
-/// Phosphor Regular alone. Inter has its own glyphs at some Phosphor codepoints (e.g. ARROW_LEFT), so icons must not go through Inter.
-fn phosphor() -> egui::FontFamily {
-    egui::FontFamily::Name("Phosphor".into())
-}
-
-/// Bold weight of the UI font (egui's `strong()` only brightens the color).
-fn bold() -> egui::FontFamily {
-    egui::FontFamily::Name("bold".into())
-}
-
-/// Phosphor Regular codepoints used by the UI.
-mod icons {
-    pub const ARROW_LEFT: &str = "\u{E058}";
-    pub const ARROWS_IN: &str = "\u{E09A}";
-    pub const ARROWS_OUT: &str = "\u{E0A2}";
-    pub const CARET_LEFT: &str = "\u{E138}";
-    pub const CHECK: &str = "\u{E182}";
-    pub const MAGNIFYING_GLASS: &str = "\u{E30C}";
-    pub const PAUSE: &str = "\u{E39E}";
-    pub const PLAY: &str = "\u{E3D0}";
-    pub const PLUS: &str = "\u{E3D4}";
-    pub const SKIP_FORWARD: &str = "\u{E5A6}";
-    pub const SPEAKER_HIGH: &str = "\u{E44A}";
-    pub const SPEAKER_X: &str = "\u{E45C}";
-    pub const SUBTITLES: &str = "\u{E1A8}";
-    pub const WAVEFORM: &str = "\u{E802}";
-    pub const GEAR: &str = "\u{E270}";
-    pub const X: &str = "\u{E4F6}";
-}
-
 /// Player popover opened from its control-row button.
 #[derive(Clone, Copy, PartialEq)]
 enum Menu {
@@ -716,165 +604,9 @@ enum Menu {
     Playback,
 }
 
-/// Keyboard-focus outline for the popover's custom controls.
-fn focus_ring(ui: &egui::Ui, r: &egui::Response, radius: u8) {
-    if r.has_focus() {
-        ui.painter().rect_stroke(r.rect, radius, egui::Stroke::new(2.0, accent()), egui::StrokeKind::Inside);
-    }
-}
-
-/// Small caps section heading inside a player popover.
-fn menu_heading(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(12.0);
-    ui.label(RichText::new(text.to_uppercase()).size(11.5).family(bold()).color(ui.visuals().weak_text_color()));
-    ui.add_space(4.0);
-}
-
-/// Full-width popover row: accent check when selected, highlight on hover, long labels truncated.
-fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-    let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
-    r.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, label));
-    focus_ring(ui, &r, 6);
-    let p = ui.painter();
-    if r.hovered() {
-        p.rect_filled(rect, 6, tint(ui, 14));
-    }
-    if selected {
-        p.text(pos2(rect.left() + 14.0, rect.center().y), egui::Align2::LEFT_CENTER, icons::CHECK, egui::FontId::new(16.0, phosphor()), accent());
-    }
-    let font = egui::FontId::new(15.0, if selected { bold() } else { egui::FontFamily::Proportional });
-    let color = if selected { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
-    let mut job = egui::text::LayoutJob::simple_singleline(label.to_string(), font, color);
-    job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - 50.0);
-    let g = p.layout_job(job);
-    p.galley(pos2(rect.left() + 40.0, rect.center().y - g.size().y / 2.0), g, color);
-    r.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
 /// Bounds a UI zoom factor to 0.75-2.0 in 0.05 steps; non-finite falls back to 1.0.
 fn clamp_scale(z: f32) -> f32 {
     if z.is_finite() { ((z * 20.0).round() / 20.0).clamp(0.75, 2.0) } else { 1.0 }
-}
-
-/// Rounded chip, accent-filled when selected.
-fn pill(ui: &mut egui::Ui, label: &str, selected: bool, role: egui::Role) -> egui::Response {
-    let fg = if selected { Color32::WHITE } else { ui.visuals().strong_text_color() };
-    let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::new(14.0, if selected { bold() } else { egui::FontFamily::Proportional }), fg);
-    let (rect, r) = ui.allocate_exact_size(vec2(g.size().x + 24.0, 30.0), Sense::click());
-    r.widget_info(|| egui::WidgetInfo::selected(role, true, selected, label));
-    let fill = if selected { accent() } else { tint(ui, if r.hovered() { 30 } else { 16 }) };
-    ui.painter().rect_filled(rect, 15, fill);
-    focus_ring(ui, &r, 15);
-    ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
-    r.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// Color dot with an accent ring when selected.
-fn swatch(ui: &mut egui::Ui, name: &str, color: Color32, selected: bool) -> egui::Response {
-    let (rect, r) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
-    r.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, name));
-    focus_ring(ui, &r, 15);
-    if selected || r.hovered() {
-        ui.painter().circle_stroke(rect.center(), 13.0, egui::Stroke::new(2.0, if selected { accent() } else { Color32::from_gray(120) }));
-    }
-    ui.painter().circle_filled(rect.center(), 9.0, color);
-    r.on_hover_text(name).on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// Label on the left, `− value +` on the right; returns -1, 0 or 1.
-fn stepper(ui: &mut egui::Ui, label: &str, value: &str) -> i32 {
-    let mut step = 0;
-    ui.horizontal(|ui| {
-        ui.set_min_height(36.0);
-        ui.label(RichText::new(label).size(15.0).color(ui.visuals().text_color()));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if pill(ui, "+", false, egui::Role::Button).on_hover_text(format!("Increase {label}")).clicked() {
-                step = 1;
-            }
-            ui.add_sized([56.0, 30.0], egui::Label::new(RichText::new(value).size(14.0).color(ui.visuals().strong_text_color())));
-            if pill(ui, "−", false, egui::Role::Button).on_hover_text(format!("Decrease {label}")).clicked() {
-                step = -1;
-            }
-        });
-    });
-    step
-}
-
-/// Full-width row with a label and an on/off switch.
-fn switch_row(ui: &mut egui::Ui, label: &str, on: &mut bool) -> egui::Response {
-    let (rect, mut r) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
-    if r.clicked() {
-        *on = !*on;
-        r.mark_changed();
-    }
-    r.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, *on, label));
-    focus_ring(ui, &r, 6);
-    let p = ui.painter();
-    if r.hovered() {
-        p.rect_filled(rect, 6, tint(ui, 14));
-    }
-    p.text(pos2(rect.left() + 8.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(15.0), ui.visuals().text_color());
-    let t = ui.ctx().animate_bool_with_time(r.id, *on, 0.12);
-    let track = egui::Rect::from_center_size(pos2(rect.right() - 26.0, rect.center().y), vec2(36.0, 20.0));
-    p.rect_filled(track, 10, Color32::from_gray(80).lerp_to_gamma(accent(), t));
-    p.circle_filled(pos2(egui::lerp(track.left() + 10.0..=track.right() - 10.0, t), track.center().y), 7.0, Color32::WHITE);
-    r.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// Inter (OFL) as the UI font: the closest free match to Netflix Sans, which is proprietary.
-/// egui's default fonts stay as fallbacks for symbols and emoji.
-fn install_fonts(ctx: &egui::Context) {
-    let mut f = egui::FontDefinitions::default();
-    for (name, bytes) in [("Inter", &include_bytes!("../assets/fonts/Inter-Regular.ttf")[..]), ("Inter-Bold", &include_bytes!("../assets/fonts/Inter-Bold.ttf")[..])] {
-        f.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(bytes)));
-    }
-    // Phosphor icons (MIT). Kept as the last fallback: it also maps a-z for ligatures.
-    f.font_data.insert("Phosphor".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Phosphor.ttf"))));
-    f.families.insert(phosphor(), vec!["Phosphor".into()]);
-    f.families.get_mut(&egui::FontFamily::Proportional).unwrap().push("Phosphor".into());
-    f.font_data.insert("Phosphor-Fill".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Phosphor-Fill.ttf"))));
-    f.families.insert(fill(), vec!["Phosphor-Fill".into()]);
-    let fallback = f.families[&egui::FontFamily::Proportional].clone();
-    f.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0, "Inter".into());
-    f.families.insert(bold(), std::iter::once("Inter-Bold".into()).chain(fallback).collect());
-    ctx.set_fonts(f);
-}
-
-fn pill_style(ui: &mut egui::Ui, fill: [Color32; 2], fg: Color32) {
-    let w = &mut ui.visuals_mut().widgets;
-    for (st, f) in [(&mut w.inactive, fill[0]), (&mut w.hovered, fill[1]), (&mut w.active, fill[1])] {
-        (st.weak_bg_fill, st.bg_stroke, st.fg_stroke.color) = (f, egui::Stroke::NONE, fg);
-    }
-}
-
-fn pill_widget<'a>(text: &str, size: f32) -> egui::Button<'a> {
-    let rt = |s: &str, family| RichText::new(s).size(size).strong().family(family);
-    // A leading icon ("<icon>  Label") is drawn in Phosphor, not Inter; see `phosphor`.
-    match text.split_once("  ") {
-        Some((i, t)) if !i.is_empty() && i.chars().all(|c| ('\u{E000}'..='\u{F8FF}').contains(&c)) => egui::Button::new((rt(i, phosphor()), rt(t, bold()))),
-        _ => egui::Button::new(rt(text, bold())),
-    }
-}
-
-/// Netflix flat pill: `fill` = [normal, hovered], no outline; fully rounded ends.
-fn pill_button(ui: &mut egui::Ui, text: &str, size: f32, min: egui::Vec2, fill: [Color32; 2], fg: Color32) -> egui::Response {
-    ui.scope(|ui| {
-        pill_style(ui, fill, fg);
-        ui.add(pill_widget(text, size).min_size(min).corner_radius((min.y / 2.0) as u8))
-    })
-    .inner
-}
-
-/// White primary pill (Netflix "Play") and translucent gray secondary pill.
-fn white_fill() -> [Color32; 2] {
-    [Color32::WHITE, Color32::from_white_alpha(191)]
-}
-fn gray_fill() -> [Color32; 2] {
-    [Color32::from_rgba_unmultiplied(109, 109, 110, 179), Color32::from_rgba_unmultiplied(109, 109, 110, 102)]
-}
-
-fn hero_button(ui: &mut egui::Ui, text: &str, fill: [Color32; 2], text_color: Color32) -> egui::Response {
-    pill_button(ui, text, 18.0, vec2(130.0, 46.0), fill, text_color)
 }
 
 /// An update must keep the installed addon's id, or it would replace a different addon.
@@ -892,52 +624,9 @@ fn health_error(e: &anyhow::Error) -> String {
     }
 }
 
-/// Small secondary pill for toolbar actions (Uninstall, Clear, Stop …).
-fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    let (fill, fg) = if ui.visuals().dark_mode { (gray_fill(), Color32::WHITE) } else { ([tint(ui, 34), tint(ui, 20)], ui.visuals().strong_text_color()) };
-    pill_button(ui, text, 14.0, vec2(0.0, 32.0), fill, fg)
-}
-
-/// Small white pill for the main action in a row (Install, Play …).
-fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    // A white pill vanishes on the light panel.
-    let (fill, fg) = if ui.visuals().dark_mode { (white_fill(), Color32::BLACK) } else { ([Color32::BLACK, Color32::from_gray(60)], Color32::WHITE) };
-    pill_button(ui, text, 14.0, vec2(0.0, 32.0), fill, fg)
-}
-
-/// Labeled text field and its action button on one centered line; fields of consecutive rows start at the same x.
-/// True when the button is pressed, or Enter in the field, with non-blank text (any text if `allow_blank`).
-/// `tip`: hover text of the button.
-fn form_row(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str, action: &str, tip: Option<&str>, allow_blank: bool) -> bool {
-    ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
-        let l = ui.label(label);
-        ui.add_space((150.0 - l.rect.width()).max(0.0));
-        let r = ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(400.0)).labelled_by(l.id);
-        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let b = primary_button(ui, action);
-        let b = match tip {
-            Some(t) => b.on_hover_text(t),
-            None => b,
-        };
-        (b.clicked() || enter) && (allow_blank || !text.trim().is_empty())
-    })
-    .inner
-}
-
 /// Poster art rarely has readable text at card size, so the tooltip leads with the title.
 fn card_tip(m: &MetaPreview) -> String {
     m.description.as_ref().map_or_else(|| m.name.clone(), |d| format!("{}\n\n{d}", m.name))
-}
-
-/// Gray card with centered, wrapped text (used when there's no poster).
-fn card_text(ui: &egui::Ui, rect: egui::Rect, text: &str) {
-    // Clipped: a very long title would otherwise spill past the card.
-    let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
-    p.rect_filled(rect, 6, Color32::from_gray(40));
-    let mut job = egui::text::LayoutJob::simple(text.to_owned(), egui::FontId::proportional(15.0), Color32::WHITE, rect.width() - 16.0);
-    job.halign = Align::Center; // each line centered around x = 0
-    let g = p.layout_job(job);
-    p.galley(pos2(rect.center().x, rect.center().y - g.size().y / 2.0), g, Color32::WHITE);
 }
 
 fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream, reserve: f32) -> egui::Response {
@@ -969,41 +658,6 @@ fn episode_row(ui: &mut egui::Ui, v: &Video, watched: bool) -> egui::Response {
 
 /// Size of the "Mark watched" pill overlaid on episode rows, left of the play circle.
 const EPISODE_BUTTON: egui::Vec2 = egui::Vec2::new(150.0, 32.0);
-
-/// Netflix episode-list row: index, bold name, gray details, play circle; highlights on hover.
-/// `reserve`: extra width kept free of text on the right (for an overlaid button).
-fn list_row(ui: &mut egui::Ui, n: usize, head: String, details: String, reserve: f32) -> egui::Response {
-    let (w, text_x, pad) = (ui.available_width().min(960.0), 84.0, 18.0);
-    let wrap = (w - text_x - 96.0 - reserve).max(40.0);
-    let (strong, weak, panel) = (ui.visuals().strong_text_color(), ui.visuals().weak_text_color(), ui.visuals().panel_fill);
-    let p = ui.painter();
-    let hg = p.layout(head.clone(), egui::FontId::new(17.0, bold()), strong, wrap);
-    let has_details = !details.is_empty();
-    let mut job = egui::text::LayoutJob::simple(details, egui::FontId::proportional(14.0), weak, wrap);
-    job.sections[0].format.line_height = Some(20.0);
-    let dg = p.layout_job(job);
-    let block = hg.size().y + if has_details { 8.0 + dg.size().y } else { 0.0 };
-    let h = (pad * 2.0 + block).max(88.0);
-    let (rect, r) = ui.allocate_exact_size(vec2(w, h), Sense::click());
-    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Play {head}")));
-    let t = ui.ctx().animate_bool(r.id, r.hovered() || r.has_focus());
-    // Hover wash: strong text at alpha 34 is the old gray 51 on the dark panel.
-    let hover = tint(ui, 34);
-    let p = ui.painter();
-    // Inset so neighbouring rows' highlights never touch.
-    p.rect_filled(rect.shrink2(vec2(4.0, 4.0)), 8, hover.gamma_multiply(t));
-    let num = p.layout_no_wrap(n.to_string(), egui::FontId::proportional(24.0), strong);
-    p.galley(pos2(rect.left() + text_x / 2.0 - num.size().x / 2.0, rect.center().y - num.size().y / 2.0), num, strong);
-    let top = rect.center().y - block / 2.0;
-    p.galley(pos2(rect.left() + text_x, top), hg.clone(), strong);
-    p.galley(pos2(rect.left() + text_x, top + hg.size().y + 8.0), dg, weak);
-    // Play button: outlined circle that fills with strong text on hover.
-    let c = pos2(rect.right() - 48.0, rect.center().y);
-    p.circle(c, 20.0, strong.gamma_multiply(t), (2.0, strong));
-    let tri = strong.lerp_to_gamma(panel, t);
-    p.add(egui::Shape::convex_polygon(vec![c + vec2(-6.0, -9.0), c + vec2(10.0, 0.0), c + vec2(-6.0, 9.0)], tri, egui::Stroke::NONE));
-    r
-}
 
 fn kind_label(kind: &str) -> &str {
     match kind {
@@ -2920,7 +2574,7 @@ impl App {
     /// "Add to list" menu: a checkbox per list, plus a new list that gets `meta`.
     fn list_menu(&mut self, ui: &mut egui::Ui, meta: &MetaPreview) {
         let t = SavedTitle { key: format!("{}:{}", meta.kind, meta.id), title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone(), year: None, rating: None, last_watched: None };
-        egui::containers::menu::MenuButton::from_button(pill_widget(&format!("{}  Add to list", icons::PLUS), 18.0).min_size(vec2(130.0, 46.0)).corner_radius(23)).ui(ui, |ui| {
+        egui::containers::menu::MenuButton::from_button(hero_pill(&format!("{}  Add to list", icons::PLUS))).ui(ui, |ui| {
             let mut change = None;
             for l in &self.lists {
                 let mut on = l.keys.contains(&t.key);
@@ -2931,7 +2585,7 @@ impl App {
             ui.separator();
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.list_name).hint_text("New list…").char_limit(60).desired_width(140.0));
-                if ui.button("Create").clicked() {
+                if small_button(ui, "Create").clicked() {
                     match self.db.create_list(&self.list_name) {
                         Ok(id) => {
                             self.list_name.clear();
@@ -3161,7 +2815,7 @@ impl App {
         let (mut want, mut open, mut quick) = (Vec::new(), None, None);
         let scroll = std::mem::take(&mut self.scroll_top);
         let Some(page) = &self.search_page else { return };
-        let heading = ui.label(RichText::new(format!("Results for \"{}\"", page.query)).size(26.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        let heading = page_heading(ui, format!("Results for \"{}\"", page.query));
         if scroll {
             ui.scroll_to_rect(heading.rect, Some(Align::TOP));
         }
@@ -3169,18 +2823,18 @@ impl App {
             match &row.items {
                 Some(items) if items.is_empty() => continue,
                 Some(items) => {
-                    Self::row_title(ui, &row.title);
+                    row_title(ui, &row.title);
                     self.ui_cards(ui, &row.title, items, &mut want, &mut open, &mut quick);
                 }
                 None => {
-                    Self::row_title(ui, &row.title);
+                    row_title(ui, &row.title);
                     ui.spinner();
                 }
             }
         }
         if page.rows.iter().all(|r| r.items.as_ref().is_some_and(Vec::is_empty)) && page.failed.len() < page.rows.len() {
             ui.add_space(22.0);
-            ui.label("No results.");
+            muted(ui, "No results.");
         }
         want.sort();
         want.dedup();
@@ -3237,7 +2891,7 @@ impl App {
         {
             ui.add_space(16.0);
             ui.horizontal(|ui| {
-                let r = ui.label(RichText::new("Streams").size(24.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+                let r = page_heading(ui, "Streams");
                 if std::mem::take(&mut self.show_streams) {
                     r.scroll_to_me(Some(Align::TOP));
                 }
@@ -3286,7 +2940,7 @@ impl App {
         {
             ui.add_space(16.0);
             ui.horizontal(|ui| {
-                let r = ui.label(RichText::new("Episodes").size(24.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+                let r = page_heading(ui, "Episodes");
                 if self.episode.is_none() && std::mem::take(&mut self.show_streams) {
                     r.scroll_to_me(Some(Align::TOP));
                 }
@@ -3328,7 +2982,7 @@ impl App {
             }
         }
         if !self.recent.is_empty() {
-            Self::row_title(ui, "Continue Watching");
+            row_title(ui, "Continue Watching");
             egui::ScrollArea::horizontal().id_salt("recent").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for p in &self.recent {
@@ -3370,7 +3024,7 @@ impl App {
             .collect();
         fresh.sort_by(|a, b| b.1.released.cmp(&a.1.released));
         if !fresh.is_empty() {
-            Self::row_title(ui, "New Episodes");
+            row_title(ui, "New Episodes");
             egui::ScrollArea::horizontal().id_salt("new_episodes").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for (m, v) in fresh {
@@ -3385,7 +3039,7 @@ impl App {
             });
         }
         if !self.watched.is_empty() {
-            Self::row_title(ui, "Watch It Again");
+            row_title(ui, "Watch It Again");
             egui::ScrollArea::horizontal().id_salt("watched").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for w in &self.watched {
@@ -3410,14 +3064,14 @@ impl App {
             match &row.items {
                 Some(items) if items.is_empty() => continue,
                 Some(items) => {
-                    Self::row_title(ui, &row.title);
+                    row_title(ui, &row.title);
                     let near_end = self.ui_cards(ui, &row.title, items, &mut want, &mut open, &mut quick);
                     if row.wants_more(near_end) {
                         more.push((row.src.clone(), row.fetched));
                     }
                 }
                 None => {
-                    Self::row_title(ui, &row.title);
+                    row_title(ui, &row.title);
                     ui.spinner();
                 }
             }
@@ -3587,12 +3241,6 @@ impl App {
         }
     }
 
-    fn row_title(ui: &mut egui::Ui, title: &str) {
-        ui.add_space(22.0);
-        ui.label(RichText::new(title).size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
-        ui.add_space(4.0);
-    }
-
     /// Horizontally scrolling poster cards; a click selects the title.
     /// Returns true when one of the last 3 cards is on screen.
     fn ui_cards(&self, ui: &mut egui::Ui, salt: &str, items: &[MetaPreview], want: &mut Vec<String>, open: &mut Option<(MetaPreview, bool)>, quick: &mut Option<MetaPreview>) -> bool {
@@ -3679,7 +3327,7 @@ impl App {
         ui.scope_builder(UiBuilder::new().max_rect(col).layout(Layout::bottom_up(Align::LEFT)), |ui| {
             ui.horizontal(|ui| {
                 let mut show_streams = false;
-                if hero_button(ui, &format!("{}  Play", icons::PLAY), [Color32::WHITE, Color32::from_white_alpha(191)], Color32::BLACK).clicked() {
+                if hero_button(ui, &format!("{}  Play", icons::PLAY), white_fill(), Color32::BLACK).clicked() {
                     match &self.selected {
                         Some((m, streams, subs)) if m == meta => match (only_source(streams), self.play_key()) {
                             (Some(src), Some((k, t))) => *play = Some((k, t, src, subs.clone())),
@@ -3689,15 +3337,14 @@ impl App {
                     }
                 }
                 self.show_streams |= show_streams;
-                let gray = |a| Color32::from_rgba_unmultiplied(109, 109, 110, a);
                 // The open title's page is already showing; reopening it would reload it and reset the season.
                 let is_open = self.selected.as_ref().is_some_and(|(m, ..)| m == meta);
-                if !is_open && hero_button(ui, "More info", [gray(179), gray(102)], Color32::WHITE).clicked() {
+                if !is_open && hero_button(ui, "More info", gray_fill(), Color32::WHITE).clicked() {
                     *open = Some((meta.clone(), false));
                 }
                 let in_lib = self.saved.iter().any(|t| t.key == format!("{}:{}", meta.kind, meta.id));
                 let label = if in_lib { format!("{}  In library", icons::CHECK) } else { format!("{}  Add to library", icons::PLUS) };
-                if hero_button(ui, &label, [gray(179), gray(102)], Color32::WHITE).clicked() {
+                if hero_button(ui, &label, gray_fill(), Color32::WHITE).clicked() {
                     self.toggle_saved(meta);
                 }
                 ui.scope(|ui| { pill_style(ui, gray_fill(), Color32::WHITE); self.list_menu(ui, meta) });
@@ -3752,7 +3399,7 @@ impl App {
         if !d.trailers.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 for t in &d.trailers {
-                    if ui.button(format!("▶ {}", t.title.as_deref().unwrap_or("Trailer"))).clicked() {
+                    if small_button(ui, &format!("{}  {}", icons::PLAY, t.title.as_deref().unwrap_or("Trailer"))).clicked() {
                         clicked = Some(t);
                     }
                 }
@@ -4060,7 +3707,7 @@ impl App {
                 // Right edge sits 150 px past its button's center, clamped inside the window.
                 let right = (rect.right() - 52.0 - (2 - i) as f32 * 64.0 + 150.0).min(rect.right() - 16.0);
                 egui::Area::new(ui.scope_id().with(("menu", i))).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_BOTTOM).fixed_pos(pos2(right, y - 70.0)).show(&ctx, |ui| {
-                    egui::Frame::new().fill(Color32::from_rgba_unmultiplied(24, 24, 28, 245)).stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(18))).corner_radius(12).inner_margin(egui::Margin::symmetric(12, 14)).show(ui, |ui| {
+                    egui::Frame::new().fill(surface(245)).stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(18))).corner_radius(12).inner_margin(egui::Margin::symmetric(12, 14)).show(ui, |ui| {
                         ui.style_mut().visuals = ui.ctx().style_of(egui::Theme::Dark).visuals.clone();
                         ui.set_width(300.0);
                         ui.spacing_mut().item_spacing.y = 2.0;
@@ -4073,7 +3720,7 @@ impl App {
                             let off = !tracks.iter().any(|t| t.selected);
                             let entries: Vec<_> = (kind == "sub").then_some((None, "Off", None, off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.lang.as_deref(), t.selected))).collect();
                             if entries.is_empty() {
-                                ui.label(RichText::new("No tracks").size(14.0).color(Color32::from_gray(150)));
+                                caption(ui, "No tracks");
                             }
                             egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
                                 for (id, label, lang, sel) in entries {
@@ -4108,14 +3755,14 @@ impl App {
                             });
                             if kind == "audio" {
                                 style.audio_delay += stepper(ui, "Audio delay", &format!("{:+.1}s", style.audio_delay)) as f64 * 0.1;
-                                if style.audio_delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(accent())).frame(false)).clicked() {
+                                if style.audio_delay != 0.0 && link_button(ui, "Reset delay").clicked() {
                                     style.audio_delay = 0.0;
                                 }
                             }
                             if kind == "sub" {
                                 menu_heading(ui, "Search");
                                 let s = &mut p.search;
-                                if ui.add(egui::Button::new(RichText::new(if s.open { "Hide search" } else { "Search subtitles" }).size(14.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(16)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0))).clicked() {
+                                if block_button(ui, if s.open { "Hide search" } else { "Search subtitles" }).clicked() {
                                     s.open = !s.open;
                                     search_req = s.open && s.results.is_empty() && !s.busy;
                                 }
@@ -4124,13 +3771,13 @@ impl App {
                                     let hits = filter_subs(&s.results, &s.filter);
                                     let note = if s.busy { "Searching..." } else if hits.is_empty() { "No subtitles found" } else { "" };
                                     if !note.is_empty() {
-                                        ui.label(RichText::new(note).size(14.0).color(Color32::from_gray(150)));
+                                        caption(ui, note);
                                     }
                                     egui::ScrollArea::vertical().id_salt("sub_search").max_height(200.0).show(ui, |ui| {
                                         // shortcut: first 100 matches only; type a filter to narrow.
                                         for f in hits.into_iter().take(100) {
                                             ui.horizontal(|ui| {
-                                                if ui.small_button("Save").on_hover_text("Save next to the video or in downloads").clicked() {
+                                                if small_button(ui, "Save").on_hover_text("Save next to the video or in downloads").clicked() {
                                                     sub_act = Some((true, f.clone()));
                                                 }
                                                 if menu_row(ui, &format!("{} · {}", f.lang, f.addon), false).clicked() {
@@ -4140,35 +3787,17 @@ impl App {
                                         }
                                     });
                                     if !s.status.is_empty() {
-                                        ui.label(RichText::new(&s.status).size(13.0).color(Color32::from_gray(170)));
+                                        caption(ui, &s.status);
                                     }
                                 }
                                 menu_heading(ui, "Style");
                                 style.scale = (style.scale * 10.0).round() / 10.0 + stepper(ui, "Size", &format!("{:.1}x", style.scale)) as f64 * 0.1;
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("Color").size(15.0).color(Color32::from_gray(210)));
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        for (i, (name, hex)) in SUB_COLORS.iter().enumerate().rev() {
-                                            if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::WHITE), style.color == i).clicked() {
-                                                style.color = i;
-                                            }
-                                        }
-                                    });
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("Outline").size(15.0).color(Color32::from_gray(210)));
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        for (i, (name, hex)) in SUB_OUTLINES.iter().enumerate().rev() {
-                                            if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::BLACK), style.outline == i).clicked() {
-                                                style.outline = i;
-                                            }
-                                        }
-                                    });
-                                });
+                                swatch_row(ui, "Color", &SUB_COLORS, &mut style.color);
+                                swatch_row(ui, "Outline", &SUB_OUTLINES, &mut style.outline);
                                 style.pos += stepper(ui, "Position", &format!("{}%", style.pos)) as f64 * 5.0;
                                 switch_row(ui, "Background box", &mut style.background);
                                 style.delay += stepper(ui, "Delay", &format!("{:+.1}s", style.delay)) as f64 * 0.1;
-                                if style.delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(accent())).frame(false)).clicked() {
+                                if style.delay != 0.0 && link_button(ui, "Reset delay").clicked() {
                                     style.delay = 0.0;
                                 }
                             }
@@ -4192,12 +3821,11 @@ impl App {
                                 report(&mut self.error, format!("saving sub_off: {e:#}"));
                             }
                             if valid.is_none() {
-                                ui.label(RichText::new("Use codes like en,eng,pt-BR (max 8)").size(13.0).color(Color32::from_rgb(230, 90, 90)));
+                                error_caption(ui, "Use codes like en,eng,pt-BR (max 8)");
                             }
                         } else {
                             menu_heading(ui, "Speed");
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                            chip_row(ui, |ui| {
                                 for sp in SPEEDS {
                                     if pill(ui, &format!("{sp}x"), (st.speed - sp).abs() < 0.01, egui::Role::RadioButton).clicked() {
                                         cmd(&["set", "speed", &sp.to_string()]);
@@ -4213,8 +3841,7 @@ impl App {
                                 Some((t, _)) => format!("Sleep timer ({} min left)", t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60)),
                                 None => "Sleep timer".into(),
                             });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                            chip_row(ui, |ui| {
                                 if pill(ui, "Off", self.sleep.is_none(), egui::Role::RadioButton).clicked() {
                                     self.sleep = None;
                                 }
@@ -4225,8 +3852,7 @@ impl App {
                                 }
                             });
                             menu_heading(ui, "Video");
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                            chip_row(ui, |ui| {
                                 for (i, (name, v)) in ASPECTS.iter().enumerate() {
                                     if pill(ui, name, p.aspect == i, egui::Role::RadioButton).clicked() {
                                         p.aspect = i;
@@ -4242,13 +3868,12 @@ impl App {
                                 p.zoom = (p.zoom + step).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
                                 cmd(&["set", "video-zoom", &zoom_value(p.zoom)]);
                             }
-                            if p.zoom != 0 && ui.add(egui::Button::new(RichText::new("Reset zoom").size(13.0).color(accent())).frame(false)).clicked() {
+                            if p.zoom != 0 && link_button(ui, "Reset zoom").clicked() {
                                 p.zoom = 0;
                                 cmd(&["set", "video-zoom", "0"]);
                             }
                             menu_heading(ui, "Loop");
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                            chip_row(ui, |ui| {
                                 // A pill, not a switch row: the panel must stay short enough to clear the seek bar at 700 px.
                                 if pill(ui, "Repeat", p.repeat, egui::Role::CheckBox).clicked() {
                                     p.repeat = !p.repeat;
@@ -4280,7 +3905,7 @@ impl App {
                             }
                             switch_row(ui, "Playback stats (I)", &mut p.stats);
                             ui.add_space(8.0);
-                            external =ui.add(egui::Button::new(RichText::new("Open in external player").size(14.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(16)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0))).on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
+                            external = block_button(ui, "Open in external player").on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
                         }
                     });
                 });
@@ -4309,7 +3934,7 @@ impl App {
                 rows.push(("Speed", net.map_or("-".into(), |n| format!("{} down, {} up", fmt_rate(n.down), fmt_rate(n.up)))));
             }
             egui::Area::new(ui.scope_id().with("stats")).order(egui::Order::Foreground).fixed_pos(pos2(rect.left() + 16.0, rect.top() + 72.0)).interactable(false).show(&ctx, |ui| {
-                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(24, 24, 28, 230)).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+                egui::Frame::new().fill(surface(230)).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
                     for (k, v) in rows {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(format!("{k:<8}")).size(13.0).monospace().color(Color32::from_gray(150)));
@@ -4331,7 +3956,7 @@ impl App {
                 let paint = ui.painter().clone();
                 // Swallows clicks on the card so they don't pause the video; the buttons, registered later, win.
                 let _ = ui.interact(card, ui.scope_id().with("up_next_card"), Sense::CLICK);
-                paint.rect_filled(card, 12, Color32::from_rgb(22, 22, 26));
+                paint.rect_filled(card, 12, surface(255));
                 // The buttons need 316 px; the still takes the rest (14 px at the narrowest).
                 let thumb = egui::Rect::from_min_size(card.min, vec2((size.x - 316.0).clamp(0.0, size.y * 1.05), size.y));
                 let left = egui::CornerRadius { nw: 12, sw: 12, ne: 0, se: 0 };
@@ -4388,7 +4013,7 @@ impl App {
             let paint = ui.painter().clone();
             let resp = ui.interact(r, ui.scope_id().with("skip"), Sense::CLICK).on_hover_cursor(egui::CursorIcon::PointingHand);
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, sk.kind.label()));
-            paint.rect_filled(r, 25, Color32::from_rgb(22, 22, 26));
+            paint.rect_filled(r, 25, surface(255));
             paint.rect_stroke(r, 25, egui::Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Inside);
             if resp.hovered() {
                 paint.rect_filled(r, 25, Color32::from_white_alpha(20));
@@ -4555,7 +4180,7 @@ impl App {
                 reset_order = true;
             }
         });
-        ui.label(RichText::new("Per-type order applies to metadata, streams and subtitles; catalog rows and search keep the global order.").size(13.0).color(ui.visuals().weak_text_color()));
+        caption(ui, "Per-type order applies to metadata, streams and subtitles; catalog rows and search keep the global order.");
         let n = self.addons.len();
         let urls: Vec<String> = self.addons.iter().map(|(u, _)| u.clone()).collect();
         let view = arrange_rows(&urls, self.addon_orders.get(&self.addon_order_kind).map_or(&[][..], |o| o));
@@ -4583,7 +4208,7 @@ impl App {
             });
             match self.addon_updates.iter().find(|(u, _)| u == url).map(|(_, r)| r) {
                 Some(Ok(new)) if !same_addon(m, new) => {
-                    ui.label(RichText::new("Addon id changed; not offered").weak());
+                    muted(ui, "Addon id changed; not offered");
                 }
                 Some(Ok(new)) if stremflix_rs::addon::is_newer(&new.version, &m.version) => {
                     ui.horizontal(|ui| {
@@ -4594,15 +4219,15 @@ impl App {
                     });
                 }
                 Some(Err(e)) => {
-                    ui.label(RichText::new(e).weak());
+                    muted(ui, e);
                 }
                 Some(Ok(_)) => {
-                    ui.label(RichText::new("Reachable").weak());
+                    muted(ui, "Reachable");
                 }
                 None => {}
             }
             if m.behavior_hints.configuration_required {
-                ui.label(RichText::new("Needs configuration before use. Press Configure.").weak());
+                muted(ui, "Needs configuration before use. Press Configure.");
             }
             if self.addon_details.as_ref() == Some(url) {
                 Self::ui_addon_details(ui, m);
@@ -4681,7 +4306,7 @@ impl App {
     fn ui_browse_addons(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.separator();
-        ui.label(RichText::new("Browse addons").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        section_heading(ui, "Browse addons");
         let label = |addon: &str, c: &CatalogDef| sanitize_text(&format!("{addon} - {} ({})", c.name.as_deref().unwrap_or(&c.id), kind_label(&c.kind)), 400);
         let sources: Vec<(AddonCatalogSrc, String)> = self
             .addons
@@ -4689,7 +4314,7 @@ impl App {
             .flat_map(|(u, m)| m.addon_catalogs.iter().map(move |c| ((u.clone(), c.kind.clone(), c.id.clone()), label(&m.name, c))))
             .collect();
         if sources.is_empty() {
-            ui.label("Install an addon with addon catalogs to browse more addons, e.g. Cinemeta: https://v3-cinemeta.strem.io/manifest.json");
+            muted(ui, "Install an addon with addon catalogs to browse more addons, e.g. Cinemeta: https://v3-cinemeta.strem.io/manifest.json");
             return;
         }
         let mut pick = self.browse.as_ref().map(|b| b.0.clone()).filter(|s| sources.iter().any(|(x, _)| x == s));
@@ -4716,7 +4341,7 @@ impl App {
             return;
         };
         if items.is_empty() {
-            ui.label("No addons in this catalog.");
+            muted(ui, "No addons in this catalog.");
         }
         let mut install = None;
         for a in items {
@@ -4730,7 +4355,7 @@ impl App {
                 ui.label(RichText::new(format!("{} {}", a.manifest.name, a.manifest.version)).strong());
                 // The host shows where the addon really lives, since any listed addon can claim any name.
                 if let Ok(u) = url::Url::parse(&a.transport_url) {
-                    ui.label(RichText::new(u.host_str().unwrap_or_default()).weak());
+                    muted(ui, u.host_str().unwrap_or_default());
                 }
                 if let Some(d) = &a.manifest.description {
                     // One line; the full text is on hover.
@@ -4785,10 +4410,10 @@ impl App {
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         let mut save: Vec<(&str, String)> = Vec::new();
         ui.add_space(8.0);
-        ui.label(RichText::new("Appearance").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        section_heading(ui, "Appearance");
         ui.horizontal(|ui| {
             ui.set_min_height(32.0);
-            ui.label(RichText::new("Theme").size(15.0).color(ui.visuals().text_color()));
+            field_label(ui, "Theme");
             for (name, light) in [("Dark", false), ("Light", true)] {
                 if pill(ui, name, self.light == light, egui::Role::RadioButton).clicked() && self.light != light {
                     self.light = light;
@@ -4796,7 +4421,7 @@ impl App {
                 }
             }
             ui.add_space(12.0);
-            ui.label(RichText::new("Accent").size(15.0).color(ui.visuals().text_color()));
+            field_label(ui, "Accent");
             for (i, (name, color)) in ACCENTS.iter().enumerate() {
                 let cur = ACCENT_IDX.load(std::sync::atomic::Ordering::Relaxed);
                 if swatch(ui, name, *color, cur == i).clicked() && cur != i {
@@ -4812,11 +4437,11 @@ impl App {
                 ui.ctx().set_zoom_factor(clamp_scale(self.ui_scale + step as f32 * 0.25));
             }
         });
-        ui.label(RichText::new("Also Ctrl and +, Ctrl and −, Ctrl and 0.").size(13.0).color(ui.visuals().weak_text_color()));
+        caption(ui, "Also Ctrl and +, Ctrl and −, Ctrl and 0.");
         if !save.is_empty() {
             apply_theme(ui.ctx(), self.light);
         }
-        Self::row_title(ui, "Stremio account");
+        row_title(ui, "Stremio account");
         let ctx = ui.ctx().clone();
         if let Some(email) = self.account.clone() {
             ui.horizontal(|ui| {
@@ -4848,7 +4473,7 @@ impl App {
             });
             if self.confirm_upload {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Overwrites the account's addon list with this order (addons only on the account are kept, last). Saved titles missing on the account are added (ones it has, even removed, stay as they are), and progress is updated only where it is newer there. Nothing is deleted.").size(13.0).color(ui.visuals().weak_text_color()));
+                    caption(ui, "Overwrites the account's addon list with this order (addons only on the account are kept, last). Saved titles missing on the account are added (ones it has, even removed, stay as they are), and progress is updated only where it is newer there. Nothing is deleted.");
                     if primary_button(ui, "Upload").clicked() {
                         self.confirm_upload = false;
                         self.upload_account(&ctx);
@@ -4859,15 +4484,12 @@ impl App {
                 });
             }
             if let Some(note) = &self.account_note {
-                ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
+                caption(ui, note);
             }
         } else {
             let mut go = false;
-            ui.horizontal(|ui| {
-                ui.set_min_height(32.0);
-                let l = ui.label("Email:");
-                ui.add_space((150.0 - l.rect.width()).max(0.0));
-                ui.add(egui::TextEdit::singleline(&mut self.login.0).desired_width(260.0)).labelled_by(l.id);
+            field_row(ui, "Email:", |ui, l| {
+                ui.add(egui::TextEdit::singleline(&mut self.login.0).desired_width(260.0)).labelled_by(l);
                 let l = ui.label("Password:");
                 let r = ui.add(egui::TextEdit::singleline(&mut self.login.1).password(true).desired_width(200.0)).labelled_by(l.id);
                 go = ui.add_enabled_ui(!self.account_busy, |ui| primary_button(ui, "Sign in")).inner.clicked()
@@ -4876,7 +4498,7 @@ impl App {
                     ui.spinner();
                 }
             });
-            ui.label(RichText::new("Copies your addons, library and watched titles from api.strem.io. Settings can upload them back after signing in.").size(13.0).color(ui.visuals().weak_text_color()));
+            caption(ui, "Copies your addons, library and watched titles from api.strem.io. Settings can upload them back after signing in.");
             let email = self.login.0.trim().to_string();
             if go && !email.is_empty() && !self.login.1.is_empty() {
                 // Not kept after use, even if signing in fails.
@@ -4888,14 +4510,14 @@ impl App {
                 });
             }
         }
-        Self::row_title(ui, "Data");
+        row_title(ui, "Data");
         if small_button(ui, "Export data").on_hover_text("Write addons, saved titles, progress and settings to a JSON file in the data folder").clicked() {
             match self.db.export_file(&self.data_dir.join("exports")) {
                 Ok(p) => self.data_msg = Some(format!("Exported to {}", p.display())),
                 Err(e) => report(&mut self.error, format!("exporting: {e:#}")),
             }
         }
-        ui.label(RichText::new("The export includes addon URLs, which can hold account tokens. Keep it private.").size(13.0).color(ui.visuals().weak_text_color()));
+        caption(ui, "The export includes addon URLs, which can hold account tokens. Keep it private.");
         if form_row(ui, "Import file:", &mut self.data_import, "/path/to/stremflix-rs-export.json", "Import", Some("Merges the file into your data; nothing is deleted"), false) {
             match self.db.import_file(std::path::Path::new(self.data_import.trim())) {
                 Ok(m) => self.data_msg = Some(format!("{m}. Restart the app to apply.")),
@@ -4903,9 +4525,9 @@ impl App {
             }
         }
         if let Some(m) = &self.data_msg {
-            ui.label(RichText::new(m).size(13.0).color(ui.visuals().weak_text_color()));
+            caption(ui, m);
         }
-        Self::row_title(ui, "Diagnostics");
+        row_title(ui, "Diagnostics");
         let out = self.data_dir.join("diagnostics.txt");
         if small_button(ui, "Export diagnostics").on_hover_text(format!("Version, OS and recent log without secrets, saved to {}", out.display())).clicked() {
             let summary = format!("addons: {}\nsigned in: {}", self.addons.len(), self.account.is_some());
@@ -4924,7 +4546,7 @@ impl App {
                 Err(e) => report(&mut self.error, format!("diagnostics export: {e}")),
             }
         }
-        Self::row_title(ui, "Torrents");
+        row_title(ui, "Torrents");
         let hint = self.data_dir.join("torrents").display().to_string();
         if form_row(ui, "Cache location:", &mut self.torrent_dir, &hint, "Save", Some("Empty: the app's data folder"), true) {
             let d = self.torrent_dir.trim().to_string();
@@ -4935,65 +4557,28 @@ impl App {
                 report(&mut self.error, "cache location must be an absolute path");
             }
         }
-        ui.horizontal(|ui| {
-            ui.set_min_height(32.0);
-            let l = ui.label("Cache size:");
-            ui.add_space((150.0 - l.rect.width()).max(0.0));
-            let label = CACHE_SIZES.iter().find(|c| c.1 == self.torrent_cache).map_or("Custom", |c| c.0);
-            egui::ComboBox::from_id_salt("torrent_cache").selected_text(label).show_ui(ui, |ui| {
-                for (name, bytes) in CACHE_SIZES {
-                    if ui.selectable_value(&mut self.torrent_cache, bytes, name).changed() {
-                        save.push(("torrent_cache", bytes.to_string()));
-                    }
-                }
-            });
-        });
-        ui.horizontal(|ui| {
-            ui.set_min_height(32.0);
-            let l = ui.label("Connections:");
-            ui.add_space((150.0 - l.rect.width()).max(0.0));
-            egui::ComboBox::from_id_salt("torrent_profile").selected_text(self.torrent_profile.label()).show_ui(ui, |ui| {
-                for p in Profile::ALL {
-                    if ui.selectable_value(&mut self.torrent_profile, p, p.label()).changed() {
-                        save.push(("torrent_profile", p.label().into()));
-                    }
-                }
-            });
-        });
-        for (title, key, val) in [("Download limit:", "torrent_down_limit", &mut self.torrent_limits.0), ("Upload limit:", "torrent_up_limit", &mut self.torrent_limits.1)] {
-            ui.horizontal(|ui| {
-                ui.set_min_height(32.0);
-                let l = ui.label(title);
-                ui.add_space((150.0 - l.rect.width()).max(0.0));
-                let label = SPEED_LIMITS.iter().find(|c| c.1 == *val).map_or("Custom", |c| c.0);
-                egui::ComboBox::from_id_salt(key).selected_text(label).show_ui(ui, |ui| {
-                    for (name, bps) in SPEED_LIMITS {
-                        if ui.selectable_value(val, bps, name).changed() {
-                            save.push((key, bps.to_string()));
-                        }
-                    }
-                });
-            });
+        if combo_row(ui, "Cache size:", &mut self.torrent_cache, &CACHE_SIZES) {
+            save.push(("torrent_cache", self.torrent_cache.to_string()));
         }
-        for (label, id, choices) in [("Seed to ratio:", "seed_ratio", &SEED_RATIOS), ("Seed for (after playback):", "seed_secs", &SEED_TIMES)] {
-            ui.horizontal(|ui| {
-                let l = ui.label(label);
-                ui.add_space((150.0 - l.rect.width()).max(0.0));
-                let cur = if id == "seed_ratio" { self.torrent_seed.ratio } else { self.torrent_seed.secs as f64 };
-                egui::ComboBox::from_id_salt(id).selected_text(choices.iter().find(|c| c.1 == cur).map_or("Custom", |c| c.0)).show_ui(ui, |ui| {
-                    for &(name, v) in choices {
-                        if ui.selectable_label(cur == v, name).clicked() {
-                            if id == "seed_ratio" { self.torrent_seed.ratio = v } else { self.torrent_seed.secs = v as u64 }
-                            save.push((id, v.to_string()));
-                        }
-                    }
-                });
-            });
+        if combo_row(ui, "Connections:", &mut self.torrent_profile, &Profile::ALL.map(|p| (p.label(), p))) {
+            save.push(("torrent_profile", self.torrent_profile.label().into()));
+        }
+        for (title, key, val) in [("Download limit:", "torrent_down_limit", &mut self.torrent_limits.0), ("Upload limit:", "torrent_up_limit", &mut self.torrent_limits.1)] {
+            if combo_row(ui, title, val, &SPEED_LIMITS) {
+                save.push((key, val.to_string()));
+            }
+        }
+        for (label, id, choices) in [("Seed to ratio:", "seed_ratio", &SEED_RATIOS), ("Seed for:", "seed_secs", &SEED_TIMES)] {
+            let mut cur = if id == "seed_ratio" { self.torrent_seed.ratio } else { self.torrent_seed.secs as f64 };
+            if combo_row(ui, label, &mut cur, choices) {
+                if id == "seed_ratio" { self.torrent_seed.ratio = cur } else { self.torrent_seed.secs = cur as u64 }
+                save.push((id, cur.to_string()));
+            }
         }
         let note = "Finished torrents keep seeding after playback ends (the \"Seed for\" timer starts then, not when the download completes) until a seeding limit is reached (both Off: stop at once). Seeding torrents are exempt from the cache size: they stay on disk until their limit is reached and the next release. Other stopped torrents stay on disk up to the cache size, and are cleared when the app starts.";
-        ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
+        caption(ui, note);
         if self.torrent.get().is_some() {
-            ui.label(RichText::new("A torrent has already played: restart the app to apply changes.").size(13.0).color(ui.visuals().weak_text_color()));
+            caption(ui, "A torrent has already played: restart the app to apply changes.");
         }
         if let Some(engine) = self.torrent.get() {
             ui.ctx().request_repaint_after(Duration::from_secs(2));
@@ -5002,7 +4587,7 @@ impl App {
                 ui.horizontal(|ui| {
                     if self.confirm_delete == Some(t.id) {
                         ui.label("Delete files?");
-                        if ui.small_button("Yes").clicked() {
+                        if small_button(ui, "Yes").clicked() {
                             self.confirm_delete = None;
                             // The engine also refuses the torrent being streamed; this covers a play that started after the prompt.
                             let res = if playing == Some(t.id) { Err(anyhow::anyhow!("torrent is playing")) } else { self.rt.block_on(engine.remove(t.id)) };
@@ -5010,10 +4595,10 @@ impl App {
                                 report(&mut self.error, e);
                             }
                         }
-                        if ui.small_button("No").clicked() {
+                        if small_button(ui, "No").clicked() {
                             self.confirm_delete = None;
                         }
-                    } else if playing != Some(t.id) && ui.small_button("Delete").on_hover_text("Stop and delete its files").clicked() {
+                    } else if playing != Some(t.id) && small_button(ui, "Delete").on_hover_text("Stop and delete its files").clicked() {
                         self.confirm_delete = Some(t.id);
                     }
                     let state = if t.paused { "stopped" } else { "running" };
@@ -5022,32 +4607,15 @@ impl App {
                 });
             }
         }
-        Self::row_title(ui, "Proxy");
-        let kinds = [("", "Off"), ("http", "HTTP"), ("socks5", "SOCKS5")];
-        ui.horizontal(|ui| {
-            ui.set_min_height(32.0);
-            let l = ui.label("Type:");
-            ui.add_space((150.0 - l.rect.width()).max(0.0));
-            let shown = kinds.iter().find(|k| k.0 == self.proxy[0]).map_or("Off", |k| k.1);
-            egui::ComboBox::from_id_salt("proxy_kind").selected_text(shown).show_ui(ui, |ui| {
-                for (k, name) in kinds {
-                    ui.selectable_value(&mut self.proxy[0], k.to_string(), name);
-                }
-            });
-        });
+        row_title(ui, "Proxy");
+        combo_row(ui, "Type:", &mut self.proxy[0], &[("Off", String::new()), ("HTTP", "http".to_string()), ("SOCKS5", "socks5".to_string())]);
         let mut apply = false;
         if !self.proxy[0].is_empty() {
-            ui.horizontal(|ui| {
-                ui.set_min_height(32.0);
-                let l = ui.label("Address:");
-                ui.add_space((150.0 - l.rect.width()).max(0.0));
-                ui.add(egui::TextEdit::singleline(&mut self.proxy[1]).hint_text("host:port").desired_width(260.0)).labelled_by(l.id);
+            field_row(ui, "Address:", |ui, l| {
+                ui.add(egui::TextEdit::singleline(&mut self.proxy[1]).hint_text("host:port").desired_width(260.0)).labelled_by(l);
             });
-            ui.horizontal(|ui| {
-                ui.set_min_height(32.0);
-                let l = ui.label("Username:");
-                ui.add_space((150.0 - l.rect.width()).max(0.0));
-                ui.add(egui::TextEdit::singleline(&mut self.proxy[2]).hint_text("optional").desired_width(160.0)).labelled_by(l.id);
+            field_row(ui, "Username:", |ui, l| {
+                ui.add(egui::TextEdit::singleline(&mut self.proxy[2]).hint_text("optional").desired_width(160.0)).labelled_by(l);
                 let l = ui.label("Password:");
                 ui.add(egui::TextEdit::singleline(&mut self.proxy[3]).password(true).desired_width(160.0)).labelled_by(l.id);
             });
@@ -5056,7 +4624,7 @@ impl App {
         match stremflix_rs::addon::proxy_url(kind, addr, user, pass) {
             Ok(_) => apply = primary_button(ui, "Save proxy").clicked(),
             Err(e) => {
-                ui.label(RichText::new(e).size(13.0).color(Color32::from_rgb(230, 90, 90)));
+                error_caption(ui, e);
             }
         }
         if apply {
@@ -5067,8 +4635,8 @@ impl App {
         let note = "Applies after a restart. HTTP covers addons, downloads, the update check and mpv streams, but not torrents. \
             SOCKS5 covers addons, downloads, the update check and torrent peers and HTTP trackers, but not mpv's direct HTTP streams \
             (mpv has no SOCKS support) or DHT. The password is stored unencrypted in the app's database.";
-        ui.label(RichText::new(note).size(13.0).color(ui.visuals().weak_text_color()));
-        Self::row_title(ui, "Player");
+        caption(ui, note);
+        row_title(ui, "Player");
         if form_row(ui, "External player:", &mut self.external_player, "vlc", "Save", Some("Command run with the stream URL; no shell"), true) {
             save.push(("external_player", self.external_player.trim().to_string()));
         }
@@ -5098,42 +4666,21 @@ impl App {
             if step != 0 {
                 style.scale = (style.scale * 10.0).round() / 10.0 + step as f64 * 0.1;
             }
-            ui.horizontal(|ui| {
-                ui.set_min_height(32.0);
-                ui.label(RichText::new("Subtitle color").size(15.0).color(ui.visuals().weak_text_color()));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    for (i, (name, hex)) in SUB_COLORS.iter().enumerate().rev() {
-                        if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::WHITE), style.color == i).clicked() {
-                            style.color = i;
-                        }
-                    }
-                });
-            });
-            ui.horizontal(|ui| {
-                ui.set_min_height(32.0);
-                ui.label(RichText::new("Subtitle outline").size(15.0).color(ui.visuals().weak_text_color()));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    for (i, (name, hex)) in SUB_OUTLINES.iter().enumerate().rev() {
-                        if swatch(ui, name, Color32::from_hex(hex).unwrap_or(Color32::BLACK), style.outline == i).clicked() {
-                            style.outline = i;
-                        }
-                    }
-                });
-            });
+            swatch_row(ui, "Subtitle color", &SUB_COLORS, &mut style.color);
+            swatch_row(ui, "Subtitle outline", &SUB_OUTLINES, &mut style.outline);
             style.pos += stepper(ui, "Subtitle position", &format!("{}%", style.pos)) as f64 * 5.0;
             switch_row(ui, "Subtitle background box", &mut style.background);
             style.delay += stepper(ui, "Subtitle delay", &format!("{:+.1}s", style.delay)) as f64 * 0.1;
-            if style.delay != 0.0 && ui.add(egui::Button::new(RichText::new("Reset delay").size(13.0).color(accent())).frame(false)).clicked() {
+            if style.delay != 0.0 && link_button(ui, "Reset delay").clicked() {
                 style.delay = 0.0;
             }
             let mut off = self.subs_off();
             if switch_row(ui, "Subtitles off by default", &mut off).changed() {
                 save.push(("sub_off", if off { "1" } else { "0" }.into()));
             }
-            ui.horizontal_wrapped(|ui| {
+            chip_row(ui, |ui| {
                 ui.set_min_height(32.0);
-                ui.label(RichText::new("Default speed").size(15.0).color(ui.visuals().weak_text_color()));
-                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                field_label(ui, "Default speed");
                 for sp in SPEEDS {
                     if pill(ui, &format!("{sp}x"), self.default_speed == sp, egui::Role::RadioButton).clicked() {
                         self.default_speed = sp;
@@ -5156,13 +4703,10 @@ impl App {
                 }
             }
         });
-        Self::row_title(ui, "Languages");
+        row_title(ui, "Languages");
         for (i, key, label) in [(0, "alang", "Audio:"), (1, "slang", "Subtitles:")] {
-            ui.horizontal(|ui| {
-                ui.set_min_height(32.0);
-                let l = ui.label(label);
-                ui.add_space((150.0 - l.rect.width()).max(0.0));
-                let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("en,eng").desired_width(400.0)).labelled_by(l.id);
+            field_row(ui, label, |ui, l| {
+                let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("en,eng").desired_width(400.0)).labelled_by(l);
                 match valid_langs(&self.langs[i]) {
                     Some(v) if r.changed() => {
                         // As in the player: a subtitle language preference turns subtitles back on after a remembered "Off".
@@ -5172,32 +4716,29 @@ impl App {
                         save.push((key, v));
                     }
                     None => {
-                        ui.label(RichText::new("Use codes like en,eng,pt-BR (max 8)").size(13.0).color(Color32::from_rgb(230, 90, 90)));
+                        error_caption(ui, "Use codes like en,eng,pt-BR (max 8)");
                     }
                     _ => {}
                 }
             });
         }
-        ui.label(RichText::new("Comma-separated, most preferred first. Also editable in the player.").size(13.0).color(ui.visuals().weak_text_color()));
-        Self::row_title(ui, "Network");
-        ui.horizontal(|ui| {
-            ui.set_min_height(32.0);
-            let l = ui.label("User-Agent:");
-            ui.add_space((150.0 - l.rect.width()).max(0.0));
-            let r = ui.add(egui::TextEdit::singleline(&mut self.user_agent).hint_text("stremflix-rs").desired_width(400.0)).labelled_by(l.id);
+        caption(ui, "Comma-separated, most preferred first. Also editable in the player.");
+        row_title(ui, "Network");
+        field_row(ui, "User-Agent:", |ui, l| {
+            let r = ui.add(egui::TextEdit::singleline(&mut self.user_agent).hint_text("stremflix-rs").desired_width(400.0)).labelled_by(l);
             match stremflix_rs::addon::valid_user_agent(&self.user_agent) {
                 Some(v) if r.changed() => {
                     stremflix_rs::addon::set_user_agent(&v);
                     save.push(("user_agent", v));
                 }
                 None => {
-                    ui.label(RichText::new(format!("Printable ASCII only, max {} characters", stremflix_rs::addon::MAX_UA_LEN)).size(13.0).color(Color32::from_rgb(230, 90, 90)));
+                    error_caption(ui, format!("Printable ASCII only, max {} characters", stremflix_rs::addon::MAX_UA_LEN));
                 }
                 _ => {}
             }
         });
-        ui.label(RichText::new("Sent to addons and for downloads. Empty uses the default. Torrent (librqbit) traffic is not covered.").size(13.0).color(ui.visuals().weak_text_color()));
-        Self::row_title(ui, "Customize Home");
+        caption(ui, "Sent to addons and for downloads. Empty uses the default. Torrent (librqbit) traffic is not covered.");
+        row_title(ui, "Customize Home");
         let (mut swap, mut toggle, mut reset) = (None, None, false);
         let n = self.home_all.len();
         for (i, (key, title)) in self.home_all.iter().enumerate() {
@@ -5216,7 +4757,7 @@ impl App {
             });
         }
         if self.home_all.is_empty() {
-            ui.label(RichText::new("No catalog rows yet.").weak());
+            muted(ui, "No catalog rows yet.");
         }
         if small_button(ui, "Reset").on_hover_text("Addon order, nothing hidden").clicked() {
             reset = true;
@@ -5259,7 +4800,7 @@ impl App {
         let (mut want, mut open, mut quick) = (Vec::new(), None, None);
         ui.horizontal(|ui| {
             ui.set_min_height(32.0);
-            ui.label(RichText::new("Saved titles").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+            section_heading(ui, "Saved titles");
             let before = self.lib_sort;
             egui::ComboBox::from_id_salt("lib_sort").selected_text(self.lib_sort.label()).show_ui(ui, |ui| {
                 for s in [LibSort::Added, LibSort::Title, LibSort::Watched, LibSort::Rating, LibSort::Year] {
@@ -5314,9 +4855,9 @@ impl App {
             .filter_map(SavedTitle::preview)
             .collect();
         if self.saved.is_empty() {
-            ui.label(RichText::new("Nothing saved yet. Open a title and choose \"Add to library\".").color(ui.visuals().weak_text_color()));
+            muted(ui, "Nothing saved yet. Open a title and choose \"Add to library\".");
         } else if items.is_empty() {
-            ui.label(RichText::new(if list.is_some() { "No titles match in this list." } else { "No saved titles match." }).color(ui.visuals().weak_text_color()));
+            muted(ui, if list.is_some() { "No titles match in this list." } else { "No saved titles match." });
         }
         self.ui_cards(ui, "saved", &items, &mut want, &mut open, &mut quick);
         for u in want {
@@ -5332,11 +4873,11 @@ impl App {
         }
         ui.separator();
         let mut cal_open = None;
-        egui::CollapsingHeader::new(RichText::new("Calendar").size(20.0).strong().family(bold())).id_salt("calendar").show(ui, |ui| {
+        egui::CollapsingHeader::new(heading_text(ui, "Calendar", 20.0)).id_salt("calendar").show(ui, |ui| {
             let live: Vec<_> = self.upcoming.iter().filter(|(m, _)| self.saved.iter().any(|t| t.key == format!("series:{}", m.id))).cloned().collect();
             let groups = calendar_groups(&live, unix_days());
             if groups.is_empty() {
-                ui.label(RichText::new("No upcoming episodes for saved series in the next 30 days (or still loading).").color(ui.visuals().weak_text_color()));
+                muted(ui, "No upcoming episodes for saved series in the next 30 days (or still loading).");
             }
             for (head, eps) in groups {
                 ui.label(RichText::new(head).strong());
@@ -5353,9 +4894,9 @@ impl App {
             self.open_meta(&ctx, m, false);
         }
         ui.separator();
-        ui.label(RichText::new("Downloads").size(20.0).strong().family(bold()).color(ui.visuals().strong_text_color()));
+        section_heading(ui, "Downloads");
         if self.downloads.is_empty() && self.queue.is_empty() {
-            ui.label(RichText::new("Nothing downloaded yet. Open a title and choose \"Download\" on a stream.").color(ui.visuals().weak_text_color()));
+            muted(ui, "Nothing downloaded yet. Open a title and choose \"Download\" on a stream.");
         }
         // (index, 0 pause, 1 resume, 2 remove)
         let mut act = None;
@@ -5601,8 +5142,8 @@ impl eframe::App for App {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.set_min_width(220.0);
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new("Recent searches").small().color(ui.visuals().weak_text_color()));
-                                    if ui.small_button("Clear").clicked() {
+                                    caption(ui, "Recent searches");
+                                    if small_button(ui, "Clear").clicked() {
                                         clear = true;
                                     }
                                 });
@@ -5642,7 +5183,7 @@ impl eframe::App for App {
                     for (i, name, len) in files.iter() {
                         ui.radio_value(sel, *i, format!("{}  ({})", sanitize_text(name, 120), fmt_size(*len)));
                     }
-                    if ui.button("Play").clicked() {
+                    if primary_button(ui, "Play").clicked() {
                         chosen = Some(*sel);
                     }
                 });
@@ -5653,27 +5194,21 @@ impl eframe::App for App {
             if let (Some(idx), Some((key, title, source, subs, _, _))) = (chosen, self.file_pick.take()) {
                 self.play(&ctx, key, title, format!("{source}&so={idx}"), subs);
             }
-            if let Some(e) = self.error.clone() {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Error: {e}")).color(Color32::from_rgb(230, 90, 90)));
-                    if ui.small_button("Dismiss").clicked() {
-                        self.error = None;
-                    }
-                });
+            if let Some(e) = self.error.clone()
+                && dismissible(ui, RichText::new(format!("Error: {e}")).color(ERROR))
+            {
+                self.error = None;
             }
-            if let Some(n) = self.notice.clone() {
-                ui.horizontal(|ui| {
-                    ui.label(n);
-                    if ui.small_button("Dismiss").clicked() {
-                        self.notice = None;
-                    }
-                });
+            if let Some(n) = self.notice.clone()
+                && dismissible(ui, n)
+            {
+                self.notice = None;
             }
             if let Some(url) = self.update.clone() {
                 ui.horizontal(|ui| {
                     ui.label("A new version is available.");
                     ui.hyperlink_to("Download", url);
-                    if ui.small_button("Dismiss").clicked() {
+                    if small_button(ui, "Dismiss").clicked() {
                         self.update = None;
                     }
                 });
@@ -5924,23 +5459,6 @@ const SEEK_STEP_RANGE: std::ops::RangeInclusive<u32> = 1..=600;
 /// Saved seek step in seconds; a missing, unparsable or out-of-range value falls back to `default`.
 fn seek_step(v: Option<String>, default: u32) -> u32 {
     v.and_then(|v| v.parse().ok()).filter(|v| SEEK_STEP_RANGE.contains(v)).unwrap_or(default)
-}
-
-/// Draw `text` as a QR code of egui rects (no image files); dark on white so phones scan it in any theme.
-fn qr_ui(ui: &mut egui::Ui, text: &str) {
-    let Ok(code) = qrcode::QrCode::new(text) else {
-        ui.label(RichText::new("Link too long for a QR code").weak());
-        return;
-    };
-    let (w, quiet, px) = (code.width(), 2, 4.0);
-    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat((w + 2 * quiet) as f32 * px), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
-    for (i, c) in code.to_colors().into_iter().enumerate() {
-        if c == qrcode::Color::Dark {
-            let p = rect.min + vec2(((i % w) + quiet) as f32, ((i / w) + quiet) as f32) * px;
-            ui.painter().rect_filled(egui::Rect::from_min_size(p, egui::Vec2::splat(px)), 0.0, Color32::BLACK);
-        }
-    }
 }
 
 #[cfg(test)]

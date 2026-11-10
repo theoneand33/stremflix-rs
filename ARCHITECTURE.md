@@ -10,6 +10,7 @@ src/torrent.rs  librqbit session + its HTTP streaming API on 127.0.0.1
 src/tray.rs     Tray icon (Show/Hide, Play/Pause, Quit): ksni StatusNotifierItem over D-Bus on Linux (no GTK), tray-icon on Windows/macOS
 src/stremio_import.rs  Reads a local Stremio's localStorage (WebKit SQLite or Chromium LevelDB via rusty-leveldb)
 src/main.rs     egui/eframe GUI; tokio runtime for network/torrent work, results via mpsc
+src/widgets.rs  Reusable egui widgets, theme and fonts; no app state or addon types
 test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed via librqbit.
 ```
 
