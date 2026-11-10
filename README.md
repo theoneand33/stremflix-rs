@@ -4,7 +4,7 @@
 # Stremflix-rs
 ![Home page with a hero title and a row of film posters](assets/screenshot.png)
 
-<small> Screenshot titles are the Blender Foundation's open movies (CC BY 3.0): Big Buck Bunny, Sintel, Tears of Steel, Elephants Dream, Cosmos Laundromat. </small>
+<small> Screenshot titles are the Blender Foundation's open movies (CC BY 3.0 and 4.0), resized: Big Buck Bunny, Sintel, Tears of Steel, Elephants Dream, Cosmos Laundromat. </small>
 
 </div>
 
