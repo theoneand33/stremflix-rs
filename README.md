@@ -7,6 +7,10 @@ A Rust desktop client for [Stremio addons](https://github.com/Stremio/stremio-ad
 
 The client ships with no content sources; you install every addon yourself. Design: [ARCHITECTURE.md](ARCHITECTURE.md) (egui, libmpv, librqbit). Planned work: [TODO.md](TODO.md).
 
+![Home page with a hero title and a row of film posters](assets/screenshot.png)
+
+Screenshot titles are the Blender Foundation's open movies (CC BY 3.0): Big Buck Bunny, Sintel, Tears of Steel, Elephants Dream, Cosmos Laundromat.
+
 ## Install
 
 Download a build from GitHub Releases (`stremflix-rs-<tag>-<target>`):
@@ -44,7 +48,7 @@ cargo test
 
 ### Addons and search
 
-Addons lists installed addons in priority order; Up/Down reorder them, and the stream list and Home rows follow. Details shows an addon's id, types, resources, and catalogs. Streams are grouped by addon. `externalUrl` streams open in the browser; `ytId` streams play through yt-dlp, as do the trailer buttons on a title's detail page (from `trailerStreams` or legacy `trailers`).
+Addons lists installed addons in priority order; Up/Down reorder them, and the stream list and Home rows follow. The All/Movies/Series switch orders metadata, streams, and subtitles per type; catalog rows and search keep the global order. Each addon shows whether it is reachable, timed out, or unreachable. Details shows an addon's id, types, resources, and catalogs. Streams are grouped by addon. `externalUrl` streams open in the browser; `ytId` streams play through yt-dlp, as do the trailer buttons on a title's detail page (from `trailerStreams` or legacy `trailers`).
 
 Press Enter in the header search to open a results page with one row for each catalog that supports the `search` extra. Rows fill in as addons reply.
 
@@ -66,11 +70,11 @@ For series, pick a season and episode. ⏭ in the player opens the next episode.
 | F, double-click | Full screen |
 | Esc | Leave full screen / back |
 
-The bottom-right buttons open the Audio, Subtitles, and Playback panels. Playback sets speed, repeat file, an A-B loop (set A and B at the current position), hardware decoding, and can hand the stream to an external player (command set in Settings; quote paths with spaces). For torrents, stay on the player screen while the external player streams: going back stops the torrent.
+A Skip button appears over intros, recaps, and credits. Spans come from the addon, chapter names, or TheIntroDB (looked up by IMDb id; a Settings switch turns it off, since it sends what you watch). The player menu has a sleep timer (15, 30, 60, or 90 min) that pauses playback, and Settings can pause playback while the window is minimized. The bottom-right buttons open the Audio, Subtitles, and Playback panels. Playback sets speed, repeat file, an A-B loop (set A and B at the current position), hardware decoding, and can hand the stream to an external player (command set in Settings; quote paths with spaces). For torrents, stay on the player screen while the external player streams: going back stops the torrent.
 
 ### Torrents
 
-Play a magnet or `.torrent` from Library → Torrent, drop a `.torrent` on the window, or paste a magnet with no text field focused (dragging magnet links doesn't work). Settings sets the torrent folder, a cache size, a connection profile (Soft 40 / Default 128 / Fast 300 peers), and download/upload speed limits. With no cache (the default), a torrent's files are deleted when playback stops.
+Play a magnet or `.torrent` from Library → Torrent, drop a `.torrent` on the window, or paste a magnet with no text field focused (dragging magnet links doesn't work). Settings sets the torrent folder, a cache size, a connection profile (Soft 40 / Default 128 / Fast 300 peers), and download/upload speed limits. With no cache (the default), a torrent's files are deleted when playback stops. Finished torrents keep seeding after playback until a ratio or time limit is reached (both Off by default: stop at once). Settings lists torrents with a Delete button.
 
 ### `stremio://` links
 
@@ -86,6 +90,10 @@ stremflix-rs 'stremio:///detail/movie/tt0111161'
 The same argument can be a magnet link, a `.torrent` path, or a local media file path: it plays in the running window (or a new one). `--help` prints usage; unknown flags exit with status 2. Use `--` before a file name that starts with `-`. Local media files open from the command line only (Finder file-open and non-UTF8 paths are not supported yet).
 
 Scheme registration: the Linux AppImage declares it (installed by AppImageLauncher or appimaged); macOS picks it up once `Stremflix-rs.app` is in Applications or opened; Windows registers it per user at start unless another app (e.g. Stremio) owns it.
+
+### Settings and recovery
+
+The app reopens on the tab you last used. Settings sets the HTTP User-Agent. If the last run did not exit cleanly, the next launch shows a notice. Startup also checks the database and reports corruption; neither blocks startup.
 
 ### Import from Stremio
 
