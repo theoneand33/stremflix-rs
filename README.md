@@ -112,6 +112,21 @@ Only the Linux Flatpak (Stremio 5) is tested against a real install; fixtures co
 
 Settings → Stremio account signs in to api.strem.io and copies the account's addons, library (as saved titles), and watched titles, on sign-in, at startup, and with Sync. Sync is one-way: nothing is uploaded, already installed addons are kept, and deletions on the account aren't removed here. Addons and library titles you remove here, and titles or episodes you mark unwatched, stay that way after a sync or import. The auth key is stored in the local DB (owner-only on Linux and macOS); Sign out clears it there and tries to sign the key out on the server. Account progress needs the stream that was playing, which the account doesn't hold, so it isn't copied.
 
+## Comparison with Stremio
+
+Stremflix-rs against the official Stremio desktop app (Flathub `com.stremio.Stremio` 1.2.2), each launched 10 times on Linux with an i7-10700KF, 32 GB RAM, a GeForce GTX 1070 Ti (driver 580.196.07), and a 1920x1080 Wayland desktop (both apps ran through XWayland). Stremflix-rs was a release build of commit `9308832` with a fresh data directory. Stremio was signed out. Values are medians.
+
+| | Stremflix-rs | Stremio | Difference |
+|---|---|---|---|
+| Time to first visible window | 0.08 s | 0.58 s | 7x faster |
+| Memory 15 s after launch, RSS | 136 MB | 1229 MB | 9x less |
+| Memory 15 s after launch, PSS | 86 MB | 1018 MB | 12x less |
+| Processes | 1 | 8 | 8x fewer |
+| CPU time in the first 15 s | 0.2 s | 4.5 s | 26x less |
+| On disk | 42 MB binary (plus libmpv) | 134 MB Flatpak app (plus runtime) | 3x smaller |
+
+Memory sums every process the app started. PSS splits shared pages between the processes that map them, so it is the fairer figure for Stremio's multi-process layout. "First visible window" is when a new window larger than 300x300 pixels is mapped, not when the first frame is painted, so it understates the time to a usable UI for both apps. Stremio loads its interface from the web, so its numbers also depend on the network. Stremio does more than this client: it bundles a streaming server and a full web UI. Nothing here measures playback, scrolling, search latency, or GPU load.
+
 ## End-to-end demo
 
 ```sh
