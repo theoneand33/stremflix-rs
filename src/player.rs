@@ -314,7 +314,7 @@ fn ipc_path(ipc: Option<std::ffi::OsString>, data: Option<std::ffi::OsString>) -
         return p.into();
     }
     match (cfg!(windows), data.map(PathBuf::from)) {
-        (true, Some(d)) => format!(r"\\.\pipe\stremflix-rs-mpv-{}", d.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>()).into(),
+        (true, Some(d)) => format!(r"\\.\pipe\stremflix-rs-mpv-{}", d.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c.to_string() } else { format!("_{:x}_", c as u32) }).collect::<String>()).into(),
         (true, None) => PathBuf::from(r"\\.\pipe\stremflix-rs-mpv"),
         (false, Some(d)) => d.join("mpv.sock"),
         (false, None) => std::env::temp_dir().join("stremflix-rs-mpv.sock"),
@@ -824,8 +824,10 @@ mod tests {
         assert_eq!(ipc_path(os("/x/custom"), os("/d")), PathBuf::from("/x/custom"));
         if cfg!(windows) {
             assert_eq!(ipc_path(None, None), PathBuf::from(r"\\.\pipe\stremflix-rs-mpv"));
-            assert_eq!(ipc_path(None, os(r"C:\d\a")), PathBuf::from(r"\\.\pipe\stremflix-rs-mpv-C__d_a"));
-            assert_ne!(ipc_path(None, os(r"C:\a\data")), ipc_path(None, os(r"D:\b\data")));
+            assert_eq!(ipc_path(None, os(r"C:\a")), PathBuf::from(r"\\.\pipe\stremflix-rs-mpv-C_3a__5c_a"));
+            for (a, b) in [(r"C:\a\data", r"D:\b\data"), (r"C:\a\data", r"C:\a_data"), (r"C:\my-app", r"C:\my_app")] {
+                assert_ne!(ipc_path(None, os(a)), ipc_path(None, os(b)), "{a} vs {b}");
+            }
         } else {
             assert_eq!(ipc_path(None, None), std::env::temp_dir().join("stremflix-rs-mpv.sock"));
             assert_eq!(ipc_path(None, os("/d/a")), PathBuf::from("/d/a/mpv.sock"));

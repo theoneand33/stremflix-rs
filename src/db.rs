@@ -602,6 +602,7 @@ impl Db {
     /// Imported progress keeps its original time (ISO 8601 `at`) and never overwrites newer local progress.
     pub fn import_progress(&self, p: &Progress, at: &str) -> Result<()> {
         // Removed or finished here at or after `at`: stays gone.
+        // shortcut: compares this machine's clock with the account's `_mtime`, so clock skew can revive or hide a copy; upgrade if the API ever gives a server time.
         let gone: Option<i64> = self.conn.query_row("SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'unprogress:' || ?1", [&p.key], |r| r.get(0)).optional()?;
         let when: Option<i64> = self.conn.query_row("SELECT unixepoch(?1)", [at], |r| r.get(0))?;
         if gone.is_some_and(|g| when.unwrap_or(0) <= g) {
