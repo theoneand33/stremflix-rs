@@ -456,3 +456,14 @@ fn opensubtitles_hash_and_subtitle_extras() {
     let extra = [("videoHash", "8e245d9679d31e12".to_string()), ("videoSize", "12".to_string()), ("filename", "a b&c=/../d.mkv".to_string())];
     assert_eq!(subtitles_path("series", "tt1:1:2", &extra), "subtitles/series/tt1%3A1%3A2/videoHash=8e245d9679d31e12&videoSize=12&filename=a%20b%26c%3D%2F..%2Fd.mkv.json");
 }
+
+#[test]
+fn resource_types_and_prefixes_override_the_manifest() {
+    let m = parse_manifest(br#"{"id":"a","version":"1","name":"n","types":["movie","series"],"idPrefixes":["tt"],
+      "resources":["catalog","meta",{"name":"stream","types":["series","anime"],"idPrefixes":["kitsu"]},{"name":"subtitles","types":[]}]}"#).unwrap();
+    assert!(m.serves("meta", "movie", "tt1") && !m.serves("meta", "movie", "kitsu:1"), "plain name: manifest lists");
+    assert!(m.serves("stream", "anime", "kitsu:1") && !m.serves("stream", "movie", "kitsu:1"), "resource types win");
+    assert!(!m.serves("stream", "series", "tt1"), "resource prefixes win");
+    assert!(m.serves("subtitles", "movie", "tt1"), "empty types fall back to the manifest's");
+    assert!(!m.serves("addon_catalog", "movie", "tt1"));
+}

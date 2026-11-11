@@ -170,6 +170,18 @@ impl Manifest {
     pub fn has_resource(&self, name: &str) -> bool {
         self.resources.iter().any(|r| r.name() == name)
     }
+
+    /// Whether the addon serves `res` for type `kind` and id `id`. A resource's own `types` / `idPrefixes`
+    /// replace the manifest-wide ones; absent or empty, the manifest's apply.
+    pub fn serves(&self, res: &str, kind: &str, id: &str) -> bool {
+        self.resources.iter().filter(|r| r.name() == res).any(|r| {
+            let (types, prefixes) = match r {
+                Resource::Full { types, id_prefixes, .. } => (if types.is_empty() { &self.types } else { types }, id_prefixes.as_ref().or(self.id_prefixes.as_ref())),
+                Resource::Name(_) => (&self.types, self.id_prefixes.as_ref()),
+            };
+            types.iter().any(|t| t == kind) && prefixes.is_none_or(|ps| ps.iter().any(|p| id.starts_with(p.as_str())))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

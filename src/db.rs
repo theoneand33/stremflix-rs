@@ -579,8 +579,16 @@ impl Db {
     }
 
     /// Drop a resume point without marking it watched (removes it from Continue Watching).
+    /// Remembered (`unprogress:<key>` = unix time), so an account sync doesn't bring back a resume point that is not newer.
     pub fn remove_progress(&self, key: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
+        self.transaction(|| {
+            self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
+            self.mark_unprogress(key)
+        })
+    }
+
+    fn mark_unprogress(&self, key: &str) -> Result<()> {
+        self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('unprogress:' || ?1, CAST(unixepoch() AS TEXT))", [key])?;
         Ok(())
     }
 
@@ -593,6 +601,12 @@ impl Db {
 
     /// Imported progress keeps its original time (ISO 8601 `at`) and never overwrites newer local progress.
     pub fn import_progress(&self, p: &Progress, at: &str) -> Result<()> {
+        // Removed or finished here at or after `at`: stays gone.
+        let gone: Option<i64> = self.conn.query_row("SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'unprogress:' || ?1", [&p.key], |r| r.get(0)).optional()?;
+        let when: Option<i64> = self.conn.query_row("SELECT unixepoch(?1)", [at], |r| r.get(0))?;
+        if gone.is_some_and(|g| when.unwrap_or(0) <= g) {
+            return Ok(());
+        }
         self.conn.execute(
             "INSERT INTO progress (key, title, source, position, duration, poster, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, coalesce(unixepoch(?7), 0))
@@ -639,6 +653,7 @@ impl Db {
             if on {
                 self.set_setting(&k, "1")?;
                 self.conn.execute("DELETE FROM progress WHERE key = ?1", [key])?;
+                self.mark_unprogress(key)?;
                 self.conn.execute("DELETE FROM settings WHERE key = ?1", [format!("unwatched:{key}")])?;
                 // The series' tombstone, `unwatched:<series key>` (10-char prefix).
                 self.conn.execute("DELETE FROM settings WHERE key LIKE 'unwatched:%' AND substr(?1, 1, length(key) - 9) = substr(key, 11) || ':'", [key])?;
