@@ -460,10 +460,11 @@ fn opensubtitles_hash_and_subtitle_extras() {
 #[test]
 fn resource_types_and_prefixes_override_the_manifest() {
     let m = parse_manifest(br#"{"id":"a","version":"1","name":"n","types":["movie","series"],"idPrefixes":["tt"],
-      "resources":["catalog","meta",{"name":"stream","types":["series","anime"],"idPrefixes":["kitsu"]},{"name":"subtitles","types":[]}]}"#).unwrap();
+      "resources":["catalog","meta",{"name":"stream","types":["series","anime"],"idPrefixes":["kitsu"]},{"name":"subtitles","types":[]},{"name":"addon_catalog","types":["movie"],"idPrefixes":[]}]}"#).unwrap();
     assert!(m.serves("meta", "movie", "tt1") && !m.serves("meta", "movie", "kitsu:1"), "plain name: manifest lists");
     assert!(m.serves("stream", "anime", "kitsu:1") && !m.serves("stream", "movie", "kitsu:1"), "resource types win");
     assert!(!m.serves("stream", "series", "tt1"), "resource prefixes win");
     assert!(m.serves("subtitles", "movie", "tt1"), "empty types fall back to the manifest's");
-    assert!(!m.serves("addon_catalog", "movie", "tt1"));
+    assert!(m.serves("addon_catalog", "movie", "tt1"), "empty prefixes fall back to the manifest's");
+    assert!(!m.serves("nope", "movie", "tt1"));
 }
