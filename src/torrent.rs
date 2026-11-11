@@ -436,4 +436,36 @@ mod tests {
         engine.remove(id).await.unwrap();
         assert!(engine.list().is_empty());
     }
+
+    #[tokio::test]
+    async fn finished_torrent_seeds_until_the_limit_then_pauses() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.mkv"), vec![7u8; 64 * 1024]).unwrap();
+        let t = librqbit::create_torrent(&src.join("a.mkv"), Default::default(), &librqbit::spawn_utils::BlockingSpawner::new(1)).await.unwrap();
+        let file = dir.path().join("a.torrent");
+        std::fs::write(&file, t.as_bytes().unwrap()).unwrap();
+        let seed = SeedLimit { ratio: 0.0, secs: 1 };
+        let engine = TorrentEngine::start(dir.path().join("dl"), false, u64::MAX, Profile::Default, (0, 0), seed).await.unwrap();
+        // The data is already in place, so the initial check finishes the torrent without peers.
+        std::fs::copy(src.join("a.mkv"), dir.path().join("dl/a.mkv")).unwrap();
+        let (_, id) = engine.stream_url(file.to_str().unwrap(), None, false).await.unwrap();
+        let h = engine.session.get(id.into()).unwrap();
+        for _ in 0..100 {
+            if h.stats().finished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(h.stats().finished, "initial check found the file");
+        engine.release_except(None).await;
+        assert!(!h.is_paused(), "finished and under the limit: keeps seeding");
+        engine.stop_seeded().await;
+        assert!(!h.is_paused(), "limit not reached yet");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        engine.stop_seeded().await;
+        assert!(h.is_paused(), "time limit reached: paused");
+        assert!(engine.seeding.lock().unwrap().is_empty(), "no longer tracked");
+    }
 }

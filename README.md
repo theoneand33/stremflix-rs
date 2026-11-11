@@ -42,7 +42,7 @@ cargo test
 |---|---|
 | `STREMFLIX_RS_DATA` | Data directory for the DB and torrents. Default: `$XDG_DATA_HOME/stremflix-rs` (`~/.local/share/stremflix-rs`), or `%APPDATA%\stremflix-rs` on Windows |
 | `STREMFLIX_RS_MPV_ARGS` | Extra mpv options, e.g. `--ao=null` for headless runs |
-| `STREMFLIX_RS_IPC` | mpv IPC endpoint. Default: `$TMPDIR/stremflix-rs-mpv.sock`, or `\\.\pipe\stremflix-rs-mpv` on Windows |
+| `STREMFLIX_RS_IPC` | mpv IPC endpoint. Default: `$TMPDIR/stremflix-rs-mpv.sock`, or `\\.\pipe\stremflix-rs-mpv` on Windows; with `STREMFLIX_RS_DATA` set, `<data>/mpv.sock` (pipe `stremflix-rs-mpv-<data path, non-alphanumerics hex-escaped>`) |
 | `STREMFLIX_RS_NO_DHT` | Disable the BitTorrent DHT (offline/CI) |
 
 ## Usage
@@ -140,7 +140,7 @@ STREMFLIX_RS_DATA=/tmp/stremflix-rs-demo STREMFLIX_RS_NO_DHT=1 cargo run --bin s
 3. Library: add the absolute path of `demo-media/library` and play test-pattern-local.
 4. Close and restart with the same command: Continue Watching resumes at the saved position.
 
-Query player state while it runs: `printf '{"command":["get_property","time-pos"]}\n' | socat - /tmp/stremflix-rs-mpv.sock`.
+Query player state while it runs: `printf '{"command":["get_property","time-pos"]}\n' | socat - /tmp/stremflix-rs-mpv.sock`. With `STREMFLIX_RS_DATA` set, use `<data>/mpv.sock`.
 
 ## Legal
 

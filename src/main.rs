@@ -2475,10 +2475,7 @@ impl App {
 
     /// URLs of installed addons serving `res` for this type and id.
     fn addons_for(&self, res: &str, kind: &str, id: &str) -> Vec<String> {
-        let matches = |m: &Manifest| {
-            m.has_resource(res) && m.types.iter().any(|t| t == kind) && m.id_prefixes.as_ref().is_none_or(|ps| ps.iter().any(|p| id.starts_with(p.as_str())))
-        };
-        let urls: Vec<String> = self.addons.iter().filter(|(_, m)| matches(m)).map(|(u, _)| u.clone()).collect();
+        let urls: Vec<String> = self.addons.iter().filter(|(_, m)| m.serves(res, kind, id)).map(|(u, _)| u.clone()).collect();
         order_urls(urls, self.addon_orders.get(kind).map_or(&[][..], |o| o))
     }
 
@@ -4600,9 +4597,17 @@ impl App {
                         if small_button(ui, "Yes").clicked() {
                             self.confirm_delete = None;
                             // The engine also refuses the torrent being streamed; this covers a play that started after the prompt.
-                            let res = if playing == Some(t.id) { Err(anyhow::anyhow!("torrent is playing")) } else { self.rt.block_on(engine.remove(t.id)) };
-                            if let Err(e) = res {
-                                report(&mut self.error, e);
+                            if playing == Some(t.id) {
+                                report(&mut self.error, "torrent is playing");
+                            } else {
+                                // Off the UI thread: deleting a big torrent's files can take a while.
+                                let (engine, id, tx, ctx) = (engine.clone(), t.id, self.tx.clone(), ui.ctx().clone());
+                                self.rt.spawn(async move {
+                                    if let Err(e) = engine.remove(id).await {
+                                        let _ = tx.send(Msg::Error(format!("{e:#}")));
+                                    }
+                                    ctx.request_repaint();
+                                });
                             }
                         }
                         if small_button(ui, "No").clicked() {

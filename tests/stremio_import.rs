@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use stremflix_rs::db::{Db, Watched};
+use stremflix_rs::db::{Db, Progress, Watched};
 use stremflix_rs::stremio_import::Import;
 use stremflix_rs::addon::Video;
 use stremflix_rs::stremio_import::{from_account, import, parse, read_storage, watched_episodes, watched_videos};
@@ -391,4 +391,21 @@ fn account_push_never_deletes_or_regresses() {
     assert_eq!(ids, ["tt3"], "tt1 older progress, tt2 removed on the account, tt9 account-only: none sent");
     assert_eq!(changes[0]["state"]["timeOffset"], 20000);
     assert_eq!(changes[0]["_mtime"], "2026-04-01T00:00:00.000Z");
+}
+
+#[test]
+fn removed_or_finished_progress_stays_gone_after_a_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("a.db")).unwrap();
+    let p = |key: &str| Progress { key: key.into(), title: "P".into(), source: "https://s.example/v".into(), position: 30.0, duration: 100.0, poster: None };
+    let (old, new) = ("2020-01-01T00:00:00.000Z", "2999-01-01T00:00:00.000Z");
+    db.import_progress(&p("movie:tt1"), old).unwrap();
+    db.remove_progress("movie:tt1").unwrap();
+    db.import_progress(&p("movie:tt1"), old).unwrap();
+    assert!(db.progress("movie:tt1").unwrap().is_none(), "removed here: an older account copy doesn't return");
+    db.import_progress(&p("movie:tt1"), new).unwrap();
+    assert!(db.progress("movie:tt1").unwrap().is_some(), "watched on another device later: it returns");
+    db.set_watched("movie:tt2", true).unwrap();
+    db.import_progress(&p("movie:tt2"), old).unwrap();
+    assert!(db.progress("movie:tt2").unwrap().is_none(), "finished here: an older account copy doesn't return");
 }

@@ -302,17 +302,23 @@ pub struct Player {
     pub state: State,
 }
 
-/// Fixed, documented socket path so external tools can query player state.
+/// Documented socket path so external tools can query player state. A custom `STREMFLIX_RS_DATA` gets its own
+/// (`<data>/mpv.sock`, pipe `stremflix-rs-mpv-<data path>`), so two instances never delete each other's socket.
+/// shortcut: a data path over ~100 bytes overflows the Unix socket limit; set `STREMFLIX_RS_IPC` then.
 pub fn ipc_socket_path() -> PathBuf {
-    std::env::var_os("STREMFLIX_RS_IPC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                PathBuf::from(r"\\.\pipe\stremflix-rs-mpv")
-            } else {
-                std::env::temp_dir().join("stremflix-rs-mpv.sock")
-            }
-        })
+    ipc_path(std::env::var_os("STREMFLIX_RS_IPC"), std::env::var_os("STREMFLIX_RS_DATA"))
+}
+
+fn ipc_path(ipc: Option<std::ffi::OsString>, data: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(p) = ipc {
+        return p.into();
+    }
+    match (cfg!(windows), data.map(PathBuf::from)) {
+        (true, Some(d)) => format!(r"\\.\pipe\stremflix-rs-mpv-{}", d.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c.to_string() } else { format!("_{:x}_", c as u32) }).collect::<String>()).into(),
+        (true, None) => PathBuf::from(r"\\.\pipe\stremflix-rs-mpv"),
+        (false, Some(d)) => d.join("mpv.sock"),
+        (false, None) => std::env::temp_dir().join("stremflix-rs-mpv.sock"),
+    }
 }
 
 fn cstr(s: &str) -> CString {
@@ -813,15 +819,18 @@ mod tests {
     }
 
     #[test]
-    fn default_ipc_path_per_platform() {
-        if std::env::var_os("STREMFLIX_RS_IPC").is_some() {
-            return;
-        }
-        let p = ipc_socket_path();
+    fn ipc_path_per_platform_and_data_dir() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(ipc_path(os("/x/custom"), os("/d")), PathBuf::from("/x/custom"));
         if cfg!(windows) {
-            assert_eq!(p, PathBuf::from(r"\\.\pipe\stremflix-rs-mpv"));
+            assert_eq!(ipc_path(None, None), PathBuf::from(r"\\.\pipe\stremflix-rs-mpv"));
+            assert_eq!(ipc_path(None, os(r"C:\a")), PathBuf::from(r"\\.\pipe\stremflix-rs-mpv-C_3a__5c_a"));
+            for (a, b) in [(r"C:\a\data", r"D:\b\data"), (r"C:\a\data", r"C:\a_data"), (r"C:\my-app", r"C:\my_app")] {
+                assert_ne!(ipc_path(None, os(a)), ipc_path(None, os(b)), "{a} vs {b}");
+            }
         } else {
-            assert_eq!(p, std::env::temp_dir().join("stremflix-rs-mpv.sock"));
+            assert_eq!(ipc_path(None, None), std::env::temp_dir().join("stremflix-rs-mpv.sock"));
+            assert_eq!(ipc_path(None, os("/d/a")), PathBuf::from("/d/a/mpv.sock"));
         }
     }
 
