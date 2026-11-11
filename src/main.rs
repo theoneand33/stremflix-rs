@@ -1115,11 +1115,15 @@ struct App {
     torrent_seed: SeedLimit,
     /// Torrent row in the manager awaiting a delete confirmation.
     confirm_delete: Option<usize>,
+    /// Downloaded file in Library awaiting a delete confirmation.
+    confirm_delete_dl: Option<PathBuf>,
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
     /// Settings > Data: path typed for an import, and the last export/import result.
     data_import: String,
     data_msg: Option<String>,
+    /// Settings > Diagnostics: where the last export went.
+    diag_msg: Option<String>,
     /// mpv hardware decoding.
     hwdec: bool,
     /// Custom Home row order and hidden rows (row keys).
@@ -1309,8 +1313,10 @@ impl App {
                 secs: db.setting("seed_secs")?.and_then(|v| v.parse().ok()).unwrap_or(0),
             },
             confirm_delete: None,
+            confirm_delete_dl: None,
             data_import: String::new(),
             data_msg: None,
+            diag_msg: None,
             external_player: db.setting("external_player")?.unwrap_or_else(|| "vlc".into()),
             hwdec: db.setting("hwdec")?.as_deref() != Some("0"),
             home_order: decode_keys(&db.setting("home_order")?.unwrap_or_default()),
@@ -2864,7 +2870,7 @@ impl App {
             Some(meta) => self.ui_hero(ui, &meta, &mut want, &mut open, &mut play),
             None if self.rows.is_empty() => {
                 ui.add_space(40.0);
-                ui.label(RichText::new("Install an addon with a catalog in Addons to start browsing.").size(18.0));
+                muted(ui, "Install an addon with a catalog in Addons to start browsing.");
             }
             None => {
                 ui.add_space(40.0);
@@ -3140,7 +3146,7 @@ impl App {
             .collect();
         if cats.is_empty() {
             ui.add_space(40.0);
-            ui.label(RichText::new("Install an addon with a catalog in Addons to start browsing.").size(18.0));
+            muted(ui, "Install an addon with a catalog in Addons to start browsing.");
             return;
         }
         let d = &mut self.discover;
@@ -3209,7 +3215,7 @@ impl App {
                 ui.spinner();
             }
             Some(items) if items.is_empty() => {
-                ui.label("Nothing in this catalog.");
+                muted(ui, "Nothing in this catalog.");
             }
             Some(items) => {
                 ui.horizontal_wrapped(|ui| {
@@ -4143,7 +4149,7 @@ impl App {
                 Ok(Msg::Imported(imp))
             });
         }
-        if ui.add_enabled_ui(!self.checking_updates && !self.addons.is_empty(), |ui| small_button(ui, if self.checking_updates { "Checking..." } else { "Check for updates" })).inner.clicked() {
+        if ui.add_enabled_ui(!self.checking_updates && !self.addons.is_empty(), |ui| small_button(ui, if self.checking_updates { "Checking…" } else { "Check for updates" })).inner.clicked() {
             self.checking_updates = true;
             let (client, urls) = (self.client.clone(), self.addons.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>());
             self.spawn(&ctx, async move {
@@ -4161,6 +4167,7 @@ impl App {
             });
         }
         ui.separator();
+        section_heading(ui, "Installed addons");
         let mut update = None;
         let mut remove = None;
         let mut configure = None;
@@ -4170,8 +4177,8 @@ impl App {
         let mut reset_order = false;
         ui.horizontal(|ui| {
             ui.set_min_height(32.0);
-            ui.label("Order for:");
-            for (k, label) in [("", "All"), ("movie", "Movies"), ("series", "Series")] {
+            field_label(ui, "Order for:");
+            for (k, label) in [("", "All"), ("movie", "Movies"), ("series", "Shows")] {
                 if pill(ui, label, self.addon_order_kind == k, egui::Role::RadioButton).clicked() {
                     self.addon_order_kind = k.to_string();
                 }
@@ -4490,7 +4497,7 @@ impl App {
             let mut go = false;
             field_row(ui, "Email:", |ui, l| {
                 ui.add(egui::TextEdit::singleline(&mut self.login.0).desired_width(260.0)).labelled_by(l);
-                let l = ui.label("Password:");
+                let l = field_label(ui, "Password:");
                 let r = ui.add(egui::TextEdit::singleline(&mut self.login.1).password(true).desired_width(200.0)).labelled_by(l.id);
                 go = ui.add_enabled_ui(!self.account_busy, |ui| primary_button(ui, "Sign in")).inner.clicked()
                     || !self.account_busy && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -4542,9 +4549,12 @@ impl App {
                 std::io::Write::write_all(&mut f, stremflix_rs::diag::bundle(&summary).as_bytes())
             });
             match res {
-                Ok(()) => self.data_msg = Some(format!("Diagnostics saved to {}", out.display())),
+                Ok(()) => self.diag_msg = Some(format!("Diagnostics saved to {}", out.display())),
                 Err(e) => report(&mut self.error, format!("diagnostics export: {e}")),
             }
+        }
+        if let Some(m) = &self.diag_msg {
+            caption(ui, m);
         }
         row_title(ui, "Torrents");
         let hint = self.data_dir.join("torrents").display().to_string();
@@ -4586,7 +4596,7 @@ impl App {
             for t in engine.list() {
                 ui.horizontal(|ui| {
                     if self.confirm_delete == Some(t.id) {
-                        ui.label("Delete files?");
+                        field_label(ui, "Delete files?");
                         if small_button(ui, "Yes").clicked() {
                             self.confirm_delete = None;
                             // The engine also refuses the torrent being streamed; this covers a play that started after the prompt.
@@ -4616,7 +4626,7 @@ impl App {
             });
             field_row(ui, "Username:", |ui, l| {
                 ui.add(egui::TextEdit::singleline(&mut self.proxy[2]).hint_text("optional").desired_width(160.0)).labelled_by(l);
-                let l = ui.label("Password:");
+                let l = field_label(ui, "Password:");
                 ui.add(egui::TextEdit::singleline(&mut self.proxy[3]).password(true).desired_width(160.0)).labelled_by(l.id);
             });
         }
@@ -4697,7 +4707,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.set_min_height(32.0);
             for (i, key, label) in [(0, "seek_step", "Arrow-key seek"), (1, "seek_step_shift", "Shift + arrow seek")] {
-                ui.label(label);
+                field_label(ui, label);
                 if ui.add(egui::DragValue::new(&mut self.seek_steps[i]).range(SEEK_STEP_RANGE).suffix(" s")).changed() {
                     save.push((key, self.seek_steps[i].to_string()));
                 }
@@ -4843,7 +4853,7 @@ impl App {
                 self.lists_changed(res);
             }
             let edit = ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Filter by title").desired_width(180.0));
-            if (edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape))) || (!self.lib_query.is_empty() && small_button(ui, "x").on_hover_text("Clear filter").clicked()) {
+            if (edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape))) || (!self.lib_query.is_empty() && small_button(ui, icons::X).on_hover_text("Clear filter").clicked()) {
                 self.lib_query.clear();
             }
         });
@@ -4942,8 +4952,16 @@ impl App {
                 if btn.on_disabled_hover_text("File is missing").clicked() {
                     play = Some(d.clone());
                 }
-                if small_button(ui, "Delete").clicked() {
-                    delete = Some(d.clone());
+                if self.confirm_delete_dl.as_ref() == Some(&d.path) {
+                    field_label(ui, "Delete file?");
+                    if small_button(ui, "Yes").clicked() {
+                        delete = Some(d.clone());
+                    }
+                    if small_button(ui, "No").clicked() {
+                        self.confirm_delete_dl = None;
+                    }
+                } else if small_button(ui, "Delete").on_hover_text("Delete the downloaded file").clicked() {
+                    self.confirm_delete_dl = Some(d.path.clone());
                 }
                 ui.label(d.path.display().to_string());
             });
@@ -4952,6 +4970,7 @@ impl App {
             self.play(&ctx, d.key(), d.title, d.path.to_string_lossy().into_owned(), vec![]);
         }
         if let Some(d) = delete {
+            self.confirm_delete_dl = None;
             let gone = std::fs::remove_file(&d.path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) });
             match gone.map_err(anyhow::Error::from).and_then(|()| self.db.remove_download(&d)) {
                 Ok(()) => {
@@ -4962,6 +4981,7 @@ impl App {
             }
         }
         ui.separator();
+        section_heading(ui, "Local files");
         let tip = "Or drop a .torrent file on the window, or paste a magnet anywhere";
         if form_row(ui, "Torrent:", &mut self.magnet, "magnet:?xt=urn:btih:... or /path/to/file.torrent", "Play torrent", Some(tip), false) {
             let m = self.magnet.clone();

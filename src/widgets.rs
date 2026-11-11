@@ -350,7 +350,7 @@ const LABEL_WIDTH: f32 = 150.0;
 pub fn field_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui, egui::Id) -> R) -> R {
     ui.horizontal(|ui| {
         ui.set_min_height(32.0);
-        let l = ui.label(label);
+        let l = field_label(ui, label);
         ui.add_space((LABEL_WIDTH - l.rect.width()).max(0.0));
         add(ui, l.id)
     })
