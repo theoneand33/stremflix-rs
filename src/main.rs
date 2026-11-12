@@ -2439,6 +2439,15 @@ impl App {
         self.search_page = Some(SearchPage { query, rows, failed: Vec::new() });
     }
 
+    /// A nav click. Home while already on Home also leaves the open title, like Back; from another tab it returns to that title.
+    fn go_tab(&mut self, tab: Tab) {
+        if tab == Tab::Home && self.tab == Tab::Home && self.selected.is_some() {
+            self.close_details();
+        }
+        self.tab = tab;
+        self.search_page = None;
+    }
+
     /// Leave the open title's page, dropping replies still on their way to it.
     fn close_details(&mut self) {
         (self.selected, self.details) = (None, None);
@@ -5155,8 +5164,7 @@ impl eframe::App for App {
                         sel_rect = Some(r.rect);
                     }
                     if r.clicked() {
-                        self.tab = tab;
-                        self.search_page = None;
+                        self.go_tab(tab);
                     }
                 }
                 if let Some(target) = sel_rect {
@@ -5972,6 +5980,18 @@ mod tests {
         assert!(app.player.is_none());
         app.handle(&ctx, Msg::Streams(m("b"), None, vec![], vec![], Autoplay::Off, None, 2));
         assert_eq!(app.selected.as_ref().map(|(m, ..)| m.id.as_str()), Some("b"), "current reply applies");
+    }
+
+    #[test]
+    fn home_on_home_leaves_the_title_page() {
+        let (_dir, mut app) = test_app();
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
+        app.selected = Some((m, vec![], vec![]));
+        app.tab = Tab::Library;
+        app.go_tab(Tab::Home);
+        assert!(app.selected.is_some(), "coming back from another tab returns to the title");
+        app.go_tab(Tab::Home);
+        assert!(app.selected.is_none());
     }
 
     #[test]
