@@ -109,6 +109,23 @@ fn malformed_manifests_rejected() {
     assert!(parse_manifest(&huge).is_err());
 }
 
+/// Addons written in languages that serialize an empty list as `null` (Go's nil slice) work in Stremio.
+#[test]
+fn null_lists_are_empty_lists() {
+    let m = parse_manifest(br#"{"id":"a","version":"1","name":"n","resources":["stream",{"name":"meta","types":null}],"types":["movie"],
+        "catalogs":[{"type":"movie","id":"c","extra":null,"extraSupported":null,"extraRequired":null}, 7]}"#)
+    .unwrap();
+    assert_eq!(m.catalogs.len(), 1, "the malformed entry is dropped, the rest kept");
+    assert!(!m.catalogs[0].requires_extra());
+    assert!(m.serves("meta", "movie", "tt1"), "null resource types fall back to the manifest's");
+    assert!(parse_manifest(br#"{"id":"a","version":"1","name":"n","resources":["stream"],"types":["movie"],"catalogs":null}"#).unwrap().catalogs.is_empty());
+    let s = parse_streams(br#"{"streams":[{"url":"https://a.example/v.mp4","sources":null}]}"#).unwrap();
+    assert_eq!(s.len(), 1);
+    // Numeric subtitle ids are kept as text.
+    let subs = parse_subtitles(br#"{"subtitles":[{"id":7,"url":"https://a.example/s.srt","lang":"eng"}]}"#).unwrap();
+    assert_eq!(subs[0].id.as_deref(), Some("7"));
+}
+
 #[test]
 fn catalog_parsing_drops_bad_entries() {
     let body = r#"{"metas": [

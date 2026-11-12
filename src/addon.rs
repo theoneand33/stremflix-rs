@@ -27,7 +27,7 @@ pub enum Resource {
     Name(String),
     Full {
         name: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "lenient_vec")]
         types: Vec<String>,
         #[serde(default, rename = "idPrefixes")]
         id_prefixes: Option<Vec<String>>,
@@ -49,12 +49,13 @@ pub struct CatalogDef {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
+    // Lists are lenient: addons that serialize an empty list as `null` work in Stremio.
+    #[serde(default, deserialize_with = "lenient_vec")]
     pub extra: Vec<ExtraDef>,
     /// Legacy form of `extra`.
-    #[serde(default, rename = "extraSupported")]
+    #[serde(default, rename = "extraSupported", deserialize_with = "lenient_vec")]
     pub extra_supported: Vec<String>,
-    #[serde(default, rename = "extraRequired")]
+    #[serde(default, rename = "extraRequired", deserialize_with = "lenient_vec")]
     pub extra_required: Vec<String>,
 }
 
@@ -122,7 +123,7 @@ pub struct Manifest {
     pub description: Option<String>,
     pub resources: Vec<Resource>,
     pub types: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_vec")]
     pub catalogs: Vec<CatalogDef>,
     /// Catalogs of other addons, served by the `addon_catalog` resource; malformed entries are dropped.
     #[serde(default, rename = "addonCatalogs", deserialize_with = "lenient_vec")]
@@ -308,7 +309,7 @@ pub struct Stream {
     #[serde(default)]
     pub description: Option<String>,
     /// e.g. "tracker:<url>", "dht:<hash>"; "peer:<host:port>" is a local extension.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_vec")]
     pub sources: Vec<String>,
     /// Page to open in the browser instead of playing; only http(s) is kept.
     #[serde(default, rename = "externalUrl")]
@@ -472,7 +473,7 @@ fn behavior_hints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BehaviorHint
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Subtitle {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_text")]
     pub id: Option<String>,
     pub url: String,
     pub lang: String,
