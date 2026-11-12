@@ -3716,200 +3716,205 @@ impl App {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         let title = match m { Menu::Audio => "Audio", Menu::Subtitles => "Subtitles", Menu::Playback => "Playback" };
                         ui.label(RichText::new(title).size(18.0).family(bold()).color(Color32::WHITE));
-                        if m != Menu::Playback {
-                            let (kind, prop) = if m == Menu::Audio { ("audio", "aid") } else { ("sub", "sid") };
-                            menu_heading(ui, "Track");
-                            let tracks: Vec<_> = st.tracks.iter().filter(|t| t.kind == kind).collect();
-                            let off = !tracks.iter().any(|t| t.selected);
-                            let entries: Vec<_> = (kind == "sub").then_some((None, "Off", None, off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.lang.as_deref(), t.selected))).collect();
-                            if entries.is_empty() {
-                                caption(ui, "No tracks");
-                            }
-                            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                                for (id, label, lang, sel) in entries {
-                                    if menu_row(ui, label, sel).clicked() {
-                                        let v = id.map_or("no".to_string(), |i| i.to_string());
-                                        cmd(&["set", prop, &v]);
-                                        // Remember the subtitle choice for the next video: Off, or the picked language first in `slang`.
-                                        if kind == "audio" {
-                                            // Remember the audio language: the picked track's language first in `alang`.
-                                            if let Some(v) = lang.and_then(|l| prefer_lang(&self.langs[0], l)) {
-                                                self.langs[0] = v.clone();
-                                                if let Err(e) = self.db.set_setting("alang", &v) {
-                                                    report(&mut self.error, format!("saving alang: {e:#}"));
+                        // Short windows: the body scrolls under the title instead of the popover running over the controls.
+                        // Both bounds: the Area's first-frame size guess would otherwise cap it lower.
+                        let body = (y - rect.top() - 140.0).max(120.0);
+                        egui::ScrollArea::vertical().id_salt("menu_body").max_height(body).min_scrolled_height(body).show(ui, |ui| {
+                            if m != Menu::Playback {
+                                let (kind, prop) = if m == Menu::Audio { ("audio", "aid") } else { ("sub", "sid") };
+                                menu_heading(ui, "Track");
+                                let tracks: Vec<_> = st.tracks.iter().filter(|t| t.kind == kind).collect();
+                                let off = !tracks.iter().any(|t| t.selected);
+                                let entries: Vec<_> = (kind == "sub").then_some((None, "Off", None, off)).into_iter().chain(tracks.iter().map(|t| (Some(t.id), t.label.as_str(), t.lang.as_deref(), t.selected))).collect();
+                                if entries.is_empty() {
+                                    caption(ui, "No tracks");
+                                }
+                                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                                    for (id, label, lang, sel) in entries {
+                                        if menu_row(ui, label, sel).clicked() {
+                                            let v = id.map_or("no".to_string(), |i| i.to_string());
+                                            cmd(&["set", prop, &v]);
+                                            // Remember the subtitle choice for the next video: Off, or the picked language first in `slang`.
+                                            if kind == "audio" {
+                                                // Remember the audio language: the picked track's language first in `alang`.
+                                                if let Some(v) = lang.and_then(|l| prefer_lang(&self.langs[0], l)) {
+                                                    self.langs[0] = v.clone();
+                                                    if let Err(e) = self.db.set_setting("alang", &v) {
+                                                        report(&mut self.error, format!("saving alang: {e:#}"));
+                                                    }
+                                                }
+                                            }
+                                            if kind == "sub" {
+                                                let mut save = vec![("sub_off", if id.is_none() { "1" } else { "0" }.to_string())];
+                                                // shortcut: name-only addon languages ("English") fail `valid_langs` and aren't remembered; map names to codes if users hit it.
+                                                if let Some(v) = lang.and_then(|l| prefer_lang(&self.langs[1], l)) {
+                                                    self.langs[1] = v.clone();
+                                                    save.push(("slang", v));
+                                                }
+                                                for (k, v) in save {
+                                                    if let Err(e) = self.db.set_setting(k, &v) {
+                                                        report(&mut self.error, format!("saving {k}: {e:#}"));
+                                                    }
                                                 }
                                             }
                                         }
-                                        if kind == "sub" {
-                                            let mut save = vec![("sub_off", if id.is_none() { "1" } else { "0" }.to_string())];
-                                            // shortcut: name-only addon languages ("English") fail `valid_langs` and aren't remembered; map names to codes if users hit it.
-                                            if let Some(v) = lang.and_then(|l| prefer_lang(&self.langs[1], l)) {
-                                                self.langs[1] = v.clone();
-                                                save.push(("slang", v));
+                                    }
+                                });
+                                if kind == "audio" {
+                                    style.audio_delay += stepper(ui, "Audio delay", &format!("{:+.1}s", style.audio_delay)) as f64 * 0.1;
+                                    if style.audio_delay != 0.0 && link_button(ui, "Reset delay").clicked() {
+                                        style.audio_delay = 0.0;
+                                    }
+                                }
+                                if kind == "sub" {
+                                    menu_heading(ui, "Search");
+                                    let s = &mut p.search;
+                                    if block_button(ui, if s.open { "Hide search" } else { "Search subtitles" }).clicked() {
+                                        s.open = !s.open;
+                                        search_req = s.open && s.results.is_empty() && !s.busy;
+                                    }
+                                    if s.open {
+                                        ui.add(egui::TextEdit::singleline(&mut s.filter).hint_text("Filter by language or addon").desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
+                                        let hits = filter_subs(&s.results, &s.filter);
+                                        let note = if s.busy { "Searching..." } else if hits.is_empty() { "No subtitles found" } else { "" };
+                                        if !note.is_empty() {
+                                            caption(ui, note);
+                                        }
+                                        egui::ScrollArea::vertical().id_salt("sub_search").max_height(200.0).show(ui, |ui| {
+                                            // shortcut: first 100 matches only; type a filter to narrow.
+                                            for f in hits.into_iter().take(100) {
+                                                ui.horizontal(|ui| {
+                                                    if small_button(ui, "Save").on_hover_text("Save next to the video or in downloads").clicked() {
+                                                        sub_act = Some((true, f.clone()));
+                                                    }
+                                                    if menu_row(ui, &format!("{} · {}", f.lang, f.addon), false).clicked() {
+                                                        sub_act = Some((false, f.clone()));
+                                                    }
+                                                });
                                             }
-                                            for (k, v) in save {
-                                                if let Err(e) = self.db.set_setting(k, &v) {
-                                                    report(&mut self.error, format!("saving {k}: {e:#}"));
-                                                }
+                                        });
+                                        if !s.status.is_empty() {
+                                            caption(ui, &s.status);
+                                        }
+                                    }
+                                    menu_heading(ui, "Style");
+                                    style.scale = (style.scale * 10.0).round() / 10.0 + stepper(ui, "Size", &format!("{:.1}x", style.scale)) as f64 * 0.1;
+                                    swatch_row(ui, "Color", &SUB_COLORS, &mut style.color);
+                                    swatch_row(ui, "Outline", &SUB_OUTLINES, &mut style.outline);
+                                    style.pos += stepper(ui, "Position", &format!("{}%", style.pos)) as f64 * 5.0;
+                                    switch_row(ui, "Background box", &mut style.background);
+                                    style.delay += stepper(ui, "Delay", &format!("{:+.1}s", style.delay)) as f64 * 0.1;
+                                    if style.delay != 0.0 && link_button(ui, "Reset delay").clicked() {
+                                        style.delay = 0.0;
+                                    }
+                                }
+                                let (i, key) = if kind == "audio" { (0, "alang") } else { (1, "slang") };
+                                menu_heading(ui, "Preferred languages");
+                                let valid = valid_langs(&self.langs[i]);
+                                let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("en,eng").desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
+                                r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, format!("Preferred {kind} languages")));
+                                if let Some(v) = &valid
+                                    && r.changed()
+                                    && let Err(e) = self.db.set_setting(key, v)
+                                {
+                                    report(&mut self.error, format!("saving {key}: {e:#}"));
+                                }
+                                // Typing a subtitle language preference turns subtitles back on after a remembered "Off".
+                                if kind == "sub"
+                                    && r.changed()
+                                    && valid_langs(&self.langs[1]).is_some_and(|v| !v.is_empty())
+                                    && let Err(e) = self.db.set_setting("sub_off", "0")
+                                {
+                                    report(&mut self.error, format!("saving sub_off: {e:#}"));
+                                }
+                                if valid.is_none() {
+                                    error_caption(ui, "Use codes like en,eng,pt-BR (max 8)");
+                                }
+                            } else {
+                                menu_heading(ui, "Speed");
+                                chip_row(ui, |ui| {
+                                    for sp in SPEEDS {
+                                        if pill(ui, &format!("{sp}x"), (st.speed - sp).abs() < 0.01, egui::Role::RadioButton).clicked() {
+                                            cmd(&["set", "speed", &sp.to_string()]);
+                                            // Also the starting speed of the next video, like the Default speed setting.
+                                            self.default_speed = sp;
+                                            if let Err(e) = self.db.set_setting("default_speed", &sp.to_string()) {
+                                                report(&mut self.error, format!("saving default_speed: {e:#}"));
                                             }
                                         }
                                     }
-                                }
-                            });
-                            if kind == "audio" {
-                                style.audio_delay += stepper(ui, "Audio delay", &format!("{:+.1}s", style.audio_delay)) as f64 * 0.1;
-                                if style.audio_delay != 0.0 && link_button(ui, "Reset delay").clicked() {
-                                    style.audio_delay = 0.0;
-                                }
-                            }
-                            if kind == "sub" {
-                                menu_heading(ui, "Search");
-                                let s = &mut p.search;
-                                if block_button(ui, if s.open { "Hide search" } else { "Search subtitles" }).clicked() {
-                                    s.open = !s.open;
-                                    search_req = s.open && s.results.is_empty() && !s.busy;
-                                }
-                                if s.open {
-                                    ui.add(egui::TextEdit::singleline(&mut s.filter).hint_text("Filter by language or addon").desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
-                                    let hits = filter_subs(&s.results, &s.filter);
-                                    let note = if s.busy { "Searching..." } else if hits.is_empty() { "No subtitles found" } else { "" };
-                                    if !note.is_empty() {
-                                        caption(ui, note);
+                                });
+                                menu_heading(ui, &match self.sleep {
+                                    Some((t, _)) => format!("Sleep timer ({} min left)", t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60)),
+                                    None => "Sleep timer".into(),
+                                });
+                                chip_row(ui, |ui| {
+                                    if pill(ui, "Off", self.sleep.is_none(), egui::Role::RadioButton).clicked() {
+                                        self.sleep = None;
                                     }
-                                    egui::ScrollArea::vertical().id_salt("sub_search").max_height(200.0).show(ui, |ui| {
-                                        // shortcut: first 100 matches only; type a filter to narrow.
-                                        for f in hits.into_iter().take(100) {
-                                            ui.horizontal(|ui| {
-                                                if small_button(ui, "Save").on_hover_text("Save next to the video or in downloads").clicked() {
-                                                    sub_act = Some((true, f.clone()));
-                                                }
-                                                if menu_row(ui, &format!("{} · {}", f.lang, f.addon), false).clicked() {
-                                                    sub_act = Some((false, f.clone()));
-                                                }
-                                            });
-                                        }
-                                    });
-                                    if !s.status.is_empty() {
-                                        caption(ui, &s.status);
-                                    }
-                                }
-                                menu_heading(ui, "Style");
-                                style.scale = (style.scale * 10.0).round() / 10.0 + stepper(ui, "Size", &format!("{:.1}x", style.scale)) as f64 * 0.1;
-                                swatch_row(ui, "Color", &SUB_COLORS, &mut style.color);
-                                swatch_row(ui, "Outline", &SUB_OUTLINES, &mut style.outline);
-                                style.pos += stepper(ui, "Position", &format!("{}%", style.pos)) as f64 * 5.0;
-                                switch_row(ui, "Background box", &mut style.background);
-                                style.delay += stepper(ui, "Delay", &format!("{:+.1}s", style.delay)) as f64 * 0.1;
-                                if style.delay != 0.0 && link_button(ui, "Reset delay").clicked() {
-                                    style.delay = 0.0;
-                                }
-                            }
-                            let (i, key) = if kind == "audio" { (0, "alang") } else { (1, "slang") };
-                            menu_heading(ui, "Preferred languages");
-                            let valid = valid_langs(&self.langs[i]);
-                            let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("en,eng").desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
-                            r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, format!("Preferred {kind} languages")));
-                            if let Some(v) = &valid
-                                && r.changed()
-                                && let Err(e) = self.db.set_setting(key, v)
-                            {
-                                report(&mut self.error, format!("saving {key}: {e:#}"));
-                            }
-                            // Typing a subtitle language preference turns subtitles back on after a remembered "Off".
-                            if kind == "sub"
-                                && r.changed()
-                                && valid_langs(&self.langs[1]).is_some_and(|v| !v.is_empty())
-                                && let Err(e) = self.db.set_setting("sub_off", "0")
-                            {
-                                report(&mut self.error, format!("saving sub_off: {e:#}"));
-                            }
-                            if valid.is_none() {
-                                error_caption(ui, "Use codes like en,eng,pt-BR (max 8)");
-                            }
-                        } else {
-                            menu_heading(ui, "Speed");
-                            chip_row(ui, |ui| {
-                                for sp in SPEEDS {
-                                    if pill(ui, &format!("{sp}x"), (st.speed - sp).abs() < 0.01, egui::Role::RadioButton).clicked() {
-                                        cmd(&["set", "speed", &sp.to_string()]);
-                                        // Also the starting speed of the next video, like the Default speed setting.
-                                        self.default_speed = sp;
-                                        if let Err(e) = self.db.set_setting("default_speed", &sp.to_string()) {
-                                            report(&mut self.error, format!("saving default_speed: {e:#}"));
+                                    for m in [15u64, 30, 60, 90] {
+                                        if pill(ui, &format!("{m} min"), self.sleep.is_some_and(|(_, c)| c == m), egui::Role::RadioButton).clicked() {
+                                            self.sleep = Some((Instant::now() + Duration::from_secs(m * 60), m));
                                         }
                                     }
-                                }
-                            });
-                            menu_heading(ui, &match self.sleep {
-                                Some((t, _)) => format!("Sleep timer ({} min left)", t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60)),
-                                None => "Sleep timer".into(),
-                            });
-                            chip_row(ui, |ui| {
-                                if pill(ui, "Off", self.sleep.is_none(), egui::Role::RadioButton).clicked() {
-                                    self.sleep = None;
-                                }
-                                for m in [15u64, 30, 60, 90] {
-                                    if pill(ui, &format!("{m} min"), self.sleep.is_some_and(|(_, c)| c == m), egui::Role::RadioButton).clicked() {
-                                        self.sleep = Some((Instant::now() + Duration::from_secs(m * 60), m));
-                                    }
-                                }
-                            });
-                            menu_heading(ui, "Video");
-                            chip_row(ui, |ui| {
-                                for (i, (name, v)) in ASPECTS.iter().enumerate() {
-                                    if pill(ui, name, p.aspect == i, egui::Role::RadioButton).clicked() {
-                                        p.aspect = i;
-                                        cmd(&["set", "video-aspect-override", v]);
-                                    }
-                                }
-                            });
-                            if switch_row(ui, "Fill screen (crop)", &mut p.fill).changed() {
-                                cmd(&["set", "panscan", if p.fill { "1.0" } else { "0.0" }]);
-                            }
-                            let step = stepper(ui, "Zoom", &if p.zoom == 0 { "0.0".into() } else { format!("{:+.1}", p.zoom as f64 / 10.0) });
-                            if step != 0 {
-                                p.zoom = (p.zoom + step).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
-                                cmd(&["set", "video-zoom", &zoom_value(p.zoom)]);
-                            }
-                            if p.zoom != 0 && link_button(ui, "Reset zoom").clicked() {
-                                p.zoom = 0;
-                                cmd(&["set", "video-zoom", "0"]);
-                            }
-                            menu_heading(ui, "Loop");
-                            chip_row(ui, |ui| {
-                                // A pill, not a switch row: the panel must stay short enough to clear the seek bar at 700 px.
-                                if pill(ui, "Repeat", p.repeat, egui::Role::CheckBox).clicked() {
-                                    p.repeat = !p.repeat;
-                                    cmd(&["set", "loop-file", if p.repeat { "inf" } else { "no" }]);
-                                }
-                                for (i, (name, prop)) in [("A", "ab-loop-a"), ("B", "ab-loop-b")].into_iter().enumerate() {
-                                    let label = p.ab[i].map_or(format!("Set {name}"), |t| format!("{name} {t:.0}s"));
-                                    if pill(ui, &label, p.ab[i].is_some(), egui::Role::Button).clicked() {
-                                        cmd(&["set", prop, &st.pos.to_string()]);
-                                        // Keep A before B so the labels match the loop mpv plays.
-                                        if set_ab(&mut p.ab, i, st.pos) {
-                                            cmd(&["set", "ab-loop-a", &p.ab[0].unwrap_or_default().to_string()]);
-                                            cmd(&["set", "ab-loop-b", &p.ab[1].unwrap_or_default().to_string()]);
+                                });
+                                menu_heading(ui, "Video");
+                                chip_row(ui, |ui| {
+                                    for (i, (name, v)) in ASPECTS.iter().enumerate() {
+                                        if pill(ui, name, p.aspect == i, egui::Role::RadioButton).clicked() {
+                                            p.aspect = i;
+                                            cmd(&["set", "video-aspect-override", v]);
                                         }
                                     }
+                                });
+                                if switch_row(ui, "Fill screen (crop)", &mut p.fill).changed() {
+                                    cmd(&["set", "panscan", if p.fill { "1.0" } else { "0.0" }]);
                                 }
-                                if pill(ui, "Clear", false, egui::Role::Button).clicked() {
-                                    p.ab = [None; 2];
-                                    cmd(&["set", "ab-loop-a", "no"]);
-                                    cmd(&["set", "ab-loop-b", "no"]);
+                                let step = stepper(ui, "Zoom", &if p.zoom == 0 { "0.0".into() } else { format!("{:+.1}", p.zoom as f64 / 10.0) });
+                                if step != 0 {
+                                    p.zoom = (p.zoom + step).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
+                                    cmd(&["set", "video-zoom", &zoom_value(p.zoom)]);
                                 }
-                            });
-                            menu_heading(ui, "Advanced");
-                            if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
-                                cmd(&["set", "hwdec", hwdec_value(self.hwdec)]);
-                                if let Err(e) = self.db.set_setting("hwdec", if self.hwdec { "1" } else { "0" }) {
-                                    report(&mut self.error, format!("saving hwdec: {e:#}"));
+                                if p.zoom != 0 && link_button(ui, "Reset zoom").clicked() {
+                                    p.zoom = 0;
+                                    cmd(&["set", "video-zoom", "0"]);
                                 }
+                                menu_heading(ui, "Loop");
+                                chip_row(ui, |ui| {
+                                    // A pill, not a switch row: the panel must stay short enough to clear the seek bar at 700 px.
+                                    if pill(ui, "Repeat", p.repeat, egui::Role::CheckBox).clicked() {
+                                        p.repeat = !p.repeat;
+                                        cmd(&["set", "loop-file", if p.repeat { "inf" } else { "no" }]);
+                                    }
+                                    for (i, (name, prop)) in [("A", "ab-loop-a"), ("B", "ab-loop-b")].into_iter().enumerate() {
+                                        let label = p.ab[i].map_or(format!("Set {name}"), |t| format!("{name} {t:.0}s"));
+                                        if pill(ui, &label, p.ab[i].is_some(), egui::Role::Button).clicked() {
+                                            cmd(&["set", prop, &st.pos.to_string()]);
+                                            // Keep A before B so the labels match the loop mpv plays.
+                                            if set_ab(&mut p.ab, i, st.pos) {
+                                                cmd(&["set", "ab-loop-a", &p.ab[0].unwrap_or_default().to_string()]);
+                                                cmd(&["set", "ab-loop-b", &p.ab[1].unwrap_or_default().to_string()]);
+                                            }
+                                        }
+                                    }
+                                    if pill(ui, "Clear", false, egui::Role::Button).clicked() {
+                                        p.ab = [None; 2];
+                                        cmd(&["set", "ab-loop-a", "no"]);
+                                        cmd(&["set", "ab-loop-b", "no"]);
+                                    }
+                                });
+                                menu_heading(ui, "Advanced");
+                                if switch_row(ui, "Hardware decoding", &mut self.hwdec).changed() {
+                                    cmd(&["set", "hwdec", hwdec_value(self.hwdec)]);
+                                    if let Err(e) = self.db.set_setting("hwdec", if self.hwdec { "1" } else { "0" }) {
+                                        report(&mut self.error, format!("saving hwdec: {e:#}"));
+                                    }
+                                }
+                                switch_row(ui, "Playback stats (I)", &mut p.stats);
+                                ui.add_space(8.0);
+                                external = block_button(ui, "Open in external player").on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
                             }
-                            switch_row(ui, "Playback stats (I)", &mut p.stats);
-                            ui.add_space(8.0);
-                            external = block_button(ui, "Open in external player").on_hover_text(format!("Pause here and open in: {}", self.external_player)).clicked();
-                        }
+                        });
                     });
                 });
             }
@@ -4172,19 +4177,23 @@ impl App {
         let mut swap = None;
         let mut details = None;
         let mut reset_order = false;
-        ui.horizontal(|ui| {
-            ui.set_min_height(32.0);
-            field_label(ui, "Order for");
-            for (k, label) in [("", "All"), ("movie", "Movies"), ("series", "Shows")] {
-                if pill(ui, label, self.addon_order_kind == k, egui::Role::RadioButton).clicked() {
-                    self.addon_order_kind = k.to_string();
+        if self.addons.is_empty() {
+            muted(ui, "No addons installed. Paste a manifest URL above or import from Stremio.");
+        } else {
+            ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
+                field_label(ui, "Order for");
+                for (k, label) in [("", "All"), ("movie", "Movies"), ("series", "Shows")] {
+                    if pill(ui, label, self.addon_order_kind == k, egui::Role::RadioButton).clicked() {
+                        self.addon_order_kind = k.to_string();
+                    }
                 }
-            }
-            if !self.addon_order_kind.is_empty() && self.addon_orders.get(&self.addon_order_kind).is_some_and(|o| !o.is_empty()) && small_button(ui, "Reset to global").clicked() {
-                reset_order = true;
-            }
-        });
-        caption(ui, "Per-type order applies to metadata, streams and subtitles; catalog rows and search keep the global order.");
+                if !self.addon_order_kind.is_empty() && self.addon_orders.get(&self.addon_order_kind).is_some_and(|o| !o.is_empty()) && small_button(ui, "Reset to global").clicked() {
+                    reset_order = true;
+                }
+            });
+            caption(ui, "Per-type order applies to metadata, streams and subtitles; catalog rows and search keep the global order.");
+        }
         let n = self.addons.len();
         let urls: Vec<String> = self.addons.iter().map(|(u, _)| u.clone()).collect();
         let view = arrange_rows(&urls, self.addon_orders.get(&self.addon_order_kind).map_or(&[][..], |o| o));
@@ -4223,6 +4232,7 @@ impl App {
                 }
                 Some(Ok(new)) if stremflix_rs::addon::is_newer(&new.version, &m.version) => {
                     ui.horizontal(|ui| {
+                        ui.set_min_height(32.0);
                         ui.label(format!("Update available: {} \u{2192} {}", m.version, new.version));
                         if small_button(ui, "Update").clicked() {
                             update = Some((url.clone(), new.clone()));
@@ -4453,6 +4463,7 @@ impl App {
         let ctx = ui.ctx().clone();
         if let Some(email) = self.account.clone() {
             ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
                 ui.label(format!("Signed in as {email}"));
                 let busy = self.account_busy;
                 if ui.add_enabled_ui(!busy, |ui| primary_button(ui, "Sync")).inner.on_hover_text("Copy the account's addons and library here").clicked() {
@@ -4919,6 +4930,7 @@ impl App {
         let mut act = None;
         for (i, j) in self.queue.iter().enumerate() {
             ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
                 ui.label(&j.d.title);
                 let (txt, frac) = match j.state {
                     State::Queued => ("Queued".to_string(), 0.0),
@@ -5167,6 +5179,7 @@ impl eframe::App for App {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.set_min_width(220.0);
                                 ui.horizontal(|ui| {
+                                    ui.set_min_height(32.0);
                                     caption(ui, "Recent searches");
                                     if small_button(ui, "Clear").clicked() {
                                         clear = true;
@@ -5231,6 +5244,7 @@ impl eframe::App for App {
             }
             if let Some(url) = self.update.clone() {
                 ui.horizontal(|ui| {
+                    ui.set_min_height(32.0);
                     ui.label("A new version is available.");
                     ui.hyperlink_to("Download", url);
                     if small_button(ui, "Dismiss").clicked() {
@@ -5247,7 +5261,8 @@ impl eframe::App for App {
                 ui.add_space(6.0);
             }
             // No shrinking: a page of narrow rows would pull the scroll bar in from the window edge.
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.tab {
+            // Own offset per tab and for the detail and search pages, so one page's scroll never carries into another.
+            egui::ScrollArea::vertical().id_salt((self.tab.name(), self.tab == Tab::Home && self.selected.is_some(), self.search_page.is_some())).auto_shrink(false).show(ui, |ui| match self.tab {
                 Tab::Home => self.ui_home(ui),
                 Tab::Discover => self.ui_discover(ui),
                 Tab::Addons => self.ui_addons(ui),
