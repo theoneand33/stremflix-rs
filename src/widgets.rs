@@ -459,7 +459,13 @@ pub fn form_row(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str, a
 /// Message with a Dismiss button after it; true when dismissed.
 pub fn dismissible(ui: &mut egui::Ui, message: impl Into<egui::WidgetText>) -> bool {
     ui.horizontal(|ui| {
-        ui.label(message);
+        // Row as tall as the button, so the message centers on it.
+        ui.set_min_height(32.0);
+        // Wrapped short of the edge: a long error would otherwise push Dismiss out of the window.
+        ui.scope(|ui| {
+            ui.set_max_width((ui.available_width() - 100.0).max(40.0));
+            ui.add(egui::Label::new(message).wrap());
+        });
         small_button(ui, "Dismiss").clicked()
     })
     .inner
@@ -623,6 +629,18 @@ mod tests {
         .drop_without_applying_deltas();
         assert_eq!(widths[0], widths[1]);
         assert!(cap > 600.0 && cap <= 720.0, "{cap}");
+    }
+
+    #[test]
+    fn long_dismissible_message_keeps_its_button_in_view() {
+        let (ctx, mut used, mut max) = (egui::Context::default(), 0.0, 0.0);
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0))), ..Default::default() };
+        ctx.run_ui(input, |ui| {
+            dismissible(ui, "error ".repeat(100));
+            (used, max) = (ui.min_rect().right(), ui.max_rect().right());
+        })
+        .drop_without_applying_deltas();
+        assert!(used <= max, "{used} > {max}");
     }
 
     #[test]
