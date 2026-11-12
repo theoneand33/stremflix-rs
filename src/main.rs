@@ -285,6 +285,8 @@ enum Msg {
     AddonCatalog(AddonCatalogSrc, Result<Vec<AddonEntry>, String>),
     /// Discover grid source and its items or error.
     Discover(DiscoverSrc, Result<Vec<MetaPreview>, String>),
+    /// Next page of the Discover grid: selection, the `skip` it was requested with, items.
+    DiscoverMore(DiscoverSrc, usize, Result<Vec<MetaPreview>, String>),
     /// meta, episode (series only), streams, subtitle URLs, what to autoplay on arrival,
     /// the `bingeGroup` to prefer (next episode), and the `nav` it was requested at
     Streams(MetaPreview, Option<Video>, Vec<Stream>, Subs, Autoplay, Option<String>, u64),
@@ -596,6 +598,18 @@ struct Discover {
     src: Option<DiscoverSrc>,
     /// `None` while loading.
     items: Option<Vec<MetaPreview>>,
+    /// Paging, as in [`Row`].
+    fetched: usize,
+    loading_more: bool,
+    exhausted: bool,
+}
+
+/// Add a catalog page to `items`, skipping ids already there and stopping at `ROW_CAP`. False when it added nothing.
+fn append_page(items: &mut Vec<MetaPreview>, page: Vec<MetaPreview>) -> bool {
+    let mut seen: std::collections::HashSet<String> = items.iter().map(|m| m.id.clone()).collect();
+    let before = items.len();
+    items.extend(page.into_iter().filter(|m| seen.insert(m.id.clone())).take(ROW_CAP - before));
+    items.len() > before
 }
 
 /// Player popover opened from its control-row button.
@@ -1715,11 +1729,7 @@ impl App {
                 match res {
                     Ok(page) => {
                         row.fetched += page.len();
-                        let items = row.items.get_or_insert_with(Vec::new);
-                        let mut seen: std::collections::HashSet<String> = items.iter().map(|m| m.id.clone()).collect();
-                        let before = items.len();
-                        items.extend(page.into_iter().filter(|m| seen.insert(m.id.clone())).take(ROW_CAP - before));
-                        row.exhausted = items.len() == before;
+                        row.exhausted = !append_page(row.items.get_or_insert_with(Vec::new), page);
                     }
                     Err(e) => {
                         row.exhausted = true;
@@ -1743,10 +1753,29 @@ impl App {
             Msg::Discover(src, res) => {
                 // Ignore replies for a selection the user has since changed.
                 if self.discover.src.as_ref() == Some(&src) {
-                    self.discover.items = Some(res.unwrap_or_else(|e| {
+                    let items = res.unwrap_or_else(|e| {
                         report(&mut self.error, format!("loading catalog: {e:#}"));
                         Vec::new()
-                    }));
+                    });
+                    (self.discover.fetched, self.discover.items) = (items.len(), Some(items));
+                }
+            }
+            Msg::DiscoverMore(src, skip, res) => {
+                // Ignore replies for a selection the user has since changed.
+                let d = &mut self.discover;
+                if d.src.as_ref() != Some(&src) || !d.loading_more || d.fetched != skip {
+                    return;
+                }
+                d.loading_more = false;
+                match res {
+                    Ok(page) => {
+                        d.fetched += page.len();
+                        d.exhausted = !append_page(d.items.get_or_insert_with(Vec::new), page);
+                    }
+                    Err(e) => {
+                        d.exhausted = true;
+                        report(&mut self.error, format!("loading more of the catalog: {e:#}"));
+                    }
                 }
             }
             Msg::Streams(meta, episode, streams, subs, autoplay, binge, nav) => {
@@ -3199,7 +3228,7 @@ impl App {
         }
     }
 
-    /// Pick a type, catalog and its extras (genre, year, sort, ...); the catalog's first page shows as a poster grid.
+    /// Pick a type, catalog and its extras (genre, year, sort, ...); the catalog shows as a poster grid that loads further pages as it scrolls.
     fn ui_discover(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let cats: Vec<(&String, &String, &CatalogDef)> = self
@@ -3229,8 +3258,10 @@ impl App {
         d.cat = (cur.0.clone(), cur.2.id.clone());
         d.extras = cur.2.valid_extras(&d.extras);
         let src = (d.cat.0.clone(), d.kind.clone(), d.cat.1.clone(), d.extras.clone());
+        let skippable = cur.2.supports("skip");
         if d.src.as_ref() != Some(&src) {
             (d.src, d.items) = (Some(src.clone()), None);
+            (d.fetched, d.loading_more, d.exhausted) = (0, false, false);
             let client = self.client.clone();
             self.spawn(&ctx, async move {
                 let res = client.discover(&src.0, &src.1, &src.2, &src.3).await.map_err(|e| format!("{e:#}"));
@@ -3273,7 +3304,7 @@ impl App {
             }
         });
         ui.add_space(12.0);
-        let (mut want, mut open, mut quick) = (Vec::new(), None, None);
+        let (mut want, mut open, mut quick, mut more) = (Vec::new(), None, None, None);
         match &self.discover.items {
             None => {
                 ui.spinner();
@@ -3282,9 +3313,12 @@ impl App {
                 muted(ui, "Nothing in this catalog.");
             }
             Some(items) => {
+                let mut near_end = false;
                 ui.horizontal_wrapped(|ui| {
-                    for m in items {
+                    for (i, m) in items.iter().enumerate() {
                         let (r, rect) = card(ui, CARD, &m.name);
+                        // About a row of cards before the end, so the next page is on its way when the grid runs out.
+                        near_end |= i + 6 >= items.len() && ui.is_rect_visible(r.rect);
                         self.paint_poster(ui, &r, rect, &m.poster, &m.name, &mut want);
                         if card_play(ui, &r, rect, &m.name) {
                             quick = Some(m.clone());
@@ -3294,7 +3328,22 @@ impl App {
                         }
                     }
                 });
+                let d = &self.discover;
+                if d.loading_more {
+                    ui.spinner();
+                } else if near_end && skippable && !d.exhausted && items.len() < ROW_CAP {
+                    more = d.src.clone().map(|s| (s, d.fetched));
+                }
             }
+        }
+        if let Some((src, skip)) = more {
+            self.discover.loading_more = true;
+            let client = self.client.clone();
+            self.spawn(&ctx, async move {
+                let extras: Vec<_> = src.3.iter().cloned().chain([("skip".to_string(), skip.to_string())]).collect();
+                let res = client.discover(&src.0, &src.1, &src.2, &extras).await.map_err(|e| format!("{e:#}"));
+                Ok(Msg::DiscoverMore(src, skip, res))
+            });
         }
         want.sort();
         want.dedup();
@@ -6180,6 +6229,25 @@ mod tests {
         let hit = MetaPreview { id: "x".into(), kind: "movie".into(), name: "x".into(), poster: None, background: None, description: None };
         app.handle(&ctx, Msg::Row(src, Ok(vec![hit])));
         assert!(app.rows[0].error.is_none() && app.rows[0].fetched == 1);
+    }
+
+    #[test]
+    fn discover_pages_append_until_one_adds_nothing() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let m = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
+        let src: DiscoverSrc = ("https://a.example/manifest.json".into(), "movie".into(), "c".into(), vec![]);
+        app.discover.src = Some(src.clone());
+        app.handle(&ctx, Msg::Discover(src.clone(), Ok(vec![m("a"), m("b")])));
+        app.handle(&ctx, Msg::DiscoverMore(src.clone(), 2, Ok(vec![m("c")])));
+        assert_eq!(app.discover.items.as_ref().map(Vec::len), Some(2), "no page was asked for");
+        app.discover.loading_more = true;
+        app.handle(&ctx, Msg::DiscoverMore(src.clone(), 2, Ok(vec![m("b"), m("c")])));
+        assert_eq!(app.discover.items.as_ref().map(Vec::len), Some(3), "the repeated title is skipped");
+        assert_eq!((app.discover.fetched, app.discover.loading_more, app.discover.exhausted), (4, false, false));
+        app.discover.loading_more = true;
+        app.handle(&ctx, Msg::DiscoverMore(src, 4, Ok(vec![m("c")])));
+        assert!(app.discover.exhausted);
     }
 
     #[test]
