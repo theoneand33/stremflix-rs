@@ -343,6 +343,8 @@ struct Row {
     loading_more: bool,
     /// Last page was empty, had nothing new, or failed.
     exhausted: bool,
+    /// Why the first page failed; a Home row shows it with a Retry.
+    error: Option<String>,
 }
 
 /// What the search results page shows.
@@ -1697,11 +1699,12 @@ impl App {
             }
             Msg::Row(src, res) => {
                 let Some(row) = self.rows.iter_mut().find(|r| r.src == src) else { return };
-                row.items = Some(res.unwrap_or_else(|e| {
-                    report(&mut self.error, format!("loading {}: {e:#}", row.title));
-                    Vec::new()
-                }));
-                row.fetched = row.items.as_ref().map_or(0, Vec::len);
+                // A failure stays on its row (with a Retry), not in the page-wide error banner.
+                let (items, error) = match res {
+                    Ok(items) => (items, None),
+                    Err(e) => (Vec::new(), Some(e)),
+                };
+                (row.fetched, row.items, row.error) = (items.len(), Some(items), error);
             }
             Msg::More(src, skip, res) => {
                 // Ignore replies for a row that was rebuilt or advanced since the request.
@@ -2358,7 +2361,7 @@ impl App {
             .into_iter()
             .map(|(title, i)| {
                 let (u, _, c) = cats[i];
-                Row { title, src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: c.supports("skip"), fetched: 0, loading_more: false, exhausted: false }
+                Row { title, src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: c.supports("skip"), fetched: 0, loading_more: false, exhausted: false, error: None }
             })
             .collect();
         let keys: Vec<String> = rows.iter().map(|r| row_key(&r.src)).collect();
@@ -2367,13 +2370,18 @@ impl App {
         self.home_all = ordered.iter().map(|r| (row_key(&r.src), r.title.clone())).collect();
         self.rows = ordered.into_iter().filter(|r| !self.home_hidden.contains(&row_key(&r.src))).collect();
         for src in self.rows.iter().map(|r| r.src.clone()).collect::<Vec<_>>() {
-            let client = self.client.clone();
-            self.spawn(ctx, async move {
-                let res = client.catalog(&src.0, &src.1, &src.2, 0).await.map_err(|e| format!("{e:#}"));
-                Ok(Msg::Row(src, res))
-            });
+            self.fetch_row(ctx, src);
         }
         self.fetch_new_episodes(ctx);
+    }
+
+    /// Ask for the first page of a Home row.
+    fn fetch_row(&self, ctx: &egui::Context, src: (String, String, String)) {
+        let client = self.client.clone();
+        self.spawn(ctx, async move {
+            let res = client.catalog(&src.0, &src.1, &src.2, 0).await.map_err(|e| format!("{e:#}"));
+            Ok(Msg::Row(src, res))
+        });
     }
 
     /// Ask a meta addon for the episodes of each saved series and keep those released recently.
@@ -2423,7 +2431,7 @@ impl App {
             .iter()
             .filter(|(_, m)| m.has_resource("catalog"))
             .flat_map(|(u, m)| {
-                m.catalogs.iter().filter(|c| c.searchable()).map(move |c| Row { title: catalog_title(&m.name, c), src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false })
+                m.catalogs.iter().filter(|c| c.searchable()).map(move |c| Row { title: catalog_title(&m.name, c), src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false, error: None })
             })
             .collect();
         if rows.is_empty() {
@@ -3086,10 +3094,22 @@ impl App {
                 });
             });
         }
-        let mut more = Vec::new();
+        let (mut more, mut retry) = (Vec::new(), Vec::new());
         for row in &self.rows {
             match &row.items {
-                Some(items) if items.is_empty() => continue,
+                Some(items) if items.is_empty() => {
+                    if let Some(e) = &row.error {
+                        row_title(ui, &row.title);
+                        ui.horizontal(|ui| {
+                            ui.set_min_height(32.0);
+                            if small_button(ui, "Retry").clicked() {
+                                retry.push(row.src.clone());
+                            }
+                            // Last and truncated: a long error would push the button out of the window.
+                            ui.add(egui::Label::new(RichText::new(format!("Couldn't load: {e}")).color(ui.visuals().weak_text_color())).truncate()).on_hover_text(e);
+                        });
+                    }
+                }
                 Some(items) => {
                     row_title(ui, &row.title);
                     let near_end = self.ui_cards(ui, &row.title, items, &mut want, &mut open, &mut quick);
@@ -3102,6 +3122,12 @@ impl App {
                     ui.spinner();
                 }
             }
+        }
+        for src in retry {
+            if let Some(row) = self.rows.iter_mut().find(|r| r.src == src) {
+                (row.items, row.error) = (None, None);
+            }
+            self.fetch_row(&ctx, src);
         }
         for (src, skip) in more {
             if let Some(row) = self.rows.iter_mut().find(|r| r.src == src) {
@@ -5942,7 +5968,7 @@ mod tests {
     #[test]
     fn row_wants_more_only_when_it_can() {
         let m = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
-        let row = Row { title: String::new(), src: Default::default(), items: Some(vec![m("a")]), skippable: true, fetched: 1, loading_more: false, exhausted: false };
+        let row = Row { title: String::new(), src: Default::default(), items: Some(vec![m("a")]), skippable: true, fetched: 1, loading_more: false, exhausted: false, error: None };
         assert!(row.wants_more(true));
         assert!(!row.wants_more(false), "not near the end");
         assert!(!Row { skippable: false, ..clone_row(&row) }.wants_more(true), "no skip extra");
@@ -5953,7 +5979,7 @@ mod tests {
     }
 
     fn clone_row(r: &Row) -> Row {
-        Row { title: String::new(), src: Default::default(), items: r.items.clone(), skippable: r.skippable, fetched: r.fetched, loading_more: r.loading_more, exhausted: r.exhausted }
+        Row { title: String::new(), src: Default::default(), items: r.items.clone(), skippable: r.skippable, fetched: r.fetched, loading_more: r.loading_more, exhausted: r.exhausted, error: None }
     }
 
     #[test]
@@ -6096,7 +6122,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         let ctx = egui::Context::default();
         let src = |id: &str| ("https://a.example/manifest.json".to_string(), "movie".to_string(), id.to_string());
-        let row = |id: &str| Row { title: id.into(), src: src(id), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false };
+        let row = |id: &str| Row { title: id.into(), src: src(id), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false, error: None };
         let hit = MetaPreview { id: "x".into(), kind: "movie".into(), name: "x".into(), poster: None, background: None, description: None };
         app.search_page = Some(SearchPage { query: "new".into(), rows: vec![row("a"), row("b")], failed: vec![] });
         app.handle(&ctx, Msg::Search("old".into(), src("a"), Ok(vec![hit.clone()])));
@@ -6109,6 +6135,20 @@ mod tests {
         app.search_page = Some(SearchPage { query: "new".into(), rows: vec![row("a")], failed: vec![] });
         app.handle(&ctx, Msg::Search("new".into(), src("a"), Err("boom".into())));
         assert!(app.error.as_deref().is_some_and(|e| e.contains("boom")), "every catalog failed");
+    }
+
+    #[test]
+    fn failed_home_row_keeps_its_error_until_a_reply_succeeds() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let src = ("https://a.example/manifest.json".to_string(), "movie".to_string(), "c".to_string());
+        app.rows = vec![Row { title: "c".into(), src: src.clone(), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false, error: None }];
+        app.handle(&ctx, Msg::Row(src.clone(), Err("boom".into())));
+        assert_eq!(app.rows[0].error.as_deref(), Some("boom"));
+        assert!(app.error.is_none(), "one failed row is not a page-wide error");
+        let hit = MetaPreview { id: "x".into(), kind: "movie".into(), name: "x".into(), poster: None, background: None, description: None };
+        app.handle(&ctx, Msg::Row(src, Ok(vec![hit])));
+        assert!(app.rows[0].error.is_none() && app.rows[0].fetched == 1);
     }
 
     #[test]
