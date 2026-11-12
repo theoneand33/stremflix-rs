@@ -4710,6 +4710,7 @@ impl App {
             caption(ui, m);
         }
         row_title(ui, "Diagnostics");
+        caption(ui, format!("Version {}", stremflix_rs::diag::version()));
         let out = self.data_dir.join("diagnostics.txt");
         if small_button(ui, "Export diagnostics").on_hover_text(format!("Version, OS and recent log without secrets, saved to {}", out.display())).clicked() {
             let summary = format!("addons: {}\nsigned in: {}", self.addons.len(), self.account.is_some());
