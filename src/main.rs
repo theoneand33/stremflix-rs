@@ -313,7 +313,8 @@ enum Msg {
     /// Account auth key an upload ran with, and its summary or the error.
     Uploaded(String, Result<String, String>),
     /// Library folder and its scanned media files.
-    Scanned(PathBuf, Result<Vec<LibraryItem>, String>),
+    /// Folder, whether it was a rescan of a listed folder (dropped if the folder was removed meanwhile), items.
+    Scanned(PathBuf, bool, Result<Vec<LibraryItem>, String>),
     /// Release page of a newer build, if any.
     Update(Option<String>),
     /// A `stremio://` link from the command line, a later launch, or macOS.
@@ -2082,7 +2083,10 @@ impl App {
                 }
                 self.pump_downloads(ctx);
             }
-            Msg::Scanned(dir, res) => {
+            Msg::Scanned(dir, rescan, res) => {
+                if rescan && !self.library_folders.contains(&dir.to_string_lossy().into_owned()) {
+                    return;
+                }
                 let saved = res.map_err(anyhow::Error::msg).and_then(|items| {
                     self.db.add_library_folder(&dir, &items)?;
                     self.db.set_setting("last_folder", &dir.to_string_lossy())?;
@@ -2193,14 +2197,14 @@ impl App {
     }
 
     /// Scan `dir` off the UI thread (a big folder or network share can take minutes); the reply replaces its library items.
-    fn scan_folder(&self, ctx: &egui::Context, dir: PathBuf) {
+    fn scan_folder(&self, ctx: &egui::Context, dir: PathBuf, rescan: bool) {
         self.spawn(ctx, async move {
             let res = tokio::task::spawn_blocking({
                 let dir = dir.clone();
                 move || scan(&dir).map_err(|e| e.to_string())
             })
             .await?;
-            Ok(Msg::Scanned(dir, res))
+            Ok(Msg::Scanned(dir, rescan, res))
         });
     }
 
@@ -5184,7 +5188,7 @@ impl App {
             self.play_torrent(&ctx, &m);
         }
         if form_row(ui, "Folder path", &mut self.folder, "/path/to/videos", "Add folder", None, false) {
-            self.scan_folder(&ctx, PathBuf::from(self.folder.trim()));
+            self.scan_folder(&ctx, PathBuf::from(self.folder.trim()), false);
         }
         let (mut rescan, mut forget) = (None, None);
         for f in &self.library_folders {
@@ -5201,7 +5205,7 @@ impl App {
             });
         }
         if let Some(f) = rescan {
-            self.scan_folder(&ctx, PathBuf::from(f));
+            self.scan_folder(&ctx, PathBuf::from(f), true);
         }
         if let Some(f) = forget {
             match self.db.remove_library_folder(&f) {
@@ -6190,6 +6194,17 @@ mod tests {
         assert!(app.player.is_none());
         app.handle(&ctx, Msg::Streams(m("b"), None, vec![], vec![], Autoplay::Off, None, 2));
         assert_eq!(app.selected.as_ref().map(|(m, ..)| m.id.as_str()), Some("b"), "current reply applies");
+    }
+
+    #[test]
+    fn a_rescan_reply_for_a_removed_folder_is_dropped() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let item = LibraryItem { path: "/a/1.mp4".into(), title: "1".into() };
+        app.handle(&ctx, Msg::Scanned("/a".into(), true, Ok(vec![item.clone()])));
+        assert!(app.library.is_empty() && app.library_folders.is_empty(), "folder was removed before the reply");
+        app.handle(&ctx, Msg::Scanned("/a".into(), false, Ok(vec![item])));
+        assert_eq!(app.library_folders, ["/a"], "adding a folder still works");
     }
 
     #[test]
