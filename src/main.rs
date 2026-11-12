@@ -2951,8 +2951,9 @@ impl App {
                 ui.spinner();
             }
         }
+        let mut person = None;
         if let Some(d) = self.selected_details()
-            && let Some(t) = Self::ui_details(ui, d)
+            && let Some(t) = Self::ui_details(ui, d, &mut person)
             && let Some(src) = t.source()
         {
             // Not `play`: its `nav` bump would drop the title's still-loading streams and episodes.
@@ -3226,6 +3227,10 @@ impl App {
         if let Some(p) = resume {
             self.open_progress(&ctx, p);
         }
+        if let Some(name) = person {
+            self.search = name;
+            self.search(&ctx);
+        }
     }
 
     /// Pick a type, catalog and its extras (genre, year, sort, ...); the catalog shows as a poster grid that loads further pages as it scrolls.
@@ -3493,8 +3498,8 @@ impl App {
     }
 
     /// Detail facts under the banner: year, runtime, rating, genres, cast, director, links, trailers.
-    /// Returns the trailer the user clicked.
-    fn ui_details<'a>(ui: &mut egui::Ui, d: &'a Meta) -> Option<&'a Stream> {
+    /// Returns the trailer the user clicked; a clicked cast or director name goes to `search`.
+    fn ui_details<'a>(ui: &mut egui::Ui, d: &'a Meta, search: &mut Option<String>) -> Option<&'a Stream> {
         ui.add_space(14.0);
         let gray = ui.visuals().weak_text_color();
         let facts: Vec<String> = [d.release_info.clone(), d.runtime.clone(), d.imdb_rating.as_ref().map(|r| format!("IMDb {r}"))]
@@ -3507,7 +3512,19 @@ impl App {
         }
         for (name, list) in [("Cast", &d.cast), ("Director", &d.director)] {
             if !list.is_empty() {
-                ui.add(egui::Label::new(RichText::new(format!("{name}: {}", list.join(", "))).size(15.0).color(gray)).wrap());
+                ui.horizontal_wrapped(|ui| {
+                    // Flush: the separators carry their own spaces.
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label(RichText::new(format!("{name}: ")).size(15.0).color(gray));
+                    for (i, person) in list.iter().enumerate() {
+                        if i > 0 {
+                            ui.label(RichText::new(", ").size(15.0).color(gray));
+                        }
+                        if ui.link(RichText::new(person).size(15.0)).on_hover_text(format!("Search for {person}")).clicked() {
+                            *search = Some(person.clone());
+                        }
+                    }
+                });
             }
         }
         if !d.links.is_empty() {
