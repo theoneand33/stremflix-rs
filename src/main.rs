@@ -665,11 +665,17 @@ fn fmt_size(b: u64) -> String {
 }
 
 /// Episode row: number, title, release date.
-fn episode_row(ui: &mut egui::Ui, v: &Video, watched: bool) -> egui::Response {
+fn episode_row(ui: &mut egui::Ui, v: &Video, watched: bool, today: &str) -> egui::Response {
     let n = v.episode.unwrap_or(0) as usize;
     let head = v.title.clone().unwrap_or_else(|| format!("Episode {n}"));
-    let date: String = v.released.as_deref().map(|d| d.chars().take(10).collect()).unwrap_or_default();
+    let date = episode_date(v.released.as_deref(), today);
     list_row(ui, n, if watched { format!("{head}  {}", icons::CHECK) } else { head }, date, EPISODE_BUTTON.x + 12.0)
+}
+
+/// An episode's release day, marked when it is after `today` (both `YYYY-MM-DD`): addons list episodes before they air, with no streams yet.
+fn episode_date(released: Option<&str>, today: &str) -> String {
+    let day: String = released.map(|d| d.chars().take(10).collect()).unwrap_or_default();
+    if day.as_str() > today { format!("Airs {day}") } else { day }
 }
 
 /// Size of the "Mark watched" pill overlaid on episode rows, left of the play circle.
@@ -3042,10 +3048,11 @@ impl App {
                 }
             });
             ui.add_space(8.0);
+            let today = date_string(unix_days());
             for v in self.episodes.iter().filter(|v| v.season == self.season) {
                 let k = format!("{}:{}", meta.kind, v.id);
                 let seen = self.watched_keys.contains(&k);
-                let r = episode_row(ui, v, seen);
+                let r = episode_row(ui, v, seen, &today);
                 if self.episode.as_ref() == Some(v) {
                     // Same inset and radius as the row's hover fill.
                     ui.painter().rect_stroke(r.rect.shrink(4.0), 8, (2.0, accent()), egui::StrokeKind::Inside);
@@ -6144,6 +6151,14 @@ mod tests {
         assert!(app.player.is_none());
         app.handle(&ctx, Msg::Streams(m("b"), None, vec![], vec![], Autoplay::Off, None, 2));
         assert_eq!(app.selected.as_ref().map(|(m, ..)| m.id.as_str()), Some("b"), "current reply applies");
+    }
+
+    #[test]
+    fn unaired_episodes_say_when_they_air() {
+        assert_eq!(episode_date(Some("2026-11-20T00:00:00.000Z"), "2026-11-13"), "Airs 2026-11-20");
+        assert_eq!(episode_date(Some("2026-11-13T23:00:00.000Z"), "2026-11-13"), "2026-11-13", "today has aired");
+        assert_eq!(episode_date(Some("2019-01-02"), "2026-11-13"), "2019-01-02");
+        assert_eq!(episode_date(None, "2026-11-13"), "");
     }
 
     #[test]
