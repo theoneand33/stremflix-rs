@@ -153,7 +153,12 @@ pub fn row_title(ui: &mut egui::Ui, title: &str) {
 /// Secondary line of explanation or status.
 pub fn caption(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
     let c = ui.visuals().weak_text_color();
-    ui.label(RichText::new(text).size(13.0).color(c))
+    ui.scope(|ui| {
+        // Capped measure: a caption across a wide window is hard to read.
+        ui.set_max_width(ui.available_width().min(720.0));
+        ui.label(RichText::new(text).size(13.0).color(c))
+    })
+    .inner
 }
 
 /// Validation or failure message at caption size.
@@ -283,6 +288,8 @@ pub fn swatch(ui: &mut egui::Ui, name: &str, color: Color32, selected: bool) -> 
         ui.painter().circle_stroke(rect.center(), 13.0, egui::Stroke::new(2.0, if selected { accent() } else { Color32::from_gray(120) }));
     }
     ui.painter().circle_filled(rect.center(), 9.0, color);
+    // Edge, so a dot the color of the panel (white on the light theme) still shows.
+    ui.painter().circle_stroke(rect.center(), 9.0, egui::Stroke::new(1.0, tint(ui, 50)));
     r.on_hover_text(name).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -333,11 +340,12 @@ pub fn switch_row(ui: &mut egui::Ui, label: &str, on: &mut bool) -> egui::Respon
     focus_ring(ui, &r, 6);
     let p = ui.painter();
     if r.hovered() {
-        p.rect_filled(rect, 6, tint(ui, 14));
+        // Wider than the row, so the label and switch keep the edges of the rows around them.
+        p.rect_filled(rect.expand2(vec2(8.0, 0.0)), 6, tint(ui, 14));
     }
-    p.text(pos2(rect.left() + 8.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(15.0), ui.visuals().text_color());
+    p.text(pos2(rect.left(), rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(15.0), ui.visuals().text_color());
     let t = ui.ctx().animate_bool_with_time(r.id, *on, 0.12);
-    let track = egui::Rect::from_center_size(pos2(rect.right() - 26.0, rect.center().y), vec2(36.0, 20.0));
+    let track = egui::Rect::from_center_size(pos2(rect.right() - 18.0, rect.center().y), vec2(36.0, 20.0));
     p.rect_filled(track, 10, Color32::from_gray(80).lerp_to_gamma(accent(), t));
     p.circle_filled(pos2(egui::lerp(track.left() + 10.0..=track.right() - 10.0, t), track.center().y), 7.0, Color32::WHITE);
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -345,6 +353,10 @@ pub fn switch_row(ui: &mut egui::Ui, label: &str, on: &mut bool) -> egui::Respon
 
 /// Settings column width: fields of consecutive rows start at the same x.
 const LABEL_WIDTH: f32 = 150.0;
+/// Width of a `form_row`'s text field.
+const FIELD_WIDTH: f32 = 400.0;
+/// Width of a settings row (label column, gap, field): switches, steppers and swatches end where the fields do.
+pub const ROW_WIDTH: f32 = LABEL_WIDTH + 8.0 + FIELD_WIDTH;
 
 /// A label and whatever `add` puts after it; `add` gets the label's id for `labelled_by`.
 pub fn field_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui, egui::Id) -> R) -> R {
@@ -362,6 +374,7 @@ pub fn combo_row<T: Clone + PartialEq>(ui: &mut egui::Ui, label: &str, value: &m
     field_row(ui, label, |ui, _| {
         let shown = choices.iter().find(|c| c.1 == *value).map_or("Custom", |c| c.0);
         let mut changed = false;
+        ui.spacing_mut().combo_width = 160.0; // one width down a column of dropdowns
         dropdown(ui, label, shown, |ui| {
             for (name, v) in choices {
                 changed |= ui.selectable_value(value, v.clone(), *name).changed();
@@ -369,6 +382,16 @@ pub fn combo_row<T: Clone + PartialEq>(ui: &mut egui::Ui, label: &str, value: &m
         });
         changed
     })
+}
+
+/// Field look for the buttons drawn next in `ui`: field fill and a thin edge that brightens on hover and takes the accent while open.
+pub fn field_style(ui: &mut egui::Ui) {
+    let v = ui.visuals_mut();
+    let (field, edge, edge_hover) = if v.dark_mode { (v.extreme_bg_color, Color32::from_gray(60), Color32::from_gray(110)) } else { (v.extreme_bg_color, Color32::from_gray(205), Color32::from_gray(150)) };
+    let w = &mut v.widgets;
+    for (st, edge) in [(&mut w.inactive, edge), (&mut w.hovered, edge_hover), (&mut w.active, edge_hover), (&mut w.open, accent())] {
+        (st.weak_bg_fill, st.bg_stroke, st.corner_radius) = (field, egui::Stroke::new(1.0, edge), 6.into());
+    }
 }
 
 /// The app's dropdown: a field-styled button with a chevron over a rounded, shadowed menu
@@ -380,12 +403,7 @@ pub fn dropdown<'a, R>(
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
     ui.scope(|ui| {
-        let v = ui.visuals_mut();
-        let (field, edge, edge_hover) = if v.dark_mode { (v.extreme_bg_color, Color32::from_gray(60), Color32::from_gray(110)) } else { (v.extreme_bg_color, Color32::from_gray(205), Color32::from_gray(150)) };
-        let w = &mut v.widgets;
-        for (st, edge) in [(&mut w.inactive, edge), (&mut w.hovered, edge_hover), (&mut w.active, edge_hover), (&mut w.open, accent())] {
-            (st.weak_bg_fill, st.bg_stroke, st.corner_radius) = (field, egui::Stroke::new(1.0, edge), 6.into());
-        }
+        field_style(ui);
         egui::ComboBox::from_id_salt(id_salt)
             .selected_text(text)
             .icon(|ui, rect, vis, open| {
@@ -427,7 +445,7 @@ pub fn dropdown<'a, R>(
 /// `tip`: hover text of the button.
 pub fn form_row(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str, action: &str, tip: Option<&str>, allow_blank: bool) -> bool {
     field_row(ui, label, |ui, l| {
-        let r = ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(400.0)).labelled_by(l);
+        let r = ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(FIELD_WIDTH)).labelled_by(l);
         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let b = primary_button(ui, action);
         let b = match tip {
@@ -581,14 +599,30 @@ mod tests {
         let (ctx, mut xs, mut value) = (egui::Context::default(), Vec::new(), 7u32);
         ctx.run_ui(Default::default(), |ui| {
             xs.clear();
-            for label in ["A:", "A longer label:"] {
+            for label in ["A", "A longer label"] {
                 field_row(ui, label, |ui, _| xs.push(ui.cursor().left()));
             }
-            assert!(!combo_row(ui, "Limit:", &mut value, &[("Off", 0)]));
+            assert!(!combo_row(ui, "Limit", &mut value, &[("Off", 0)]));
         })
         .drop_without_applying_deltas();
         assert_eq!(xs[0], xs[1]);
         assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn dropdowns_share_a_width_and_captions_stay_narrow() {
+        let (ctx, mut widths, mut cap) = (egui::Context::default(), Vec::new(), 0.0);
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(2000.0, 800.0))), ..Default::default() };
+        ctx.run_ui(input, |ui| {
+            widths.clear();
+            for choice in ["Off", "Unlimited"] {
+                widths.push(ui.scope(|ui| combo_row(ui, "Limit", &mut 0, &[(choice, 0)])).response.rect.width());
+            }
+            cap = caption(ui, "word ".repeat(400)).rect.width();
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(widths[0], widths[1]);
+        assert!(cap > 600.0 && cap <= 720.0, "{cap}");
     }
 
     #[test]
