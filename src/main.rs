@@ -2990,6 +2990,9 @@ impl App {
                 ui.add(egui::Label::new(RichText::new(format!("{}  ·  {} subtitle track{}", key.1, subs.len(), if subs.len() == 1 { "" } else { "s" })).size(15.0).color(ui.visuals().weak_text_color())).truncate());
             });
             ui.add_space(8.0);
+            if streams.is_empty() {
+                muted(ui, "No streams found.");
+            }
             for (i, s) in streams.iter().enumerate() {
                 if (i == 0 || streams[i - 1].addon != s.addon) && !s.addon.is_empty() {
                     ui.add_space(8.0);
