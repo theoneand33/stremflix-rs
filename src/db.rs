@@ -237,11 +237,17 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Forget a folder and its scanned items. Files on disk and their saved progress are untouched.
+    /// Forget a folder and the items under it that no other listed folder still covers. Files on disk and their saved progress are untouched.
+    /// By path, not by the `folder` column: an item under nested folders is owned by whichever was scanned last.
     pub fn remove_library_folder(&self, folder: &str) -> Result<()> {
         self.transaction(|| {
-            self.conn.execute("DELETE FROM library_items WHERE folder = ?1", [folder])?;
             self.conn.execute("DELETE FROM library_folders WHERE path = ?1", [folder])?;
+            let keep = self.library_folders()?;
+            let mut st = self.conn.prepare("SELECT path FROM library_items")?;
+            let paths: Vec<String> = st.query_map([], |r| r.get(0))?.filter_map(|r| r.ok()).collect();
+            for p in paths.iter().filter(|p| Path::new(p).starts_with(folder) && !keep.iter().any(|k| Path::new(p).starts_with(k))) {
+                self.conn.execute("DELETE FROM library_items WHERE path = ?1", [p])?;
+            }
             Ok(())
         })
     }

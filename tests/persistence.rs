@@ -53,6 +53,25 @@ fn removing_a_library_folder_drops_only_its_items() {
 }
 
 #[test]
+fn removing_a_nested_library_folder_follows_what_is_still_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("app.db")).unwrap();
+    let item = |p: &str| LibraryItem { path: p.into(), title: "t".into() };
+    let paths = |db: &Db| db.library_items().unwrap().into_iter().map(|i| i.path.to_string_lossy().into_owned()).collect::<Vec<_>>();
+    // Parent scanned first: the nested file ends up owned by /a/sub.
+    db.add_library_folder("/a".as_ref(), &[item("/a/1.mp4"), item("/a/sub/2.mp4")]).unwrap();
+    db.add_library_folder("/a/sub".as_ref(), &[item("/a/sub/2.mp4")]).unwrap();
+    db.remove_library_folder("/a").unwrap();
+    assert_eq!(paths(&db), ["/a/sub/2.mp4"], "still covered by /a/sub");
+    // Child scanned first: the nested file ends up owned by /a.
+    db.add_library_folder("/a".as_ref(), &[item("/a/1.mp4"), item("/a/sub/2.mp4")]).unwrap();
+    db.remove_library_folder("/a/sub").unwrap();
+    assert_eq!(paths(&db), ["/a/1.mp4", "/a/sub/2.mp4"], "still covered by /a");
+    db.remove_library_folder("/a").unwrap();
+    assert!(paths(&db).is_empty());
+}
+
+#[test]
 fn saved_titles_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("app.db");
