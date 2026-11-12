@@ -607,6 +607,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn emoji_fonts_are_bundled() {
+        // Addon text is full of emoji; they must not depend on the OS having an emoji font.
+        let f = egui::FontDefinitions::default();
+        assert!(f.families[&egui::FontFamily::Proportional].iter().any(|n| n == "NotoEmoji-Regular"));
+    }
+
+    #[test]
     fn field_rows_line_up_and_unlisted_combo_value_survives() {
         let (ctx, mut xs, mut value) = (egui::Context::default(), Vec::new(), 7u32);
         ctx.run_ui(Default::default(), |ui| {

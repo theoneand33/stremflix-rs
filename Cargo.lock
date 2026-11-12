@@ -5298,6 +5298,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "eframe",
+ "egui",
  "flate2",
  "image",
  "keepawake",

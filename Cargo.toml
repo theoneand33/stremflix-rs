@@ -10,6 +10,8 @@ anyhow = "1.0.104"
 base64 = "0.23"
 # glow (OpenGL) instead of the default wgpu: libmpv renders through OpenGL into our framebuffer.
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "system_fonts", "wayland", "x11"] }
+# Only for the feature: eframe doesn't forward it, and without it emoji in addon text (stream titles) need an OS font with outlines.
+egui = { version = "0.37.0", default-features = false, features = ["monochrome_emoji_fonts"] }
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 keepawake = "0.6"
