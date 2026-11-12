@@ -1142,6 +1142,8 @@ struct App {
     confirm_delete: Option<usize>,
     /// Downloaded file in Library awaiting a delete confirmation.
     confirm_delete_dl: Option<PathBuf>,
+    /// Addon (transport URL) in Addons awaiting an uninstall confirmation.
+    confirm_uninstall: Option<String>,
     /// A widget had keyboard focus last frame: egui drops focus on Escape before `ui` runs, so that Escape must not also go back.
     had_focus: bool,
     /// External player command, e.g. `vlc` or `mpv --fs`.
@@ -1342,6 +1344,7 @@ impl App {
             },
             confirm_delete: None,
             confirm_delete_dl: None,
+            confirm_uninstall: None,
             had_focus: false,
             data_import: String::new(),
             data_msg: None,
@@ -4385,8 +4388,17 @@ impl App {
                 if m.behavior_hints.configurable && small_button(ui, "Configure").clicked() {
                     configure = Some(url.clone());
                 }
-                if small_button(ui, "Uninstall").clicked() {
-                    remove = Some(url.clone());
+                // Asked first, like deleting a download: a configured URL can't be recovered once removed.
+                if self.confirm_uninstall.as_ref() == Some(url) {
+                    field_label(ui, "Uninstall?");
+                    if small_button(ui, "Yes").clicked() {
+                        remove = Some(url.clone());
+                    }
+                    if small_button(ui, "No").clicked() {
+                        self.confirm_uninstall = None;
+                    }
+                } else if small_button(ui, "Uninstall").clicked() {
+                    self.confirm_uninstall = Some(url.clone());
                 }
             });
             match self.addon_updates.iter().find(|(u, _)| u == url).map(|(_, r)| r) {
@@ -4479,6 +4491,7 @@ impl App {
             self.build_rows(&ctx);
         }
         if let Some(u) = remove {
+            self.confirm_uninstall = None;
             let _ = self.db.remove_addon(&u);
             self.addons.retain(|(x, _)| *x != u);
             self.build_rows(&ctx);
