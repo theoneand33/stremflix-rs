@@ -60,9 +60,21 @@ pub fn redact(s: &str) -> String {
         .collect()
 }
 
+/// Package version plus the release channel and commit a release build was made from: nightlies all share one package version.
+pub fn version() -> String {
+    build_label(env!("CARGO_PKG_VERSION"), crate::addon::RELEASE, crate::addon::COMMIT)
+}
+
+fn build_label(version: &str, release: Option<&str>, commit: Option<&str>) -> String {
+    match (release, commit) {
+        (Some(r), Some(c)) => format!("{version} ({r} {})", c.get(..7).unwrap_or(c)),
+        _ => format!("{version} (source build)"),
+    }
+}
+
 /// Version, OS, caller's summary and the redacted tail of the log.
 pub fn bundle(summary: &str) -> String {
-    let mut out = format!("stremflix-rs {}\nos: {} {}\n{summary}\n\n--- recent log ---\n", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+    let mut out = format!("stremflix-rs {}\nos: {} {}\n{summary}\n\n--- recent log ---\n", version(), std::env::consts::OS, std::env::consts::ARCH);
     if let Some(p) = LOG.get() {
         let log = std::fs::read(p).map(|b| String::from_utf8_lossy(&b[b.len().saturating_sub(64 * 1024)..]).into_owned()).unwrap_or_default();
         out.push_str(&redact(&log));
@@ -73,6 +85,14 @@ pub fn bundle(summary: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_names_the_release_build() {
+        assert_eq!(build_label("0.1.0", Some("nightly"), Some("0123456789abcdef")), "0.1.0 (nightly 0123456)");
+        assert_eq!(build_label("0.1.0", Some("v1.2.0"), Some("abc")), "0.1.0 (v1.2.0 abc)");
+        assert_eq!(build_label("0.1.0", None, None), "0.1.0 (source build)");
+        assert!(bundle("x").starts_with(&format!("stremflix-rs {}\n", version())));
+    }
 
     #[test]
     fn redacts_credentials_paths_and_queries() {

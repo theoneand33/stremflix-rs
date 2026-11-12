@@ -109,6 +109,23 @@ fn malformed_manifests_rejected() {
     assert!(parse_manifest(&huge).is_err());
 }
 
+/// Addons written in languages that serialize an empty list as `null` (Go's nil slice) work in Stremio.
+#[test]
+fn null_lists_are_empty_lists() {
+    let m = parse_manifest(br#"{"id":"a","version":"1","name":"n","resources":["stream",{"name":"meta","types":null}],"types":["movie"],
+        "catalogs":[{"type":"movie","id":"c","extra":null,"extraSupported":null,"extraRequired":null}, 7]}"#)
+    .unwrap();
+    assert_eq!(m.catalogs.len(), 1, "the malformed entry is dropped, the rest kept");
+    assert!(!m.catalogs[0].requires_extra());
+    assert!(m.serves("meta", "movie", "tt1"), "null resource types fall back to the manifest's");
+    assert!(parse_manifest(br#"{"id":"a","version":"1","name":"n","resources":["stream"],"types":["movie"],"catalogs":null}"#).unwrap().catalogs.is_empty());
+    let s = parse_streams(br#"{"streams":[{"url":"https://a.example/v.mp4","sources":null}]}"#).unwrap();
+    assert_eq!(s.len(), 1);
+    // Numeric subtitle ids are kept as text.
+    let subs = parse_subtitles(br#"{"subtitles":[{"id":7,"url":"https://a.example/s.srt","lang":"eng"}]}"#).unwrap();
+    assert_eq!(subs[0].id.as_deref(), Some("7"));
+}
+
 #[test]
 fn catalog_parsing_drops_bad_entries() {
     let body = r#"{"metas": [
@@ -217,7 +234,7 @@ fn stream_parsing_and_targets() {
     let body = format!(
         r#"{{"streams": [
         {{"url": "https://cdn.example/v.mp4", "title": "HTTP"}},
-        {{"infoHash": "{hash}", "fileIdx": 1, "sources": ["tracker:http://tr.example/announce", "peer:127.0.0.1:6881", "dht:{hash}"]}},
+        {{"infoHash": "{hash}", "fileIdx": 1, "sources": ["tracker:http://tr.example/announce", "tracker:udp://tr.example:1337/announce", "tracker:file:///etc/passwd", "peer:127.0.0.1:6881", "dht:{hash}"]}},
         {{"url": "file:///etc/passwd"}},
         {{"url": "javascript:alert(1)"}},
         {{"infoHash": "nothex"}},
@@ -231,6 +248,9 @@ fn stream_parsing_and_targets() {
     let Some(PlayTarget::Magnet(m, Some(1))) = s[1].target() else { panic!("expected magnet") };
     assert_eq!(parse_magnet_hash(&m).as_deref(), Some(hash));
     assert!(m.contains("&tr=http%3A%2F%2Ftr.example%2Fannounce"));
+    // Most public trackers are UDP; other schemes are dropped.
+    assert!(m.contains("&tr=udp%3A%2F%2Ftr.example%3A1337%2Fannounce"));
+    assert_eq!(m.matches("&tr=").count(), 2);
     assert_eq!(magnet_peers(&m), vec!["127.0.0.1:6881".parse().unwrap()]);
     assert!(matches!(s[2].target(), Some(PlayTarget::Magnet(_, None))));
     // Base32 (32 chars, uppercase as librqbit reads it) is a valid info hash too; other lengths are not.

@@ -51,7 +51,7 @@ cargo test
 
 Addons lists installed addons in priority order; Up/Down reorder them, and the stream list and Home rows follow. The All/Movies/Shows switch orders metadata, streams, and subtitles per type; catalog rows and search keep the global order. Each addon shows whether it is reachable, timed out, or unreachable. Details shows an addon's id, types, resources, and catalogs. Streams are grouped by addon. `externalUrl` streams open in the browser; `ytId` streams play through yt-dlp, as do the trailer buttons on a title's detail page (from `trailerStreams` or legacy `trailers`).
 
-Press Enter in the header search to open a results page with one row for each catalog that supports the `search` extra. Rows fill in as addons reply.
+Press Enter in the header search to open a results page with one row for each catalog that supports the `search` extra. Rows fill in as addons reply. `/` or Ctrl+F focuses the search box; Esc or the mouse's back button leaves a title or results page.
 
 ### Playing
 
@@ -75,7 +75,7 @@ A Skip button appears over intros, recaps, and credits. Spans come from the addo
 
 ### Torrents
 
-Play a magnet or `.torrent` from Library → Torrent, drop a `.torrent` on the window, or paste a magnet with no text field focused (dragging magnet links doesn't work). Settings sets the torrent folder, a cache size, a connection profile (Soft 40 / Default 128 / Fast 300 peers), and download/upload speed limits. With no cache (the default), a torrent's files are deleted when playback stops. Finished torrents keep seeding after playback until a ratio or time limit is reached (both Off by default: stop at once). Settings lists torrents with a Delete button.
+Play a magnet or `.torrent` from Library → Torrent, drop a `.torrent` (or a video or audio file) on the window, or paste a magnet with no text field focused (dragging magnet links doesn't work). Settings sets the torrent folder, a cache size, a connection profile (Soft 40 / Default 128 / Fast 300 peers), and download/upload speed limits. With no cache (the default), a torrent's files are deleted when playback stops. Finished torrents keep seeding after playback until a ratio or time limit is reached (both Off by default: stop at once). Settings lists torrents with a Delete button.
 
 ### `stremio://` links
 

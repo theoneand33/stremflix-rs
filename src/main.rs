@@ -14,7 +14,7 @@ use stremflix_rs::addon::{AddonClient, Skip, SkipKind, AddonEntry, CatalogDef, D
 use stremflix_rs::instance;
 use stremflix_rs::db::{self, Db, Download, List, Progress, SavedTitle, Watched};
 use stremflix_rs::download::{self, State};
-use stremflix_rs::library::{LibraryItem, scan};
+use stremflix_rs::library::{LibraryItem, is_media, scan};
 use eframe::glow::{self, HasContext};
 use stremflix_rs::player::{self, chapter_skips, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
@@ -285,6 +285,8 @@ enum Msg {
     AddonCatalog(AddonCatalogSrc, Result<Vec<AddonEntry>, String>),
     /// Discover grid source and its items or error.
     Discover(DiscoverSrc, Result<Vec<MetaPreview>, String>),
+    /// Next page of the Discover grid: selection, the `skip` it was requested with, items.
+    DiscoverMore(DiscoverSrc, usize, Result<Vec<MetaPreview>, String>),
     /// meta, episode (series only), streams, subtitle URLs, what to autoplay on arrival,
     /// the `bingeGroup` to prefer (next episode), and the `nav` it was requested at
     Streams(MetaPreview, Option<Video>, Vec<Stream>, Subs, Autoplay, Option<String>, u64),
@@ -311,7 +313,8 @@ enum Msg {
     /// Account auth key an upload ran with, and its summary or the error.
     Uploaded(String, Result<String, String>),
     /// Library folder and its scanned media files.
-    Scanned(PathBuf, Result<Vec<LibraryItem>, String>),
+    /// Folder, whether it was a rescan of a listed folder (dropped if the folder was removed meanwhile), items.
+    Scanned(PathBuf, bool, Result<Vec<LibraryItem>, String>),
     /// Release page of a newer build, if any.
     Update(Option<String>),
     /// A `stremio://` link from the command line, a later launch, or macOS.
@@ -343,6 +346,8 @@ struct Row {
     loading_more: bool,
     /// Last page was empty, had nothing new, or failed.
     exhausted: bool,
+    /// Why the first page failed; a Home row shows it with a Retry.
+    error: Option<String>,
 }
 
 /// What the search results page shows.
@@ -594,6 +599,18 @@ struct Discover {
     src: Option<DiscoverSrc>,
     /// `None` while loading.
     items: Option<Vec<MetaPreview>>,
+    /// Paging, as in [`Row`].
+    fetched: usize,
+    loading_more: bool,
+    exhausted: bool,
+}
+
+/// Add a catalog page to `items`, skipping ids already there and stopping at `ROW_CAP`. False when it added nothing.
+fn append_page(items: &mut Vec<MetaPreview>, page: Vec<MetaPreview>) -> bool {
+    let mut seen: std::collections::HashSet<String> = items.iter().map(|m| m.id.clone()).collect();
+    let before = items.len();
+    items.extend(page.into_iter().filter(|m| seen.insert(m.id.clone())).take(ROW_CAP - before));
+    items.len() > before
 }
 
 /// Player popover opened from its control-row button.
@@ -649,11 +666,17 @@ fn fmt_size(b: u64) -> String {
 }
 
 /// Episode row: number, title, release date.
-fn episode_row(ui: &mut egui::Ui, v: &Video, watched: bool) -> egui::Response {
+fn episode_row(ui: &mut egui::Ui, v: &Video, watched: bool, today: &str) -> egui::Response {
     let n = v.episode.unwrap_or(0) as usize;
     let head = v.title.clone().unwrap_or_else(|| format!("Episode {n}"));
-    let date: String = v.released.as_deref().map(|d| d.chars().take(10).collect()).unwrap_or_default();
+    let date = episode_date(v.released.as_deref(), today);
     list_row(ui, n, if watched { format!("{head}  {}", icons::CHECK) } else { head }, date, EPISODE_BUTTON.x + 12.0)
+}
+
+/// An episode's release day, marked when it is after `today` (both `YYYY-MM-DD`): addons list episodes before they air, with no streams yet.
+fn episode_date(released: Option<&str>, today: &str) -> String {
+    let day: String = released.map(|d| d.chars().take(10).collect()).unwrap_or_default();
+    if day.as_str() > today { format!("Airs {day}") } else { day }
 }
 
 /// Size of the "Mark watched" pill overlaid on episode rows, left of the play circle.
@@ -1034,6 +1057,8 @@ struct App {
     pending: Option<(String, Option<String>)>,
     /// Bumped by every navigation (open a title or episode, play, Back); replies for an older one are dropped.
     nav: u64,
+    /// `nav` and title of a title or episode whose streams or episodes were asked for and have not arrived.
+    opening: Option<(u64, String)>,
     /// Full meta of the selected title, if an addon served one; checked against `selected` by id.
     details: Option<Meta>,
     /// Type and id of the movie whose details were last requested; older replies are dropped.
@@ -1059,6 +1084,7 @@ struct App {
     /// Custom User-Agent as edited; saved and applied only when valid.
     user_agent: String,
     library: Vec<LibraryItem>,
+    library_folders: Vec<String>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
     /// User lists of saved titles; `lib_list` is the one shown in Library (`None` = all saved).
@@ -1117,6 +1143,10 @@ struct App {
     confirm_delete: Option<usize>,
     /// Downloaded file in Library awaiting a delete confirmation.
     confirm_delete_dl: Option<PathBuf>,
+    /// Addon (transport URL) in Addons awaiting an uninstall confirmation.
+    confirm_uninstall: Option<String>,
+    /// A widget had keyboard focus last frame: egui drops focus on Escape before `ui` runs, so that Escape must not also go back.
+    had_focus: bool,
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
     /// Settings > Data: path typed for an import, and the last export/import result.
@@ -1273,6 +1303,7 @@ impl App {
             rt: tokio::runtime::Runtime::new()?,
             addons: db.addons()?,
             library: db.library_items()?,
+            library_folders: db.library_folders()?,
             saved: db.saved_titles()?,
             lists: db.lists()?,
             lib_list: None,
@@ -1314,6 +1345,8 @@ impl App {
             },
             confirm_delete: None,
             confirm_delete_dl: None,
+            confirm_uninstall: None,
+            had_focus: false,
             data_import: String::new(),
             data_msg: None,
             diag_msg: None,
@@ -1363,6 +1396,7 @@ impl App {
             episode: None,
             pending: None,
             nav: 0,
+            opening: None,
             details: None,
             details_want: Default::default(),
             scroll_top: false,
@@ -1639,7 +1673,7 @@ impl App {
     fn handle(&mut self, ctx: &egui::Context, msg: Msg) {
         match msg {
             Msg::Error(e) => {
-                self.sleep_carry = None;
+                (self.sleep_carry, self.opening) = (None, None);
                 report(&mut self.error, e);
             }
             Msg::Installed(url, m, replaces) => {
@@ -1694,11 +1728,12 @@ impl App {
             }
             Msg::Row(src, res) => {
                 let Some(row) = self.rows.iter_mut().find(|r| r.src == src) else { return };
-                row.items = Some(res.unwrap_or_else(|e| {
-                    report(&mut self.error, format!("loading {}: {e:#}", row.title));
-                    Vec::new()
-                }));
-                row.fetched = row.items.as_ref().map_or(0, Vec::len);
+                // A failure stays on its row (with a Retry), not in the page-wide error banner.
+                let (items, error) = match res {
+                    Ok(items) => (items, None),
+                    Err(e) => (Vec::new(), Some(e)),
+                };
+                (row.fetched, row.items, row.error) = (items.len(), Some(items), error);
             }
             Msg::More(src, skip, res) => {
                 // Ignore replies for a row that was rebuilt or advanced since the request.
@@ -1707,11 +1742,7 @@ impl App {
                 match res {
                     Ok(page) => {
                         row.fetched += page.len();
-                        let items = row.items.get_or_insert_with(Vec::new);
-                        let mut seen: std::collections::HashSet<String> = items.iter().map(|m| m.id.clone()).collect();
-                        let before = items.len();
-                        items.extend(page.into_iter().filter(|m| seen.insert(m.id.clone())).take(ROW_CAP - before));
-                        row.exhausted = items.len() == before;
+                        row.exhausted = !append_page(row.items.get_or_insert_with(Vec::new), page);
                     }
                     Err(e) => {
                         row.exhausted = true;
@@ -1735,10 +1766,29 @@ impl App {
             Msg::Discover(src, res) => {
                 // Ignore replies for a selection the user has since changed.
                 if self.discover.src.as_ref() == Some(&src) {
-                    self.discover.items = Some(res.unwrap_or_else(|e| {
+                    let items = res.unwrap_or_else(|e| {
                         report(&mut self.error, format!("loading catalog: {e:#}"));
                         Vec::new()
-                    }));
+                    });
+                    (self.discover.fetched, self.discover.items) = (items.len(), Some(items));
+                }
+            }
+            Msg::DiscoverMore(src, skip, res) => {
+                // Ignore replies for a selection the user has since changed.
+                let d = &mut self.discover;
+                if d.src.as_ref() != Some(&src) || !d.loading_more || d.fetched != skip {
+                    return;
+                }
+                d.loading_more = false;
+                match res {
+                    Ok(page) => {
+                        d.fetched += page.len();
+                        d.exhausted = !append_page(d.items.get_or_insert_with(Vec::new), page);
+                    }
+                    Err(e) => {
+                        d.exhausted = true;
+                        report(&mut self.error, format!("loading more of the catalog: {e:#}"));
+                    }
                 }
             }
             Msg::Streams(meta, episode, streams, subs, autoplay, binge, nav) => {
@@ -1746,6 +1796,7 @@ impl App {
                 if nav != self.nav {
                     return;
                 }
+                self.opening = None;
                 if episode.is_none() {
                     self.episodes.clear();
                     self.scroll_top = true;
@@ -1779,6 +1830,7 @@ impl App {
                 if nav != self.nav {
                     return;
                 }
+                self.opening = None;
                 fill_deep_linked(&mut meta, &m); // before the rename below, which the name guard depends on
                 let mut videos = std::mem::take(&mut m.videos);
                 // A Continue Watching entry only knows the episode title.
@@ -2031,16 +2083,17 @@ impl App {
                 }
                 self.pump_downloads(ctx);
             }
-            Msg::Scanned(dir, res) => {
+            Msg::Scanned(dir, rescan, res) => {
+                if rescan && !self.library_folders.contains(&dir.to_string_lossy().into_owned()) {
+                    return;
+                }
                 let saved = res.map_err(anyhow::Error::msg).and_then(|items| {
                     self.db.add_library_folder(&dir, &items)?;
                     self.db.set_setting("last_folder", &dir.to_string_lossy())?;
                     Ok(items.len())
                 });
                 match saved {
-                    Ok(_) => {
-                        self.library = self.db.library_items().unwrap_or_default();
-                    }
+                    Ok(_) => self.reload_library(),
                     Err(e) => report(&mut self.error, e),
                 }
             }
@@ -2136,6 +2189,23 @@ impl App {
                 ctx.request_repaint();
             }
         }
+    }
+
+    fn reload_library(&mut self) {
+        self.library = self.db.library_items().unwrap_or_default();
+        self.library_folders = self.db.library_folders().unwrap_or_default();
+    }
+
+    /// Scan `dir` off the UI thread (a big folder or network share can take minutes); the reply replaces its library items.
+    fn scan_folder(&self, ctx: &egui::Context, dir: PathBuf, rescan: bool) {
+        self.spawn(ctx, async move {
+            let res = tokio::task::spawn_blocking({
+                let dir = dir.clone();
+                move || scan(&dir).map_err(|e| e.to_string())
+            })
+            .await?;
+            Ok(Msg::Scanned(dir, rescan, res))
+        });
     }
 
     fn save_progress(&mut self) {
@@ -2355,7 +2425,7 @@ impl App {
             .into_iter()
             .map(|(title, i)| {
                 let (u, _, c) = cats[i];
-                Row { title, src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: c.supports("skip"), fetched: 0, loading_more: false, exhausted: false }
+                Row { title, src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: c.supports("skip"), fetched: 0, loading_more: false, exhausted: false, error: None }
             })
             .collect();
         let keys: Vec<String> = rows.iter().map(|r| row_key(&r.src)).collect();
@@ -2364,13 +2434,18 @@ impl App {
         self.home_all = ordered.iter().map(|r| (row_key(&r.src), r.title.clone())).collect();
         self.rows = ordered.into_iter().filter(|r| !self.home_hidden.contains(&row_key(&r.src))).collect();
         for src in self.rows.iter().map(|r| r.src.clone()).collect::<Vec<_>>() {
-            let client = self.client.clone();
-            self.spawn(ctx, async move {
-                let res = client.catalog(&src.0, &src.1, &src.2, 0).await.map_err(|e| format!("{e:#}"));
-                Ok(Msg::Row(src, res))
-            });
+            self.fetch_row(ctx, src);
         }
         self.fetch_new_episodes(ctx);
+    }
+
+    /// Ask for the first page of a Home row.
+    fn fetch_row(&self, ctx: &egui::Context, src: (String, String, String)) {
+        let client = self.client.clone();
+        self.spawn(ctx, async move {
+            let res = client.catalog(&src.0, &src.1, &src.2, 0).await.map_err(|e| format!("{e:#}"));
+            Ok(Msg::Row(src, res))
+        });
     }
 
     /// Ask a meta addon for the episodes of each saved series and keep those released recently.
@@ -2420,7 +2495,7 @@ impl App {
             .iter()
             .filter(|(_, m)| m.has_resource("catalog"))
             .flat_map(|(u, m)| {
-                m.catalogs.iter().filter(|c| c.searchable()).map(move |c| Row { title: catalog_title(&m.name, c), src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false })
+                m.catalogs.iter().filter(|c| c.searchable()).map(move |c| Row { title: catalog_title(&m.name, c), src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false, error: None })
             })
             .collect();
         if rows.is_empty() {
@@ -2437,6 +2512,31 @@ impl App {
         self.close_details();
         self.tab = Tab::Home;
         self.search_page = Some(SearchPage { query, rows, failed: Vec::new() });
+    }
+
+    /// A nav click. Home while already on Home also leaves the open title, like Back; from another tab it returns to that title.
+    fn go_tab(&mut self, tab: Tab) {
+        if tab == Tab::Home && self.tab == Tab::Home && self.selected.is_some() {
+            self.close_details();
+        }
+        self.tab = tab;
+        self.search_page = None;
+    }
+
+    /// Title being opened, while its request is the current navigation and unanswered.
+    fn loading(&self) -> Option<&str> {
+        self.opening.as_ref().filter(|(nav, _)| *nav == self.nav).map(|(_, t)| t.as_str())
+    }
+
+    /// Escape or the mouse's back button: close the file picker, else the title page, else the search page.
+    fn go_back(&mut self) {
+        if self.file_pick.is_some() {
+            self.clear_file_pick();
+        } else if self.tab == Tab::Home && self.selected.is_some() {
+            self.close_details();
+        } else if self.tab == Tab::Home {
+            self.search_page = None;
+        }
     }
 
     /// Leave the open title's page, dropping replies still on their way to it.
@@ -2679,6 +2779,7 @@ impl App {
         self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
+        self.opening = Some((nav, meta.name.clone()));
         self.spawn(ctx, async move {
             let mut errors = Vec::new();
             for u in &addons {
@@ -2759,6 +2860,7 @@ impl App {
         self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
+        self.opening = Some((nav, episode.as_ref().and_then(|v| v.title.clone()).unwrap_or_else(|| meta.name.clone())));
         self.spawn(ctx, async move {
             let (mut streams, mut subs, mut errors) = (Vec::new(), Vec::new(), Vec::new());
             let (kind, vid) = (meta.kind.clone(), id.clone());
@@ -2874,8 +2976,9 @@ impl App {
                 ui.spinner();
             }
         }
+        let mut person = None;
         if let Some(d) = self.selected_details()
-            && let Some(t) = Self::ui_details(ui, d)
+            && let Some(t) = Self::ui_details(ui, d, &mut person)
             && let Some(src) = t.source()
         {
             // Not `play`: its `nav` bump would drop the title's still-loading streams and episodes.
@@ -2906,6 +3009,9 @@ impl App {
                 ui.add(egui::Label::new(RichText::new(format!("{}  ·  {} subtitle track{}", key.1, subs.len(), if subs.len() == 1 { "" } else { "s" })).size(15.0).color(ui.visuals().weak_text_color())).truncate());
             });
             ui.add_space(8.0);
+            if streams.is_empty() {
+                muted(ui, "No streams found.");
+            }
             for (i, s) in streams.iter().enumerate() {
                 if (i == 0 || streams[i - 1].addon != s.addon) && !s.addon.is_empty() {
                     ui.add_space(8.0);
@@ -2964,10 +3070,11 @@ impl App {
                 }
             });
             ui.add_space(8.0);
+            let today = date_string(unix_days());
             for v in self.episodes.iter().filter(|v| v.season == self.season) {
                 let k = format!("{}:{}", meta.kind, v.id);
                 let seen = self.watched_keys.contains(&k);
-                let r = episode_row(ui, v, seen);
+                let r = episode_row(ui, v, seen, &today);
                 if self.episode.as_ref() == Some(v) {
                     // Same inset and radius as the row's hover fill.
                     ui.painter().rect_stroke(r.rect.shrink(4.0), 8, (2.0, accent()), egui::StrokeKind::Inside);
@@ -3063,10 +3170,22 @@ impl App {
                 });
             });
         }
-        let mut more = Vec::new();
+        let (mut more, mut retry) = (Vec::new(), Vec::new());
         for row in &self.rows {
             match &row.items {
-                Some(items) if items.is_empty() => continue,
+                Some(items) if items.is_empty() => {
+                    if let Some(e) = &row.error {
+                        row_title(ui, &row.title);
+                        ui.horizontal(|ui| {
+                            ui.set_min_height(32.0);
+                            if small_button(ui, "Retry").clicked() {
+                                retry.push(row.src.clone());
+                            }
+                            // Last and truncated: a long error would push the button out of the window.
+                            ui.add(egui::Label::new(RichText::new(format!("Couldn't load: {e}")).color(ui.visuals().weak_text_color())).truncate()).on_hover_text(e);
+                        });
+                    }
+                }
                 Some(items) => {
                     row_title(ui, &row.title);
                     let near_end = self.ui_cards(ui, &row.title, items, &mut want, &mut open, &mut quick);
@@ -3079,6 +3198,12 @@ impl App {
                     ui.spinner();
                 }
             }
+        }
+        for src in retry {
+            if let Some(row) = self.rows.iter_mut().find(|r| r.src == src) {
+                (row.items, row.error) = (None, None);
+            }
+            self.fetch_row(&ctx, src);
         }
         for (src, skip) in more {
             if let Some(row) = self.rows.iter_mut().find(|r| r.src == src) {
@@ -3131,9 +3256,13 @@ impl App {
         if let Some(p) = resume {
             self.open_progress(&ctx, p);
         }
+        if let Some(name) = person {
+            self.search = name;
+            self.search(&ctx);
+        }
     }
 
-    /// Pick a type, catalog and its extras (genre, year, sort, ...); the catalog's first page shows as a poster grid.
+    /// Pick a type, catalog and its extras (genre, year, sort, ...); the catalog shows as a poster grid that loads further pages as it scrolls.
     fn ui_discover(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let cats: Vec<(&String, &String, &CatalogDef)> = self
@@ -3163,8 +3292,10 @@ impl App {
         d.cat = (cur.0.clone(), cur.2.id.clone());
         d.extras = cur.2.valid_extras(&d.extras);
         let src = (d.cat.0.clone(), d.kind.clone(), d.cat.1.clone(), d.extras.clone());
+        let skippable = cur.2.supports("skip");
         if d.src.as_ref() != Some(&src) {
             (d.src, d.items) = (Some(src.clone()), None);
+            (d.fetched, d.loading_more, d.exhausted) = (0, false, false);
             let client = self.client.clone();
             self.spawn(&ctx, async move {
                 let res = client.discover(&src.0, &src.1, &src.2, &src.3).await.map_err(|e| format!("{e:#}"));
@@ -3207,7 +3338,7 @@ impl App {
             }
         });
         ui.add_space(12.0);
-        let (mut want, mut open, mut quick) = (Vec::new(), None, None);
+        let (mut want, mut open, mut quick, mut more) = (Vec::new(), None, None, None);
         match &self.discover.items {
             None => {
                 ui.spinner();
@@ -3216,9 +3347,12 @@ impl App {
                 muted(ui, "Nothing in this catalog.");
             }
             Some(items) => {
+                let mut near_end = false;
                 ui.horizontal_wrapped(|ui| {
-                    for m in items {
+                    for (i, m) in items.iter().enumerate() {
                         let (r, rect) = card(ui, CARD, &m.name);
+                        // About a row of cards before the end, so the next page is on its way when the grid runs out.
+                        near_end |= i + 6 >= items.len() && ui.is_rect_visible(r.rect);
                         self.paint_poster(ui, &r, rect, &m.poster, &m.name, &mut want);
                         if card_play(ui, &r, rect, &m.name) {
                             quick = Some(m.clone());
@@ -3228,7 +3362,22 @@ impl App {
                         }
                     }
                 });
+                let d = &self.discover;
+                if d.loading_more {
+                    ui.spinner();
+                } else if near_end && skippable && !d.exhausted && items.len() < ROW_CAP {
+                    more = d.src.clone().map(|s| (s, d.fetched));
+                }
             }
+        }
+        if let Some((src, skip)) = more {
+            self.discover.loading_more = true;
+            let client = self.client.clone();
+            self.spawn(&ctx, async move {
+                let extras: Vec<_> = src.3.iter().cloned().chain([("skip".to_string(), skip.to_string())]).collect();
+                let res = client.discover(&src.0, &src.1, &src.2, &extras).await.map_err(|e| format!("{e:#}"));
+                Ok(Msg::DiscoverMore(src, skip, res))
+            });
         }
         want.sort();
         want.dedup();
@@ -3378,8 +3527,8 @@ impl App {
     }
 
     /// Detail facts under the banner: year, runtime, rating, genres, cast, director, links, trailers.
-    /// Returns the trailer the user clicked.
-    fn ui_details<'a>(ui: &mut egui::Ui, d: &'a Meta) -> Option<&'a Stream> {
+    /// Returns the trailer the user clicked; a clicked cast or director name goes to `search`.
+    fn ui_details<'a>(ui: &mut egui::Ui, d: &'a Meta, search: &mut Option<String>) -> Option<&'a Stream> {
         ui.add_space(14.0);
         let gray = ui.visuals().weak_text_color();
         let facts: Vec<String> = [d.release_info.clone(), d.runtime.clone(), d.imdb_rating.as_ref().map(|r| format!("IMDb {r}"))]
@@ -3392,7 +3541,19 @@ impl App {
         }
         for (name, list) in [("Cast", &d.cast), ("Director", &d.director)] {
             if !list.is_empty() {
-                ui.add(egui::Label::new(RichText::new(format!("{name}: {}", list.join(", "))).size(15.0).color(gray)).wrap());
+                ui.horizontal_wrapped(|ui| {
+                    // Flush: the separators carry their own spaces.
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label(RichText::new(format!("{name}: ")).size(15.0).color(gray));
+                    for (i, person) in list.iter().enumerate() {
+                        if i > 0 {
+                            ui.label(RichText::new(", ").size(15.0).color(gray));
+                        }
+                        if ui.link(RichText::new(person).size(15.0)).on_hover_text(format!("Search for {person}")).clicked() {
+                            *search = Some(person.clone());
+                        }
+                    }
+                });
             }
         }
         if !d.links.is_empty() {
@@ -4231,8 +4392,17 @@ impl App {
                 if m.behavior_hints.configurable && small_button(ui, "Configure").clicked() {
                     configure = Some(url.clone());
                 }
-                if small_button(ui, "Uninstall").clicked() {
-                    remove = Some(url.clone());
+                // Asked first, like deleting a download: a configured URL can't be recovered once removed.
+                if self.confirm_uninstall.as_ref() == Some(url) {
+                    field_label(ui, "Uninstall?");
+                    if small_button(ui, "Yes").clicked() {
+                        remove = Some(url.clone());
+                    }
+                    if small_button(ui, "No").clicked() {
+                        self.confirm_uninstall = None;
+                    }
+                } else if small_button(ui, "Uninstall").clicked() {
+                    self.confirm_uninstall = Some(url.clone());
                 }
             });
             match self.addon_updates.iter().find(|(u, _)| u == url).map(|(_, r)| r) {
@@ -4325,6 +4495,7 @@ impl App {
             self.build_rows(&ctx);
         }
         if let Some(u) = remove {
+            self.confirm_uninstall = None;
             let _ = self.db.remove_addon(&u);
             self.addons.retain(|(x, _)| *x != u);
             self.build_rows(&ctx);
@@ -4556,6 +4727,7 @@ impl App {
             caption(ui, m);
         }
         row_title(ui, "Diagnostics");
+        caption(ui, format!("Version {}", stremflix_rs::diag::version()));
         let out = self.data_dir.join("diagnostics.txt");
         if small_button(ui, "Export diagnostics").on_hover_text(format!("Version, OS and recent log without secrets, saved to {}", out.display())).clicked() {
             let summary = format!("addons: {}\nsigned in: {}", self.addons.len(), self.account.is_some());
@@ -5016,16 +5188,30 @@ impl App {
             self.play_torrent(&ctx, &m);
         }
         if form_row(ui, "Folder path", &mut self.folder, "/path/to/videos", "Add folder", None, false) {
-            let dir = PathBuf::from(self.folder.trim());
-            // Off the UI thread: a big folder or network share can take minutes.
-            self.spawn(&ctx, async move {
-                let res = tokio::task::spawn_blocking({
-                    let dir = dir.clone();
-                    move || scan(&dir).map_err(|e| e.to_string())
-                })
-                .await?;
-                Ok(Msg::Scanned(dir, res))
+            self.scan_folder(&ctx, PathBuf::from(self.folder.trim()), false);
+        }
+        let (mut rescan, mut forget) = (None, None);
+        for f in &self.library_folders {
+            ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
+                if small_button(ui, "Rescan").on_hover_text("Look for added and removed files").clicked() {
+                    rescan = Some(f.clone());
+                }
+                if small_button(ui, "Remove").on_hover_text("Take this folder out of the library; its files stay on disk").clicked() {
+                    forget = Some(f.clone());
+                }
+                // Last and truncated: a long path would push the buttons out of the window.
+                ui.add(egui::Label::new(f).truncate());
             });
+        }
+        if let Some(f) = rescan {
+            self.scan_folder(&ctx, PathBuf::from(f), true);
+        }
+        if let Some(f) = forget {
+            match self.db.remove_library_folder(&f) {
+                Ok(()) => self.reload_library(),
+                Err(e) => report(&mut self.error, format!("removing {f}: {e:#}")),
+            }
         }
         let mut play = None;
         for it in self.library.iter().filter(|it| title_matches(&it.title, &self.lib_query)) {
@@ -5115,21 +5301,32 @@ impl eframe::App for App {
         if ctx.cumulative_frame_nr() == 2 {
             std::thread::spawn(stremflix_rs::player::load_mpv);
         }
-        // A dropped .torrent file, or a magnet pasted with no text field focused, plays at once.
+        // A dropped .torrent or media file, or a magnet pasted with no text field focused, plays at once.
         // Window systems deliver dropped files only, not dropped text, so magnets come in by paste.
         let (dropped, pasted) = ctx.input(|i| {
-            let file = i.raw.dropped_files.iter().filter_map(|f| f.path().to_str().map(String::from)).find(|p| is_torrent_file(p));
+            let file = i.raw.dropped_files.iter().filter_map(|f| f.path().to_str().map(String::from)).find(|p| is_torrent_file(p) || is_media(p.as_ref()));
             (file, i.events.iter().find_map(|e| if let egui::Event::Paste(t) = e { Some(t.trim().to_string()) } else { None }))
         });
         let pasted = pasted.filter(|t| t.starts_with("magnet:") && ctx.memory(|m| m.focused().is_none()));
-        if let Some(t) = dropped.or(pasted) {
-            self.play_torrent(&ctx, &t);
+        match dropped.or(pasted) {
+            Some(t) if is_torrent_source(&t) => self.play_torrent(&ctx, &t),
+            // A media file opens like one given on the command line.
+            Some(t) => self.handle(&ctx, Msg::Link(t)),
+            None => {}
         }
         if self.player.is_some() {
+            // The player has its own keys; don't carry a stale focus into the first page shown after it.
+            self.had_focus = false;
             self.ui_player(ui, frame);
             return;
         }
 
+        // Not a key repeat: holding Escape to leave the player must not also close the page under it. An open dropdown takes Escape for itself.
+        let esc = |e: &egui::Event| matches!(e, egui::Event::Key { key: egui::Key::Escape, pressed: true, repeat: false, .. });
+        let back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1) || (!self.had_focus && i.events.iter().any(esc)));
+        if back && !egui::Popup::is_any_open(&ctx) {
+            self.go_back();
+        }
         // The search page lives on Home; any other tab (also set by links) closes it.
         if self.tab != Tab::Home {
             self.search_page = None;
@@ -5155,8 +5352,7 @@ impl eframe::App for App {
                         sel_rect = Some(r.rect);
                     }
                     if r.clicked() {
-                        self.tab = tab;
-                        self.search_page = None;
+                        self.go_tab(tab);
                     }
                 }
                 if let Some(target) = sel_rect {
@@ -5176,6 +5372,10 @@ impl eframe::App for App {
                     let pill = r.rect.union(b.rect);
                     ui.painter().set(bg, egui::epaint::RectShape::filled(egui::Rect::from_center_size(pos2(pill.center().x, icon.center().y), vec2(pill.width() + 24.0, 34.0)), 17, tint(ui, 34)));
                     let r = r.labelled_by(b.id);
+                    // "/" (when not typing) or Ctrl+F jumps to the search box.
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F) || (!self.had_focus && i.consume_key(egui::Modifiers::NONE, egui::Key::Slash))) {
+                        r.request_focus();
+                    }
                     if b.clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                         self.search(&ctx);
                     }
@@ -5221,6 +5421,11 @@ impl eframe::App for App {
                         }
                     } else {
                         ui.ctx().data_mut(|d| d.remove::<egui::Rect>(id));
+                    }
+                    // In the header, where it shifts nothing: a clicked title shows no page until its addons reply.
+                    if let Some(title) = self.loading() {
+                        ui.add_space(24.0);
+                        ui.spinner().on_hover_text(format!("Loading {title}"));
                     }
                 });
             });
@@ -5283,6 +5488,7 @@ impl eframe::App for App {
                 Tab::Settings => self.ui_settings(ui),
             });
         });
+        self.had_focus = ctx.memory(|m| m.focused().is_some());
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
@@ -5421,6 +5627,22 @@ fn main() -> eframe::Result {
             let _ = tx.send(Msg::Tray(a));
             ctx.request_repaint();
         });
+        // SIGTERM (logout, shutdown) and Ctrl+C quit like the tray's Quit, so the session ends cleanly and the window is saved.
+        #[cfg(unix)]
+        {
+            let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
+            app.rt.spawn(async move {
+                use tokio::signal::unix::{SignalKind, signal};
+                let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };
+                let mut next = async || tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} };
+                next().await;
+                let _ = tx.send(Msg::Tray(tray::Action::Quit));
+                ctx.request_repaint();
+                // A second signal means the UI did not get to it.
+                next().await;
+                std::process::exit(1);
+            });
+        }
         let _ = ctx_cell.set(cc.egui_ctx.clone());
         Ok(Box::new(app))
     });
@@ -5909,7 +6131,7 @@ mod tests {
     #[test]
     fn row_wants_more_only_when_it_can() {
         let m = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
-        let row = Row { title: String::new(), src: Default::default(), items: Some(vec![m("a")]), skippable: true, fetched: 1, loading_more: false, exhausted: false };
+        let row = Row { title: String::new(), src: Default::default(), items: Some(vec![m("a")]), skippable: true, fetched: 1, loading_more: false, exhausted: false, error: None };
         assert!(row.wants_more(true));
         assert!(!row.wants_more(false), "not near the end");
         assert!(!Row { skippable: false, ..clone_row(&row) }.wants_more(true), "no skip extra");
@@ -5920,7 +6142,7 @@ mod tests {
     }
 
     fn clone_row(r: &Row) -> Row {
-        Row { title: String::new(), src: Default::default(), items: r.items.clone(), skippable: r.skippable, fetched: r.fetched, loading_more: r.loading_more, exhausted: r.exhausted }
+        Row { title: String::new(), src: Default::default(), items: r.items.clone(), skippable: r.skippable, fetched: r.fetched, loading_more: r.loading_more, exhausted: r.exhausted, error: None }
     }
 
     #[test]
@@ -5972,6 +6194,67 @@ mod tests {
         assert!(app.player.is_none());
         app.handle(&ctx, Msg::Streams(m("b"), None, vec![], vec![], Autoplay::Off, None, 2));
         assert_eq!(app.selected.as_ref().map(|(m, ..)| m.id.as_str()), Some("b"), "current reply applies");
+    }
+
+    #[test]
+    fn a_rescan_reply_for_a_removed_folder_is_dropped() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let item = LibraryItem { path: "/a/1.mp4".into(), title: "1".into() };
+        app.handle(&ctx, Msg::Scanned("/a".into(), true, Ok(vec![item.clone()])));
+        assert!(app.library.is_empty() && app.library_folders.is_empty(), "folder was removed before the reply");
+        app.handle(&ctx, Msg::Scanned("/a".into(), false, Ok(vec![item])));
+        assert_eq!(app.library_folders, ["/a"], "adding a folder still works");
+    }
+
+    #[test]
+    fn unaired_episodes_say_when_they_air() {
+        assert_eq!(episode_date(Some("2026-11-20T00:00:00.000Z"), "2026-11-13"), "Airs 2026-11-20");
+        assert_eq!(episode_date(Some("2026-11-13T23:00:00.000Z"), "2026-11-13"), "2026-11-13", "today has aired");
+        assert_eq!(episode_date(Some("2019-01-02"), "2026-11-13"), "2019-01-02");
+        assert_eq!(episode_date(None, "2026-11-13"), "");
+    }
+
+    #[test]
+    fn a_title_is_loading_until_its_reply_or_another_navigation() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "A".into(), poster: None, background: None, description: None };
+        app.open_streams(&ctx, m.clone(), None, Autoplay::Off, None);
+        assert_eq!(app.loading(), Some("A"));
+        app.handle(&ctx, Msg::Streams(m.clone(), None, vec![], vec![], Autoplay::Off, None, app.nav));
+        assert_eq!(app.loading(), None);
+        app.open_streams(&ctx, m.clone(), None, Autoplay::Off, None);
+        app.close_details();
+        assert_eq!(app.loading(), None, "Back left the request behind");
+        app.open_streams(&ctx, m, None, Autoplay::Off, None);
+        app.handle(&ctx, Msg::Error("boom".into()));
+        assert_eq!(app.loading(), None);
+    }
+
+    #[test]
+    fn home_on_home_leaves_the_title_page() {
+        let (_dir, mut app) = test_app();
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
+        app.selected = Some((m, vec![], vec![]));
+        app.tab = Tab::Library;
+        app.go_tab(Tab::Home);
+        assert!(app.selected.is_some(), "coming back from another tab returns to the title");
+        app.go_tab(Tab::Home);
+        assert!(app.selected.is_none());
+    }
+
+    #[test]
+    fn back_closes_the_title_then_the_search_page() {
+        let (_dir, mut app) = test_app();
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
+        app.tab = Tab::Home;
+        app.selected = Some((m, vec![], vec![]));
+        app.search_page = Some(SearchPage { query: "q".into(), rows: vec![], failed: vec![] });
+        app.go_back();
+        assert!(app.selected.is_none() && app.search_page.is_some());
+        app.go_back();
+        assert!(app.search_page.is_none());
     }
 
     #[test]
@@ -6038,7 +6321,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         let ctx = egui::Context::default();
         let src = |id: &str| ("https://a.example/manifest.json".to_string(), "movie".to_string(), id.to_string());
-        let row = |id: &str| Row { title: id.into(), src: src(id), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false };
+        let row = |id: &str| Row { title: id.into(), src: src(id), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false, error: None };
         let hit = MetaPreview { id: "x".into(), kind: "movie".into(), name: "x".into(), poster: None, background: None, description: None };
         app.search_page = Some(SearchPage { query: "new".into(), rows: vec![row("a"), row("b")], failed: vec![] });
         app.handle(&ctx, Msg::Search("old".into(), src("a"), Ok(vec![hit.clone()])));
@@ -6051,6 +6334,39 @@ mod tests {
         app.search_page = Some(SearchPage { query: "new".into(), rows: vec![row("a")], failed: vec![] });
         app.handle(&ctx, Msg::Search("new".into(), src("a"), Err("boom".into())));
         assert!(app.error.as_deref().is_some_and(|e| e.contains("boom")), "every catalog failed");
+    }
+
+    #[test]
+    fn failed_home_row_keeps_its_error_until_a_reply_succeeds() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let src = ("https://a.example/manifest.json".to_string(), "movie".to_string(), "c".to_string());
+        app.rows = vec![Row { title: "c".into(), src: src.clone(), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false, error: None }];
+        app.handle(&ctx, Msg::Row(src.clone(), Err("boom".into())));
+        assert_eq!(app.rows[0].error.as_deref(), Some("boom"));
+        assert!(app.error.is_none(), "one failed row is not a page-wide error");
+        let hit = MetaPreview { id: "x".into(), kind: "movie".into(), name: "x".into(), poster: None, background: None, description: None };
+        app.handle(&ctx, Msg::Row(src, Ok(vec![hit])));
+        assert!(app.rows[0].error.is_none() && app.rows[0].fetched == 1);
+    }
+
+    #[test]
+    fn discover_pages_append_until_one_adds_nothing() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let m = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
+        let src: DiscoverSrc = ("https://a.example/manifest.json".into(), "movie".into(), "c".into(), vec![]);
+        app.discover.src = Some(src.clone());
+        app.handle(&ctx, Msg::Discover(src.clone(), Ok(vec![m("a"), m("b")])));
+        app.handle(&ctx, Msg::DiscoverMore(src.clone(), 2, Ok(vec![m("c")])));
+        assert_eq!(app.discover.items.as_ref().map(Vec::len), Some(2), "no page was asked for");
+        app.discover.loading_more = true;
+        app.handle(&ctx, Msg::DiscoverMore(src.clone(), 2, Ok(vec![m("b"), m("c")])));
+        assert_eq!(app.discover.items.as_ref().map(Vec::len), Some(3), "the repeated title is skipped");
+        assert_eq!((app.discover.fetched, app.discover.loading_more, app.discover.exhausted), (4, false, false));
+        app.discover.loading_more = true;
+        app.handle(&ctx, Msg::DiscoverMore(src, 4, Ok(vec![m("c")])));
+        assert!(app.discover.exhausted);
     }
 
     #[test]
