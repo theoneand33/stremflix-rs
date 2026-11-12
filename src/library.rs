@@ -10,6 +10,11 @@ pub struct LibraryItem {
     pub title: String,
 }
 
+/// Whether `path` has one of [`MEDIA_EXTS`], in any case.
+pub fn is_media(path: &Path) -> bool {
+    path.extension().and_then(|x| x.to_str()).is_some_and(|x| MEDIA_EXTS.contains(&x.to_ascii_lowercase().as_str()))
+}
+
 /// Recursively find media files under `dir`, skipping hidden files/dirs. Sorted by path.
 pub fn scan(dir: &Path) -> std::io::Result<Vec<LibraryItem>> {
     if !dir.is_dir() {
@@ -21,12 +26,7 @@ pub fn scan(dir: &Path) -> std::io::Result<Vec<LibraryItem>> {
         .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| MEDIA_EXTS.contains(&x.to_ascii_lowercase().as_str()))
-        })
+        .filter(|e| is_media(e.path()))
         .map(|e| LibraryItem {
             title: e.path().file_stem().unwrap_or_default().to_string_lossy().into_owned(),
             path: e.into_path(),

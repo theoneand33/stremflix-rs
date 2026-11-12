@@ -14,7 +14,7 @@ use stremflix_rs::addon::{AddonClient, Skip, SkipKind, AddonEntry, CatalogDef, D
 use stremflix_rs::instance;
 use stremflix_rs::db::{self, Db, Download, List, Progress, SavedTitle, Watched};
 use stremflix_rs::download::{self, State};
-use stremflix_rs::library::{LibraryItem, scan};
+use stremflix_rs::library::{LibraryItem, is_media, scan};
 use eframe::glow::{self, HasContext};
 use stremflix_rs::player::{self, chapter_skips, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
@@ -5283,15 +5283,18 @@ impl eframe::App for App {
         if ctx.cumulative_frame_nr() == 2 {
             std::thread::spawn(stremflix_rs::player::load_mpv);
         }
-        // A dropped .torrent file, or a magnet pasted with no text field focused, plays at once.
+        // A dropped .torrent or media file, or a magnet pasted with no text field focused, plays at once.
         // Window systems deliver dropped files only, not dropped text, so magnets come in by paste.
         let (dropped, pasted) = ctx.input(|i| {
-            let file = i.raw.dropped_files.iter().filter_map(|f| f.path().to_str().map(String::from)).find(|p| is_torrent_file(p));
+            let file = i.raw.dropped_files.iter().filter_map(|f| f.path().to_str().map(String::from)).find(|p| is_torrent_file(p) || is_media(p.as_ref()));
             (file, i.events.iter().find_map(|e| if let egui::Event::Paste(t) = e { Some(t.trim().to_string()) } else { None }))
         });
         let pasted = pasted.filter(|t| t.starts_with("magnet:") && ctx.memory(|m| m.focused().is_none()));
-        if let Some(t) = dropped.or(pasted) {
-            self.play_torrent(&ctx, &t);
+        match dropped.or(pasted) {
+            Some(t) if is_torrent_source(&t) => self.play_torrent(&ctx, &t),
+            // A media file opens like one given on the command line.
+            Some(t) => self.handle(&ctx, Msg::Link(t)),
+            None => {}
         }
         if self.player.is_some() {
             self.ui_player(ui, frame);

@@ -11,3 +11,10 @@ fn scans_fixture_folder() {
     assert!(items[1].path.ends_with("sub/clip-two.mkv"));
     assert!(scan(&dir.join("does-not-exist")).is_err());
 }
+
+#[test]
+fn media_files_go_by_extension_in_any_case() {
+    use stremflix_rs::library::is_media;
+    assert!(is_media(Path::new("/x/Film.MKV")) && is_media(Path::new("song.flac")));
+    assert!(!is_media(Path::new("/x/film.torrent")) && !is_media(Path::new("/x/mkv")) && !is_media(Path::new("notes.txt")));
+}
