@@ -217,7 +217,7 @@ fn stream_parsing_and_targets() {
     let body = format!(
         r#"{{"streams": [
         {{"url": "https://cdn.example/v.mp4", "title": "HTTP"}},
-        {{"infoHash": "{hash}", "fileIdx": 1, "sources": ["tracker:http://tr.example/announce", "peer:127.0.0.1:6881", "dht:{hash}"]}},
+        {{"infoHash": "{hash}", "fileIdx": 1, "sources": ["tracker:http://tr.example/announce", "tracker:udp://tr.example:1337/announce", "tracker:file:///etc/passwd", "peer:127.0.0.1:6881", "dht:{hash}"]}},
         {{"url": "file:///etc/passwd"}},
         {{"url": "javascript:alert(1)"}},
         {{"infoHash": "nothex"}},
@@ -231,6 +231,9 @@ fn stream_parsing_and_targets() {
     let Some(PlayTarget::Magnet(m, Some(1))) = s[1].target() else { panic!("expected magnet") };
     assert_eq!(parse_magnet_hash(&m).as_deref(), Some(hash));
     assert!(m.contains("&tr=http%3A%2F%2Ftr.example%2Fannounce"));
+    // Most public trackers are UDP; other schemes are dropped.
+    assert!(m.contains("&tr=udp%3A%2F%2Ftr.example%3A1337%2Fannounce"));
+    assert_eq!(m.matches("&tr=").count(), 2);
     assert_eq!(magnet_peers(&m), vec!["127.0.0.1:6881".parse().unwrap()]);
     assert!(matches!(s[2].target(), Some(PlayTarget::Magnet(_, None))));
     // Base32 (32 chars, uppercase as librqbit reads it) is a valid info hash too; other lengths are not.

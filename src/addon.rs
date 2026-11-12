@@ -508,7 +508,7 @@ impl Stream {
         };
         let mut magnet = format!("magnet:?xt=urn:btih:{}", hash.to_ascii_lowercase());
         for s in &self.sources {
-            if let Some(tr) = s.strip_prefix("tracker:").and_then(safe_http_url) {
+            if let Some(tr) = s.strip_prefix("tracker:").and_then(tracker_url) {
                 magnet.push_str("&tr=");
                 magnet.push_str(&url::form_urlencoded::byte_serialize(tr.as_str().as_bytes()).collect::<String>());
             } else if let Some(p) = s.strip_prefix("peer:").and_then(|p| p.parse::<std::net::SocketAddr>().ok()) {
@@ -536,6 +536,12 @@ pub fn sanitize_text(s: &str, max: usize) -> String {
 pub fn safe_http_url(s: &str) -> Option<Url> {
     let u = Url::parse(s.trim()).ok()?;
     (matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())).then_some(u)
+}
+
+/// Announce URL of a `tracker:` source: http(s), or udp as most public trackers are.
+fn tracker_url(s: &str) -> Option<Url> {
+    let u = Url::parse(s.trim()).ok()?;
+    (matches!(u.scheme(), "http" | "https" | "udp") && u.host_str().is_some_and(|h| !h.is_empty())).then_some(u)
 }
 
 /// Watch URL of a YouTube video id (11 chars of `[A-Za-z0-9_-]`); `None` for anything else.
