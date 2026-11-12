@@ -5311,6 +5311,8 @@ impl eframe::App for App {
             None => {}
         }
         if self.player.is_some() {
+            // The player has its own keys; don't carry a stale focus into the first page shown after it.
+            self.had_focus = false;
             self.ui_player(ui, frame);
             return;
         }
