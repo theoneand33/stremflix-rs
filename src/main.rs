@@ -5577,6 +5577,22 @@ fn main() -> eframe::Result {
             let _ = tx.send(Msg::Tray(a));
             ctx.request_repaint();
         });
+        // SIGTERM (logout, shutdown) and Ctrl+C quit like the tray's Quit, so the session ends cleanly and the window is saved.
+        #[cfg(unix)]
+        {
+            let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
+            app.rt.spawn(async move {
+                use tokio::signal::unix::{SignalKind, signal};
+                let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };
+                let mut next = async || tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} };
+                next().await;
+                let _ = tx.send(Msg::Tray(tray::Action::Quit));
+                ctx.request_repaint();
+                // A second signal means the UI did not get to it.
+                next().await;
+                std::process::exit(1);
+            });
+        }
         let _ = ctx_cell.set(cc.egui_ctx.clone());
         Ok(Box::new(app))
     });
