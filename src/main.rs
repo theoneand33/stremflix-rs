@@ -1117,6 +1117,8 @@ struct App {
     confirm_delete: Option<usize>,
     /// Downloaded file in Library awaiting a delete confirmation.
     confirm_delete_dl: Option<PathBuf>,
+    /// A widget had keyboard focus last frame: egui drops focus on Escape before `ui` runs, so that Escape must not also go back.
+    had_focus: bool,
     /// External player command, e.g. `vlc` or `mpv --fs`.
     external_player: String,
     /// Settings > Data: path typed for an import, and the last export/import result.
@@ -1314,6 +1316,7 @@ impl App {
             },
             confirm_delete: None,
             confirm_delete_dl: None,
+            had_focus: false,
             data_import: String::new(),
             data_msg: None,
             diag_msg: None,
@@ -2446,6 +2449,17 @@ impl App {
         }
         self.tab = tab;
         self.search_page = None;
+    }
+
+    /// Escape or the mouse's back button: close the file picker, else the title page, else the search page.
+    fn go_back(&mut self) {
+        if self.file_pick.is_some() {
+            self.clear_file_pick();
+        } else if self.tab == Tab::Home && self.selected.is_some() {
+            self.close_details();
+        } else if self.tab == Tab::Home {
+            self.search_page = None;
+        }
     }
 
     /// Leave the open title's page, dropping replies still on their way to it.
@@ -5139,6 +5153,12 @@ impl eframe::App for App {
             return;
         }
 
+        // Not a key repeat: holding Escape to leave the player must not also close the page under it. An open dropdown takes Escape for itself.
+        let esc = |e: &egui::Event| matches!(e, egui::Event::Key { key: egui::Key::Escape, pressed: true, repeat: false, .. });
+        let back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1) || (!self.had_focus && i.events.iter().any(esc)));
+        if back && !egui::Popup::is_any_open(&ctx) {
+            self.go_back();
+        }
         // The search page lives on Home; any other tab (also set by links) closes it.
         if self.tab != Tab::Home {
             self.search_page = None;
@@ -5184,6 +5204,10 @@ impl eframe::App for App {
                     let pill = r.rect.union(b.rect);
                     ui.painter().set(bg, egui::epaint::RectShape::filled(egui::Rect::from_center_size(pos2(pill.center().x, icon.center().y), vec2(pill.width() + 24.0, 34.0)), 17, tint(ui, 34)));
                     let r = r.labelled_by(b.id);
+                    // "/" (when not typing) or Ctrl+F jumps to the search box.
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F) || (!self.had_focus && i.consume_key(egui::Modifiers::NONE, egui::Key::Slash))) {
+                        r.request_focus();
+                    }
                     if b.clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                         self.search(&ctx);
                     }
@@ -5291,6 +5315,7 @@ impl eframe::App for App {
                 Tab::Settings => self.ui_settings(ui),
             });
         });
+        self.had_focus = ctx.memory(|m| m.focused().is_some());
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
@@ -5992,6 +6017,19 @@ mod tests {
         assert!(app.selected.is_some(), "coming back from another tab returns to the title");
         app.go_tab(Tab::Home);
         assert!(app.selected.is_none());
+    }
+
+    #[test]
+    fn back_closes_the_title_then_the_search_page() {
+        let (_dir, mut app) = test_app();
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
+        app.tab = Tab::Home;
+        app.selected = Some((m, vec![], vec![]));
+        app.search_page = Some(SearchPage { query: "q".into(), rows: vec![], failed: vec![] });
+        app.go_back();
+        assert!(app.selected.is_none() && app.search_page.is_some());
+        app.go_back();
+        assert!(app.search_page.is_none());
     }
 
     #[test]

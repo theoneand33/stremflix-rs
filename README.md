@@ -51,7 +51,7 @@ cargo test
 
 Addons lists installed addons in priority order; Up/Down reorder them, and the stream list and Home rows follow. The All/Movies/Shows switch orders metadata, streams, and subtitles per type; catalog rows and search keep the global order. Each addon shows whether it is reachable, timed out, or unreachable. Details shows an addon's id, types, resources, and catalogs. Streams are grouped by addon. `externalUrl` streams open in the browser; `ytId` streams play through yt-dlp, as do the trailer buttons on a title's detail page (from `trailerStreams` or legacy `trailers`).
 
-Press Enter in the header search to open a results page with one row for each catalog that supports the `search` extra. Rows fill in as addons reply.
+Press Enter in the header search to open a results page with one row for each catalog that supports the `search` extra. Rows fill in as addons reply. `/` or Ctrl+F focuses the search box; Esc or the mouse's back button leaves a title or results page.
 
 ### Playing
 
