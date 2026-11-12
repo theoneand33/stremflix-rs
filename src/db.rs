@@ -219,7 +219,14 @@ impl Db {
         let f = folder.to_string_lossy();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("INSERT OR IGNORE INTO library_folders (path) VALUES (?1)", [&f])?;
-        tx.execute("DELETE FROM library_items WHERE folder = ?1", [&f])?;
+        // By path, not by the `folder` column: an item under nested folders is owned by whichever was scanned last, and this scan lists every file under `folder`.
+        let stale: Vec<String> = {
+            let mut st = tx.prepare("SELECT path FROM library_items")?;
+            st.query_map([], |r| r.get::<_, String>(0))?.filter_map(|r| r.ok()).filter(|p| Path::new(p).starts_with(folder)).collect()
+        };
+        for p in &stale {
+            tx.execute("DELETE FROM library_items WHERE path = ?1", [p])?;
+        }
         for it in items {
             tx.execute(
                 "INSERT OR REPLACE INTO library_items (path, folder, title) VALUES (?1, ?2, ?3)",
