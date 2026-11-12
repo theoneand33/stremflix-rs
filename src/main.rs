@@ -1056,6 +1056,8 @@ struct App {
     pending: Option<(String, Option<String>)>,
     /// Bumped by every navigation (open a title or episode, play, Back); replies for an older one are dropped.
     nav: u64,
+    /// `nav` and title of a title or episode whose streams or episodes were asked for and have not arrived.
+    opening: Option<(u64, String)>,
     /// Full meta of the selected title, if an addon served one; checked against `selected` by id.
     details: Option<Meta>,
     /// Type and id of the movie whose details were last requested; older replies are dropped.
@@ -1390,6 +1392,7 @@ impl App {
             episode: None,
             pending: None,
             nav: 0,
+            opening: None,
             details: None,
             details_want: Default::default(),
             scroll_top: false,
@@ -1666,7 +1669,7 @@ impl App {
     fn handle(&mut self, ctx: &egui::Context, msg: Msg) {
         match msg {
             Msg::Error(e) => {
-                self.sleep_carry = None;
+                (self.sleep_carry, self.opening) = (None, None);
                 report(&mut self.error, e);
             }
             Msg::Installed(url, m, replaces) => {
@@ -1789,6 +1792,7 @@ impl App {
                 if nav != self.nav {
                     return;
                 }
+                self.opening = None;
                 if episode.is_none() {
                     self.episodes.clear();
                     self.scroll_top = true;
@@ -1822,6 +1826,7 @@ impl App {
                 if nav != self.nav {
                     return;
                 }
+                self.opening = None;
                 fill_deep_linked(&mut meta, &m); // before the rename below, which the name guard depends on
                 let mut videos = std::mem::take(&mut m.videos);
                 // A Continue Watching entry only knows the episode title.
@@ -2511,6 +2516,11 @@ impl App {
         self.search_page = None;
     }
 
+    /// Title being opened, while its request is the current navigation and unanswered.
+    fn loading(&self) -> Option<&str> {
+        self.opening.as_ref().filter(|(nav, _)| *nav == self.nav).map(|(_, t)| t.as_str())
+    }
+
     /// Escape or the mouse's back button: close the file picker, else the title page, else the search page.
     fn go_back(&mut self) {
         if self.file_pick.is_some() {
@@ -2762,6 +2772,7 @@ impl App {
         self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
+        self.opening = Some((nav, meta.name.clone()));
         self.spawn(ctx, async move {
             let mut errors = Vec::new();
             for u in &addons {
@@ -2842,6 +2853,7 @@ impl App {
         self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
+        self.opening = Some((nav, episode.as_ref().and_then(|v| v.title.clone()).unwrap_or_else(|| meta.name.clone())));
         self.spawn(ctx, async move {
             let (mut streams, mut subs, mut errors) = (Vec::new(), Vec::new(), Vec::new());
             let (kind, vid) = (meta.kind.clone(), id.clone());
@@ -5387,6 +5399,11 @@ impl eframe::App for App {
                     } else {
                         ui.ctx().data_mut(|d| d.remove::<egui::Rect>(id));
                     }
+                    // In the header, where it shifts nothing: a clicked title shows no page until its addons reply.
+                    if let Some(title) = self.loading() {
+                        ui.add_space(24.0);
+                        ui.spinner().on_hover_text(format!("Loading {title}"));
+                    }
                 });
             });
             let mut chosen = None;
@@ -6162,6 +6179,23 @@ mod tests {
         assert_eq!(episode_date(Some("2026-11-13T23:00:00.000Z"), "2026-11-13"), "2026-11-13", "today has aired");
         assert_eq!(episode_date(Some("2019-01-02"), "2026-11-13"), "2019-01-02");
         assert_eq!(episode_date(None, "2026-11-13"), "");
+    }
+
+    #[test]
+    fn a_title_is_loading_until_its_reply_or_another_navigation() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "A".into(), poster: None, background: None, description: None };
+        app.open_streams(&ctx, m.clone(), None, Autoplay::Off, None);
+        assert_eq!(app.loading(), Some("A"));
+        app.handle(&ctx, Msg::Streams(m.clone(), None, vec![], vec![], Autoplay::Off, None, app.nav));
+        assert_eq!(app.loading(), None);
+        app.open_streams(&ctx, m.clone(), None, Autoplay::Off, None);
+        app.close_details();
+        assert_eq!(app.loading(), None, "Back left the request behind");
+        app.open_streams(&ctx, m, None, Autoplay::Off, None);
+        app.handle(&ctx, Msg::Error("boom".into()));
+        assert_eq!(app.loading(), None);
     }
 
     #[test]
