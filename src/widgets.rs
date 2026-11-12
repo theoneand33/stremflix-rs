@@ -206,7 +206,18 @@ fn pill_widget<'a>(text: &str, size: f32, min: egui::Vec2) -> egui::Button<'a> {
         Some((i, t)) if !i.is_empty() && i.chars().all(|c| ('\u{E000}'..='\u{F8FF}').contains(&c)) => egui::Button::new((rt(i, phosphor()), rt(t, bold()))),
         _ => egui::Button::new(rt(text, bold())),
     };
-    b.min_size(min).corner_radius((min.y / 2.0) as u8)
+    // Never wrapped: in a wrapping row a pill moves to the next row whole.
+    b.min_size(min).corner_radius((min.y / 2.0) as u8).wrap_mode(egui::TextWrapMode::Extend)
+}
+
+/// Runs `add` with the widget visuals `style` sets, then puts the old ones back.
+/// Not `ui.scope`: a child ui starts its own row, so its content never wraps to the next row of a wrapping layout.
+fn with_widgets<R>(ui: &mut egui::Ui, style: impl FnOnce(&mut egui::Ui), add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let old = ui.visuals().widgets.clone();
+    style(ui);
+    let r = add(ui);
+    ui.visuals_mut().widgets = old;
+    r
 }
 
 /// A hero-sized pill to build other controls from, such as a menu button.
@@ -215,11 +226,7 @@ pub fn hero_pill<'a>(text: &str) -> egui::Button<'a> {
 }
 
 fn pill_button(ui: &mut egui::Ui, text: &str, size: f32, min: egui::Vec2, fill: [Color32; 2], fg: Color32) -> egui::Response {
-    ui.scope(|ui| {
-        pill_style(ui, fill, fg);
-        ui.add(pill_widget(text, size, min))
-    })
-    .inner
+    with_widgets(ui, |ui| pill_style(ui, fill, fg), |ui| ui.add(pill_widget(text, size, min)))
 }
 
 /// White primary pill (Netflix "Play") and translucent gray secondary pill.
@@ -402,10 +409,10 @@ pub fn dropdown<'a, R>(
     text: impl egui::IntoAtoms<'a>,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
-    ui.scope(|ui| {
-        field_style(ui);
+    with_widgets(ui, field_style, |ui| {
         egui::ComboBox::from_id_salt(id_salt)
             .selected_text(text)
+            .wrap_mode(egui::TextWrapMode::Extend)
             .icon(|ui, rect, vis, open| {
                 // Thin chevron that flips up while the menu is open.
                 let (c, s) = (rect.center(), rect.height().min(rect.width()) * 0.3);
@@ -437,7 +444,6 @@ pub fn dropdown<'a, R>(
             }))
             .show_ui(ui, add)
     })
-    .inner
 }
 
 /// Labeled text field and its action button on one centered line.
@@ -641,6 +647,27 @@ mod tests {
         })
         .drop_without_applying_deltas();
         assert!(used <= max, "{used} > {max}");
+    }
+
+    #[test]
+    fn pills_and_dropdowns_wrap_to_the_next_row_and_restore_the_style() {
+        let (ctx, mut rects, mut same) = (egui::Context::default(), Vec::new(), false);
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 400.0))), ..Default::default() };
+        ctx.run_ui(input, |ui| {
+            rects.clear();
+            let before = ui.visuals().widgets.inactive.weak_bg_fill;
+            ui.horizontal_wrapped(|ui| {
+                for i in 0..4 {
+                    rects.push(small_button(ui, "A button label").rect);
+                    rects.push(dropdown(ui, i, "A dropdown label", |_| ()).response.rect);
+                }
+            });
+            same = ui.visuals().widgets.inactive.weak_bg_fill == before;
+        })
+        .drop_without_applying_deltas();
+        assert!(rects.iter().all(|r| r.right() <= 300.0), "{rects:?}");
+        assert!(rects.last().unwrap().top() > rects[0].bottom());
+        assert!(same);
     }
 
     #[test]

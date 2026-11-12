@@ -2898,11 +2898,12 @@ impl App {
                 if std::mem::take(&mut self.show_streams) {
                     r.scroll_to_me(Some(Align::TOP));
                 }
-                ui.label(RichText::new(format!("{}  ·  {} subtitle track{}", key.1, subs.len(), if subs.len() == 1 { "" } else { "s" })).size(15.0).color(ui.visuals().weak_text_color()));
                 let seen = self.watched_keys.contains(&key.0);
                 if small_button(ui, if seen { "Mark unwatched" } else { "Mark watched" }).clicked() {
                     toggle = Some((key.0.clone(), !seen));
                 }
+                // Last and truncated: a long title would push the button out of the window.
+                ui.add(egui::Label::new(RichText::new(format!("{}  ·  {} subtitle track{}", key.1, subs.len(), if subs.len() == 1 { "" } else { "s" })).size(15.0).color(ui.visuals().weak_text_color())).truncate());
             });
             ui.add_space(8.0);
             for (i, s) in streams.iter().enumerate() {
@@ -3173,7 +3174,7 @@ impl App {
         // Picker changes apply on the next frame, after the checks above.
         let d = &mut self.discover;
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             dropdown(ui, "discover_kind", kind_label(&d.kind).to_owned(), |ui| {
                 for k in &kinds {
                     ui.selectable_value(&mut d.kind, k.to_string(), kind_label(k));
@@ -3353,10 +3354,14 @@ impl App {
                 ui.scope(|ui| { pill_style(ui, gray_fill(), Color32::WHITE); self.list_menu(ui, meta) });
             });
             ui.add_space(12.0);
+            // Row caps: this column fills bottom-up, so a long description or title would climb out of the banner's top.
+            let capped = |text: &str, font, rows| {
+                let mut job = egui::text::LayoutJob::simple(text.to_owned(), font, Color32::WHITE, col.width());
+                job.wrap.max_rows = rows;
+                egui::Label::new(job).wrap()
+            };
             if let Some(d) = &meta.description {
-                let short: String = d.chars().take(240).collect();
-                let short = if short.len() < d.len() { format!("{}…", short.trim_end()) } else { short };
-                ui.label(RichText::new(short).size(17.0).color(Color32::WHITE));
+                ui.add(capped(d, egui::FontId::proportional(17.0), 3));
             }
             ui.add_space(6.0);
             let kind = match meta.kind.as_str() {
@@ -3367,7 +3372,7 @@ impl App {
             ui.label(RichText::new(kind).size(15.0).strong().family(bold()).color(Color32::from_gray(220)));
             match self.image(&logo, want) {
                 Some(t) => ui.add(egui::Image::from_texture(t).alt_text(&meta.name).max_height(120.0).max_width(col.width())),
-                None => ui.add(egui::Label::new(RichText::new(&meta.name).size(46.0).strong().family(bold()).color(Color32::WHITE)).wrap()),
+                None => ui.add(capped(&meta.name, egui::FontId::new(46.0, bold()), 2)),
             };
         });
     }
@@ -3537,13 +3542,15 @@ impl App {
             p.after_hold = long;
         }
         let focused = ctx.memory(|m| m.focused());
+        let typing = ctx.text_edit_focused(); // read outside ctx.input, like the ones below
         let line = ctx.options(|o| o.input_options.line_scroll_speed); // read outside ctx.input to avoid nested locking
         let vol_id = ui.scope_id().with("volume");
         let over_vol = ctx.read_response(vol_id).is_some_and(|r| r.hovered()); // also outside ctx.input
         let (old_vol, mut vol_held) = (p.volume, false);
         ctx.input(|i| {
             use egui::Key::*;
-            let k = |key| i.key_pressed(key);
+            // Not while typing: "k" or "," in a popover's text field must not pause or step.
+            let k = |key| !typing && i.key_pressed(key);
             // Space activates a focused popover control, so it must not also toggle pause.
             // A short Space press pauses on release; a hold is 2x speed, like the mouse.
             if (i.key_released(Space) && focused.is_none() && !long) || k(K) { cmd(&["cycle", "pause"]) }
@@ -3570,8 +3577,9 @@ impl App {
                 p.wheel = 0.0;
             }
             toggle_fs |= k(F);
-            if k(Escape) {
-                if fs { toggle_fs = true } else { back = true }
+            // egui drops the focus on Escape before this runs, so an open popover (the only place to type) closes first.
+            if i.key_pressed(Escape) {
+                if p.menu.is_some() { p.menu = None } else if fs { toggle_fs = true } else { back = true }
             }
             if i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_pressed() || !i.events.is_empty() {
                 p.osd_until = now + 3.0;
@@ -3718,7 +3726,8 @@ impl App {
                         ui.label(RichText::new(title).size(18.0).family(bold()).color(Color32::WHITE));
                         // Short windows: the body scrolls under the title instead of the popover running over the controls.
                         // Both bounds: the Area's first-frame size guess would otherwise cap it lower.
-                        let body = (y - rect.top() - 140.0).max(120.0);
+                        // 200: the popover's top stays under the top bar, clear of the full screen button.
+                        let body = (y - rect.top() - 200.0).max(120.0);
                         egui::ScrollArea::vertical().id_salt("menu_body").max_height(body).min_scrolled_height(body).show(ui, |ui| {
                             if m != Menu::Playback {
                                 let (kind, prop) = if m == Menu::Audio { ("audio", "aid") } else { ("sub", "sid") };
@@ -4491,8 +4500,8 @@ impl App {
                 }
             });
             if self.confirm_upload {
+                caption(ui, "Overwrites the account's addon list with this order (addons only on the account are kept, last). Saved titles missing on the account are added (ones it has, even removed, stay as they are), and progress is updated only where it is newer there. Nothing is deleted.");
                 ui.horizontal(|ui| {
-                    caption(ui, "Overwrites the account's addon list with this order (addons only on the account are kept, last). Saved titles missing on the account are added (ones it has, even removed, stay as they are), and progress is updated only where it is newer there. Nothing is deleted.");
                     if primary_button(ui, "Upload").clicked() {
                         self.confirm_upload = false;
                         self.upload_account(&ctx);
@@ -4633,7 +4642,7 @@ impl App {
                     }
                     let state = if t.paused { "stopped" } else { "running" };
                     let (done, total) = t.progress;
-                    ui.label(format!("{} - {state}, {}% of {}, uploaded {}", t.name, done * 100 / total.max(1), fmt_size(total), fmt_size(t.uploaded)));
+                    ui.add(egui::Label::new(format!("{} - {state}, {}% of {}, uploaded {}", t.name, done * 100 / total.max(1), fmt_size(total), fmt_size(t.uploaded))).truncate());
                 });
             }
         }
@@ -4781,7 +4790,7 @@ impl App {
                 if small_button(ui, if hidden { "Show" } else { "Hide" }).clicked() {
                     toggle = Some(key.clone());
                 }
-                ui.label(if hidden { RichText::new(title).weak() } else { RichText::new(title) });
+                ui.add(egui::Label::new(if hidden { RichText::new(title).weak() } else { RichText::new(title) }).truncate());
             });
         }
         if self.home_all.is_empty() {
@@ -4827,7 +4836,7 @@ impl App {
         let ctx = ui.ctx().clone();
         let (mut want, mut open, mut quick) = (Vec::new(), None, None);
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.set_min_height(32.0);
             section_heading(ui, "Saved titles");
             let before = self.lib_sort;
@@ -4931,7 +4940,6 @@ impl App {
         for (i, j) in self.queue.iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.set_min_height(32.0);
-                ui.label(&j.d.title);
                 let (txt, frac) = match j.state {
                     State::Queued => ("Queued".to_string(), 0.0),
                     State::Active if j.total == 0 => ("Starting".to_string(), 0.0),
@@ -4951,6 +4959,8 @@ impl App {
                 if small_button(ui, if j.state == State::Failed { "Remove" } else { "Cancel" }).clicked() {
                     act = Some((i, 2));
                 }
+                // Last and truncated: a long title would push the buttons out of the window.
+                ui.add(egui::Label::new(&j.d.title).truncate());
             });
         }
         match act {
@@ -4982,7 +4992,7 @@ impl App {
                 } else if small_button(ui, "Delete").on_hover_text("Delete the downloaded file").clicked() {
                     self.confirm_delete_dl = Some(d.path.clone());
                 }
-                ui.label(d.path.display().to_string());
+                ui.add(egui::Label::new(d.path.display().to_string()).truncate());
             });
         }
         if let Some(d) = play {
@@ -5023,7 +5033,7 @@ impl App {
                 if primary_button(ui, &format!("Play {}", it.title)).clicked() {
                     play = Some(it.clone());
                 }
-                ui.label(it.path.display().to_string());
+                ui.add(egui::Label::new(it.path.display().to_string()).truncate());
             });
         }
         if let Some(it) = play {
@@ -5158,7 +5168,7 @@ impl eframe::App for App {
                     // Right-to-left: the field is added first so the icon sits on its left.
                     let bg = ui.painter().add(egui::Shape::Noop);
                     ui.add_space(12.0);
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Titles, people, genres").frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 2, ..Default::default() })).desired_width(170.0)); // top margin: optically center the text; width leaves room for five tabs at the 1000 px default size
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Titles, people, genres").frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 2, ..Default::default() })).desired_width((ui.available_width() - 60.0).clamp(40.0, 170.0))); // top margin: optically center the text; width leaves room for five tabs at the 1000 px default size, and shrinks in a narrower window instead of covering them
                     let (icon, b) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
                     b.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Search"));
                     ui.painter().text(icon.center(), egui::Align2::CENTER_CENTER, icons::MAGNIFYING_GLASS, egui::FontId::proportional(18.0), ui.visuals().weak_text_color());
@@ -5218,9 +5228,12 @@ impl eframe::App for App {
             if let Some((_, title, _, _, files, sel)) = &mut self.file_pick {
                 let mut open = true;
                 egui::Window::new(format!("Choose a file: {}", sanitize_text(title, 80))).open(&mut open).collapsible(false).show(&ctx, |ui| {
-                    for (i, name, len) in files.iter() {
-                        ui.radio_value(sel, *i, format!("{}  ({})", sanitize_text(name, 120), fmt_size(*len)));
-                    }
+                    // Scrolls: a season pack's file list would run past the window and take Play with it.
+                    egui::ScrollArea::vertical().max_height((ui.ctx().content_rect().height() - 160.0).max(80.0)).show(ui, |ui| {
+                        for (i, name, len) in files.iter() {
+                            ui.radio_value(sel, *i, format!("{}  ({})", sanitize_text(name, 120), fmt_size(*len)));
+                        }
+                    });
                     if primary_button(ui, "Play").clicked() {
                         chosen = Some(*sel);
                     }
