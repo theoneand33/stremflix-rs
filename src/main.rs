@@ -4127,7 +4127,8 @@ impl App {
 
     fn ui_addons(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        if form_row(ui, "Manifest URL:", &mut self.addon_url, "http://127.0.0.1:7070/manifest.json", "Install", None, false) {
+        ui.add_space(8.0);
+        if form_row(ui, "Manifest URL", &mut self.addon_url, "http://127.0.0.1:7070/manifest.json", "Install", None, false) {
             // A pasted stremio:// link becomes its manifest URL (http for loopback).
             if let Some(stremflix_rs::addon::DeepLink::Addon(u)) = stremflix_rs::addon::parse_deep_link(&self.addon_url) {
                 self.addon_url = u.into();
@@ -4139,7 +4140,7 @@ impl App {
             });
         }
         // Blank path = auto-detect.
-        if form_row(ui, "Stremio data:", &mut self.import_path, "Auto-detect local Stremio", "Import from Stremio", Some("Import addons, library, watched titles and progress"), true) {
+        if form_row(ui, "Stremio data", &mut self.import_path, "Auto-detect local Stremio", "Import from Stremio", Some("Import addons, library, watched titles and progress"), true) {
             let path = Some(PathBuf::from(self.import_path.trim())).filter(|p| !p.as_os_str().is_empty());
             self.spawn(&ctx, async move {
                 let (_, imp) = tokio::task::spawn_blocking(move || stremio_import::import(path.as_deref())).await??;
@@ -4163,8 +4164,7 @@ impl App {
                 Ok(Msg::UpdateCheck(out))
             });
         }
-        ui.separator();
-        section_heading(ui, "Installed addons");
+        row_title(ui, "Installed addons");
         let mut update = None;
         let mut remove = None;
         let mut configure = None;
@@ -4174,7 +4174,7 @@ impl App {
         let mut reset_order = false;
         ui.horizontal(|ui| {
             ui.set_min_height(32.0);
-            field_label(ui, "Order for:");
+            field_label(ui, "Order for");
             for (k, label) in [("", "All"), ("movie", "Movies"), ("series", "Shows")] {
                 if pill(ui, label, self.addon_order_kind == k, egui::Role::RadioButton).clicked() {
                     self.addon_order_kind = k.to_string();
@@ -4198,7 +4198,14 @@ impl App {
                 if ui.add_enabled_ui(pos + 1 < n, |ui| small_button(ui, "Down")).inner.on_hover_text("Lower priority").clicked() {
                     swap = Some(pos);
                 }
-                ui.label(format!("{} {}", m.name, m.version)).on_hover_text(url);
+                // Fixed-width name cell, so the actions line up whatever the names' lengths.
+                ui.allocate_ui_with_layout(vec2(280.0, 32.0), Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_width(280.0);
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(&m.name, 0.0, egui::TextFormat::simple(egui::FontId::proportional(15.0), ui.visuals().strong_text_color()));
+                    job.append(&m.version, 8.0, egui::TextFormat::simple(egui::FontId::proportional(13.0), ui.visuals().weak_text_color()));
+                    ui.add(egui::Label::new(job).truncate()).on_hover_text(url);
+                });
                 let open = self.addon_details.as_ref() == Some(url);
                 if small_button(ui, if open { "Hide details" } else { "Details" }).clicked() {
                     details = Some((!open).then(|| url.clone()));
@@ -4240,7 +4247,7 @@ impl App {
                 ui.collapsing("Install on phone (QR)", |ui| qr_ui(ui, &link));
             }
             if let Some((old, pasted)) = self.configuring.as_mut().filter(|(o, _)| o == url)
-                && form_row(ui, "Configured URL:", pasted, "https://.../manifest.json", "Replace", None, false)
+                && form_row(ui, "Configured URL", pasted, "https://.../manifest.json", "Replace", None, false)
             {
                 replace = Some((old.clone(), pasted.trim().to_string()));
             }
@@ -4309,8 +4316,7 @@ impl App {
     /// Addons listed by the `addon_catalog` resource of installed addons (e.g. Cinemeta's Community catalog), each installable.
     fn ui_browse_addons(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        ui.separator();
-        section_heading(ui, "Browse addons");
+        row_title(ui, "Browse addons");
         let label = |addon: &str, c: &CatalogDef| sanitize_text(&format!("{addon} - {} ({})", c.name.as_deref().unwrap_or(&c.id), kind_label(&c.kind)), 400);
         let sources: Vec<(AddonCatalogSrc, String)> = self
             .addons
@@ -4415,9 +4421,7 @@ impl App {
         let mut save: Vec<(&str, String)> = Vec::new();
         ui.add_space(8.0);
         section_heading(ui, "Appearance");
-        ui.horizontal(|ui| {
-            ui.set_min_height(32.0);
-            field_label(ui, "Theme");
+        field_row(ui, "Theme", |ui, _| {
             for (name, light) in [("Dark", false), ("Light", true)] {
                 if pill(ui, name, self.light == light, egui::Role::RadioButton).clicked() && self.light != light {
                     self.light = light;
@@ -4435,7 +4439,7 @@ impl App {
             }
         });
         ui.scope(|ui| {
-            ui.set_max_width(550.0);
+            ui.set_max_width(ROW_WIDTH);
             let step = stepper(ui, "UI scale", &format!("{:.0}%", self.ui_scale * 100.0));
             if step != 0 {
                 ui.ctx().set_zoom_factor(clamp_scale(self.ui_scale + step as f32 * 0.25));
@@ -4492,9 +4496,9 @@ impl App {
             }
         } else {
             let mut go = false;
-            field_row(ui, "Email:", |ui, l| {
+            field_row(ui, "Email", |ui, l| {
                 ui.add(egui::TextEdit::singleline(&mut self.login.0).desired_width(260.0)).labelled_by(l);
-                let l = field_label(ui, "Password:");
+                let l = field_label(ui, "Password");
                 let r = ui.add(egui::TextEdit::singleline(&mut self.login.1).password(true).desired_width(200.0)).labelled_by(l.id);
                 go = ui.add_enabled_ui(!self.account_busy, |ui| primary_button(ui, "Sign in")).inner.clicked()
                     || !self.account_busy && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -4522,7 +4526,7 @@ impl App {
             }
         }
         caption(ui, "The export includes addon URLs, which can hold account tokens. Keep it private.");
-        if form_row(ui, "Import file:", &mut self.data_import, "/path/to/stremflix-rs-export.json", "Import", Some("Merges the file into your data; nothing is deleted"), false) {
+        if form_row(ui, "Import file", &mut self.data_import, "/path/to/stremflix-rs-export.json", "Import", Some("Merges the file into your data; nothing is deleted"), false) {
             match self.db.import_file(std::path::Path::new(self.data_import.trim())) {
                 Ok(m) => self.data_msg = Some(format!("{m}. Restart the app to apply.")),
                 Err(e) => report(&mut self.error, format!("importing: {e:#}")),
@@ -4555,7 +4559,7 @@ impl App {
         }
         row_title(ui, "Torrents");
         let hint = self.data_dir.join("torrents").display().to_string();
-        if form_row(ui, "Cache location:", &mut self.torrent_dir, &hint, "Save", Some("Empty: the app's data folder"), true) {
+        if form_row(ui, "Cache location", &mut self.torrent_dir, &hint, "Save", Some("Empty: the app's data folder"), true) {
             let d = self.torrent_dir.trim().to_string();
             // Relative paths would depend on the working directory.
             if d.is_empty() || std::path::Path::new(&d).is_absolute() {
@@ -4564,18 +4568,18 @@ impl App {
                 report(&mut self.error, "cache location must be an absolute path");
             }
         }
-        if combo_row(ui, "Cache size:", &mut self.torrent_cache, &CACHE_SIZES) {
+        if combo_row(ui, "Cache size", &mut self.torrent_cache, &CACHE_SIZES) {
             save.push(("torrent_cache", self.torrent_cache.to_string()));
         }
-        if combo_row(ui, "Connections:", &mut self.torrent_profile, &Profile::ALL.map(|p| (p.label(), p))) {
+        if combo_row(ui, "Connections", &mut self.torrent_profile, &Profile::ALL.map(|p| (p.label(), p))) {
             save.push(("torrent_profile", self.torrent_profile.label().into()));
         }
-        for (title, key, val) in [("Download limit:", "torrent_down_limit", &mut self.torrent_limits.0), ("Upload limit:", "torrent_up_limit", &mut self.torrent_limits.1)] {
+        for (title, key, val) in [("Download limit", "torrent_down_limit", &mut self.torrent_limits.0), ("Upload limit", "torrent_up_limit", &mut self.torrent_limits.1)] {
             if combo_row(ui, title, val, &SPEED_LIMITS) {
                 save.push((key, val.to_string()));
             }
         }
-        for (label, id, choices) in [("Seed to ratio:", "seed_ratio", &SEED_RATIOS), ("Seed for:", "seed_secs", &SEED_TIMES)] {
+        for (label, id, choices) in [("Seed to ratio", "seed_ratio", &SEED_RATIOS), ("Seed for", "seed_secs", &SEED_TIMES)] {
             let mut cur = if id == "seed_ratio" { self.torrent_seed.ratio } else { self.torrent_seed.secs as f64 };
             if combo_row(ui, label, &mut cur, choices) {
                 if id == "seed_ratio" { self.torrent_seed.ratio = cur } else { self.torrent_seed.secs = cur as u64 }
@@ -4623,15 +4627,15 @@ impl App {
             }
         }
         row_title(ui, "Proxy");
-        combo_row(ui, "Type:", &mut self.proxy[0], &[("Off", String::new()), ("HTTP", "http".to_string()), ("SOCKS5", "socks5".to_string())]);
+        combo_row(ui, "Type", &mut self.proxy[0], &[("Off", String::new()), ("HTTP", "http".to_string()), ("SOCKS5", "socks5".to_string())]);
         let mut apply = false;
         if !self.proxy[0].is_empty() {
-            field_row(ui, "Address:", |ui, l| {
+            field_row(ui, "Address", |ui, l| {
                 ui.add(egui::TextEdit::singleline(&mut self.proxy[1]).hint_text("host:port").desired_width(260.0)).labelled_by(l);
             });
-            field_row(ui, "Username:", |ui, l| {
+            field_row(ui, "Username", |ui, l| {
                 ui.add(egui::TextEdit::singleline(&mut self.proxy[2]).hint_text("optional").desired_width(160.0)).labelled_by(l);
-                let l = field_label(ui, "Password:");
+                let l = field_label(ui, "Password");
                 ui.add(egui::TextEdit::singleline(&mut self.proxy[3]).password(true).desired_width(160.0)).labelled_by(l.id);
             });
         }
@@ -4652,13 +4656,13 @@ impl App {
             (mpv has no SOCKS support) or DHT. The password is stored unencrypted in the app's database.";
         caption(ui, note);
         row_title(ui, "Player");
-        if form_row(ui, "External player:", &mut self.external_player, "vlc", "Save", Some("Command run with the stream URL; no shell"), true) {
+        if form_row(ui, "External player", &mut self.external_player, "vlc", "Save", Some("Command run with the stream URL; no shell"), true) {
             save.push(("external_player", self.external_player.trim().to_string()));
         }
         let on = |b: bool| if b { "1" } else { "0" }.to_string();
         let mut style = self.sub_style;
         ui.scope(|ui| {
-            ui.set_max_width(550.0);
+            ui.set_max_width(ROW_WIDTH);
             if switch_row(ui, "Play next episode automatically", &mut self.autoplay_next).changed() {
                 save.push(("autoplay_next", on(self.autoplay_next)));
             }
@@ -4693,9 +4697,8 @@ impl App {
             if switch_row(ui, "Subtitles off by default", &mut off).changed() {
                 save.push(("sub_off", if off { "1" } else { "0" }.into()));
             }
-            chip_row(ui, |ui| {
-                ui.set_min_height(32.0);
-                field_label(ui, "Default speed");
+            field_row(ui, "Default speed", |ui, _| {
+                ui.spacing_mut().item_spacing.x = 6.0; // seven chips end inside the row
                 for sp in SPEEDS {
                     if pill(ui, &format!("{sp}x"), self.default_speed == sp, egui::Role::RadioButton).clicked() {
                         self.default_speed = sp;
@@ -4709,17 +4712,16 @@ impl App {
             self.sub_style = style;
             save.push(("sub_style", style.encode()));
         }
-        ui.horizontal(|ui| {
-            ui.set_min_height(32.0);
-            for (i, key, label) in [(0, "seek_step", "Arrow-key seek"), (1, "seek_step_shift", "Shift + arrow seek")] {
-                field_label(ui, label);
-                if ui.add(egui::DragValue::new(&mut self.seek_steps[i]).range(SEEK_STEP_RANGE).suffix(" s")).changed() {
+        for (i, key, label) in [(0, "seek_step", "Arrow-key seek"), (1, "seek_step_shift", "Shift + arrow seek")] {
+            field_row(ui, label, |ui, l| {
+                field_style(ui);
+                if ui.add(egui::DragValue::new(&mut self.seek_steps[i]).range(SEEK_STEP_RANGE).suffix(" s")).labelled_by(l).changed() {
                     save.push((key, self.seek_steps[i].to_string()));
                 }
-            }
-        });
+            });
+        }
         row_title(ui, "Languages");
-        for (i, key, label) in [(0, "alang", "Audio:"), (1, "slang", "Subtitles:")] {
+        for (i, key, label) in [(0, "alang", "Audio"), (1, "slang", "Subtitles")] {
             field_row(ui, label, |ui, l| {
                 let r = ui.add(egui::TextEdit::singleline(&mut self.langs[i]).hint_text("en,eng").desired_width(400.0)).labelled_by(l);
                 match valid_langs(&self.langs[i]) {
@@ -4739,7 +4741,7 @@ impl App {
         }
         caption(ui, "Comma-separated, most preferred first. Also editable in the player.");
         row_title(ui, "Network");
-        field_row(ui, "User-Agent:", |ui, l| {
+        field_row(ui, "User-Agent", |ui, l| {
             let r = ui.add(egui::TextEdit::singleline(&mut self.user_agent).hint_text("stremflix-rs").desired_width(400.0)).labelled_by(l);
             match stremflix_rs::addon::valid_user_agent(&self.user_agent) {
                 Some(v) if r.changed() => {
@@ -4813,6 +4815,7 @@ impl App {
     fn ui_library(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let (mut want, mut open, mut quick) = (Vec::new(), None, None);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.set_min_height(32.0);
             section_heading(ui, "Saved titles");
@@ -4886,7 +4889,7 @@ impl App {
         if let Some(m) = quick {
             self.quick_play(&ctx, m);
         }
-        ui.separator();
+        ui.add_space(18.0);
         let mut cal_open = None;
         egui::CollapsingHeader::new(heading_text(ui, "Calendar", 20.0)).id_salt("calendar").show(ui, |ui| {
             let live: Vec<_> = self.upcoming.iter().filter(|(m, _)| self.saved.iter().any(|t| t.key == format!("series:{}", m.id))).cloned().collect();
@@ -4908,8 +4911,7 @@ impl App {
             self.tab = Tab::Home;
             self.open_meta(&ctx, m, false);
         }
-        ui.separator();
-        section_heading(ui, "Downloads");
+        row_title(ui, "Downloads");
         if self.downloads.is_empty() && self.queue.is_empty() {
             muted(ui, "Nothing downloaded yet. Open a title and choose \"Download\" on a stream.");
         }
@@ -4985,14 +4987,13 @@ impl App {
                 Err(e) => report(&mut self.error, format!("delete {}: {e:#}", d.path.display())),
             }
         }
-        ui.separator();
-        section_heading(ui, "Local files");
+        row_title(ui, "Local files");
         let tip = "Or drop a .torrent file on the window, or paste a magnet anywhere";
-        if form_row(ui, "Torrent:", &mut self.magnet, "magnet:?xt=urn:btih:... or /path/to/file.torrent", "Play torrent", Some(tip), false) {
+        if form_row(ui, "Torrent", &mut self.magnet, "magnet:?xt=urn:btih:... or /path/to/file.torrent", "Play torrent", Some(tip), false) {
             let m = self.magnet.clone();
             self.play_torrent(&ctx, &m);
         }
-        if form_row(ui, "Folder path:", &mut self.folder, "/path/to/videos", "Add folder", None, false) {
+        if form_row(ui, "Folder path", &mut self.folder, "/path/to/videos", "Add folder", None, false) {
             let dir = PathBuf::from(self.folder.trim());
             // Off the UI thread: a big folder or network share can take minutes.
             self.spawn(&ctx, async move {
@@ -5004,7 +5005,6 @@ impl App {
                 Ok(Msg::Scanned(dir, res))
             });
         }
-        ui.separator();
         let mut play = None;
         for it in self.library.iter().filter(|it| title_matches(&it.title, &self.lib_query)) {
             ui.horizontal(|ui| {
@@ -5246,7 +5246,8 @@ impl eframe::App for App {
                 }
                 ui.add_space(6.0);
             }
-            egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
+            // No shrinking: a page of narrow rows would pull the scroll bar in from the window edge.
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.tab {
                 Tab::Home => self.ui_home(ui),
                 Tab::Discover => self.ui_discover(ui),
                 Tab::Addons => self.ui_addons(ui),
