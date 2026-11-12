@@ -230,6 +230,22 @@ impl Db {
         Ok(())
     }
 
+    /// Paths of the folders added to the local library.
+    pub fn library_folders(&self) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare("SELECT path FROM library_folders ORDER BY path")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Forget a folder and its scanned items. Files on disk and their saved progress are untouched.
+    pub fn remove_library_folder(&self, folder: &str) -> Result<()> {
+        self.transaction(|| {
+            self.conn.execute("DELETE FROM library_items WHERE folder = ?1", [folder])?;
+            self.conn.execute("DELETE FROM library_folders WHERE path = ?1", [folder])?;
+            Ok(())
+        })
+    }
+
     pub fn library_items(&self) -> Result<Vec<LibraryItem>> {
         let mut st = self.conn.prepare("SELECT path, title FROM library_items ORDER BY path")?;
         let rows = st.query_map([], |r| {

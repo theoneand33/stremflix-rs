@@ -1061,6 +1061,7 @@ struct App {
     /// Custom User-Agent as edited; saved and applied only when valid.
     user_agent: String,
     library: Vec<LibraryItem>,
+    library_folders: Vec<String>,
     /// Titles saved with "Add to library", newest first.
     saved: Vec<SavedTitle>,
     /// User lists of saved titles; `lib_list` is the one shown in Library (`None` = all saved).
@@ -1277,6 +1278,7 @@ impl App {
             rt: tokio::runtime::Runtime::new()?,
             addons: db.addons()?,
             library: db.library_items()?,
+            library_folders: db.library_folders()?,
             saved: db.saved_titles()?,
             lists: db.lists()?,
             lib_list: None,
@@ -2044,9 +2046,7 @@ impl App {
                     Ok(items.len())
                 });
                 match saved {
-                    Ok(_) => {
-                        self.library = self.db.library_items().unwrap_or_default();
-                    }
+                    Ok(_) => self.reload_library(),
                     Err(e) => report(&mut self.error, e),
                 }
             }
@@ -2142,6 +2142,23 @@ impl App {
                 ctx.request_repaint();
             }
         }
+    }
+
+    fn reload_library(&mut self) {
+        self.library = self.db.library_items().unwrap_or_default();
+        self.library_folders = self.db.library_folders().unwrap_or_default();
+    }
+
+    /// Scan `dir` off the UI thread (a big folder or network share can take minutes); the reply replaces its library items.
+    fn scan_folder(&self, ctx: &egui::Context, dir: PathBuf) {
+        self.spawn(ctx, async move {
+            let res = tokio::task::spawn_blocking({
+                let dir = dir.clone();
+                move || scan(&dir).map_err(|e| e.to_string())
+            })
+            .await?;
+            Ok(Msg::Scanned(dir, res))
+        });
     }
 
     fn save_progress(&mut self) {
@@ -5065,16 +5082,30 @@ impl App {
             self.play_torrent(&ctx, &m);
         }
         if form_row(ui, "Folder path", &mut self.folder, "/path/to/videos", "Add folder", None, false) {
-            let dir = PathBuf::from(self.folder.trim());
-            // Off the UI thread: a big folder or network share can take minutes.
-            self.spawn(&ctx, async move {
-                let res = tokio::task::spawn_blocking({
-                    let dir = dir.clone();
-                    move || scan(&dir).map_err(|e| e.to_string())
-                })
-                .await?;
-                Ok(Msg::Scanned(dir, res))
+            self.scan_folder(&ctx, PathBuf::from(self.folder.trim()));
+        }
+        let (mut rescan, mut forget) = (None, None);
+        for f in &self.library_folders {
+            ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
+                if small_button(ui, "Rescan").on_hover_text("Look for added and removed files").clicked() {
+                    rescan = Some(f.clone());
+                }
+                if small_button(ui, "Remove").on_hover_text("Take this folder out of the library; its files stay on disk").clicked() {
+                    forget = Some(f.clone());
+                }
+                // Last and truncated: a long path would push the buttons out of the window.
+                ui.add(egui::Label::new(f).truncate());
             });
+        }
+        if let Some(f) = rescan {
+            self.scan_folder(&ctx, PathBuf::from(f));
+        }
+        if let Some(f) = forget {
+            match self.db.remove_library_folder(&f) {
+                Ok(()) => self.reload_library(),
+                Err(e) => report(&mut self.error, format!("removing {f}: {e:#}")),
+            }
         }
         let mut play = None;
         for it in self.library.iter().filter(|it| title_matches(&it.title, &self.lib_query)) {

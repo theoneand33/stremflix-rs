@@ -40,6 +40,19 @@ fn data_survives_reopen() {
 }
 
 #[test]
+fn removing_a_library_folder_drops_only_its_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("app.db")).unwrap();
+    let item = |p: &str| LibraryItem { path: p.into(), title: "t".into() };
+    db.add_library_folder("/a".as_ref(), &[item("/a/1.mp4")]).unwrap();
+    db.add_library_folder("/b".as_ref(), &[item("/b/2.mp4")]).unwrap();
+    assert_eq!(db.library_folders().unwrap(), ["/a", "/b"]);
+    db.remove_library_folder("/a").unwrap();
+    assert_eq!(db.library_folders().unwrap(), ["/b"]);
+    assert_eq!(db.library_items().unwrap(), vec![item("/b/2.mp4")]);
+}
+
+#[test]
 fn saved_titles_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("app.db");
