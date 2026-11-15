@@ -317,8 +317,10 @@ enum Msg {
     /// Library folder and its scanned media files.
     /// Folder, whether it was a rescan of a listed folder (dropped if the folder was removed meanwhile), items.
     Scanned(PathBuf, bool, Result<Vec<LibraryItem>, String>),
-    /// Release page of a newer build, if any.
-    Update(Option<String>),
+    /// Release page of a newer build and its download for this platform, if any.
+    Update(Option<(String, Option<String>)>),
+    /// The self-update finished installing, or failed.
+    UpdateInstalled(Result<(), String>),
     /// A `stremio://` link from the command line, a later launch, or macOS.
     Link(String),
     /// A download's path, run number, bytes got, total and file validator, while it transfers.
@@ -1196,8 +1198,10 @@ struct App {
     error: Option<String>,
     /// A multi-file torrent waiting for the user to pick a file: key, title, magnet, subtitles, files, selected index.
     file_pick: Option<(String, String, String, Subs, Vec<MediaFile>, usize)>,
-    /// Release page of a newer build, shown until dismissed.
-    update: Option<String>,
+    /// Release page of a newer build and its download for this platform, shown until dismissed.
+    update: Option<(String, Option<String>)>,
+    /// A self-update is downloading and installing.
+    installing: bool,
     /// Nav pill animation: tab it's heading to, start rect, target rect, start time.
     pill: Option<(Tab, egui::Rect, egui::Rect, f64)>,
     player: Option<Playing>,
@@ -1381,6 +1385,7 @@ impl App {
             error: None,
             file_pick: None,
             update: None,
+            installing: false,
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
             user_agent: ua,
@@ -2044,6 +2049,16 @@ impl App {
                 }
             }
             Msg::Update(url) => self.update = url,
+            Msg::UpdateInstalled(res) => {
+                self.installing = false;
+                match res {
+                    Ok(()) => {
+                        self.update = None;
+                        self.notice = Some("Update installed. Restart Stremflix-rs to use it.".into());
+                    }
+                    Err(e) => self.error = Some(format!("Update failed: {e}")),
+                }
+            }
             Msg::SubSearch(key, found) => {
                 if let Some(p) = self.player.as_mut().filter(|p| p.key == key) {
                     p.search.busy = false;
@@ -5516,12 +5531,25 @@ impl eframe::App for App {
             {
                 self.notice = None;
             }
-            if let Some(url) = self.update.clone() {
+            if let Some((url, asset)) = self.update.clone() {
                 ui.horizontal(|ui| {
                     ui.set_min_height(32.0);
                     ui.label("A new version is available.");
-                    ui.hyperlink_to("Download", url);
-                    if small_button(ui, "Dismiss").clicked() {
+                    if self.installing {
+                        ui.spinner();
+                        ui.label("Installing…");
+                    } else if let Some(asset) = asset
+                        && small_button(ui, "Install").on_hover_text("Download it and replace this build; it runs after a restart").clicked()
+                    {
+                        self.installing = true;
+                        let (tx, ctx) = (self.tx.clone(), ui.ctx().clone());
+                        self.rt.spawn(async move {
+                            let _ = tx.send(Msg::UpdateInstalled(stremflix_rs::update::install(&asset).await.map_err(|e| format!("{e:#}"))));
+                            ctx.request_repaint();
+                        });
+                    }
+                    ui.hyperlink_to("Release page", url);
+                    if !self.installing && small_button(ui, "Dismiss").clicked() {
                         self.update = None;
                     }
                 });
@@ -5673,6 +5701,7 @@ fn main() -> eframe::Result {
         let client = app.client.clone();
         // A failed check (offline, rate limit) only logs: it shouldn't show as an error.
         app.spawn(&cc.egui_ctx, async move {
+            stremflix_rs::update::cleanup();
             Ok(Msg::Update(client.check_update().await.unwrap_or_else(|e| {
                 stremflix_rs::elog!("update check: {e:#}");
                 None
