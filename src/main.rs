@@ -4715,6 +4715,9 @@ impl App {
         self.child_pin = pin;
         self.addons = self.db.addons().unwrap_or_default();
         self.child_filter();
+        // Nothing loaded from a now hidden addon stays open, and replies still on their way are dropped (`nav`).
+        self.close_details();
+        (self.pending, self.opening, self.browse, self.search_page, self.discover) = (None, None, None, None, Discover::default());
         self.build_rows(ctx);
     }
 
@@ -6630,8 +6633,11 @@ mod tests {
         app.handle(&ctx, Msg::Installed(u("ok"), m(""), None));
         app.handle(&ctx, Msg::Installed(u("adult"), m(r#","behaviorHints":{"adult":true}"#), None));
         let urls = |app: &App| app.addons.iter().map(|(x, _)| x.clone()).collect::<Vec<_>>();
+        let nav = app.nav;
+        app.selected = Some((serde_json::from_str(r#"{"id":"tt1","type":"movie","name":"Open"}"#).unwrap(), vec![], vec![]));
         app.set_child_pin(&ctx, "1234".into());
         assert_eq!(urls(&app), [u("ok")]);
+        assert!(app.selected.is_none() && app.nav > nav, "an open title closes and in-flight replies are dropped");
         app.handle(&ctx, Msg::Installed(u("new"), m(""), None));
         app.handle(&ctx, Msg::Imported(Import { addons: vec![(u("imported"), m(""))], progress: vec![], watched: vec![], bitfields: vec![], saved: vec![] }));
         assert_eq!((urls(&app), app.db.addons().unwrap().len()), (vec![u("ok")], 2), "nothing installed while locked");

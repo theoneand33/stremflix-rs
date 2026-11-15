@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 pub fn valid_name(s: &str) -> Option<&str> {
     let s = s.trim();
     let u = s.to_ascii_uppercase();
-    let device = ["CON", "PRN", "AUX", "NUL"].contains(&u.as_str()) || u.len() == 4 && (u.starts_with("COM") || u.starts_with("LPT")) && u.ends_with(|c: char| c.is_ascii_digit());
+    let device = ["CON", "PRN", "AUX", "NUL"].contains(&u.as_str()) || u.chars().count() == 4 && (u.starts_with("COM") || u.starts_with("LPT")) && u.ends_with(char::is_numeric); // also COM¹: superscript digits are reserved too
     (!device && !s.is_empty() && s.chars().count() <= 32 && s.chars().all(|c| c.is_alphanumeric() || " -_".contains(c))).then_some(s)
 }
 

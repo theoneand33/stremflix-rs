@@ -3,7 +3,7 @@ use stremflix_rs::profile::{active, dir, list, switch, valid_name};
 #[test]
 fn names_are_safe_folder_names() {
     assert_eq!(valid_name("  Kids 2 "), Some("Kids 2"));
-    for bad in ["", "  ", "../x", "a/b", "a\\b", ".", "x.db", "con", "LPT1", &"a".repeat(33)] {
+    for bad in ["", "  ", "../x", "a/b", "a\\b", ".", "x.db", "con", "LPT1", "COM¹", &"a".repeat(33)] {
         assert_eq!(valid_name(bad), None, "{bad:?}");
     }
 }
