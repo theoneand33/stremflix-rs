@@ -4122,11 +4122,13 @@ impl App {
                 });
             });
         }
+        let mut card_shown = false;
         // Up next: in an episode's last 30 s, a card slides in from the right to play the next one.
         if let Some((series, label, img)) = up_next {
             // Needs a duration over 60 s so a short or still-loading stream doesn't show the card at once.
             let open = !p.next_dismissed && !looping(p.repeat, p.ab) && rect.width() >= 362.0 && st.dur > 60.0 && st.dur - st.pos <= 30.0;
             let t = ctx.animate_bool_with_time(ui.scope_id().with("up_next"), open, 0.4);
+            card_shown = t > 0.0;
             if t > 0.0 {
                 let ease = 1.0 - (1.0 - t).powi(3);
                 let size = vec2(480.0f32.min(rect.width() - 64.0).max(330.0), 160.0);
@@ -4179,25 +4181,29 @@ impl App {
             }
         }
         // Skip button while the playhead is in an addon-marked, chapter-named or TheIntroDB intro/recap/credits span.
-        // Credits of a series episode with a next one are left to the up-next card.
+        // Credits of a series episode with a next one get a Next episode button instead, hidden under the up-next card.
         if p.skip_done.is_some_and(|e| st.pos >= e) {
             p.skip_done = None;
         }
         let spans = p.skips.iter().copied().chain(chapter_skips(&st.chapters, st.dur)).chain(p.db_skips.iter().flatten().copied());
-        if let Some(sk) = spans.filter(|s| !(has_next && s.kind == SkipKind::Credits) && p.skip_done != Some(s.end)).find(|s| s.start <= st.pos && st.pos < s.end)
+        if let Some(sk) = spans.filter(|s| !(card_shown && has_next && s.kind == SkipKind::Credits) && p.skip_done != Some(s.end)).find(|s| s.start <= st.pos && st.pos < s.end)
             && rect.width() >= 250.0
         {
+            let to_next = has_next && sk.kind == SkipKind::Credits;
+            let label = if to_next { "Next episode" } else { sk.kind.label() };
             let r = egui::Rect::from_min_size(pos2(rect.right() - 32.0 - 200.0, rect.bottom() - 130.0 - 50.0), vec2(200.0, 50.0));
             let paint = ui.painter().clone();
             let resp = ui.interact(r, ui.scope_id().with("skip"), Sense::CLICK).on_hover_cursor(egui::CursorIcon::PointingHand);
-            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, sk.kind.label()));
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
             paint.rect_filled(r, 25, surface(255));
             paint.rect_stroke(r, 25, egui::Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Inside);
             if resp.hovered() {
                 paint.rect_filled(r, 25, Color32::from_white_alpha(20));
             }
-            paint.text(r.center(), egui::Align2::CENTER_CENTER, sk.kind.label(), egui::FontId::proportional(17.0), Color32::WHITE);
-            if resp.clicked() {
+            paint.text(r.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(17.0), Color32::WHITE);
+            if resp.clicked() && to_next {
+                next = true;
+            } else if resp.clicked() {
                 seek = Some((sk.end, false));
                 p.skip_done = Some(sk.end);
             }
