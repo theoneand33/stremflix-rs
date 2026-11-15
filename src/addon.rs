@@ -606,9 +606,10 @@ pub fn is_info_hash(h: &str) -> bool {
 pub fn parse_magnet_hash(m: &str) -> Option<String> {
     // Magnet::parse also takes a bare 40-hex hash, which isn't a magnet.
     let id = librqbit::Magnet::parse(m).ok().filter(|_| !is_info_hash(m))?.as_id20()?;
-    // Magnet::parse reads only uppercase base32, so the hash was given in that form iff it appears verbatim.
-    let b32 = data_encoding::BASE32.encode(&id.0);
-    Some(if m.contains(&b32) { b32 } else { id.as_string() })
+    // Same form as the btih Magnet::parse kept (the last one): 32 chars is base32.
+    let u = Url::parse(m).ok()?;
+    let (_, last) = u.query_pairs().filter(|(k, v)| k == "xt" && v.starts_with("urn:btih:")).last()?;
+    Some(if last.len() == "urn:btih:".len() + 32 { data_encoding::BASE32.encode(&id.0) } else { id.as_string() })
 }
 
 /// Peer hints (`x.pe=host:port`) embedded in a magnet link.

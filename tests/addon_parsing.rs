@@ -264,6 +264,9 @@ fn stream_parsing_and_targets() {
     // librqbit's parser rejects foreign `xt` kinds and keeps the last btih.
     assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{hash}&xt=urn:sha1:ABC")), None);
     assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{b32}&xt=urn:btih:{hash}")).as_deref(), Some(hash));
+    let b32_of_hash = "AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH";
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{b32_of_hash}")).as_deref(), Some(b32_of_hash));
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{b32_of_hash}&xt=urn:btih:{hash}")).as_deref(), Some(hash), "form follows the btih that won");
 }
 
 #[test]
