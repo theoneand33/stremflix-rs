@@ -24,7 +24,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 |---|---|---|---|
 | Bulk selection in the library | P3 | M | |
 | Rename, hide, and reorder catalog rows per profile | P3 | M | Part of Stremio's profiles feature; do with profiles. |
-| User profiles (household, child-safe) | P3 | L | Stremio now ships up to 6 profiles with optional PIN, kid profiles and per-profile addons (not on Linux). Most-requested missing Stremio feature (stremio-features #622). |
 
 ### Player
 

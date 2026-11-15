@@ -94,6 +94,8 @@ Scheme registration: the Linux AppImage declares it (installed by AppImageLaunch
 
 ### Settings and recovery
 
+Settings → Profile creates and picks household profiles; the choice takes effect at the next launch. Each profile has its own addons, library, progress, settings, and downloads, in `<data>/profiles/<name>` (the Default profile is the data folder itself). A child-safe PIN locks the current profile: the Addons tab, every other setting, and addons whose manifest flags them `adult` are hidden (addons installed by an older version are checked again on locking and stay hidden if that fetch fails), no addon can be added, and the profile can't be switched until the PIN is entered in Settings. The lock doesn't rate titles (addons don't supply ratings), reads the `adult` flag from the manifest as last installed or updated (an addon that adds the flag later stays visible until it is updated), doesn't hide titles already in that profile's library or history (lock a profile made for the child, not one you watched in), doesn't block magnets or local files, doesn't limit PIN guesses (pick a long PIN), and doesn't stop someone who can edit the data folder.
+
 The app reopens on the tab you last used. Settings sets the HTTP User-Agent. If the last run did not exit cleanly, the next launch shows a notice. Startup also checks the database and reports corruption; neither blocks startup.
 
 ### Import from Stremio
