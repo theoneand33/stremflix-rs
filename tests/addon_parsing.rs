@@ -261,6 +261,8 @@ fn stream_parsing_and_targets() {
     assert_eq!(parse_magnet_hash("magnet:?xt=urn:btih:MFRGGZDFMZTWQ2LKNNWG23TPOBYXE431"), None, "1 is not base32");
     assert_eq!(parse_magnet_hash(hash), None, "a bare hash is not a magnet");
     assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{}", hash.to_uppercase())).as_deref(), Some(hash));
+    let hybrid = format!("magnet:?xt=urn:btih:{hash}&xt=urn:btmh:1220{}", "ab".repeat(32));
+    assert_eq!(parse_magnet_hash(&hybrid).as_deref(), Some(hash), "hybrid v1/v2 magnets keep the btih");
     // librqbit's parser rejects foreign `xt` kinds and keeps the last btih.
     assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{hash}&xt=urn:sha1:ABC")), None);
     assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{b32}&xt=urn:btih:{hash}")).as_deref(), Some(hash));
