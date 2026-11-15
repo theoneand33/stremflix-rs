@@ -71,6 +71,5 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | UI translations (i18n) | P3 | M | |
-| Auto-install updates | P3 | M | Release builds already show a download link for a newer build; downloading and replacing the binary is still missing. |
 | Android, iOS, TV clients | P3 | XL | Out of scope for an egui desktop app. |
 | Screen-reader labels and focus-order polish | P3 | M | Icon-only buttons, hint-only fields, and glyph-prefixed pills are named. Left: the seek and volume bars are not keyboard-focusable, and the "Add to list" menu pill still speaks its icon glyph. |

@@ -8,6 +8,7 @@ src/download.rs Offline downloads: safe file names, streaming a URL (or the loca
 src/player.rs   libmpv (FFI) in-process: OpenGL-rendered frames, observed properties, IPC server
 src/torrent.rs  librqbit session + its HTTP streaming API on 127.0.0.1
 src/tray.rs     Tray icon (Show/Hide, Play/Pause, Quit): ksni StatusNotifierItem over D-Bus on Linux (no GTK), tray-icon on Windows/macOS
+src/update.rs   Self-update: picks this platform's release asset, unpacks it with the system tar, swaps it in for the install
 src/stremio_import.rs  Reads a local Stremio's localStorage (WebKit SQLite or Chromium LevelDB via rusty-leveldb)
 src/main.rs     egui/eframe GUI; tokio runtime for network/torrent work, results via mpsc
 src/widgets.rs  Reusable egui widgets, theme and fonts; no app state or addon types

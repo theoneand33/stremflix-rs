@@ -1213,11 +1213,13 @@ impl AddonClient {
         Ok(parse_introdb(&serde_json::from_slice(&self.get(url).await?)?, dur))
     }
 
-    /// Release page of a newer build than this one, or `None` (also for source builds).
-    pub async fn check_update(&self) -> Result<Option<String>> {
+    /// Release page of a newer build than this one and its download for this platform, or `None` (also for source builds).
+    pub async fn check_update(&self) -> Result<Option<(String, Option<String>)>> {
         let (Some(release), Some(commit)) = (RELEASE, COMMIT) else { return Ok(None) };
         let url = Url::parse(&format!("https://api.github.com/repos/{REPO}/releases/"))?.join(if release == "nightly" { "tags/nightly" } else { "latest" })?;
-        newer_release(release, commit, &self.get(url).await?)
+        let body = self.get(url).await?;
+        let suffix = crate::update::asset_suffix(crate::update::appimage().is_some());
+        Ok(newer_release(release, commit, &body)?.map(|page| (page, crate::update::asset_url(&body, REPO, &suffix))))
     }
 
     /// POST `body` to Stremio API `method`; its `result`, or its `error` message.

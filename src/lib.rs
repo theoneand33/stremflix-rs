@@ -8,3 +8,4 @@ pub mod player;
 pub mod torrent;
 pub mod tray;
 pub mod stremio_import;
+pub mod update;

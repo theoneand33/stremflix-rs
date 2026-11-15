@@ -22,7 +22,7 @@ Download a build from GitHub Releases (`stremflix-rs-<tag>-<target>`):
 | `macos-arm64`, `macos-x86_64` | `.tar.gz` with `Stremflix-rs.app` |
 | `windows-x86_64` | `.zip` (includes `libmpv-2.dll`) |
 
-A nightly build runs every 3 hours when `main` has new commits; tagged releases are cut manually. Release builds check their channel on startup and link to newer builds.
+A nightly build runs every 3 hours when `main` has new commits; tagged releases are cut manually. Release builds check their channel on startup and offer to install a newer build in place (it runs after a restart).
 
 ## Build from source
 
