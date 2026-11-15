@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use anyhow::Context;
-use stremflix_rs::addon::{AddonClient, Skip, SkipKind, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, parse_magnet_hash, sanitize_text};
+use stremflix_rs::addon::{AddonClient, Skip, SkipKind, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, flags_to_codes, parse_magnet_hash, sanitize_text};
 use stremflix_rs::instance;
 use stremflix_rs::db::{self, Db, Download, List, Progress, SavedTitle, Watched};
 use stremflix_rs::download::{self, State};
@@ -647,16 +647,16 @@ fn card_tip(m: &MetaPreview) -> String {
 }
 
 fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream, reserve: f32) -> egui::Response {
-    let mut parts = [&s.name, &s.title, &s.description].into_iter().flatten().map(|x| x.trim()).filter(|x| !x.is_empty());
-    let head = parts.next().unwrap_or("Stream").replace('\n', " ");
-    let parts: Vec<&str> = parts.collect();
+    let mut parts = [&s.name, &s.title, &s.description].into_iter().flatten().map(|x| flags_to_codes(x.trim())).filter(|x| !x.is_empty());
+    let head = parts.next().map_or("Stream".into(), |h| h.replace('\n', " "));
+    let parts: Vec<String> = parts.collect();
     // Torrent addons already describe the file (name, size) in their text; don't repeat it.
     let stem = s.hints.filename.as_deref().map(|f| f.rsplit_once('.').map_or(f, |x| x.0)).filter(|f| !f.is_empty());
-    let described = stem.is_some_and(|f| parts.iter().any(|p| p.contains(f)));
+    let described = stem.is_some_and(|f| parts.iter().any(|p| p.contains(&flags_to_codes(f))));
     let file = if described { String::new() } else { [s.hints.filename.clone(), s.hints.video_size.map(fmt_size)].into_iter().flatten().collect::<Vec<_>>().join("  ·  ") };
     let external = (s.target().is_none()).then_some("Opens in your browser");
     let not_web_ready = s.hints.not_web_ready.then_some("Not web-ready (plays directly here)");
-    let details: Vec<&str> = parts.into_iter().chain(Some(file.as_str()).filter(|f| !f.is_empty())).chain(not_web_ready).chain(external).collect();
+    let details: Vec<&str> = parts.iter().map(String::as_str).chain(Some(file.as_str()).filter(|f| !f.is_empty())).chain(not_web_ready).chain(external).collect();
     list_row(ui, n, head, details.join("\n"), reserve)
 }
 

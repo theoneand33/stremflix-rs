@@ -15,7 +15,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
-| Show the addon's `imdbRating` and a language flag on stream rows | P2 | S | Protocol already carries the rating; flags come from the stream name or title. Stremio Android shows flags (stremio-features #817). |
 | Keep addon, catalog and filters when Discover switches Movies and Series | P2 | S | stremio-features #1957. |
 | Hide the Calendar tab and other nav sections | P3 | S | stremio-features #1956. |
 

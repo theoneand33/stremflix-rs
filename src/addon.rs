@@ -520,6 +520,29 @@ impl Stream {
     }
 }
 
+/// Flag emoji (regional-indicator pairs) as their two-letter country code, e.g. "🇮🇹" -> "IT".
+/// egui has no flag glyphs, so addon language flags would otherwise render as boxes.
+// shortcut: tag-sequence flags (England, Scotland) pass through unchanged; map them if addons use them.
+pub fn flags_to_codes(s: &str) -> String {
+    let ri = |c: char| (0x1F1E6..=0x1F1FF).contains(&(c as u32)).then(|| char::from(b'A' + (c as u32 - 0x1F1E6) as u8));
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        match (ri(c), it.peek().copied().and_then(ri)) {
+            (Some(a), Some(b)) => {
+                it.next();
+                out.extend([a, b]);
+                if it.peek().copied().and_then(ri).is_some() {
+                    out.push(' ');
+                }
+            }
+            (Some(a), None) => out.push(a),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 // ---------- sanitization ----------
 
 /// Strip control characters (keeps newlines/tabs), trim, and cap length.
