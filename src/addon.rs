@@ -155,9 +155,15 @@ fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<
 }
 
 /// Whether `new` is strictly newer than `old` by semver order (pre-releases sort before their release).
-/// A leading `v` is ignored; a version that isn't semver is never offered.
+/// A leading `v` is ignored and a short core is padded (`1.9` = `1.9.0`, as addon manifests often write it);
+/// a version that still isn't semver is never offered.
 pub fn is_newer(new: &str, old: &str) -> bool {
-    let v = |s: &str| semver::Version::parse(s.trim().trim_start_matches('v')).ok();
+    let v = |s: &str| {
+        let s = s.trim().trim_start_matches('v');
+        let end = s.find(['-', '+']).unwrap_or(s.len());
+        let pad = ".0".repeat(2usize.saturating_sub(s[..end].matches('.').count()));
+        semver::Version::parse(&format!("{}{pad}{}", &s[..end], &s[end..])).ok()
+    };
     matches!((v(new), v(old)), (Some(a), Some(b)) if a > b)
 }
 

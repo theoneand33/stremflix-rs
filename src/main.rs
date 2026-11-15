@@ -6700,7 +6700,10 @@ mod tests {
     fn version_compare() {
         use stremflix_rs::addon::is_newer;
         assert!(is_newer("1.10.0", "1.9.9"));
-        assert!(!is_newer("2", "1.9"), "not semver");
+        assert!(is_newer("2", "1.9"), "short addon versions are padded");
+        assert!(!is_newer("1.0", "1.0.0"));
+        assert!(is_newer("1.1", "1.0-beta"));
+        assert!(!is_newer("1.2.3.4", "1.0.0"), "four parts isn't semver");
         assert!(!is_newer("1.0.0", "1.0.1"));
         assert!(is_newer("v1.1.0", "1.0.0"));
         assert!(!is_newer("1.0.0-beta", "1.0.0"), "a pre-release is older than its release");

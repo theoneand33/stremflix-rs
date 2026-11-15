@@ -340,10 +340,11 @@ extern "C" fn on_update(data: *mut c_void) {
     wake();
 }
 
-/// Splits a command line into words, POSIX-shell style (quotes group, backslash escapes); empty on an unclosed quote.
+/// Splits a command line into words, POSIX-shell style (quotes group, backslash escapes).
+/// An unclosed quote (`--title=Bob's`) falls back to plain whitespace splitting rather than dropping every word.
 #[cfg(not(windows))]
 pub fn command_words(s: &str) -> Vec<String> {
-    shlex::split(s).unwrap_or_default()
+    shlex::split(s).unwrap_or_else(|| s.split_whitespace().map(String::from).collect())
 }
 
 /// Splits a command line on whitespace; double quotes group words with spaces.
@@ -870,6 +871,8 @@ mod tests {
         let a = parse_args("--ao=null --no-audio-display --fs junk");
         assert_eq!(a, [("ao".into(), "null".into()), ("audio-display".into(), "no".into()), ("fs".into(), "yes".into())]);
         assert_eq!(parse_args(r#"--sub-font="Noto Sans" --title="a b""#), [("sub-font".into(), "Noto Sans".into()), ("title".into(), "a b".into())]);
+        #[cfg(not(windows))]
+        assert_eq!(parse_args("--title=Bob's --fs").len(), 2, "an unclosed quote keeps the other args");
         #[cfg(windows)]
         assert_eq!(parse_args(r"--log-file=C:\tmp\x.log"), [("log-file".into(), r"C:\tmp\x.log".into())]);
     }
