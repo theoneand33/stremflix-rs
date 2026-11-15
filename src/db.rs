@@ -215,6 +215,13 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).filter_map(|(u, m)| Some((u, parse_manifest(m.as_bytes()).ok()?))).collect())
     }
 
+    /// URLs of addons stored before the manifest's `adult` flag was kept, so the row says nothing about it.
+    pub fn unrated_addons(&self) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare("SELECT transport_url FROM addons WHERE json_extract(manifest, '$.behaviorHints.adult') IS NULL")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     pub fn add_library_folder(&self, folder: &Path, items: &[LibraryItem]) -> Result<()> {
         let f = folder.to_string_lossy();
         let tx = self.conn.unchecked_transaction()?;

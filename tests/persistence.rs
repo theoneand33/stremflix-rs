@@ -384,3 +384,27 @@ fn import_cleans_and_caps_titles() {
     assert!(t.title.chars().count() <= 300 && !t.title.contains('\u{202e}'));
     assert_eq!(t.poster, None, "oversized poster URL is dropped");
 }
+
+#[test]
+fn addons_stored_before_the_adult_flag_are_unrated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let db = Db::open(&path).unwrap();
+    let old = r#"{"id":"a","version":"1","name":"A","resources":["stream"],"types":["movie"],"catalogs":[],"behaviorHints":{"configurable":false,"configurationRequired":false}}"#;
+    let m = stremflix_rs::addon::parse_manifest(old.as_bytes()).unwrap();
+    db.add_addon("https://new.example/manifest.json", &m).unwrap();
+    assert!(db.unrated_addons().unwrap().is_empty(), "a manifest saved now records the flag");
+    drop(db);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    for (url, json) in [("https://old.example/manifest.json", old.to_string()), ("https://bare.example/manifest.json", old.replace(r#","behaviorHints":{"configurable":false,"configurationRequired":false}"#, ""))] {
+        conn.execute("INSERT INTO addons (transport_url, manifest) VALUES (?1, ?2)", rusqlite::params![url, json]).unwrap();
+    }
+    drop(conn);
+    let db = Db::open(&path).unwrap();
+    let mut unrated = db.unrated_addons().unwrap();
+    unrated.sort();
+    assert_eq!(unrated, ["https://bare.example/manifest.json", "https://old.example/manifest.json"]);
+    // Fetched again and saved, it is rated.
+    db.add_addon("https://old.example/manifest.json", &m).unwrap();
+    assert_eq!(db.unrated_addons().unwrap(), ["https://bare.example/manifest.json"]);
+}

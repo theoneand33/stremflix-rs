@@ -274,6 +274,8 @@ enum Msg {
     /// Play key and its TheIntroDB spans.
     IntroDb(String, Vec<Skip>),
     Installed(String, Manifest, Option<String>),
+    /// Manifests fetched again on locking a profile, for addons stored before the `adult` flag was kept.
+    Rated(Vec<(String, Manifest)>),
     /// Fresh manifest (or error) per installed addon URL, from "Check for updates".
     UpdateCheck(Vec<(String, Result<Manifest, String>)>),
     /// Query, the catalog searched (addon URL, type, catalog id), and its results or error.
@@ -1489,7 +1491,9 @@ impl App {
 
     fn child_filter(&mut self) {
         if self.locked() {
-            self.addons.retain(|(_, m)| !m.behavior_hints.adult);
+            // An addon whose stored row predates the flag stays hidden until its manifest is fetched again (`Msg::Rated`).
+            let Ok(unrated) = self.db.unrated_addons() else { return self.addons.clear() };
+            self.addons.retain(|(u, m)| !m.behavior_hints.adult && !unrated.contains(u));
         }
     }
 
@@ -1719,6 +1723,18 @@ impl App {
                 (self.sleep_carry, self.opening) = (None, None);
                 report(&mut self.error, e);
             }
+            // Only while still locked: nothing can have been removed since the fetch began.
+            Msg::Rated(found) if self.locked() => {
+                for (u, m) in &found {
+                    if let Err(e) = self.db.add_addon(u, m) {
+                        report(&mut self.error, format!("saving addon: {e:#}"));
+                    }
+                }
+                self.addons = self.db.addons().unwrap_or_default();
+                self.child_filter();
+                self.build_rows(ctx);
+            }
+            Msg::Rated(_) => {}
             Msg::Installed(..) if self.locked() => report(&mut self.error, "this profile is child-safe: unlock it in Settings to add addons"),
             Msg::Installed(url, m, replaces) => {
                 let saved = self.db.add_addon(&url, &m);
@@ -4713,6 +4729,19 @@ impl App {
         }
         self.profile_next = self.profile.clone();
         self.child_pin = pin;
+        if let (true, Ok(urls)) = (self.locked(), self.db.unrated_addons()) && !urls.is_empty() {
+            let client = self.client.clone();
+            self.spawn(ctx, async move {
+                let mut found = Vec::new();
+                for u in urls {
+                    // A failed fetch leaves the addon hidden.
+                    if let Ok(m) = client.fetch_manifest(&u).await {
+                        found.push((u, m));
+                    }
+                }
+                Ok(Msg::Rated(found))
+            });
+        }
         self.addons = self.db.addons().unwrap_or_default();
         self.child_filter();
         // Nothing loaded from a now hidden addon stays open, and replies still on their way are dropped (`nav`).
