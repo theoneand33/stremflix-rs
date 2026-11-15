@@ -652,7 +652,7 @@ fn stream_row(ui: &mut egui::Ui, n: usize, s: &Stream, reserve: f32) -> egui::Re
     let parts: Vec<String> = parts.collect();
     // Torrent addons already describe the file (name, size) in their text; don't repeat it.
     let stem = s.hints.filename.as_deref().map(|f| f.rsplit_once('.').map_or(f, |x| x.0)).filter(|f| !f.is_empty());
-    let described = stem.is_some_and(|f| parts.iter().any(|p| p.contains(f)));
+    let described = stem.is_some_and(|f| parts.iter().any(|p| p.contains(&flags_to_codes(f))));
     let file = if described { String::new() } else { [s.hints.filename.clone(), s.hints.video_size.map(fmt_size)].into_iter().flatten().collect::<Vec<_>>().join("  ·  ") };
     let external = (s.target().is_none()).then_some("Opens in your browser");
     let not_web_ready = s.hints.not_web_ready.then_some("Not web-ready (plays directly here)");
