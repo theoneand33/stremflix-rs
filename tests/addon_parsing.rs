@@ -488,3 +488,12 @@ fn resource_types_and_prefixes_override_the_manifest() {
     assert!(m.serves("addon_catalog", "movie", "tt1"), "empty prefixes fall back to the manifest's");
     assert!(!m.serves("nope", "movie", "tt1"));
 }
+
+#[test]
+fn flag_emoji_become_country_codes() {
+    assert_eq!(flags_to_codes("Multi Audio / 🇬🇧 / 🇮🇹"), "Multi Audio / GB / IT");
+    assert_eq!(flags_to_codes("🇫🇷🇩🇪 1080p"), "FR DE 1080p");
+    // A lone indicator still becomes a readable letter.
+    assert_eq!(flags_to_codes("x 🇺"), "x U");
+    assert_eq!(flags_to_codes("no flags 👤 5"), "no flags 👤 5");
+}
