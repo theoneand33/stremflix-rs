@@ -290,6 +290,8 @@ enum Msg {
     /// meta, episode (series only), streams, subtitle URLs, what to autoplay on arrival,
     /// the `bingeGroup` to prefer (next episode), and the `nav` it was requested at
     Streams(MetaPreview, Option<Video>, Vec<Stream>, Subs, Autoplay, Option<String>, u64),
+    /// Next episode's id and its streams and subtitles, fetched ahead near the current one's end (`None` on failure).
+    Preloaded(String, Option<(Vec<Stream>, Subs)>),
     /// series, its full meta (with episodes), and the `nav` it was requested at
     Episodes(MetaPreview, Meta, u64),
     /// Full meta of a movie (genres, cast, ...) for the detail page.
@@ -785,6 +787,11 @@ fn pause_step(enabled: bool, away: bool, paused: bool, auto: AutoPause) -> (Opti
     }
 }
 
+/// Preload the next episode in the last 2 min; the 60 s floor keeps a still-loading stream from triggering it.
+fn preload_due(pos: f64, dur: f64) -> bool {
+    dur > 60.0 && dur - pos <= 120.0
+}
+
 /// mpv's `keep-open` pauses on the last frame at end of file. That frame can sit well before the declared
 /// duration, so trust `eof`; the 90% floor keeps a stream that died mid-episode from skipping to the next one.
 fn at_end(pos: f64, dur: f64, paused: bool, eof: bool) -> bool {
@@ -1200,6 +1207,8 @@ struct App {
     /// Timer handed from play_next to the next autoplay-started player; consumed once by Msg::Play.
     /// Every other navigation (`play`, `open_*`, Back) and every error clears it.
     sleep_carry: Option<(Instant, u64)>,
+    /// Next episode id and its preloaded streams and subtitles (`None` while fetching or after a failure); cleared with the player.
+    preload: Option<(String, Option<(Vec<Stream>, Subs)>)>,
     /// The sleep timer paused playback: `Some(false)` until mpv reports paused, then `Some(true)` until resumed.
     /// Autoplay must not fire while set (see `timer_pause_step`).
     timer_paused: Option<bool>,
@@ -1413,6 +1422,7 @@ impl App {
             last_poll: Instant::now(),
             sleep: None,
             sleep_carry: None,
+            preload: None,
             timer_paused: None,
             gl_proc: None,
             window: Geo::default(),
@@ -1824,6 +1834,14 @@ impl App {
                     }
                 } else {
                     self.sleep_carry = None;
+                }
+            }
+            // A failure stays `None`, so it isn't retried and play_next fetches as before.
+            Msg::Preloaded(id, found) => {
+                if let (Some((want, slot)), Some(found)) = (&mut self.preload, found)
+                    && *want == id
+                {
+                    *slot = Some(found);
                 }
             }
             Msg::Episodes(mut meta, mut m, nav) => {
@@ -2264,6 +2282,7 @@ impl App {
         self.sleep = None;
         self.sleep_carry = None;
         self.timer_paused = None;
+        self.preload = None;
         self.save_progress();
         self.player = None;
     }
@@ -2357,6 +2376,7 @@ impl App {
             (p.pos, p.dur) = (pos, dur);
             self.save_progress();
         }
+        self.preload_next(ctx);
         // Asked once the duration is known: it selects the release and closes open-ended credits.
         if self.introdb
             && let Some(p) = self.player.as_mut().filter(|p| p.db_skips.is_none() && p.dur > 0.0)
@@ -2753,12 +2773,21 @@ impl App {
         let next = (self.selected.as_ref().zip(self.episode.as_ref()))
             .and_then(|((m, ..), cur)| Some((m.clone(), next_episode(&self.episodes, &cur.id)?.clone())));
         let sleep = self.sleep;
+        let preload = self.preload.take();
         self.stop_player();
         match next {
-            Some((m, v)) => {
-                self.open_streams(ctx, m, Some(v), Autoplay::Only, binge);
-                self.sleep_carry = sleep;
-            }
+            Some((m, v)) => match preload.filter(|(id, _)| *id == v.id).and_then(|(_, found)| found) {
+                Some((streams, subs)) => {
+                    self.clear_file_pick();
+                    self.nav += 1;
+                    self.sleep_carry = sleep;
+                    self.handle(ctx, Msg::Streams(m, Some(v), streams, subs, Autoplay::Only, binge, self.nav));
+                }
+                None => {
+                    self.open_streams(ctx, m, Some(v), Autoplay::Only, binge);
+                    self.sleep_carry = sleep;
+                }
+            },
             None => {
                 self.release_torrents(None);
             }
@@ -2851,19 +2880,40 @@ impl App {
     /// Fetch streams and subtitles for a movie, or for `episode` of a series.
     /// `binge`: on arrival, autoplay the stream in this binge group if there is one.
     fn open_streams(&mut self, ctx: &egui::Context, meta: MetaPreview, episode: Option<Video>, autoplay: Autoplay, binge: Option<String>) {
-        let client = self.client.clone();
         let id = episode.as_ref().map_or(meta.id.clone(), |v| v.id.clone());
-        let stream_addons = self.addons_for("stream", &meta.kind, &id);
-        let names: Vec<String> = stream_addons.iter().map(|u| self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default()).collect();
-        let sub_addons = self.addons_for("subtitles", &meta.kind, &id);
+        let fetch = self.fetch_streams(&meta.kind, &id);
         self.clear_file_pick();
         self.sleep_carry = None;
         self.nav += 1;
         let nav = self.nav;
         self.opening = Some((nav, episode.as_ref().and_then(|v| v.title.clone()).unwrap_or_else(|| meta.name.clone())));
         self.spawn(ctx, async move {
+            let (streams, subs) = fetch.await?;
+            Ok(Msg::Streams(meta, episode, streams, subs, autoplay, binge, nav))
+        });
+    }
+
+    /// Near the end of a series episode, fetch the next episode's streams so `play_next` needn't wait on addons.
+    fn preload_next(&mut self, ctx: &egui::Context) {
+        let Some(p) = &self.player else { return };
+        if self.preload.is_some() || !self.autoplay_next || looping(p.repeat, p.ab) || !preload_due(p.pos, p.dur) || !self.playing_episode() {
+            return;
+        }
+        let Some((m, next)) = (self.selected.as_ref().zip(self.episode.as_ref())).and_then(|((m, ..), cur)| Some((m, next_episode(&self.episodes, &cur.id)?))) else { return };
+        let (fetch, id) = (self.fetch_streams(&m.kind, &next.id), next.id.clone());
+        self.preload = Some((id.clone(), None));
+        self.spawn(ctx, async move { Ok(Msg::Preloaded(id, fetch.await.ok())) });
+    }
+
+    /// Streams (in addon priority order, tagged with the addon's name) and subtitles of `kind`/`id` from every addon serving them.
+    fn fetch_streams(&self, kind: &str, id: &str) -> impl Future<Output = anyhow::Result<(Vec<Stream>, Subs)>> + Send + 'static {
+        let client = self.client.clone();
+        let stream_addons = self.addons_for("stream", kind, id);
+        let names: Vec<String> = stream_addons.iter().map(|u| self.addons.iter().find(|(x, _)| x == u).map(|(_, m)| m.name.clone()).unwrap_or_default()).collect();
+        let sub_addons = self.addons_for("subtitles", kind, id);
+        let (kind, vid) = (kind.to_owned(), id.to_owned());
+        async move {
             let (mut streams, mut subs, mut errors) = (Vec::new(), Vec::new(), Vec::new());
-            let (kind, vid) = (meta.kind.clone(), id.clone());
             let ask_streams = |u: String| {
                 let (c, k, i) = (client.clone(), kind.clone(), vid.clone());
                 async move { c.streams(&u, &k, &i).await }
@@ -2887,8 +2937,8 @@ impl App {
             if streams.is_empty() && !errors.is_empty() {
                 anyhow::bail!("no streams: {}", errors.join("; "));
             }
-            Ok(Msg::Streams(meta, episode, streams, subs, autoplay, binge, nav))
-        });
+            Ok((streams, subs))
+        }
     }
 
     /// Full-size poster/background if loaded; queues a fetch on first sight.
@@ -6320,6 +6370,26 @@ mod tests {
         app.sleep_carry = Some(carry);
         app.play(&ctx, "movie:a".into(), "a".into(), "https://x.example/a".into(), vec![]);
         assert!(app.sleep_carry.is_none());
+    }
+
+    #[test]
+    fn preload_keeps_only_the_awaited_episode() {
+        assert!(!preload_due(10.0, 50.0), "short or still-loading stream");
+        assert!(!preload_due(1000.0, 1200.0));
+        assert!(preload_due(1080.0, 1200.0));
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let one = Stream { url: Some("https://x.example/e2".into()), ..Default::default() };
+        app.handle(&ctx, Msg::Preloaded("e2".into(), Some((vec![one.clone()], vec![]))));
+        assert!(app.preload.is_none(), "nothing awaited: dropped");
+        app.preload = Some(("e2".into(), None));
+        app.handle(&ctx, Msg::Preloaded("e3".into(), Some((vec![one.clone()], vec![]))));
+        assert!(app.preload.as_ref().is_some_and(|(id, f)| id == "e2" && f.is_none()), "another episode's reply is ignored");
+        app.handle(&ctx, Msg::Preloaded("e2".into(), Some((vec![one], vec![]))));
+        assert!(app.preload.as_ref().is_some_and(|(_, f)| f.as_ref().is_some_and(|(s, _)| s.len() == 1)));
+        app.preload = Some(("e2".into(), None));
+        app.handle(&ctx, Msg::Preloaded("e2".into(), None));
+        assert!(app.preload.as_ref().is_some_and(|(_, f)| f.is_none()), "a failure stays marked, so it isn't retried");
     }
 
     #[test]

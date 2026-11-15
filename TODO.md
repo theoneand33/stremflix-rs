@@ -34,7 +34,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Picture-in-picture / mini player | P3 | M | egui viewport or a second native window. |
 | Audio output device selection | P3 | M | mpv `audio-device`. |
 | Volume normalization / boost | P3 | M | mpv audio filter (`dynaudnorm`). |
-| Preload the next episode for gapless playback | P3 | M | |
 | Smart subtitles: hide them when the audio track matches the subtitle language | P3 | S | stremio-features #1781. |
 | Video shaders and picture filters (brightness, contrast, CRT) | P3 | S | mpv `glsl-shaders` and `brightness`/`contrast`; user-chosen shader paths only. #1789, #1961. |
 | Audio passthrough (AC3/DTS/E-AC3) | P3 | S | mpv `audio-spdif`; for soundbars. |
