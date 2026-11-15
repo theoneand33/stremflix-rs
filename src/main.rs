@@ -4514,7 +4514,7 @@ impl App {
                 Some(Ok(new)) if !same_addon(m, new) => {
                     muted(ui, "Addon id changed; not offered");
                 }
-                Some(Ok(new)) if stremflix_rs::addon::is_newer(&new.version, &m.version) => {
+                Some(Ok(new)) if stremflix_rs::addon::is_newer_addon(&new.version, &m.version) => {
                     ui.horizontal(|ui| {
                         ui.set_min_height(32.0);
                         ui.label(format!("Update available: {} \u{2192} {}", m.version, new.version));
@@ -6704,6 +6704,9 @@ mod tests {
         assert!(!is_newer("1.0", "1.0.0"));
         assert!(is_newer("1.1", "1.0-beta"));
         assert!(!is_newer("1.2.3.4", "1.0.0"), "four parts isn't semver");
+        use stremflix_rs::addon::is_newer_addon;
+        assert!(is_newer_addon("1.0.0.1", "1.0.0") && is_newer_addon("2024.02.01", "2024.01.15"), "non-semver addon versions compare numerically");
+        assert!(is_newer_addon("1.0.0", "1.0.0-beta") && !is_newer_addon("1.0.0.0", "1.0") && !is_newer_addon("x", "1.0"));
         assert!(!is_newer("1.0.0", "1.0.1"));
         assert!(is_newer("v1.1.0", "1.0.0"));
         assert!(!is_newer("1.0.0-beta", "1.0.0"), "a pre-release is older than its release");

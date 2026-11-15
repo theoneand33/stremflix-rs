@@ -154,17 +154,36 @@ fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<
     Ok(ManifestHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired"), adult })
 }
 
-/// Whether `new` is strictly newer than `old` by semver order (pre-releases sort before their release).
-/// A leading `v` is ignored and a short core is padded (`1.9` = `1.9.0`, as addon manifests often write it);
-/// a version that still isn't semver is never offered.
+/// `s` as semver, ignoring a leading `v` and padding a short core (`1.9` = `1.9.0`).
+fn version(s: &str) -> Option<semver::Version> {
+    let s = s.trim().trim_start_matches('v');
+    let end = s.find(['-', '+']).unwrap_or(s.len());
+    let pad = ".0".repeat(2usize.saturating_sub(s[..end].matches('.').count()));
+    semver::Version::parse(&format!("{}{pad}{}", &s[..end], &s[end..])).ok()
+}
+
+/// Whether release tag `new` is strictly newer than `old` by semver order (pre-releases sort before their
+/// release). A tag that isn't semver is never offered.
 pub fn is_newer(new: &str, old: &str) -> bool {
-    let v = |s: &str| {
-        let s = s.trim().trim_start_matches('v');
-        let end = s.find(['-', '+']).unwrap_or(s.len());
-        let pad = ".0".repeat(2usize.saturating_sub(s[..end].matches('.').count()));
-        semver::Version::parse(&format!("{}{pad}{}", &s[..end], &s[end..])).ok()
-    };
-    matches!((v(new), v(old)), (Some(a), Some(b)) if a > b)
+    matches!((version(new), version(old)), (Some(a), Some(b)) if a > b)
+}
+
+/// [`is_newer`] for addon manifest versions, which are often not semver (`1.0.0.1`, `2024.01.15`): those fall
+/// back to comparing the numeric dot parts of the core, with any `-`/`+` suffix ignored.
+pub fn is_newer_addon(new: &str, old: &str) -> bool {
+    if let (Some(a), Some(b)) = (version(new), version(old)) {
+        return a > b;
+    }
+    let core = |v: &str| v.trim().trim_start_matches('v').split(['-', '+']).next()?.split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
+    match (core(new), core(old)) {
+        (Some(mut a), Some(mut b)) => {
+            let n = a.len().max(b.len());
+            a.resize(n, 0);
+            b.resize(n, 0);
+            a > b
+        }
+        _ => false,
+    }
 }
 
 impl Manifest {
