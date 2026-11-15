@@ -2687,7 +2687,7 @@ impl App {
             }
             ui.separator();
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.list_name).hint_text("New list…").char_limit(60).desired_width(140.0));
+                ui.add(egui::TextEdit::singleline(&mut self.list_name).hint_text("New list…").char_limit(60).desired_width(140.0)).accessible_name("New list name");
                 if small_button(ui, "Create").clicked() {
                     match self.db.create_list(&self.list_name) {
                         Ok(id) => {
@@ -3944,7 +3944,7 @@ impl App {
                                         search_req = s.open && s.results.is_empty() && !s.busy;
                                     }
                                     if s.open {
-                                        ui.add(egui::TextEdit::singleline(&mut s.filter).hint_text("Filter by language or addon").desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
+                                        ui.add(egui::TextEdit::singleline(&mut s.filter).hint_text("Filter by language or addon").desired_width(f32::INFINITY).margin(vec2(8.0, 6.0))).accessible_name("Filter subtitles");
                                         let hits = filter_subs(&s.results, &s.filter);
                                         let note = if s.busy { "Searching..." } else if hits.is_empty() { "No subtitles found" } else { "" };
                                         if !note.is_empty() {
@@ -5039,7 +5039,7 @@ impl App {
                     ui.selectable_value(&mut self.lib_list, Some(l.id), &l.name);
                 }
             });
-            ui.add(egui::TextEdit::singleline(&mut self.list_name).hint_text("List name").char_limit(60).desired_width(140.0));
+            ui.add(egui::TextEdit::singleline(&mut self.list_name).hint_text("List name").char_limit(60).desired_width(140.0)).accessible_name("List name");
             let mut res = None;
             if small_button(ui, "New list").clicked() {
                 res = Some(self.db.create_list(&self.list_name).map(|id| self.lib_list = Some(id)));
@@ -5058,8 +5058,8 @@ impl App {
                 }
                 self.lists_changed(res);
             }
-            let edit = ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Filter by title").desired_width(180.0));
-            if (edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape))) || (!self.lib_query.is_empty() && small_button(ui, icons::X).on_hover_text("Clear filter").clicked()) {
+            let edit = ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Filter by title").desired_width(180.0)).accessible_name("Filter library");
+            if (edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape))) || (!self.lib_query.is_empty() && small_button(ui, icons::X).accessible_name("Clear filter").on_hover_text("Clear filter").clicked()) {
                 self.lib_query.clear();
             }
         });
@@ -5406,7 +5406,7 @@ impl eframe::App for App {
                                         if ui.add(egui::Button::new(q).frame(false)).clicked() {
                                             pick = Some(q.clone());
                                         }
-                                        if ui.add(egui::Button::new(icons::X).frame(false)).on_hover_text("Remove").clicked() {
+                                        if ui.add(egui::Button::new(icons::X).frame(false)).accessible_name(format!("Remove {q} from recent searches")).on_hover_text("Remove").clicked() {
                                             del = Some(i);
                                         }
                                     });
@@ -6183,6 +6183,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = App::new(dir.path().into()).unwrap();
         (dir, app)
+    }
+
+    #[test]
+    fn library_controls_have_accessible_names() {
+        use egui::accesskit::Role;
+        let (_dir, mut app) = test_app();
+        app.lib_query = "x".into(); // shows the clear-filter button
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut out = ctx.run_ui(Default::default(), |ui| app.ui_library(ui));
+        out.textures_delta.clear();
+        let nodes = out.platform_output.accesskit_update.unwrap().nodes;
+        let named = |n: &egui::accesskit::Node| !n.labelled_by().is_empty() || n.label().is_some_and(|l| l.chars().any(char::is_alphanumeric));
+        let unnamed: Vec<_> = nodes.iter().filter(|(_, n)| matches!(n.role(), Role::Button | Role::TextInput) && !named(n)).map(|(_, n)| (n.role(), n.label().map(str::to_owned))).collect();
+        assert!(unnamed.is_empty(), "unnamed controls: {unnamed:?}");
+        assert!(nodes.iter().any(|(_, n)| n.label() == Some("Clear filter")));
     }
 
     #[test]
