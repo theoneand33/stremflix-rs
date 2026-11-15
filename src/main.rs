@@ -17,7 +17,7 @@ use stremflix_rs::download::{self, State};
 use stremflix_rs::library::{LibraryItem, is_media, scan};
 use eframe::glow::{self, HasContext};
 use stremflix_rs::profile;
-use stremflix_rs::player::{self, chapter_skips, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
+use stremflix_rs::player::{self, chapter_skips, command_words, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{NetStats, Profile, SeedLimit, TorrentEngine, fmt_rate};
 use stremflix_rs::tray::{self, Tray};
@@ -118,27 +118,6 @@ fn parse_cli(args: &[String]) -> Cli {
         },
         _ => Cli::Bad(format!("no such file: {}", sanitize_text(a, 100))),
     }
-}
-
-/// Splits a command line on whitespace; double quotes group words with spaces (e.g. a Windows path).
-fn command_words(s: &str) -> Vec<String> {
-    let (mut words, mut cur, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
-    for c in s.chars() {
-        match c {
-            '"' => (quoted, any) = (!quoted, true),
-            c if c.is_whitespace() && !quoted => {
-                if any {
-                    words.push(std::mem::take(&mut cur));
-                    any = false;
-                }
-            }
-            c => (cur.push(c), any = true).1,
-        }
-    }
-    if any {
-        words.push(cur);
-    }
-    words
 }
 
 /// Start `command` (program and its arguments) with `url` as the last argument. No shell is involved.
@@ -476,20 +455,12 @@ fn os_notify(title: String, body: String) {
 
 /// Days since 1970-01-01 (UTC) today.
 fn unix_days() -> i64 {
-    (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) / 86400) as i64
+    jiff::Timestamp::now().as_second().div_euclid(86400)
 }
 
-/// `YYYY-MM-DD` of a day count since 1970-01-01 (civil-from-days).
+/// `YYYY-MM-DD` of a day count since 1970-01-01; empty outside jiff's year range (-9999..=9999).
 fn date_string(days: i64) -> String {
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + i64::from(m <= 2))
+    jiff::Span::new().try_days(days).and_then(|n| jiff::civil::date(1970, 1, 1).checked_add(n)).map(|d| d.to_string()).unwrap_or_default()
 }
 
 /// Numbered episodes released on `since..=today` (`YYYY-MM-DD`), in list order.
@@ -4543,7 +4514,7 @@ impl App {
                 Some(Ok(new)) if !same_addon(m, new) => {
                     muted(ui, "Addon id changed; not offered");
                 }
-                Some(Ok(new)) if stremflix_rs::addon::is_newer(&new.version, &m.version) => {
+                Some(Ok(new)) if stremflix_rs::addon::is_newer_addon(&new.version, &m.version) => {
                     ui.horizontal(|ui| {
                         ui.set_min_height(32.0);
                         ui.label(format!("Update available: {} \u{2192} {}", m.version, new.version));
@@ -6166,6 +6137,7 @@ mod tests {
     fn new_episodes_window() {
         assert_eq!(date_string(0), "1970-01-01");
         assert_eq!(date_string(19782), "2024-02-29");
+        assert_eq!((date_string(3_000_000), date_string(i64::MAX)), (String::new(), String::new()), "out of range is empty");
         let v = |id: &str, season, rel: Option<&str>| Video { id: id.into(), title: None, season, episode: Some(1), released: rel.map(Into::into), thumbnail: None };
         let vs = vec![
             v("old", Some(1), Some("2024-01-01T00:00:00.000Z")),
@@ -6728,13 +6700,22 @@ mod tests {
     fn version_compare() {
         use stremflix_rs::addon::is_newer;
         assert!(is_newer("1.10.0", "1.9.9"));
-        assert!(is_newer("2", "1.9"));
+        assert!(is_newer("2", "1.9"), "short addon versions are padded");
         assert!(!is_newer("1.0", "1.0.0"));
+        assert!(is_newer("1.1", "1.0-beta"));
+        assert!(!is_newer("1.2.3.4", "1.0.0"), "four parts isn't semver");
+        use stremflix_rs::addon::is_newer_addon;
+        assert!(is_newer_addon("1.0.0.1", "1.0.0") && is_newer_addon("2024.02.01", "2024.01.15"), "non-semver addon versions compare numerically");
+        assert!(is_newer_addon("1.0.0", "1.0.0-beta") && !is_newer_addon("1.0.0.0", "1.0") && !is_newer_addon("x", "1.0"));
         assert!(!is_newer("1.0.0", "1.0.1"));
         assert!(is_newer("v1.1.0", "1.0.0"));
-        assert!(!is_newer("1.0.0-beta", "1.0.0"), "same core, suffix only");
+        assert!(!is_newer("1.0.0-beta", "1.0.0"), "a pre-release is older than its release");
         assert!(is_newer("1.1.0-beta", "1.0.0"));
-        assert!(!is_newer("1.0.0", "1.0.0-beta"));
+        assert!(is_newer("v1.0.0", "v1.0.0-beta"), "the final release is newer than its beta");
+        assert!(is_newer("1.0.0-beta.2", "1.0.0-beta.1"));
+        assert!(is_newer("1.0.0-beta.10", "1.0.0-beta.2"), "numeric pre-release parts compare as numbers");
+        assert!(is_newer("1.0.0-rc.1", "1.0.0-beta.9"));
+        assert!(!is_newer("1.0.0-beta.1", "1.0.0-beta.2"));
         assert!(is_newer("1.0.1+build5", "1.0.0"));
         assert!(!is_newer("1.0.0-beta", "1.0.0-beta"));
         assert!(!is_newer("nightly", "1.0.0"), "non-numeric is never offered");
@@ -6884,6 +6865,10 @@ mod tests {
         assert_eq!(command_words("  mpv   --fs "), ["mpv", "--fs"]);
         assert_eq!(command_words(r#"a "" b"#), ["a", "", "b"]);
         assert!(command_words("   ").is_empty());
+        #[cfg(not(windows))]
+        assert_eq!(command_words(r#"mpv '--title=a b' x\ y "#), ["mpv", "--title=a b", "x y"]);
+        #[cfg(windows)]
+        assert_eq!(command_words(r"C:\mpv\mpv.exe --fs"), [r"C:\mpv\mpv.exe", "--fs"]);
     }
 
     #[test]

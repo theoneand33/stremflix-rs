@@ -259,6 +259,16 @@ fn stream_parsing_and_targets() {
     assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{}", b32.to_lowercase())), None);
     assert_eq!(parse_magnet_hash("magnet:?xt=urn:btih:MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43"), None);
     assert_eq!(parse_magnet_hash("magnet:?xt=urn:btih:MFRGGZDFMZTWQ2LKNNWG23TPOBYXE431"), None, "1 is not base32");
+    assert_eq!((parse_magnet_hash(hash), parse_magnet_hash(b32)), (None, None), "a bare hash is not a magnet");
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{}", hash.to_uppercase())).as_deref(), Some(hash));
+    let hybrid = format!("magnet:?xt=urn:btih:{hash}&xt=urn:btmh:1220{}", "ab".repeat(32));
+    assert_eq!(parse_magnet_hash(&hybrid).as_deref(), Some(hash), "hybrid v1/v2 magnets keep the btih");
+    // librqbit's parser rejects foreign `xt` kinds and keeps the last btih.
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{hash}&xt=urn:sha1:ABC")), None);
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{b32}&xt=urn:btih:{hash}")).as_deref(), Some(hash));
+    let b32_of_hash = "AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH";
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{b32_of_hash}")).as_deref(), Some(b32_of_hash));
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{b32_of_hash}&xt=urn:btih:{hash}")).as_deref(), Some(hash), "form follows the btih that won");
 }
 
 #[test]

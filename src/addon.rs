@@ -154,13 +154,27 @@ fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<
     Ok(ManifestHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired"), adult })
 }
 
-/// Whether `new` is strictly newer than `old`. Compares the numeric dot parts of the core;
-/// a `-` or `+` suffix is ignored, and non-numeric versions are never offered.
+/// `s` as semver, ignoring a leading `v` and padding a short core (`1.9` = `1.9.0`).
+fn version(s: &str) -> Option<semver::Version> {
+    let s = s.trim().trim_start_matches('v');
+    let end = s.find(['-', '+']).unwrap_or(s.len());
+    let pad = ".0".repeat(2usize.saturating_sub(s[..end].matches('.').count()));
+    semver::Version::parse(&format!("{}{pad}{}", &s[..end], &s[end..])).ok()
+}
+
+/// Whether release tag `new` is strictly newer than `old` by semver order (pre-releases sort before their
+/// release). A tag that isn't semver is never offered.
 pub fn is_newer(new: &str, old: &str) -> bool {
-    let core = |v: &str| {
-        let v = v.trim().trim_start_matches('v');
-        v.split(['-', '+']).next()?.split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>()
-    };
+    matches!((version(new), version(old)), (Some(a), Some(b)) if a > b)
+}
+
+/// [`is_newer`] for addon manifest versions, which are often not semver (`1.0.0.1`, `2024.01.15`): those fall
+/// back to comparing the numeric dot parts of the core, with any `-`/`+` suffix ignored.
+pub fn is_newer_addon(new: &str, old: &str) -> bool {
+    if let (Some(a), Some(b)) = (version(new), version(old)) {
+        return a > b;
+    }
+    let core = |v: &str| v.trim().trim_start_matches('v').split(['-', '+']).next()?.split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
     match (core(new), core(old)) {
         (Some(mut a), Some(mut b)) => {
             let n = a.len().max(b.len());
@@ -590,14 +604,12 @@ pub fn is_info_hash(h: &str) -> bool {
 
 /// Info hash of a magnet: 40 hex digits (lowercased) or the 32-character base32 form (uppercase, as librqbit reads it).
 pub fn parse_magnet_hash(m: &str) -> Option<String> {
+    // Magnet::parse also takes a bare 40-hex hash, which isn't a magnet.
+    let id = librqbit::Magnet::parse(m).ok().filter(|_| !is_info_hash(m))?.as_id20()?;
+    // Same form as the btih Magnet::parse kept (the last one): 32 chars is base32.
     let u = Url::parse(m).ok()?;
-    if u.scheme() != "magnet" {
-        return None;
-    }
-    let (_, v) = u.query_pairs().find(|(k, v)| k == "xt" && v.starts_with("urn:btih:"))?;
-    let h = &v["urn:btih:".len()..];
-    let base32 = h.len() == 32 && h.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7'));
-    if is_info_hash(h) { Some(h.to_ascii_lowercase()) } else { base32.then(|| h.to_string()) }
+    let (_, last) = u.query_pairs().filter(|(k, v)| k == "xt" && v.starts_with("urn:btih:")).last()?;
+    Some(if last.len() == "urn:btih:".len() + 32 { data_encoding::BASE32.encode(&id.0) } else { id.as_string() })
 }
 
 /// Peer hints (`x.pe=host:port`) embedded in a magnet link.
@@ -1160,15 +1172,11 @@ pub fn newer_release(release: &str, commit: &str, body: &[u8]) -> Result<Option<
         html_url: String,
     }
     let r: Rel = serde_json::from_slice(body)?;
-    // shortcut: pre-release suffixes are ignored when ordering tags (release.yml keeps `-` tags out of /latest), so a beta user is offered neither its own final nor later betas; upgrade if that matters.
-    let numeric = |t: &str| t.trim_start_matches('v').split('-').next().unwrap_or("").split('.').all(|n| n.parse::<u64>().is_ok());
     let newer = if release == "nightly" {
         // target_commitish can also be a branch name; only a full SHA is comparable
         is_info_hash(&r.target_commitish) && r.target_commitish != commit
-    } else if numeric(&r.tag_name) && numeric(release) {
-        is_newer(&r.tag_name, release)
     } else {
-        r.tag_name != release
+        is_newer(&r.tag_name, release)
     };
     Ok(newer.then(|| safe_http_url(&r.html_url).map(String::from)).flatten())
 }

@@ -1,5 +1,5 @@
 //! One window per data directory: the first instance listens on loopback, and later launches
-//! (with or without a `stremio://` link) hand it over and exit. The port and a random token sit in a file
+//! (with or without a `stremio://` link) hand it over and exit. The port and a random token (from the OS RNG via `getrandom`) sit in a file
 //! only this user can read, so other local users can't push links.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -26,7 +26,7 @@ pub fn forward(dir: &Path, link: &str) -> bool {
 /// Accept links from later launches on a background thread; each goes to `on_link`.
 pub fn listen(dir: &Path, on_link: impl Fn(String) + Send + 'static) -> std::io::Result<()> {
     let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    let token = token();
+    let token = token()?;
     write_private(&dir.join(FILE), &format!("{} {token}", l.local_addr()?.port()))?;
     std::thread::spawn(move || {
         for c in l.incoming().flatten() {
@@ -44,11 +44,11 @@ pub fn listen(dir: &Path, on_link: impl Fn(String) + Send + 'static) -> std::io:
     Ok(())
 }
 
-/// Unpredictable token from std's OS-seeded SipHash keys (no RNG dependency).
-fn token() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let r = || std::collections::hash_map::RandomState::new().build_hasher().finish();
-    format!("{:016x}{:016x}", r(), r())
+/// 128-bit token from the OS RNG, as 32 hex digits.
+fn token() -> std::io::Result<String> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(std::io::Error::other)?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
 fn write_private(path: &Path, s: &str) -> std::io::Result<()> {
@@ -91,5 +91,14 @@ pub fn register_scheme() {
             crate::elog!("error: registering stremio:// links failed");
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn token_is_32_random_hex() {
+        let (a, b) = (super::token().unwrap(), super::token().unwrap());
+        assert!(a.len() == 32 && a.bytes().all(|c| c.is_ascii_hexdigit()) && a != b);
     }
 }

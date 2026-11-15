@@ -340,10 +340,42 @@ extern "C" fn on_update(data: *mut c_void) {
     wake();
 }
 
+/// Splits a command line into words, POSIX-shell style (quotes group, backslash escapes).
+/// An unclosed quote (`--title=Bob's`) falls back to plain whitespace splitting rather than dropping every word.
+#[cfg(not(windows))]
+pub fn command_words(s: &str) -> Vec<String> {
+    shlex::split(s).unwrap_or_else(|| s.split_whitespace().map(String::from).collect())
+}
+
+/// Splits a command line on whitespace; double quotes group words with spaces.
+/// Not shlex here: it reads `\` as an escape, so unquoted `C:\mpv\mpv.exe` and UNC `\\host\x` paths would lose backslashes.
+#[cfg(windows)]
+pub fn command_words(s: &str) -> Vec<String> {
+    let (mut words, mut cur, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    for c in s.chars() {
+        match c {
+            '"' => (quoted, any) = (!quoted, true),
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    words.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            c => (cur.push(c), any = true).1,
+        }
+    }
+    if any {
+        words.push(cur);
+    }
+    words
+}
+
 /// `--key=value` / `--flag` / `--no-flag` command-line style args to (option, value) pairs.
+/// Split by [`command_words`], so `--sub-font="Noto Sans"` stays one value.
 pub fn parse_args(s: &str) -> Vec<(String, String)> {
-    s.split_whitespace()
-        .filter_map(|a| a.strip_prefix("--"))
+    command_words(s)
+        .into_iter()
+        .filter_map(|a| a.strip_prefix("--").map(str::to_owned))
         .map(|a| match a.split_once('=') {
             Some((k, v)) => (k.into(), v.into()),
             None => match a.strip_prefix("no-") {
@@ -838,6 +870,11 @@ mod tests {
     fn parses_cli_style_args() {
         let a = parse_args("--ao=null --no-audio-display --fs junk");
         assert_eq!(a, [("ao".into(), "null".into()), ("audio-display".into(), "no".into()), ("fs".into(), "yes".into())]);
+        assert_eq!(parse_args(r#"--sub-font="Noto Sans" --title="a b""#), [("sub-font".into(), "Noto Sans".into()), ("title".into(), "a b".into())]);
+        #[cfg(not(windows))]
+        assert_eq!(parse_args("--title=Bob's --fs").len(), 2, "an unclosed quote keeps the other args");
+        #[cfg(windows)]
+        assert_eq!(parse_args(r"--log-file=C:\tmp\x.log"), [("log-file".into(), r"C:\tmp\x.log".into())]);
     }
 
     #[test]
