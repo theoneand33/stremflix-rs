@@ -154,22 +154,11 @@ fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<
     Ok(ManifestHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired"), adult })
 }
 
-/// Whether `new` is strictly newer than `old`. Compares the numeric dot parts of the core;
-/// a `-` or `+` suffix is ignored, and non-numeric versions are never offered.
+/// Whether `new` is strictly newer than `old` by semver order (pre-releases sort before their release).
+/// A leading `v` is ignored; a version that isn't semver is never offered.
 pub fn is_newer(new: &str, old: &str) -> bool {
-    let core = |v: &str| {
-        let v = v.trim().trim_start_matches('v');
-        v.split(['-', '+']).next()?.split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>()
-    };
-    match (core(new), core(old)) {
-        (Some(mut a), Some(mut b)) => {
-            let n = a.len().max(b.len());
-            a.resize(n, 0);
-            b.resize(n, 0);
-            a > b
-        }
-        _ => false,
-    }
+    let v = |s: &str| semver::Version::parse(s.trim().trim_start_matches('v')).ok();
+    matches!((v(new), v(old)), (Some(a), Some(b)) if a > b)
 }
 
 impl Manifest {
@@ -590,14 +579,11 @@ pub fn is_info_hash(h: &str) -> bool {
 
 /// Info hash of a magnet: 40 hex digits (lowercased) or the 32-character base32 form (uppercase, as librqbit reads it).
 pub fn parse_magnet_hash(m: &str) -> Option<String> {
-    let u = Url::parse(m).ok()?;
-    if u.scheme() != "magnet" {
-        return None;
-    }
-    let (_, v) = u.query_pairs().find(|(k, v)| k == "xt" && v.starts_with("urn:btih:"))?;
-    let h = &v["urn:btih:".len()..];
-    let base32 = h.len() == 32 && h.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7'));
-    if is_info_hash(h) { Some(h.to_ascii_lowercase()) } else { base32.then(|| h.to_string()) }
+    // Magnet::parse also takes a bare 40-hex hash, which isn't a magnet.
+    let id = librqbit::Magnet::parse(m).ok().filter(|_| !is_info_hash(m))?.as_id20()?;
+    // Magnet::parse reads only uppercase base32, so the hash was given in that form iff it appears verbatim.
+    let b32 = data_encoding::BASE32.encode(&id.0);
+    Some(if m.contains(&b32) { b32 } else { id.as_string() })
 }
 
 /// Peer hints (`x.pe=host:port`) embedded in a magnet link.
@@ -1160,15 +1146,11 @@ pub fn newer_release(release: &str, commit: &str, body: &[u8]) -> Result<Option<
         html_url: String,
     }
     let r: Rel = serde_json::from_slice(body)?;
-    // shortcut: pre-release suffixes are ignored when ordering tags (release.yml keeps `-` tags out of /latest), so a beta user is offered neither its own final nor later betas; upgrade if that matters.
-    let numeric = |t: &str| t.trim_start_matches('v').split('-').next().unwrap_or("").split('.').all(|n| n.parse::<u64>().is_ok());
     let newer = if release == "nightly" {
         // target_commitish can also be a branch name; only a full SHA is comparable
         is_info_hash(&r.target_commitish) && r.target_commitish != commit
-    } else if numeric(&r.tag_name) && numeric(release) {
-        is_newer(&r.tag_name, release)
     } else {
-        r.tag_name != release
+        is_newer(&r.tag_name, release)
     };
     Ok(newer.then(|| safe_http_url(&r.html_url).map(String::from)).flatten())
 }

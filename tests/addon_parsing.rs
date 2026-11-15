@@ -259,6 +259,11 @@ fn stream_parsing_and_targets() {
     assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{}", b32.to_lowercase())), None);
     assert_eq!(parse_magnet_hash("magnet:?xt=urn:btih:MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43"), None);
     assert_eq!(parse_magnet_hash("magnet:?xt=urn:btih:MFRGGZDFMZTWQ2LKNNWG23TPOBYXE431"), None, "1 is not base32");
+    assert_eq!(parse_magnet_hash(hash), None, "a bare hash is not a magnet");
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{}", hash.to_uppercase())).as_deref(), Some(hash));
+    // librqbit's parser rejects foreign `xt` kinds and keeps the last btih.
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{hash}&xt=urn:sha1:ABC")), None);
+    assert_eq!(parse_magnet_hash(&format!("magnet:?xt=urn:btih:{b32}&xt=urn:btih:{hash}")).as_deref(), Some(hash));
 }
 
 #[test]
