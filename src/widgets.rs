@@ -226,7 +226,14 @@ pub fn hero_pill<'a>(text: &str) -> egui::Button<'a> {
 }
 
 fn pill_button(ui: &mut egui::Ui, text: &str, size: f32, min: egui::Vec2, fill: [Color32; 2], fg: Color32) -> egui::Response {
-    with_widgets(ui, |ui| pill_style(ui, fill, fg), |ui| ui.add(pill_widget(text, size, min)))
+    let r = with_widgets(ui, |ui| pill_style(ui, fill, fg), |ui| ui.add(pill_widget(text, size, min)));
+    let name = spoken(text);
+    if name.is_empty() || name == text { r } else { r.accessible_name(name) }
+}
+
+/// `text` without icon-font glyphs (Unicode private use area), which screen readers can't speak.
+fn spoken(text: &str) -> String {
+    text.chars().filter(|c| !('\u{E000}'..='\u{F8FF}').contains(c)).collect::<String>().trim().to_owned()
 }
 
 /// White primary pill (Netflix "Play") and translucent gray secondary pill.
@@ -605,6 +612,13 @@ pub fn qr_ui(ui: &mut egui::Ui, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icon_glyphs_are_not_spoken() {
+        assert_eq!(spoken(&format!("{}  Add to library", icons::PLUS)), "Add to library");
+        assert_eq!(spoken(icons::X), "");
+        assert_eq!(spoken("Save"), "Save");
+    }
 
     #[test]
     fn emoji_fonts_are_bundled() {
