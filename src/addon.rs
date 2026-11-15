@@ -146,10 +146,12 @@ pub struct ManifestHints {
 }
 
 /// Malformed hints (wrong type, non-bool flags) degrade to false instead of failing the manifest.
+/// `adult` fails closed instead, since a child-safe profile relies on it: malformed hints or any value but `false`/`null` count as adult.
 fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<ManifestHints, D::Error> {
     let v = serde_json::Value::deserialize(d)?;
     let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
-    Ok(ManifestHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired"), adult: flag("adult") })
+    let adult = !(v.is_object() || v.is_null()) || v.get("adult").is_some_and(|a| !matches!(a, serde_json::Value::Null | serde_json::Value::Bool(false)));
+    Ok(ManifestHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired"), adult })
 }
 
 /// Whether `new` is strictly newer than `old`. Compares the numeric dot parts of the core;
@@ -1054,7 +1056,9 @@ mod configure_tests {
         let h = m(r#","behaviorHints":{"configurable":true,"configurationRequired":true}"#);
         assert!(h.configurable && h.configuration_required && !h.adult);
         assert!(m(r#","behaviorHints":{"adult":true}"#).adult);
-        assert_eq!(m(r#","behaviorHints":"junk""#), ManifestHints::default());
+        assert_eq!(m(r#","behaviorHints":"junk""#), ManifestHints { adult: true, ..Default::default() });
+        assert!(m(r#","behaviorHints":{"adult":"true"}"#).adult && m(r#","behaviorHints":{"adult":1}"#).adult);
+        assert!(!m(r#","behaviorHints":{"adult":false}"#).adult && !m(r#","behaviorHints":null"#).adult);
         assert_eq!(m(r#","behaviorHints":{"configurable":"yes"}"#), ManifestHints::default());
     }
 }
