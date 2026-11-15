@@ -4181,12 +4181,12 @@ impl App {
             }
         }
         // Skip button while the playhead is in an addon-marked, chapter-named or TheIntroDB intro/recap/credits span.
-        // Credits of a series episode with a next one get a Next episode button instead, hidden under the up-next card.
+        // Credits of a series episode with a next one get a Next episode button instead, hidden while the up-next card shows, after it's dismissed, or while looping.
         if p.skip_done.is_some_and(|e| st.pos >= e) {
             p.skip_done = None;
         }
         let spans = p.skips.iter().copied().chain(chapter_skips(&st.chapters, st.dur)).chain(p.db_skips.iter().flatten().copied());
-        if let Some(sk) = spans.filter(|s| !(card_shown && has_next && s.kind == SkipKind::Credits) && p.skip_done != Some(s.end)).find(|s| s.start <= st.pos && st.pos < s.end)
+        if let Some(sk) = spans.filter(|s| !(has_next && s.kind == SkipKind::Credits && (card_shown || p.next_dismissed || looping(p.repeat, p.ab))) && p.skip_done != Some(s.end)).find(|s| s.start <= st.pos && st.pos < s.end)
             && rect.width() >= 250.0
         {
             let to_next = has_next && sk.kind == SkipKind::Credits;
