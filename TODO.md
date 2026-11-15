@@ -21,7 +21,6 @@ Size: **S** under a day · **M** a few days · **L** a week or more · **XL** a 
 | Item | Priority | Size | Notes |
 |---|---|---|---|
 | Bulk selection in the library | P3 | M | |
-| User profiles (household, child-safe) | P3 | L | Stremio supporter feature. |
 
 ### Player
 

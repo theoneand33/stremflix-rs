@@ -140,13 +140,16 @@ pub struct ManifestHints {
     pub configurable: bool,
     #[serde(default, rename = "configurationRequired")]
     pub configuration_required: bool,
+    /// The addon declares adult content; a child-safe profile leaves it out.
+    #[serde(default)]
+    pub adult: bool,
 }
 
 /// Malformed hints (wrong type, non-bool flags) degrade to false instead of failing the manifest.
 fn lenient_hints<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<ManifestHints, D::Error> {
     let v = serde_json::Value::deserialize(d)?;
     let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
-    Ok(ManifestHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired") })
+    Ok(ManifestHints { configurable: flag("configurable"), configuration_required: flag("configurationRequired"), adult: flag("adult") })
 }
 
 /// Whether `new` is strictly newer than `old`. Compares the numeric dot parts of the core;
@@ -1049,7 +1052,8 @@ mod configure_tests {
         };
         assert_eq!(m(""), ManifestHints::default());
         let h = m(r#","behaviorHints":{"configurable":true,"configurationRequired":true}"#);
-        assert!(h.configurable && h.configuration_required);
+        assert!(h.configurable && h.configuration_required && !h.adult);
+        assert!(m(r#","behaviorHints":{"adult":true}"#).adult);
         assert_eq!(m(r#","behaviorHints":"junk""#), ManifestHints::default());
         assert_eq!(m(r#","behaviorHints":{"configurable":"yes"}"#), ManifestHints::default());
     }

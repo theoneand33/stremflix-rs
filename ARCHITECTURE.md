@@ -4,6 +4,7 @@
 src/addon.rs    Stremio addon protocol: types, sanitizing parsers, async HTTP client
 src/db.rs       SQLite (rusqlite, bundled): addons, library folders/items, settings, progress
 src/library.rs  Recursive media-file scan (walkdir)
+src/profile.rs  Household profiles: one data folder each, the active one named in `<data>/profile`
 src/download.rs Offline downloads: safe file names, streaming a URL (or the local torrent stream) to a file
 src/player.rs   libmpv (FFI) in-process: OpenGL-rendered frames, observed properties, IPC server
 src/torrent.rs  librqbit session + its HTTP streaming API on 127.0.0.1
@@ -52,7 +53,7 @@ test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed vi
 
 ## Persistence
 
-SQLite in WAL mode at `$STREMFLIX_RS_DATA/stremflix-rs.db`. Progress keys are `<type>:<id>` for addon items, `file:<path>` for local files, and `btih:<hash>` for raw magnets. Each row stores a resumable source: URL, magnet, or path.
+SQLite in WAL mode at `$STREMFLIX_RS_DATA/stremflix-rs.db`. A profile other than the default uses `profiles/<name>/` under the data folder as its whole data folder (database, downloads, torrents), so one profile's startup cleanup never touches another's files; the instance socket and the log stay in the root. Progress keys are `<type>:<id>` for addon items, `file:<path>` for local files, and `btih:<hash>` for raw magnets. Each row stores a resumable source: URL, magnet, or path.
 
 Settings > Data exports addons, saved titles, progress, watched marks and safe settings to `exports/stremflix-rs-<time>.json` (`{"format":"stremflix-rs-export","version":1}`; no auth key, no local paths). Import treats the file as untrusted (16 MiB cap, validated entries) and merges it in one transaction, keeping newer progress.
 

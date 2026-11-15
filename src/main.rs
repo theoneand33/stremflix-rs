@@ -16,6 +16,7 @@ use stremflix_rs::db::{self, Db, Download, List, Progress, SavedTitle, Watched};
 use stremflix_rs::download::{self, State};
 use stremflix_rs::library::{LibraryItem, is_media, scan};
 use eframe::glow::{self, HasContext};
+use stremflix_rs::profile;
 use stremflix_rs::player::{self, chapter_skips, GlProc, Player, ASPECTS, SPEEDS, SUB_COLORS, SUB_OUTLINES, ZOOM_RANGE, SubStyle, hwdec_value, prefer_lang, valid_langs, zoom_value};
 use stremflix_rs::stremio_import::{self, Import};
 use stremflix_rs::torrent::{NetStats, Profile, SeedLimit, TorrentEngine, fmt_rate};
@@ -1027,7 +1028,19 @@ struct App {
     sub_style: SubStyle,
     rt: tokio::runtime::Runtime,
     db: Db,
+    /// The active profile's folder: `root` for the default profile.
     data_dir: PathBuf,
+    /// The app's data folder, which holds every profile.
+    root: PathBuf,
+    /// Active profile; empty is the default one.
+    profile: String,
+    /// Profile picked in Settings for the next launch, and the name typed for a new one.
+    profile_next: String,
+    profile_new: String,
+    /// PIN of a child-safe profile; empty when it is not locked.
+    // shortcut: kept as typed in the profile's database, which anyone who can read it can also edit; hash it if the lock must resist that.
+    child_pin: String,
+    pin_entry: String,
     client: AddonClient,
     torrent: Arc<tokio::sync::OnceCell<Arc<TorrentEngine>>>,
     tx: Sender<Msg>,
@@ -1231,6 +1244,15 @@ fn data_dir() -> PathBuf {
     base.join("stremflix-rs")
 }
 
+/// Password field for a child-safe PIN and its button; true when pressed (or Enter) with a PIN typed.
+fn pin_row(ui: &mut egui::Ui, pin: &mut String, action: &str) -> bool {
+    field_row(ui, "Child-safe PIN", |ui, l| {
+        let r = ui.add(egui::TextEdit::singleline(pin).password(true).desired_width(200.0)).labelled_by(l);
+        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        (small_button(ui, action).clicked() || enter) && !pin.is_empty()
+    })
+}
+
 fn wayland() -> bool {
     cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
@@ -1288,7 +1310,9 @@ impl Job {
 }
 
 impl App {
-    fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
+    fn new(root: PathBuf) -> anyhow::Result<Self> {
+        let profile = profile::active(&root);
+        let data_dir = profile::dir(&root, &profile);
         let db = Db::open(&data_dir.join("stremflix-rs.db"))?;
         let queue: Vec<Job> = db.download_queue()?.into_iter().map(|q| Job::new(q.d, q.source, q.headers, q.state, q.validator, q.total)).collect();
         download::clear_partial(&data_dir.join("downloads"), &queue.iter().map(|j| j.d.path.clone()).collect::<Vec<_>>());
@@ -1375,6 +1399,12 @@ impl App {
             folder: db.setting("last_folder")?.unwrap_or_default(),
             langs: [db.setting("alang")?.unwrap_or_default(), db.setting("slang")?.unwrap_or_default()],
             user_agent: ua,
+            child_pin: db.setting("child_pin")?.unwrap_or_default(),
+            pin_entry: String::new(),
+            profile_next: profile.clone(),
+            profile_new: String::new(),
+            profile,
+            root,
             db,
             data_dir,
             client: AddonClient::new(),
@@ -1420,7 +1450,8 @@ impl App {
             media: None,
             media_shown: None,
         };
-        if app.addons.is_empty() {
+        app.child_filter();
+        if app.addons.is_empty() && !app.locked() {
             app.tab = Tab::Addons;
         }
         // Neither check may block startup: a failure here only skips the notice.
@@ -1451,9 +1482,21 @@ impl App {
         });
     }
 
+    /// A child-safe profile: no Addons tab, no settings but the unlock, no adult addons, no new addons.
+    fn locked(&self) -> bool {
+        !self.child_pin.is_empty()
+    }
+
+    fn child_filter(&mut self) {
+        if self.locked() {
+            self.addons.retain(|(_, m)| !m.behavior_hints.adult);
+        }
+    }
+
     /// Pull the signed-in Stremio account's addons and library into the local DB.
     fn sync_account(&mut self, ctx: &egui::Context) {
-        if self.account_busy {
+        // A locked profile keeps the addons it was locked with.
+        if self.account_busy || self.locked() {
             return;
         }
         let Some(key) = self.db.setting("stremio_auth").ok().flatten().filter(|k| !k.is_empty()) else { return };
@@ -1676,6 +1719,7 @@ impl App {
                 (self.sleep_carry, self.opening) = (None, None);
                 report(&mut self.error, e);
             }
+            Msg::Installed(..) if self.locked() => report(&mut self.error, "this profile is child-safe: unlock it in Settings to add addons"),
             Msg::Installed(url, m, replaces) => {
                 let saved = self.db.add_addon(&url, &m);
                 if let Err(e) = &saved {
@@ -1993,12 +2037,15 @@ impl App {
                     }
                 }
             }
+            // A sync or import that was running when the profile was locked.
+            Msg::Imported(_) if self.locked() => {}
             Msg::Imported(imp) => {
                 if let Err(e) = imp.save(&self.db) {
                     report(&mut self.error, format!("saving import: {e:#}"));
                     return;
                 }
                 self.addons = self.db.addons().unwrap_or_default();
+                self.child_filter();
                 self.saved = self.db.saved_titles().unwrap_or_default();
                 self.recent = self.db.recent_progress(20).unwrap_or_default();
                 self.watched = self.db.watched(50).unwrap_or_default();
@@ -4612,11 +4659,74 @@ impl App {
         }
     }
 
+    /// Profile switcher and the child-safe lock. True while the profile is locked: the rest of Settings stays hidden.
+    fn ui_profile(&mut self, ui: &mut egui::Ui) -> bool {
+        let shown = |p: &str| if p.is_empty() { "Default".to_string() } else { p.to_string() };
+        if self.locked() {
+            caption(ui, format!("{} is child-safe: addons and settings are locked.", shown(&self.profile)));
+            if pin_row(ui, &mut self.pin_entry, "Unlock") {
+                if self.pin_entry == self.child_pin {
+                    self.set_child_pin(ui.ctx(), String::new());
+                } else {
+                    report(&mut self.error, "wrong PIN");
+                }
+                self.pin_entry.clear();
+            }
+            return self.locked();
+        }
+        let names = profile::list(&self.root);
+        let choices: Vec<(String, String)> = std::iter::once(String::new()).chain(names).map(|n| (shown(&n), n)).collect();
+        let choices: Vec<(&str, String)> = choices.iter().map(|(l, n)| (l.as_str(), n.clone())).collect();
+        let mut switch = combo_row(ui, "Profile", &mut self.profile_next, &choices);
+        if form_row(ui, "New profile", &mut self.profile_new, "Name", "Create", Some("A profile has its own addons, library, progress and settings"), false) {
+            self.profile_next = self.profile_new.trim().to_string();
+            switch = true;
+        }
+        if switch {
+            match profile::switch(&self.root, &self.profile_next) {
+                Ok(()) => self.profile_new.clear(),
+                Err(e) => {
+                    report(&mut self.error, format!("switching profile: {e:#}"));
+                    self.profile_next = self.profile.clone();
+                }
+            }
+        }
+        if self.profile_next != self.profile {
+            caption(ui, format!("Restart the app to open {}.", shown(&self.profile_next)));
+        }
+        if pin_row(ui, &mut self.pin_entry, "Lock") {
+            let pin = std::mem::take(&mut self.pin_entry);
+            self.set_child_pin(ui.ctx(), pin);
+        }
+        caption(ui, "Child-safe: a PIN locks this profile. It hides the Addons tab, these settings and addons flagged adult until the PIN is entered here.");
+        self.locked()
+    }
+
+    /// Lock the profile with `pin`, or unlock it with an empty one, and reload the addons either way.
+    fn set_child_pin(&mut self, ctx: &egui::Context, pin: String) {
+        if let Err(e) = self.db.set_setting("child_pin", &pin) {
+            return report(&mut self.error, format!("saving the PIN: {e:#}"));
+        }
+        // Also undo a switch that was picked but not started: a locked profile can only be left by its PIN.
+        if !pin.is_empty() && let Err(e) = profile::switch(&self.root, &self.profile) {
+            report(&mut self.error, format!("switching profile: {e:#}"));
+        }
+        self.profile_next = self.profile.clone();
+        self.child_pin = pin;
+        self.addons = self.db.addons().unwrap_or_default();
+        self.child_filter();
+        self.build_rows(ctx);
+    }
+
     /// Torrent engine and external player options; each is saved as soon as it changes.
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         let mut save: Vec<(&str, String)> = Vec::new();
         ui.add_space(8.0);
-        section_heading(ui, "Appearance");
+        section_heading(ui, "Profile");
+        if self.ui_profile(ui) {
+            return;
+        }
+        row_title(ui, "Appearance");
         field_row(ui, "Theme", |ui, _| {
             for (name, light) in [("Dark", false), ("Light", true)] {
                 if pill(ui, name, self.light == light, egui::Role::RadioButton).clicked() && self.light != light {
@@ -5346,7 +5456,11 @@ impl eframe::App for App {
                 // Netflix nav: current tab is bold white on a dark gray pill that slides between tabs.
                 let pill_slot = ui.painter().add(egui::Shape::Noop);
                 let mut sel_rect = None;
-                for (tab, name) in [(Tab::Home, "Home"), (Tab::Discover, "Discover"), (Tab::Addons, "Addons"), (Tab::Library, "Library"), (Tab::Settings, "Settings")] {
+                let locked = self.locked();
+                if locked && self.tab == Tab::Addons {
+                    self.tab = Tab::Home; // a saved tab or an install link
+                }
+                for (tab, name) in [(Tab::Home, "Home"), (Tab::Discover, "Discover"), (Tab::Addons, "Addons"), (Tab::Library, "Library"), (Tab::Settings, "Settings")].into_iter().filter(|t| !(locked && t.0 == Tab::Addons)) {
                     // The search page is not a tab, so nothing is current while it is up.
                     let current = self.tab == tab && (self.search_page.is_none() || self.selected.is_some());
                     let text = RichText::new(name).size(15.0);
@@ -6502,6 +6616,35 @@ mod tests {
         app.handle(&ctx, Msg::Installed(u("b2"), m.clone(), Some(u("b"))));
         assert_eq!(order(&app), [u("a"), u("b2"), u("c")], "reconfigured addon takes the old place");
         assert_eq!(app.db.addons().unwrap().into_iter().map(|(x, _)| x).collect::<Vec<_>>(), order(&app), "saved");
+    }
+
+    #[test]
+    fn child_safe_profile_hides_adult_addons_and_refuses_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        profile::switch(dir.path(), "Kids").unwrap();
+        let mut app = App::new(dir.path().into()).unwrap();
+        assert_eq!(app.data_dir, dir.path().join("profiles").join("Kids"));
+        let ctx = egui::Context::default();
+        let m = |hints: &str| stremflix_rs::addon::parse_manifest(format!(r#"{{"id":"a","version":"1","name":"A","resources":["stream"],"types":["movie"]{hints}}}"#).as_bytes()).unwrap();
+        let u = |n: &str| format!("https://{n}.example/manifest.json");
+        app.handle(&ctx, Msg::Installed(u("ok"), m(""), None));
+        app.handle(&ctx, Msg::Installed(u("adult"), m(r#","behaviorHints":{"adult":true}"#), None));
+        let urls = |app: &App| app.addons.iter().map(|(x, _)| x.clone()).collect::<Vec<_>>();
+        app.set_child_pin(&ctx, "1234".into());
+        assert_eq!(urls(&app), [u("ok")]);
+        app.handle(&ctx, Msg::Installed(u("new"), m(""), None));
+        app.handle(&ctx, Msg::Imported(Import { addons: vec![(u("imported"), m(""))], progress: vec![], watched: vec![], bitfields: vec![], saved: vec![] }));
+        assert_eq!((urls(&app), app.db.addons().unwrap().len()), (vec![u("ok")], 2), "nothing installed while locked");
+        // The lock is the profile's own and survives a restart; the default profile has neither it nor the addons.
+        drop(app);
+        let mut app = App::new(dir.path().into()).unwrap();
+        assert!(app.locked() && urls(&app) == [u("ok")]);
+        app.set_child_pin(&ctx, String::new());
+        assert_eq!(urls(&app), [u("ok"), u("adult")]);
+        drop(app);
+        profile::switch(dir.path(), "").unwrap();
+        let app = App::new(dir.path().into()).unwrap();
+        assert!(!app.locked() && app.addons.is_empty());
     }
 
     #[test]
