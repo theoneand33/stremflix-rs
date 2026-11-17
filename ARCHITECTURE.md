@@ -2,6 +2,7 @@
 
 ```
 src/addon.rs    Stremio addon protocol: types, sanitizing parsers, async HTTP client
+src/api.rs      Local HTTP API (API.md) on loopback: Continue Watching, search, play; calls go to the UI thread over mpsc
 src/db.rs       SQLite (rusqlite, bundled): addons, library folders/items, settings, progress
 src/library.rs  Recursive media-file scan (walkdir)
 src/profile.rs  Household profiles: one data folder each, the active one named in `<data>/profile`
