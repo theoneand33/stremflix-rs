@@ -22,7 +22,7 @@ Set `STREMFLIX_RS_NO_DHT=1` for tests and any headless or offline run. Set `STRE
 ## Layout
 
 - `src/main.rs`: egui GUI, tokio runtime, results back over mpsc. It is large; search before you read.
-- `src/addon.rs`, `db.rs`, `player.rs`, `torrent.rs`, `download.rs`, `stremio_import.rs`, `tray.rs`, `widgets.rs`: see ARCHITECTURE.md.
+- `src/addon.rs`, `api.rs`, `db.rs`, `player.rs`, `torrent.rs`, `download.rs`, `stremio_import.rs`, `tray.rs`, `widgets.rs`: see ARCHITECTURE.md.
 - `src/widgets.rs` holds reusable widgets with no app state and no addon types. Keep it that way.
 - `test-addon/`: std-only addon server used for end-to-end runs and tests.
 - `tests/`: integration tests (addon parsing, persistence, Stremio import, instance, library scan).

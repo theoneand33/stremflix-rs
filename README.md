@@ -44,6 +44,7 @@ cargo test
 | `STREMFLIX_RS_MPV_ARGS` | Extra mpv options, e.g. `--ao=null` for headless runs |
 | `STREMFLIX_RS_IPC` | mpv IPC endpoint. Default: `$TMPDIR/stremflix-rs-mpv.sock`, or `\\.\pipe\stremflix-rs-mpv` on Windows; with `STREMFLIX_RS_DATA` set, `<data>/mpv.sock` (pipe `stremflix-rs-mpv-<data path, non-alphanumerics hex-escaped>`) |
 | `STREMFLIX_RS_NO_DHT` | Disable the BitTorrent DHT (offline/CI) |
+| `STREMFLIX_RS_API` | Address of the [local API](API.md) for other apps. Default: `127.0.0.1:11471`; `off` disables it |
 
 ## Usage
 
@@ -143,6 +144,8 @@ STREMFLIX_RS_DATA=/tmp/stremflix-rs-demo STREMFLIX_RS_NO_DHT=1 cargo run --bin s
 4. Close and restart with the same command: Continue Watching resumes at the saved position.
 
 Query player state while it runs: `printf '{"command":["get_property","time-pos"]}\n' | socat - /tmp/stremflix-rs-mpv.sock`. With `STREMFLIX_RS_DATA` set, use `<data>/mpv.sock`.
+
+Other apps can drive the window through the [local API](API.md): `curl 'http://127.0.0.1:11471/api/search?q=test'`, then `curl -X POST 'http://127.0.0.1:11471/api/play?type=movie&id=<id>'`.
 
 ## Legal
 

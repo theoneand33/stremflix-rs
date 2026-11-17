@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use egui::{Align, Color32, Layout, RichText, Sense, UiBuilder, pos2, vec2};
 use anyhow::Context;
 use stremflix_rs::addon::{AddonClient, Skip, SkipKind, AddonEntry, CatalogDef, DeepLink, Manifest, Meta, MetaPreview, PlayTarget, Stream, Video, flags_to_codes, parse_magnet_hash, sanitize_text};
-use stremflix_rs::instance;
+use stremflix_rs::{api, instance};
 use stremflix_rs::db::{self, Db, Download, List, Progress, SavedTitle, Watched};
 use stremflix_rs::download::{self, State};
 use stremflix_rs::library::{LibraryItem, is_media, scan};
@@ -317,6 +317,8 @@ enum Msg {
     SubSaved(Result<PathBuf, String>),
     /// A media key or OS media overlay button.
     Media(souvlaki::MediaControlEvent),
+    /// A local API request and where its reply goes.
+    Api(api::Call, Sender<api::Reply>),
 }
 
 /// One horizontal catalog row on Home or the search page.
@@ -1950,12 +1952,7 @@ impl App {
                     report(&mut self.error, format!("unsupported link: {}", sanitize_text(&s, 200)));
                 } else {
                     self.show_window(ctx, true);
-                    // Leave the player like its Back button does, or the link opens behind it.
-                    if self.player.is_some() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-                        self.stop_player();
-                        self.release_torrents(None);
-                    }
+                    self.leave_player(ctx);
                     match link {
                         Some(link) => self.open_link(ctx, link),
                         None if is_torrent_source(&s) => self.play_torrent(ctx, &s),
@@ -2108,6 +2105,7 @@ impl App {
                 }
             }
             Msg::Media(e) => self.media_event(ctx, e),
+            Msg::Api(call, reply) => self.api_call(ctx, call, reply),
             Msg::DownloadProgress(path, run, got, total, validator) => {
                 if let Some(j) = self.queue.iter_mut().find(|j| j.d.path == path && j.run == run && j.state == State::Active) {
                     if (j.total, &j.validator) != (total, &validator) {
@@ -2325,6 +2323,67 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
+    }
+
+    /// Leave the player like its Back button does, so what opens next isn't behind it.
+    fn leave_player(&mut self, ctx: &egui::Context) {
+        if self.player.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            self.stop_player();
+            self.release_torrents(None);
+        }
+    }
+
+    /// Answer a local API request (API.md). Search replies from a task once every catalog answered.
+    fn api_call(&mut self, ctx: &egui::Context, call: api::Call, reply: Sender<api::Reply>) {
+        let r = match call {
+            api::Call::Continue => Ok(serde_json::Value::from_iter(self.recent.iter().map(|p| {
+                let (kind, id) = p.key.split_once(':').unwrap_or_default();
+                serde_json::json!({ "type": kind, "id": id, "title": p.title, "poster": p.poster, "position": p.position, "duration": p.duration })
+            }))),
+            api::Call::Search(q) => {
+                let srcs: Vec<_> = self.search_catalogs().into_iter().map(|(_, src)| src).collect();
+                if srcs.is_empty() {
+                    Err((400, "no installed addon supports search".into()))
+                } else {
+                    let client = self.client.clone();
+                    self.rt.spawn(async move {
+                        let tasks: Vec<_> = srcs
+                            .into_iter()
+                            .map(|(u, k, c)| {
+                                let (client, q) = (client.clone(), q.clone());
+                                tokio::spawn(async move { client.search(&u, &k, &c, &q).await })
+                            })
+                            .collect();
+                        // Addon order, first of each title; failed catalogs are skipped like the search page's.
+                        let (mut seen, mut out) = (std::collections::HashSet::new(), Vec::new());
+                        for t in tasks {
+                            if let Ok(Ok(items)) = t.await {
+                                out.extend(items.into_iter().filter(|m| seen.insert((m.kind.clone(), m.id.clone()))));
+                            }
+                        }
+                        let _ = reply.send(serde_json::to_value(out).map_err(|e| (503, e.to_string())));
+                    });
+                    return;
+                }
+            }
+            api::Call::Play { kind, id, name } => {
+                let key = format!("{kind}:{id}");
+                let title = self.recent.iter().find(|p| p.key == key).map(|p| p.title.clone());
+                // Torrents and files only resume: a path or magnet from the API alone is never opened.
+                if title.is_none() && matches!(kind.as_str(), "btih" | "file") {
+                    Err((404, "not in Continue Watching".into()))
+                } else {
+                    self.show_window(ctx, true);
+                    self.leave_player(ctx);
+                    // Saved progress keeps this name until the addon's meta renames it.
+                    let name = title.or(name).unwrap_or_else(|| id.clone());
+                    self.quick_play(ctx, MetaPreview { id, kind, name, poster: None, background: None, description: None });
+                    Ok(serde_json::json!({ "ok": true }))
+                }
+            }
+        };
+        let _ = reply.send(r);
     }
 
     fn stop_player(&mut self) {
@@ -2560,12 +2619,9 @@ impl App {
         }
         self.remember_search(&query);
         let rows: Vec<Row> = self
-            .addons
-            .iter()
-            .filter(|(_, m)| m.has_resource("catalog"))
-            .flat_map(|(u, m)| {
-                m.catalogs.iter().filter(|c| c.searchable()).map(move |c| Row { title: catalog_title(&m.name, c), src: (u.clone(), c.kind.clone(), c.id.clone()), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false, error: None })
-            })
+            .search_catalogs()
+            .into_iter()
+            .map(|(title, src)| Row { title, src, items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false, error: None })
             .collect();
         if rows.is_empty() {
             report(&mut self.error, "no installed addon supports search");
@@ -2581,6 +2637,15 @@ impl App {
         self.close_details();
         self.tab = Tab::Home;
         self.search_page = Some(SearchPage { query, rows, failed: Vec::new() });
+    }
+
+    /// Searchable catalogs of installed addons: row title and source (addon URL, type, catalog id).
+    fn search_catalogs(&self) -> Vec<(String, (String, String, String))> {
+        self.addons
+            .iter()
+            .filter(|(_, m)| m.has_resource("catalog"))
+            .flat_map(|(u, m)| m.catalogs.iter().filter(|c| c.searchable()).map(move |c| (catalog_title(&m.name, c), (u.clone(), c.kind.clone(), c.id.clone()))))
+            .collect()
     }
 
     /// A nav click. Home while already on Home also leaves the open title, like Back; from another tab it returns to that title.
@@ -5793,6 +5858,22 @@ fn main() -> eframe::Result {
     if let Err(e) = instance::listen(&dir, sink.clone()) {
         stremflix_rs::elog!("error: links from later launches won't reach this window: {e}");
     }
+    let api_addr = std::env::var("STREMFLIX_RS_API").unwrap_or_else(|_| api::DEFAULT_ADDR.into());
+    if api_addr != "off" {
+        let (tx, cell) = (app.tx.clone(), ctx_cell.clone());
+        let on_call = move |call| {
+            let (reply, got) = channel();
+            let _ = tx.send(Msg::Api(call, reply));
+            if let Some(c) = cell.get() {
+                c.request_repaint();
+            }
+            got.recv_timeout(api::WAIT).unwrap_or_else(|_| Err((503, "the app did not answer".into())))
+        };
+        match api::serve(&api_addr, on_call) {
+            Ok(a) => stremflix_rs::elog!("local API on http://{a}/api/"),
+            Err(e) => stremflix_rs::elog!("error: local API on {api_addr} is off: {e}"),
+        }
+    }
     #[cfg(windows)]
     std::thread::spawn(instance::register_scheme);
     app.window = app.db.setting("window").ok().flatten().and_then(|s| s.parse().ok()).unwrap_or_default();
@@ -6809,6 +6890,37 @@ mod tests {
         let (_d, mut app) = test_app();
         app.handle(&egui::Context::default(), Msg::Link("stremio://example.com/manifest.json".into()));
         assert!(app.tab == Tab::Addons && app.addon_url == "https://example.com/manifest.json");
+    }
+
+    #[test]
+    fn api_calls() {
+        let (_d, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let call = |app: &mut App, c| {
+            let (tx, rx) = channel();
+            app.handle(&ctx, Msg::Api(c, tx));
+            rx.try_recv().unwrap()
+        };
+        app.recent = vec![Progress { key: "series:tt1:1:2".into(), title: "Ep".into(), source: "http://x/v".into(), position: 5.0, duration: 60.0, poster: Some("http://x/p.jpg".into()) }];
+        let list = call(&mut app, api::Call::Continue).unwrap();
+        assert_eq!(list, serde_json::json!([{"type": "series", "id": "tt1:1:2", "title": "Ep", "poster": "http://x/p.jpg", "position": 5.0, "duration": 60.0}]));
+        assert_eq!(call(&mut app, api::Call::Search("x".into())).unwrap_err().0, 400);
+        // A file or magnet the app never played is not opened.
+        assert_eq!(call(&mut app, api::Call::Play { kind: "file".into(), id: "/etc/passwd".into(), name: None }).unwrap_err().0, 404);
+        // A movie not in progress opens its streams to autoplay the top one.
+        assert!(call(&mut app, api::Call::Play { kind: "movie".into(), id: "tt9".into(), name: Some("Nine".into()) }).is_ok());
+        assert_eq!(app.loading(), Some("Nine"));
+        // A file in Continue Watching resumes.
+        app.recent.push(Progress { key: "file:/v/a.mkv".into(), title: "a".into(), source: "/v/a.mkv".into(), position: 0.0, duration: 0.0, poster: None });
+        assert!(call(&mut app, api::Call::Play { kind: "file".into(), id: "/v/a.mkv".into(), name: None }).is_ok());
+        // Search merges every searchable catalog in addon order, one entry per title.
+        let base = test_addon::spawn(test_addon::Config { media_dir: None, torrent: None }).unwrap();
+        let m = app.rt.block_on(app.client.fetch_manifest(&format!("{base}/manifest.json"))).unwrap();
+        app.addons = vec![(format!("{base}/manifest.json"), m.clone()), (format!("{base}/manifest.json?again"), m)];
+        let (tx, rx) = channel();
+        app.handle(&ctx, Msg::Api(api::Call::Search("test".into()), tx));
+        let found = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(found.as_array().map(|a| a.iter().map(|m| m["id"].as_str()).collect::<Vec<_>>()), Some(vec![Some(test_addon::META_ID)]));
     }
 
     #[test]
