@@ -949,6 +949,9 @@ struct Playing {
     menu: Option<Menu>,
     /// Seek-bar position while dragging, in seconds.
     scrub: Option<f64>,
+    /// Seek-bar previews (none for torrents, whose random reads would compete with playback, and YouTube) and the last one shown.
+    thumbs: Option<player::Thumbs>,
+    thumb: Option<egui::TextureHandle>,
     /// Video held down: playing at 2x until release.
     fast: bool,
     /// Press start (egui clock) of a press that began on the video, while the button stays down.
@@ -2239,7 +2242,9 @@ impl App {
                         if self.volume != 100.0 {
                             let _ = player.command(&["set", "volume", &self.volume.to_string()]);
                         }
-                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, fast: false, hold: None, after_hold: false, wheel: 0.0, volume: self.volume, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, db_skips: None, skip_done: None, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None, auto_pause: AutoPause::Off };
+                        let wake = ctx.clone();
+                        let thumbs = (torrent.is_none() && !stremflix_rs::addon::is_youtube(&url)).then(|| player::Thumbs::new(&url, &headers, demuxer, Box::new(move || wake.request_repaint())));
+                        let p = Playing { player, key, title, source, url, torrent, pos: start, dur: 0.0, poster, osd_until: ctx.input(|i| i.time) + 3.0, menu: None, scrub: None, thumbs, thumb: None, fast: false, hold: None, after_hold: false, wheel: 0.0, volume: self.volume, next_dismissed: false, aspect: 0, fill: false, ab: [None; 2], repeat: false, zoom: 0, search: SubSearch::default(), skips, db_skips: None, skip_done: None, stats: false, net: Default::default(), net_next: 0.0, awake: None, hidden_vid: None, auto_pause: AutoPause::Off };
                         self.player = Some(p);
                         // Force a fresh render so the previous video's last frame never flashes.
                         if let Some(v) = &mut self.video {
@@ -3986,8 +3991,32 @@ impl App {
             let knob = pos2(track.left() + track.width() * frac, track.center().y);
             paint.circle_filled(knob, if hot { 9.0 } else { 7.0 }, accent().gamma_multiply(a));
             paint.circle_filled(knob, 3.0, white);
-            if let Some(h) = r.hover_pos().filter(|_| st.dur > 0.0) {
-                paint.text(pos2(h.x, bar.top() - 6.0), egui::Align2::CENTER_BOTTOM, fmt_time(at(h.x)), font.clone(), white);
+            if let Some(t) = p.thumbs.as_ref().and_then(|t| t.take()) {
+                let img = egui::ColorImage::from_rgba_unmultiplied(t.size, &t.rgba);
+                match &mut p.thumb {
+                    Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
+                    None => p.thumb = Some(ctx.load_texture("seek-preview", img, egui::TextureOptions::LINEAR)),
+                }
+            }
+            if let Some(h) = r.hover_pos().or(p.scrub.and(r.interact_pointer_pos())).filter(|_| st.dur > 0.0) {
+                let mut label_y = bar.top() - 6.0;
+                if let (Some(th), [vw, vh]) = (&mut p.thumbs, st.video) && vw > 0 && vh > 0 {
+                    // Fits a 192 px box, keeping the video's aspect (portrait too).
+                    let side = |a: usize, b: usize| (192 * a / a.max(b)).max(2) & !1;
+                    let size = [side(vw, vh), side(vh, vw)];
+                    th.request(preview_time(at(h.x), st.dur), size);
+                    if let Some(tex) = &p.thumb {
+                        // The previous preview stays up while the next one renders.
+                        let s = vec2(size[0] as f32, size[1] as f32);
+                        // min/max, not clamp: clamp panics once the window is narrower than the preview.
+                        let x = h.x.min(rect.right() - 8.0 - s.x / 2.0).max(rect.left() + 8.0 + s.x / 2.0);
+                        let img = egui::Rect::from_center_size(pos2(x, label_y - 28.0 - s.y / 2.0), s);
+                        paint.rect_filled(img.expand(2.0), 6, Color32::from_black_alpha((220.0 * a) as u8));
+                        paint.image(tex.id(), img, egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE.gamma_multiply(a));
+                        label_y = img.bottom() + 24.0;
+                    }
+                }
+                paint.text(pos2(h.x, label_y), egui::Align2::CENTER_BOTTOM, fmt_time(at(h.x)), font.clone(), white);
             }
             paint.text(pos2(rect.left() + 24.0, by), egui::Align2::LEFT_CENTER, fmt_time(pos), font.clone(), white);
             paint.text(pos2(rect.right() - 24.0, by), egui::Align2::RIGHT_CENTER, fmt_time(st.dur), font, white);
@@ -6015,6 +6044,12 @@ fn volume_at(frac: f32) -> f64 {
 
 const SEEK_STEP_RANGE: std::ops::RangeInclusive<u32> = 1..=600;
 
+/// Hover time snapped to steps of 1/200 of the duration (at least 2 s), so small mouse moves reuse the last preview.
+fn preview_time(t: f64, dur: f64) -> f64 {
+    let step = (dur / 200.0).max(2.0);
+    ((t / step).round() * step).clamp(0.0, dur.max(0.0))
+}
+
 /// Saved seek step in seconds; a missing, unparsable or out-of-range value falls back to `default`.
 fn seek_step(v: Option<String>, default: u32) -> u32 {
     v.and_then(|v| v.parse().ok()).filter(|v| SEEK_STEP_RANGE.contains(v)).unwrap_or(default)
@@ -6981,6 +7016,14 @@ mod tests {
         assert_eq!(command_words(r#"mpv '--title=a b' x\ y "#), ["mpv", "--title=a b", "x y"]);
         #[cfg(windows)]
         assert_eq!(command_words(r"C:\mpv\mpv.exe --fs"), [r"C:\mpv\mpv.exe", "--fs"]);
+    }
+
+    #[test]
+    fn preview_time_snaps_to_steps() {
+        assert_eq!(preview_time(61.0, 100.0), 62.0);
+        assert_eq!(preview_time(1001.0, 2000.0), 1000.0);
+        assert_eq!(preview_time(1999.0, 2000.0), 2000.0);
+        assert_eq!(preview_time(-5.0, 100.0), 0.0);
     }
 
     #[test]
