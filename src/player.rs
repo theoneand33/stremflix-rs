@@ -617,9 +617,12 @@ impl Thumbs {
         let (source, sink, stopped) = (source.to_string(), out.clone(), stop.clone());
         std::thread::spawn(move || {
             // Open only once a preview is wanted: most plays never hover the seek bar.
-            let Ok(first) = rx.recv() else { return };
-            if let Err(e) = thumb_loop(&source, &opts, first, &rx, &sink, &stopped, &*wake) {
-                crate::elog!("seek previews: {e:#}");
+            // A failure (e.g. a dropped connection) reopens with a fresh mpv on the next hover.
+            while let Ok(first) = rx.recv() {
+                match thumb_loop(&source, &opts, first, &rx, &sink, &stopped, &*wake) {
+                    Err(e) if !stopped.load(std::sync::atomic::Ordering::Relaxed) => crate::elog!("seek previews: {e:#}"),
+                    _ => return,
+                }
             }
         });
         Self { req, out, last: None, stop }
