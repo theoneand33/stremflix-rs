@@ -4008,7 +4008,8 @@ impl App {
                     if let Some(tex) = &p.thumb {
                         // The previous preview stays up while the next one renders.
                         let s = vec2(size[0] as f32, size[1] as f32);
-                        let x = h.x.clamp(rect.left() + 8.0 + s.x / 2.0, rect.right() - 8.0 - s.x / 2.0);
+                        // min/max, not clamp: clamp panics once the window is narrower than the preview.
+                        let x = h.x.min(rect.right() - 8.0 - s.x / 2.0).max(rect.left() + 8.0 + s.x / 2.0);
                         let img = egui::Rect::from_center_size(pos2(x, label_y - 28.0 - s.y / 2.0), s);
                         paint.rect_filled(img.expand(2.0), 6, Color32::from_black_alpha((220.0 * a) as u8));
                         paint.image(tex.id(), img, egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE.gamma_multiply(a));
