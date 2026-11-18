@@ -520,6 +520,211 @@ pub fn sidecar_subs(video: &Path) -> Vec<(String, String)> {
     out
 }
 
+/// Request headers, proxy and demuxer options for opening `source`.
+fn net_options(source: &str, headers: &[(String, String)], demuxer: Option<&str>) -> Vec<(String, String)> {
+    let mut opts = ua_and_headers(crate::addon::user_agent(), headers);
+    // ffmpeg has no SOCKS support, so only an HTTP proxy reaches mpv; the local torrent stream stays direct.
+    if let Some(p) = crate::addon::PROXY.get().filter(|p| p.scheme() == "http" && !is_local(source)) {
+        opts.push(("http-proxy".into(), p.to_string()));
+    }
+    opts.extend(demuxer.map(|f| ("demuxer-lavf-format".to_string(), f.to_string())));
+    opts
+}
+
+/// Sets `opts` on a fresh handle and initializes it.
+fn init_mpv(mpv: *mut c_void, opts: &[(String, String)]) -> Result<()> {
+    for (k, v) in opts {
+        let rc = unsafe { mpv_set_option_string(mpv, cstr(k).as_ptr(), cstr(v).as_ptr()) };
+        if rc < 0 {
+            bail!("mpv option {k}={}: {}", if k == "http-proxy" { "<proxy>" } else { v }, err_text(rc));
+        }
+    }
+    let rc = unsafe { mpv_initialize(mpv) };
+    if rc < 0 {
+        bail!("mpv init: {}", err_text(rc));
+    }
+    Ok(())
+}
+
+fn command_on(mpv: *mut c_void, args: &[&str]) -> Result<()> {
+    let owned: Vec<CString> = args.iter().map(|a| cstr(a)).collect();
+    let mut ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    let rc = unsafe { mpv_command_async(mpv, 0, ptrs.as_ptr()) };
+    if rc < 0 {
+        bail!("mpv {}: {}", args[0], err_text(rc));
+    }
+    Ok(())
+}
+
+const EVENT_PLAYBACK_RESTART: c_int = 21;
+
+/// A rendered seek-bar preview: the requested time, `size` pixels, RGBA rows.
+pub struct Thumb {
+    pub time: f64,
+    pub size: [usize; 2],
+    pub rgba: Vec<u8>,
+}
+
+/// Seek-bar previews from a second, paused, silent mpv that renders keyframes in software on its own thread,
+/// so neither the GUI's GL context nor the playing instance is touched. The file opens on the first request;
+/// a newer request replaces any still queued. Dropping this ends the thread.
+pub struct Thumbs {
+    req: std::sync::mpsc::Sender<(f64, [usize; 2])>,
+    out: std::sync::Arc<std::sync::Mutex<Option<Thumb>>>,
+    last: Option<(f64, [usize; 2])>,
+    /// Set on drop so a wait in progress (file open, seek) ends at once.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Thumbs {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+struct Handle(*mut c_void);
+// SAFETY: an mpv handle may be used from any thread; this one is used only by the thumbnail thread.
+unsafe impl Send for Handle {}
+
+impl Thumbs {
+    /// `source`, `headers` and `demuxer` as for [`Player::launch`]; `wake` runs when a preview is ready.
+    pub fn new(source: &str, headers: &[(String, String)], demuxer: Option<&str>, wake: Box<dyn Fn() + Send>) -> Self {
+        let (req, rx) = std::sync::mpsc::channel();
+        let out = std::sync::Arc::<std::sync::Mutex<Option<Thumb>>>::default();
+        let mut opts: Vec<(String, String)> = [
+            ("vo", "libmpv"),
+            ("aid", "no"),
+            ("sid", "no"),
+            ("pause", "yes"),
+            ("keep-open", "yes"),
+            ("idle", "yes"),
+            ("hwdec", "no"),
+            ("hr-seek", "no"),
+            ("cache", "no"),
+            ("ytdl", "no"),
+            ("terminal", "no"),
+            ("config", "no"),
+            ("load-scripts", "no"),
+            ("input-default-bindings", "no"),
+            ("sub-auto", "no"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        opts.extend(net_options(source, headers, demuxer));
+        let stop = std::sync::Arc::<std::sync::atomic::AtomicBool>::default();
+        let (source, sink, stopped) = (source.to_string(), out.clone(), stop.clone());
+        std::thread::spawn(move || {
+            // Open only once a preview is wanted: most plays never hover the seek bar.
+            let Ok(first) = rx.recv() else { return };
+            if let Err(e) = thumb_loop(&source, &opts, first, &rx, &sink, &stopped, &*wake) {
+                crate::elog!("seek previews: {e:#}");
+            }
+        });
+        Self { req, out, last: None, stop }
+    }
+
+    /// Asks for the frame at `time` seconds, `size` pixels; repeats of the last request are ignored.
+    pub fn request(&mut self, time: f64, size: [usize; 2]) {
+        if self.last != Some((time, size)) {
+            self.last = Some((time, size));
+            let _ = self.req.send((time, size));
+        }
+    }
+
+    /// The newest finished preview, once.
+    pub fn take(&self) -> Option<Thumb> {
+        self.out.lock().ok()?.take()
+    }
+}
+
+fn thumb_loop(source: &str, opts: &[(String, String)], first: (f64, [usize; 2]), rx: &std::sync::mpsc::Receiver<(f64, [usize; 2])>, out: &std::sync::Mutex<Option<Thumb>>, stop: &std::sync::atomic::AtomicBool, wake: &dyn Fn()) -> Result<()> {
+    load_mpv().map_err(anyhow::Error::msg)?;
+    let mpv = Handle(unsafe { mpv_create() });
+    if mpv.0.is_null() {
+        bail!("failed to create mpv instance");
+    }
+    let mut render = std::ptr::null_mut();
+    let r = (|| {
+        init_mpv(mpv.0, opts)?;
+        let mut params = [RenderParam { kind: 1, data: c"sw".as_ptr() as *mut c_void }, RenderParam { kind: 0, data: std::ptr::null_mut() }];
+        let rc = unsafe { mpv_render_context_create(&mut render, mpv.0, params.as_mut_ptr()) };
+        if rc < 0 {
+            bail!("mpv render context: {}", err_text(rc));
+        }
+        command_on(mpv.0, &["loadfile", source])?;
+        // Waits up to `secs` for event `want`, or for a new frame when `want` is 0 (`secs` 0: just drains queued events).
+        // Ok(false) on timeout; Err ends the thread: dropped, mpv shut down, or the file failed.
+        let wait = |want: c_int, secs: f64| -> Result<bool> {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+            loop {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    bail!("stopped");
+                }
+                if want == 0 && secs > 0.0 && unsafe { mpv_render_context_update(render) } & 1 != 0 {
+                    return Ok(true);
+                }
+                let left = end.saturating_duration_since(std::time::Instant::now()).as_secs_f64();
+                let ev = unsafe { &*mpv_wait_event(mpv.0, left.min(if want == 0 { 0.01 } else { 0.1 })) };
+                match ev.event_id {
+                    0 if left <= 0.0 => return Ok(false),
+                    EVENT_SHUTDOWN => bail!("mpv shut down"),
+                    EVENT_END_FILE if unsafe { (*(ev.data as *const [c_int; 2]))[0] } == END_FILE_REASON_ERROR => bail!("file failed to play"),
+                    id if id == want && want != 0 => return Ok(true),
+                    _ => {}
+                }
+            }
+        };
+        if !wait(EVENT_FILE_LOADED, 60.0)? {
+            bail!("file did not open");
+        }
+        // Consume the opening's own restart and frame, so the first seek waits for its own.
+        let _ = wait(EVENT_PLAYBACK_RESTART, 20.0)? && wait(0, 2.0)?;
+        let mut next = Some(first);
+        while let Some(mut job) = next.take().or_else(|| rx.recv().ok()) {
+            while let Ok(n) = rx.try_recv() {
+                job = n;
+            }
+            let (time, [w, h]) = job;
+            // A restart left over from a timed-out seek must not stand in for this one.
+            wait(-1, 0.0)?;
+            unsafe { mpv_render_context_update(render) };
+            command_on(mpv.0, &["seek", &format!("{time:.1}"), "absolute+keyframes"])?;
+            if !wait(EVENT_PLAYBACK_RESTART, 20.0)? || !wait(0, 2.0)? {
+                continue;
+            }
+            // u32 pixels keep the buffer 4-byte aligned, as the rgb0 format needs.
+            let mut px = vec![0u32; w * h];
+            let (mut size, mut stride) = ([w as c_int, h as c_int], w * 4);
+            let mut params = [
+                RenderParam { kind: 17, data: size.as_mut_ptr() as *mut c_void },
+                RenderParam { kind: 18, data: c"rgb0".as_ptr() as *mut c_void },
+                RenderParam { kind: 19, data: &mut stride as *mut usize as *mut c_void },
+                RenderParam { kind: 20, data: px.as_mut_ptr() as *mut c_void },
+                RenderParam { kind: 0, data: std::ptr::null_mut() },
+            ];
+            if unsafe { mpv_render_context_render(render, params.as_mut_ptr()) } < 0 {
+                continue;
+            }
+            // In-memory bytes are r, g, b, garbage: make the last opaque.
+            let rgba: Vec<u8> = px.iter().flat_map(|p| { let [r, g, b, _] = p.to_ne_bytes(); [r, g, b, 255] }).collect();
+            if let Ok(mut o) = out.lock() {
+                *o = Some(Thumb { time, size: [w, h], rgba });
+            }
+            wake();
+        }
+        Ok(())
+    })();
+    unsafe {
+        if !render.is_null() {
+            mpv_render_context_free(render);
+        }
+        mpv_terminate_destroy(mpv.0);
+    }
+    r
+}
+
 impl Player {
     /// `source` is a URL or local path, passed to `loadfile` as a plain argument (never parsed as options).
     /// `wake` is called from mpv's thread whenever a new frame is ready.
@@ -560,23 +765,9 @@ impl Player {
         if subs_off {
             opts.push(("sid".into(), "no".into()));
         }
-        opts.extend(ua_and_headers(crate::addon::user_agent(), headers));
-        // ffmpeg has no SOCKS support, so only an HTTP proxy reaches mpv; the local torrent stream stays direct.
-        if let Some(p) = crate::addon::PROXY.get().filter(|p| p.scheme() == "http" && !is_local(source)) {
-            opts.push(("http-proxy".into(), p.to_string()));
-        }
-        opts.extend(demuxer.map(|f| ("demuxer-lavf-format".to_string(), f.to_string())));
+        opts.extend(net_options(source, headers, demuxer));
         opts.extend(parse_args(&std::env::var("STREMFLIX_RS_MPV_ARGS").unwrap_or_default()));
-        for (k, v) in &opts {
-            let rc = unsafe { mpv_set_option_string(mpv, cstr(k).as_ptr(), cstr(v).as_ptr()) };
-            if rc < 0 {
-                bail!("mpv option {k}={}: {}", if k == "http-proxy" { "<proxy>" } else { v }, err_text(rc));
-            }
-        }
-        let rc = unsafe { mpv_initialize(mpv) };
-        if rc < 0 {
-            bail!("mpv init: {}", err_text(rc));
-        }
+        init_mpv(mpv, &opts)?;
         let mut init = GlInitParams { get_proc_address: gl_proc_address, ctx: &*p.gl_proc as *const GlProc as *mut c_void };
         let mut params = [
             RenderParam { kind: 1, data: c"opengl".as_ptr() as *mut c_void },
@@ -599,14 +790,7 @@ impl Player {
 
     /// Runs an mpv command without blocking the UI thread.
     pub fn command(&self, args: &[&str]) -> Result<()> {
-        let owned: Vec<CString> = args.iter().map(|a| cstr(a)).collect();
-        let mut ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
-        ptrs.push(std::ptr::null());
-        let rc = unsafe { mpv_command_async(self.mpv, 0, ptrs.as_ptr()) };
-        if rc < 0 {
-            bail!("mpv {}: {}", args[0], err_text(rc));
-        }
-        Ok(())
+        command_on(self.mpv, args)
     }
 
     /// Seeks to `to` seconds, or by `to` if `relative`. mpv runs a seek only after the stream read in
@@ -818,6 +1002,38 @@ mod tests {
     fn libmpv_loads_with_every_symbol() {
         load_mpv().unwrap();
         assert!(!unsafe { CStr::from_ptr(mpv_error_string(0)) }.to_bytes().is_empty());
+    }
+
+    #[test]
+    fn thumbs_render_the_requested_frame_without_gl() {
+        // 20 s of raw 2 fps video, black for the first 10 s and white after: a preview one seek behind shows the wrong shade.
+        // Y4M needs no encoder (lavfi sources can't seek); 4:2:0 gray, so chroma stays at 128.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shades.y4m");
+        let mut y4m = b"YUV4MPEG2 W64 H36 F2:1 Ip A1:1 C420jpeg\n".to_vec();
+        for i in 0..40 {
+            y4m.extend(b"FRAME\n");
+            y4m.extend(std::iter::repeat_n(if i < 20 { 16 } else { 235 }, 64 * 36));
+            y4m.extend(std::iter::repeat_n(128, 2 * 32 * 18));
+        }
+        std::fs::write(&path, y4m).unwrap();
+        let mut t = Thumbs::new(&path.to_string_lossy(), &[], None, Box::new(|| {}));
+        let mut shade = |time: f64| {
+            t.request(time, [64, 36]);
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let th = loop {
+                if let Some(th) = t.take() {
+                    break th;
+                }
+                assert!(std::time::Instant::now() < end, "no preview at {time}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            assert_eq!((th.time, th.size, th.rgba.len()), (time, [64, 36], 64 * 36 * 4));
+            th.rgba[0]
+        };
+        assert!(shade(15.0) > 200, "frame at 15 s is white");
+        assert!(shade(2.0) < 50, "frame at 2 s is black");
+        assert!(shade(12.0) > 200, "frame at 12 s is white");
     }
 
     #[test]
