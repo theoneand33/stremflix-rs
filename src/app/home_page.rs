@@ -183,6 +183,7 @@ impl App {
         let ctx = ui.ctx().clone();
         let (mut want, mut open, mut play, mut quick, mut resume) = (Vec::new(), None, None, None, None);
         let mut remove: Option<String> = None;
+        let mut cont = None;
         let mut trailer = None;
         match self.featured() {
             Some(meta) => self.ui_hero(ui, &meta, &mut want, &mut open, &mut play, &mut trailer),
@@ -352,7 +353,7 @@ impl App {
                         if xr.clicked() {
                             remove = Some(p.key.clone());
                         } else if card_play(ui, &r, rect, &p.title) {
-                            play = Some((p.key.clone(), p.title.clone(), p.source.clone(), vec![]));
+                            cont = Some(p.clone());
                         } else if r.clicked() {
                             resume = Some(p.clone());
                         }
@@ -478,13 +479,16 @@ impl App {
         if let Some((m, id)) = fresh_click {
             let sid = m.id.clone();
             self.open_meta(&ctx, m, false);
-            self.pending = Some((sid, Some(id)));
+            self.pending = Some((sid, OnEpisodes::Pick(id)));
         }
         if let Some((k, t, s, subs)) = play {
             self.play(&ctx, k, t, s, subs);
         }
         if let Some(m) = quick {
             self.quick_play(&ctx, m);
+        }
+        if let Some(p) = cont {
+            self.resume(&ctx, p);
         }
         if let Some(p) = resume {
             self.open_progress(&ctx, p);
