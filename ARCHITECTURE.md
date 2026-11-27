@@ -1,25 +1,31 @@
 # Architecture
 
 ```
-src/addon.rs    Stremio addon protocol: types, sanitizing parsers, async HTTP client
+src/addon.rs    Stremio addon protocol: types, sanitizing parsers, async HTTP client (proxy and User-Agent setup)
 src/api.rs      Local HTTP API (API.md) on loopback: Continue Watching, search, play; calls go to the UI thread over mpsc
-src/db.rs       SQLite (rusqlite, bundled): addons, library folders/items, settings, progress
+src/db.rs       SQLite (rusqlite, bundled): addons, library folders/items, settings, progress, download rows
+src/key.rs      Item keys: `<type>:<id>` (an episode's id is its video id), `file:<path>`, `btih:<hash>`
+src/settings.rs Every setting: its key, default and stored form (`Setting<T>`); what an export carries
 src/library.rs  Recursive media-file scan (walkdir)
 src/profile.rs  Household profiles: one data folder each, the active one named in `<data>/profile`
-src/download.rs Offline downloads: safe file names, streaming a URL (or the local torrent stream) to a file
-src/player.rs   libmpv (FFI) in-process: OpenGL-rendered frames, observed properties, IPC server
-src/torrent.rs  librqbit session + its HTTP streaming API on 127.0.0.1
+src/download.rs Offline downloads: the download queue (at most 2 transfers, pause/resume), safe file names, streaming a URL (or the local torrent stream) to a file
+src/player.rs   libmpv (FFI) in-process: OpenGL-rendered frames, observed properties, IPC server, launch options
+src/torrent.rs  librqbit session + its HTTP streaming API on 127.0.0.1; releases run in the background, ordered before later streams
 src/tray.rs     Tray icon (Show/Hide, Play/Pause, Quit): ksni StatusNotifierItem over D-Bus on Linux (no GTK), tray-icon on Windows/macOS
-src/update.rs   Self-update: picks this platform's release asset, unpacks it with the system tar, swaps it in for the install
-src/stremio_import.rs  Reads a local Stremio's localStorage (WebKit SQLite or Chromium LevelDB via rusty-leveldb)
-src/main.rs     egui/eframe GUI; tokio runtime for network/torrent work, results via mpsc
+src/update.rs   Self-update: checks GitHub releases, picks this platform's asset, unpacks it with the system tar, swaps it in for the install
+src/stremio_import.rs  Reads a local Stremio's localStorage (WebKit SQLite or Chromium LevelDB via rusty-leveldb); Stremio account sync (api.strem.io)
+src/main.rs     The GUI binary: `App` state, the message loop (`handle`), `logic`/`ui`, startup
+src/app/        One file per GUI feature. Rules without egui: cli, catalog (rows, paging), episodes (watch order, new/upcoming,
+                notified), playback (minimize pause, sleep timer, autoplay), posters (image cache), saved (Library sort/filter),
+                streams (autoplay pick, headers, hash-matched subtitles), geo, video (mpv framebuffer). Pages as `impl App`:
+                home_page, discover_page, addons_page, library_page, settings_page, player_page, header, navigation, images
 src/widgets.rs  Reusable egui widgets, theme and fonts; no app state or addon types
 test-addon/     Std-only HTTP addon server (lib + bin). The bin can also seed via librqbit.
 ```
 
 ## Choices
 
-**UI: egui (eframe 0.37, glow/OpenGL backend).** Immediate-mode UI keeps the app to one small file with no widget-state plumbing. It builds with only system GL/X11/Wayland libraries, with no GTK or webview dependency. It runs on Xvfb. The pages scroll under a floating header (painted after the page so it wins the clicks); Home and a title's page open with an edge-to-edge banner that bleeds through the page margins and fades into the page with vertex-colored meshes. eframe also exposes an AccessKit tree, which is useful for automated GUI checks. Iced is similar. Slint would need a separate markup language. Dioxus desktop would pull in a webview and make native video harder.
+**UI: egui (eframe 0.37, glow/OpenGL backend).** Immediate-mode UI keeps the app free of widget-state plumbing: each page is a function over `App`. It builds with only system GL/X11/Wayland libraries, with no GTK or webview dependency. It runs on Xvfb. The pages scroll under a floating header (painted after the page so it wins the clicks); Home and a title's page open with an edge-to-edge banner that bleeds through the page margins and fades into the page with vertex-colored meshes. eframe also exposes an AccessKit tree, which is useful for automated GUI checks. Iced is similar. Slint would need a separate markup language. Dioxus desktop would pull in a webview and make native video harder.
 
 **Playback: libmpv embedded in-process.** mpv plays nearly every container and codec, as well as HTTP URLs with Range seeking and external subtitle files (`sub-add`). The app loads libmpv at runtime with `libloading`, on a background thread after the first frames (linking it put ~150 ms of library loading before `main`), and uses its OpenGL render API to draw each frame into a framebuffer the app owns. The framebuffer's texture is registered with egui and drawn under the app's own Netflix-style controls, so scaling and color conversion run on the GPU. Hardware decoding uses only zero-copy GL-interop decoders (`nvdec,vaapi,videotoolbox,d3d11va`) and falls back to software decoding. Copy-back decoders such as `vulkan-copy` produced corrupted frames when the Vulkan device differed from the GL one. Player state (`time-pos`, `duration`, `pause`, volume, tracks) arrives as observed-property events, so the UI thread never blocks on mpv. Seek-bar previews come from a second, paused, silent mpv on its own thread: it opens the file on the first hover, seeks to keyframes, and renders through the software render API into an RGBA buffer that becomes an egui texture, so it never touches the GL context or the playing instance. Torrents and YouTube get none: random reads would compete with playback for pieces, and yt-dlp would run twice. Position is saved to SQLite once per second; resuming sets `start`. mpv's JSON IPC server stays enabled over a Unix socket, or the `\\.\pipe\stremflix-rs-mpv` named pipe on Windows (inside `STREMFLIX_RS_DATA` when set, so parallel instances don't share one), so tests and CI can still check player state from outside the app.
 

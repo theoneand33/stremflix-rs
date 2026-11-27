@@ -26,6 +26,9 @@ async fn client_against_test_addon() {
     assert!(c.poster("file:///etc/passwd").await.is_err());
     let meta = c.meta(&url, "movie", &metas[0].id).await.unwrap();
     assert_eq!(meta.name, "Test Pattern");
+    let addons = [format!("{base}/malformed/manifest.json"), url.clone()];
+    assert_eq!(c.first_meta(&addons, "movie", &meta.id, |_| true).await.unwrap().name, "Test Pattern", "a failing addon doesn't end the search");
+    assert_eq!(c.first_meta(&addons, "movie", &meta.id, |_| false).await.unwrap_err().len(), 1, "unaccepted answers are not errors");
 
     let streams = c.streams(&url, "movie", &meta.id).await.unwrap();
     assert_eq!(streams.len(), 2);

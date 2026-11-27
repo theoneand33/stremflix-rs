@@ -29,13 +29,13 @@ pub const ACCENTS: [(&str, Color32); 4] = [
     ("Green", Color32::from_rgb(30, 160, 90)),
     ("Orange", Color32::from_rgb(230, 120, 20)),
 ];
-pub static ACCENT_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub fn accent() -> Color32 {
-    ACCENTS[ACCENT_IDX.load(std::sync::atomic::Ordering::Relaxed)].1
+/// The accent color [`apply_theme`] set.
+pub fn accent(ctx: &egui::Context) -> Color32 {
+    ctx.style_of(ctx.theme()).visuals.selection.bg_fill
 }
 /// Index of the saved accent name; unknown or missing falls back to the default.
-pub fn accent_index(name: Option<&str>) -> usize {
-    ACCENTS.iter().position(|a| Some(a.0) == name).unwrap_or(0)
+pub fn accent_index(name: &str) -> usize {
+    ACCENTS.iter().position(|a| a.0 == name).unwrap_or(0)
 }
 /// The app logo as a texture, decoded and downscaled once per context (the source PNG is 512px).
 pub fn logo(ctx: &egui::Context) -> egui::TextureHandle {
@@ -58,14 +58,14 @@ pub fn surface(alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(24, 24, 28, alpha)
 }
 /// Applies the theme and accent to egui; the player menu keeps the dark visuals.
-pub fn apply_theme(ctx: &egui::Context, light: bool) {
+pub fn apply_theme(ctx: &egui::Context, light: bool, accent: Color32) {
     for (theme, is_light) in [(egui::Theme::Dark, false), (egui::Theme::Light, true)] {
         let mut v = if is_light { egui::Visuals::light() } else { egui::Visuals::dark() };
         v.panel_fill = if is_light { Color32::from_gray(245) } else { BG };
         v.window_fill = if is_light { v.panel_fill } else { RAISED };
         v.window_stroke = egui::Stroke::new(1.0, if is_light { Color32::from_gray(215) } else { HAIRLINE });
         v.extreme_bg_color = if is_light { Color32::WHITE } else { RAISED };
-        v.selection.bg_fill = accent();
+        v.selection.bg_fill = accent;
         if !is_light {
             // Keep the old dark palette: egui's defaults are dimmer than the grays used before theming.
             v.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(214, 211, 209);
@@ -146,7 +146,6 @@ pub fn install_fonts(ctx: &egui::Context) {
 
 // Text
 
-/// Bold heading text in the strong color.
 pub fn heading_text(ui: &egui::Ui, text: impl Into<String>, size: f32) -> RichText {
     RichText::new(text).size(size).strong().family(bold()).color(ui.visuals().strong_text_color())
 }
@@ -193,7 +192,6 @@ pub fn muted(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
     ui.label(RichText::new(text).color(c))
 }
 
-/// Label of a control row.
 pub fn field_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
     let c = ui.visuals().text_color();
     ui.label(RichText::new(text).size(15.0).color(c))
@@ -204,7 +202,7 @@ pub fn field_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
 /// Keyboard-focus outline for the custom-painted controls.
 fn focus_ring(ui: &egui::Ui, r: &egui::Response, radius: u8) {
     if r.has_focus() {
-        ui.painter().rect_stroke(r.rect, radius, egui::Stroke::new(2.0, accent()), egui::StrokeKind::Inside);
+        ui.painter().rect_stroke(r.rect, radius, egui::Stroke::new(2.0, accent(ui.ctx())), egui::StrokeKind::Inside);
     }
 }
 
@@ -272,7 +270,7 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 /// Frameless accent-colored text button (Reset delay …).
 pub fn link_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(text).size(13.0).color(accent())).frame(false))
+    ui.add(egui::Button::new(RichText::new(text).size(13.0).color(accent(ui.ctx()))).frame(false))
 }
 
 /// Full-width button inside a player popover.
@@ -287,7 +285,7 @@ pub fn pill(ui: &mut egui::Ui, label: &str, selected: bool, role: egui::Role) ->
     let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::new(14.0, if selected { bold() } else { egui::FontFamily::Proportional }), fg);
     let (rect, r) = ui.allocate_exact_size(vec2(g.size().x + 24.0, 30.0), Sense::click());
     r.widget_info(|| egui::WidgetInfo::selected(role, true, selected, label));
-    let fill = if selected { accent() } else { tint(ui, if r.hovered() { 30 } else { 16 }) };
+    let fill = if selected { accent(ui.ctx()) } else { tint(ui, if r.hovered() { 30 } else { 16 }) };
     ui.painter().rect_filled(rect, 15, fill);
     focus_ring(ui, &r, 15);
     ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
@@ -308,7 +306,7 @@ pub fn swatch(ui: &mut egui::Ui, name: &str, color: Color32, selected: bool) -> 
     r.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, name));
     focus_ring(ui, &r, 15);
     if selected || r.hovered() {
-        ui.painter().circle_stroke(rect.center(), 13.0, egui::Stroke::new(2.0, if selected { accent() } else { Color32::from_gray(120) }));
+        ui.painter().circle_stroke(rect.center(), 13.0, egui::Stroke::new(2.0, if selected { accent(ui.ctx()) } else { Color32::from_gray(120) }));
     }
     ui.painter().circle_filled(rect.center(), 9.0, color);
     // Edge, so a dot the color of the panel (white on the light theme) still shows.
@@ -369,7 +367,7 @@ pub fn switch_row(ui: &mut egui::Ui, label: &str, on: &mut bool) -> egui::Respon
     p.text(pos2(rect.left(), rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(15.0), ui.visuals().text_color());
     let t = ui.ctx().animate_bool_with_time(r.id, *on, 0.12);
     let track = egui::Rect::from_center_size(pos2(rect.right() - 18.0, rect.center().y), vec2(36.0, 20.0));
-    p.rect_filled(track, 10, Color32::from_gray(80).lerp_to_gamma(accent(), t));
+    p.rect_filled(track, 10, Color32::from_gray(80).lerp_to_gamma(accent(ui.ctx()), t));
     p.circle_filled(pos2(egui::lerp(track.left() + 10.0..=track.right() - 10.0, t), track.center().y), 7.0, Color32::WHITE);
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -410,9 +408,10 @@ pub fn combo_row<T: Clone + PartialEq>(ui: &mut egui::Ui, label: &str, value: &m
 /// Field look for the buttons drawn next in `ui`: field fill and a thin edge that brightens on hover and takes the accent while open.
 pub fn field_style(ui: &mut egui::Ui) {
     let v = ui.visuals_mut();
+    let accent = v.selection.bg_fill;
     let (field, edge, edge_hover) = if v.dark_mode { (v.extreme_bg_color, Color32::from_gray(60), Color32::from_gray(110)) } else { (v.extreme_bg_color, Color32::from_gray(205), Color32::from_gray(150)) };
     let w = &mut v.widgets;
-    for (st, edge) in [(&mut w.inactive, edge), (&mut w.hovered, edge_hover), (&mut w.active, edge_hover), (&mut w.open, accent())] {
+    for (st, edge) in [(&mut w.inactive, edge), (&mut w.hovered, edge_hover), (&mut w.active, edge_hover), (&mut w.open, accent)] {
         (st.weak_bg_fill, st.bg_stroke, st.corner_radius) = (field, egui::Stroke::new(1.0, edge), 6.into());
     }
 }
@@ -444,7 +443,7 @@ pub fn dropdown<'a, R>(
                 v.window_stroke = egui::Stroke::new(1.0, Color32::from_gray(if dark { 52 } else { 215 }));
                 v.menu_corner_radius = 10.into();
                 v.popup_shadow = egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(if dark { 140 } else { 45 }) };
-                let a = accent();
+                let a = v.selection.bg_fill;
                 v.selection.bg_fill = Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), if dark { 100 } else { 55 });
                 v.selection.stroke.color = v.strong_text_color();
                 let hover = if dark { Color32::from_gray(48) } else { Color32::from_gray(236) };
@@ -510,7 +509,7 @@ pub fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Respons
         p.rect_filled(rect, 6, tint(ui, 14));
     }
     if selected {
-        p.text(pos2(rect.left() + 14.0, rect.center().y), egui::Align2::LEFT_CENTER, icons::CHECK, egui::FontId::new(16.0, phosphor()), accent());
+        p.text(pos2(rect.left() + 14.0, rect.center().y), egui::Align2::LEFT_CENTER, icons::CHECK, egui::FontId::new(16.0, phosphor()), accent(ui.ctx()));
     }
     let font = egui::FontId::new(15.0, if selected { bold() } else { egui::FontFamily::Proportional });
     let color = if selected { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
@@ -672,7 +671,7 @@ pub fn split_button(ui: &mut egui::Ui, text: &str, arrow_label: &str) -> (egui::
             p.rect_filled(rr, cr, white_fill()[1]);
         }
         if r.has_focus() {
-            p.rect_stroke(rr, cr, egui::Stroke::new(2.0, accent()), egui::StrokeKind::Inside);
+            p.rect_stroke(rr, cr, egui::Stroke::new(2.0, accent(ui.ctx())), egui::StrokeKind::Inside);
         }
     }
     p.line_segment([pos2(main_rect.right(), rect.top() + 12.0), pos2(main_rect.right(), rect.bottom() - 12.0)], egui::Stroke::new(1.0, Color32::from_black_alpha(40)));
@@ -838,6 +837,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn accent_name_decodes_with_fallback() {
+        assert_eq!(accent_index("Green"), 2);
+        assert_eq!(accent_index("nope"), 0);
+    }
+
+    #[test]
+    fn the_theme_carries_the_accent() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx, true, ACCENTS[2].1);
+        assert_eq!(accent(&ctx), ACCENTS[2].1);
+        apply_theme(&ctx, false, ACCENTS[3].1);
+        assert_eq!(accent(&ctx), ACCENTS[3].1);
+    }
+
+    #[test]
     fn icon_glyphs_are_not_spoken() {
         assert_eq!(spoken(&format!("{}  Add to library", icons::PLUS)), "Add to library");
         assert_eq!(spoken(icons::X), "");
@@ -929,6 +943,6 @@ mod tests {
             egui::Popup::open_id(&ctx, id.unwrap().with("popup"));
         }
         let fill = fill.expect("menu should render once opened");
-        assert!(fill.a() < 255 && fill != accent());
+        assert!(fill.a() < 255 && fill != accent(&ctx));
     }
 }

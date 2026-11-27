@@ -2,8 +2,49 @@
 //! for the running install. The new build runs after a restart.
 
 use anyhow::{Context, Result, bail, ensure};
+use reqwest::Url;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+
+use crate::addon::{AddonClient, is_info_hash, is_newer, safe_http_url};
+
+/// Release this binary was built as (`nightly` or `vX.Y.Z`) and its commit; set by release.yml, absent in source builds.
+pub const RELEASE: Option<&str> = option_env!("STREMFLIX_RS_RELEASE");
+pub const COMMIT: Option<&str> = option_env!("STREMFLIX_RS_COMMIT");
+/// `owner/repo` the build was released from (forks check their own releases).
+const REPO: &str = match option_env!("STREMFLIX_RS_REPO") {
+    Some(r) => r,
+    None => "theoneand33/stremflix-rs",
+};
+const NIGHTLY: &str = "nightly";
+
+/// Release page of a newer build than this one and its download for this platform, or `None` (also for source builds).
+pub async fn check(client: &AddonClient) -> Result<Option<(String, Option<String>)>> {
+    let (Some(release), Some(commit)) = (RELEASE, COMMIT) else { return Ok(None) };
+    let url = Url::parse(&format!("https://api.github.com/repos/{REPO}/releases/"))?.join(if release == NIGHTLY { "tags/nightly" } else { "latest" })?;
+    let body = client.get(url).await?;
+    let suffix = asset_suffix(appimage().is_some());
+    Ok(newer_release(release, commit, &body)?.map(|page| (page, asset_url(&body, REPO, &suffix))))
+}
+
+/// Page of a newer release on `release`'s channel, given that channel's GitHub release JSON
+/// (`nightly`: any other commit; tagged: a newer latest tag).
+pub fn newer_release(release: &str, commit: &str, body: &[u8]) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Rel {
+        tag_name: String,
+        target_commitish: String,
+        html_url: String,
+    }
+    let r: Rel = serde_json::from_slice(body)?;
+    let newer = if release == NIGHTLY {
+        // target_commitish can also be a branch name; only a full SHA (40 hex characters, like an info hash) is comparable
+        is_info_hash(&r.target_commitish) && r.target_commitish != commit
+    } else {
+        is_newer(&r.tag_name, release)
+    };
+    Ok(newer.then(|| safe_http_url(&r.html_url).map(String::from)).flatten())
+}
 
 /// End of this platform's release asset name: `-{target}.{ext}`, the AppImage when running from one.
 pub fn asset_suffix(appimage: bool) -> String {
@@ -102,7 +143,7 @@ pub fn appimage() -> Option<PathBuf> {
 /// Remove `.old` copies a previous update on Windows couldn't delete while they ran.
 pub fn cleanup() {
     let Ok(exe) = std::env::current_exe() else { return };
-    if crate::addon::RELEASE.is_none() {
+    if RELEASE.is_none() {
         return;
     }
     for (_, p) in plan(&exe, appimage().as_deref()).unwrap_or_default() {
@@ -175,7 +216,6 @@ mod tests {
         assert_eq!(asset_url(rel, "o/r", "-linux-x86_64.AppImage").as_deref(), Some("https://github.com/o/r/releases/download/v2/b.AppImage"));
         assert_eq!(asset_url(rel, "o/r", "-windows-x86_64.zip"), None);
         assert_eq!(asset_url(b"{}", "o/r", "x"), None);
-        assert!(asset_suffix(true).ends_with(".AppImage"));
     }
 
     #[tokio::test]

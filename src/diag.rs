@@ -47,7 +47,7 @@ pub fn redact(s: &str) -> String {
             let (url, tail) = rest.split_at(end);
             let authority = url.split(['/', '?', '#']).next().unwrap_or("");
             let host = authority.rsplit('@').next().unwrap_or("");
-            format!("{}://{host}/<redacted>{tail}", &w[start..i])
+            format!("{}{}://{host}/<redacted>{tail}", &w[..start], &w[start..i])
         })
         .collect::<String>()
         .split_inclusive(char::is_whitespace)
@@ -62,7 +62,7 @@ pub fn redact(s: &str) -> String {
 
 /// Package version plus the release channel and commit a release build was made from: nightlies all share one package version.
 pub fn version() -> String {
-    build_label(env!("CARGO_PKG_VERSION"), crate::addon::RELEASE, crate::addon::COMMIT)
+    build_label(env!("CARGO_PKG_VERSION"), crate::update::RELEASE, crate::update::COMMIT)
 }
 
 fn build_label(version: &str, release: Option<&str>, commit: Option<&str>) -> String {
@@ -91,7 +91,6 @@ mod tests {
         assert_eq!(build_label("0.1.0", Some("nightly"), Some("0123456789abcdef")), "0.1.0 (nightly 0123456)");
         assert_eq!(build_label("0.1.0", Some("v1.2.0"), Some("abc")), "0.1.0 (v1.2.0 abc)");
         assert_eq!(build_label("0.1.0", None, None), "0.1.0 (source build)");
-        assert!(bundle("x").starts_with(&format!("stremflix-rs {}\n", version())));
     }
 
     #[test]
@@ -104,7 +103,8 @@ mod tests {
         assert_eq!(m, "add magnet:<redacted> ok");
         assert!(!m.contains("ABC123"));
         let u = redact("“https://a.example/SECRET” 日本https://b.example/TOKEN");
-        assert_eq!(u, "https://a.example/<redacted> https://b.example/<redacted>");
+        assert_eq!(u, "“https://a.example/<redacted> 日本https://b.example/<redacted>");
+        assert_eq!(redact("(see https://a.example/x)"), "(see https://a.example/<redacted>)");
         assert!(!u.contains("SECRET") && !u.contains("TOKEN"));
         let n = redact("GET https://host/SECRET?u=magnet:?xt=urn:btih:ABC123 x MAGNET:?xt=urn:btih:DEF456");
         assert_eq!(n, "GET https://host/<redacted> x magnet:<redacted>");

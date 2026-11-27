@@ -5,8 +5,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
 use crate::addon::{Manifest, MetaPreview, addon_base, parse_magnet_hash, parse_manifest, safe_http_url, sanitize_text, valid_id};
-use crate::download::State;
 use crate::library::LibraryItem;
+use crate::key;
 use serde_json::{Value, json};
 
 /// An unfinished download: where it comes from and what a resume needs.
@@ -16,20 +16,19 @@ pub struct QueuedDownload {
     /// http URL or magnet.
     pub source: String,
     pub headers: Vec<(String, String)>,
-    pub state: State,
+    /// Queue status, as stored by `download::State`.
+    pub status: String,
     /// ETag or Last-Modified of the file when it started; empty if unknown.
     pub validator: String,
     pub total: u64,
 }
 
-/// Settings an export carries. Not secrets (`stremio_auth`), local paths, or `external_player` (a command to run).
-const EXPORT_SETTINGS: [&str; 9] = ["autoplay_next", "hwdec", "sub_style", "sub_off", "torrent_cache", "torrent_profile", "default_speed", "alang", "slang"];
 const EXPORT_FORMAT: &str = "stremflix-rs-export";
 pub const MAX_IMPORT_BYTES: u64 = 16 << 20;
 
 /// A progress row is kept only if it resumes a web URL or a magnet with a real info hash, never a local path.
 fn resumable_source(key: &str, source: &str) -> bool {
-    !key.starts_with("file:") && (safe_http_url(source).is_some() || parse_magnet_hash(source).is_some())
+    key::split(key).is_none_or(|(k, _)| k != key::FILE) && (safe_http_url(source).is_some() || parse_magnet_hash(source).is_some())
 }
 
 pub struct Db {
@@ -104,15 +103,15 @@ pub struct Download {
 impl Download {
     /// Progress key, the same as when streaming, so the title resumes either way.
     pub fn key(&self) -> String {
-        format!("{}:{}", self.kind, self.video_id)
+        key::item(&self.kind, &self.video_id)
     }
 }
 
 impl SavedTitle {
     /// Detail-page view of the saved title; `None` if the key has no `<type>:<id>` shape.
     pub fn preview(&self) -> Option<MetaPreview> {
-        let (kind, id) = self.key.split_once(':')?;
-        Some(MetaPreview { id: id.into(), kind: kind.into(), name: self.title.clone(), poster: self.poster.clone(), background: None, description: None, release_info: self.year.map(|y| y.to_string()), imdb_rating: self.rating.map(|r| format!("{r:.1}")), logo: None, genres: vec![] })
+        let (kind, id) = key::split(&self.key)?;
+        Some(MetaPreview { id: id.into(), kind: kind.into(), name: self.title.clone(), poster: self.poster.clone(), release_info: self.year.map(|y| y.to_string()), imdb_rating: self.rating.map(|r| format!("{r:.1}")), ..Default::default() })
     }
 }
 
@@ -156,16 +155,27 @@ impl Db {
              CREATE TABLE IF NOT EXISTS list_items (list_id INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
                  title_key TEXT NOT NULL, added INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (list_id, title_key));",
         )?;
-        // Migrate databases created before posters were stored; fails harmlessly if the column exists.
-        let _ = conn.execute("ALTER TABLE progress ADD COLUMN poster TEXT", []);
-        // Library sorts by year and rating; older rows stay NULL and sort last.
-        let _ = conn.execute("ALTER TABLE saved_titles ADD COLUMN year INTEGER", []);
-        let _ = conn.execute("ALTER TABLE saved_titles ADD COLUMN rating REAL", []);
-        // Addon priority (streams and catalogs follow it); older rows share 0 and keep install order.
-        let _ = conn.execute("ALTER TABLE addons ADD COLUMN position INTEGER NOT NULL DEFAULT 0", []);
-        // Download queue: finished rows keep the default 'done'; queued, active, paused and failed ones carry what a resume needs.
-        for col in ["status TEXT NOT NULL DEFAULT 'done'", "source TEXT NOT NULL DEFAULT ''", "headers TEXT NOT NULL DEFAULT '[]'", "validator TEXT NOT NULL DEFAULT ''", "total INTEGER NOT NULL DEFAULT 0"] {
-            let _ = conn.execute(&format!("ALTER TABLE downloads ADD COLUMN {col}"), []);
+        // Columns added after a table first shipped; older rows take the default.
+        let added: [(&str, &str); 9] = [
+            ("progress", "poster TEXT"),
+            // Library sorts by year and rating; older rows stay NULL and sort last.
+            ("saved_titles", "year INTEGER"),
+            ("saved_titles", "rating REAL"),
+            // Addon priority (streams and catalogs follow it); older rows share 0 and keep install order.
+            ("addons", "position INTEGER NOT NULL DEFAULT 0"),
+            // Download queue: finished rows keep the default 'done'; queued, active, paused and failed ones carry what a resume needs.
+            ("downloads", "status TEXT NOT NULL DEFAULT 'done'"),
+            ("downloads", "source TEXT NOT NULL DEFAULT ''"),
+            ("downloads", "headers TEXT NOT NULL DEFAULT '[]'"),
+            ("downloads", "validator TEXT NOT NULL DEFAULT ''"),
+            ("downloads", "total INTEGER NOT NULL DEFAULT 0"),
+        ];
+        for (table, col) in added {
+            let name = col.split(' ').next().unwrap_or(col);
+            let has: bool = conn.query_row("SELECT count(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2", [table, name], |r| r.get(0))?;
+            if !has {
+                conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col}"), [])?;
+            }
         }
         Ok(Self { conn })
     }
@@ -212,14 +222,14 @@ impl Db {
     pub fn addons(&self) -> Result<Vec<(String, Manifest)>> {
         let mut st = self.conn.prepare("SELECT transport_url, manifest FROM addons ORDER BY position, installed_at, transport_url")?;
         let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        Ok(rows.filter_map(|r| r.ok()).filter_map(|(u, m)| Some((u, parse_manifest(m.as_bytes()).ok()?))).collect())
+        Ok(rows.filter_map(logged).filter_map(|(u, m)| Some((u, parse_manifest(m.as_bytes()).ok()?))).collect())
     }
 
     /// URLs of addons stored before the manifest's `adult` flag was kept, so the row says nothing about it.
     pub fn unrated_addons(&self) -> Result<Vec<String>> {
         let mut st = self.conn.prepare("SELECT transport_url FROM addons WHERE json_extract(manifest, '$.behaviorHints.adult') IS NULL")?;
         let rows = st.query_map([], |r| r.get(0))?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(logged).collect())
     }
 
     pub fn add_library_folder(&self, folder: &Path, items: &[LibraryItem]) -> Result<()> {
@@ -229,7 +239,7 @@ impl Db {
         // By path, not by the `folder` column: an item under nested folders is owned by whichever was scanned last, and this scan lists every file under `folder`.
         let stale: Vec<String> = {
             let mut st = tx.prepare("SELECT path FROM library_items")?;
-            st.query_map([], |r| r.get::<_, String>(0))?.filter_map(|r| r.ok()).filter(|p| Path::new(p).starts_with(folder)).collect()
+            st.query_map([], |r| r.get::<_, String>(0))?.filter_map(logged).filter(|p| Path::new(p).starts_with(folder)).collect()
         };
         for p in &stale {
             tx.execute("DELETE FROM library_items WHERE path = ?1", [p])?;
@@ -244,11 +254,10 @@ impl Db {
         Ok(())
     }
 
-    /// Paths of the folders added to the local library.
     pub fn library_folders(&self) -> Result<Vec<String>> {
         let mut st = self.conn.prepare("SELECT path FROM library_folders ORDER BY path")?;
         let rows = st.query_map([], |r| r.get(0))?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(logged).collect())
     }
 
     /// Forget a folder and the items under it that no other listed folder still covers. Files on disk and their saved progress are untouched.
@@ -258,7 +267,7 @@ impl Db {
             self.conn.execute("DELETE FROM library_folders WHERE path = ?1", [folder])?;
             let keep = self.library_folders()?;
             let mut st = self.conn.prepare("SELECT path FROM library_items")?;
-            let paths: Vec<String> = st.query_map([], |r| r.get(0))?.filter_map(|r| r.ok()).collect();
+            let paths: Vec<String> = st.query_map([], |r| r.get(0))?.filter_map(logged).collect();
             for p in paths.iter().filter(|p| Path::new(p).starts_with(folder) && !keep.iter().any(|k| Path::new(p).starts_with(k))) {
                 self.conn.execute("DELETE FROM library_items WHERE path = ?1", [p])?;
             }
@@ -271,7 +280,7 @@ impl Db {
         let rows = st.query_map([], |r| {
             Ok(LibraryItem { path: PathBuf::from(r.get::<_, String>(0)?), title: r.get(1)? })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(logged).collect())
     }
 
     /// Re-adding a saved title keeps its original `saved_at`, so the library order is stable.
@@ -337,7 +346,7 @@ impl Db {
             })
         })?;
         Ok(rows
-            .filter_map(|r| r.ok())
+            .filter_map(logged)
             .filter(|t| valid_id(&t.key) && valid_id(&t.kind) && !t.title.trim().is_empty())
             .collect())
     }
@@ -396,16 +405,16 @@ impl Db {
     }
 
     /// A download waiting, running or stopped: `source` (URL or magnet) and request `headers` let it resume after a restart.
-    pub fn queue_download(&self, d: &Download, source: &str, headers: &[(String, String)], state: State) -> Result<()> {
+    pub fn queue_download(&self, d: &Download, source: &str, headers: &[(String, String)], status: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO downloads (path, kind, meta_id, video_id, title, status, source, headers) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![d.path.to_string_lossy(), d.kind, d.meta_id, d.video_id, d.title, state.as_str(), source, serde_json::to_string(headers)?],
+            params![d.path.to_string_lossy(), d.kind, d.meta_id, d.video_id, d.title, status, source, serde_json::to_string(headers)?],
         )?;
         Ok(())
     }
 
-    pub fn set_download_state(&self, d: &Download, state: State) -> Result<()> {
-        self.conn.execute("UPDATE downloads SET status = ?1 WHERE path = ?2", params![state.as_str(), d.path.to_string_lossy()])?;
+    pub fn set_download_state(&self, d: &Download, status: &str) -> Result<()> {
+        self.conn.execute("UPDATE downloads SET status = ?1 WHERE path = ?2", params![status, d.path.to_string_lossy()])?;
         Ok(())
     }
 
@@ -421,9 +430,9 @@ impl Db {
         let rows = st.query_map([], |r| {
             let d = Download { path: PathBuf::from(r.get::<_, String>(0)?), kind: r.get(1)?, meta_id: r.get(2)?, video_id: r.get(3)?, title: r.get(4)? };
             let headers = serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default();
-            Ok(QueuedDownload { d, source: r.get(5)?, headers, state: State::from_db(&r.get::<_, String>(7)?), validator: r.get(8)?, total: r.get::<_, i64>(9)? as u64 })
+            Ok(QueuedDownload { d, source: r.get(5)?, headers, status: r.get(7)?, validator: r.get(8)?, total: r.get::<_, i64>(9)? as u64 })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(logged).collect())
     }
 
     /// Also drops its resume point if that plays the file, so Continue Watching doesn't open a missing file.
@@ -442,7 +451,7 @@ impl Db {
         let rows = st.query_map([], |r| {
             Ok(Download { path: PathBuf::from(r.get::<_, String>(0)?), kind: r.get(1)?, meta_id: r.get(2)?, video_id: r.get(3)?, title: r.get(4)? })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(logged).collect())
     }
 
     /// All user data as one versioned JSON document: addons (in priority order), saved titles, progress,
@@ -466,7 +475,7 @@ impl Db {
         })?;
         let marks = rows("SELECT substr(key, 9) FROM settings WHERE key LIKE 'watched:%' ORDER BY key", |r| Ok(Value::String(r.get(0)?)))?;
         let mut settings = serde_json::Map::new();
-        for k in EXPORT_SETTINGS {
+        for k in crate::settings::EXPORTED {
             if let Some(v) = self.setting(k)? {
                 settings.insert(k.into(), v.into());
             }
@@ -539,7 +548,7 @@ impl Db {
                 self.set_setting(&format!("watched:{k}"), "1")?;
                 watched += 1;
             }
-            for k in EXPORT_SETTINGS {
+            for k in crate::settings::EXPORTED {
                 if let Some(v) = doc["settings"][k].as_str().filter(|v| v.len() <= 256) {
                     self.set_setting(k, v)?;
                     settings += 1;
@@ -667,7 +676,7 @@ impl Db {
     pub fn watched(&self, limit: usize) -> Result<Vec<Watched>> {
         let mut st = self.conn.prepare("SELECT key, title, poster, episodes FROM watched ORDER BY watched_at DESC, key LIMIT ?1")?;
         let rows = st.query_map([limit as i64], |r| Ok(Watched { key: r.get(0)?, title: r.get(1)?, poster: r.get(2)?, episodes: r.get(3)? }))?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(logged).collect())
     }
 
     /// Mark a movie or episode (`<type>:<id>`) watched or not. Watching also drops its resume point,
@@ -708,7 +717,7 @@ impl Db {
 
     /// Mark episodes `keys` watched, except ones unwatched here, and drop the imported bitfield setting
     /// they came from, in one transaction. Returns the keys marked.
-    pub fn apply_watched_bitfield(&self, bitfield_key: &str, keys: &[String]) -> Result<Vec<String>> {
+    pub fn apply_watched_bitfield(&self, series: &str, keys: &[String]) -> Result<Vec<String>> {
         let mut marked = Vec::new();
         self.transaction(|| {
             for k in keys {
@@ -717,7 +726,7 @@ impl Db {
                     marked.push(k.clone());
                 }
             }
-            self.conn.execute("DELETE FROM settings WHERE key = ?1", [bitfield_key])?;
+            self.conn.execute("DELETE FROM settings WHERE key = ?1", [crate::settings::WATCHED_BITFIELD.key_at(series)])?;
             Ok(())
         })?;
         Ok(marked)
@@ -728,14 +737,14 @@ impl Db {
         let mut st = self.conn.prepare(
             "SELECT substr(key, 9) FROM settings WHERE key LIKE 'watched:%' UNION SELECT key FROM watched",
         )?;
-        Ok(st.query_map([], |r| r.get::<_, String>(0))?.filter_map(|r| r.ok()).collect())
+        Ok(st.query_map([], |r| r.get::<_, String>(0))?.filter_map(logged).collect())
     }
 
     pub fn recent_progress(&self, limit: usize) -> Result<Vec<Progress>> {
         let mut st = self.conn.prepare(
             "SELECT key, title, source, position, duration, poster FROM progress ORDER BY updated_at DESC, key LIMIT ?1",
         )?;
-        Ok(st.query_map([limit as i64], row_progress)?.filter_map(|r| r.ok()).collect())
+        Ok(st.query_map([limit as i64], row_progress)?.filter_map(logged).collect())
     }
 
     /// All resume points and when each was saved, in Stremio's ISO 8601 form (`2026-01-02T03:04:05.000Z`).
@@ -743,7 +752,7 @@ impl Db {
         let mut st = self.conn.prepare(
             "SELECT key, title, source, position, duration, poster, strftime('%Y-%m-%dT%H:%M:%fZ', updated_at, 'unixepoch') FROM progress",
         )?;
-        Ok(st.query_map([], |r| Ok((row_progress(r)?, r.get(6)?)))?.filter_map(|r| r.ok()).collect())
+        Ok(st.query_map([], |r| Ok((row_progress(r)?, r.get(6)?)))?.filter_map(logged).collect())
     }
 
     /// The current time, in the same form as [`Db::progress_times`].
@@ -752,34 +761,13 @@ impl Db {
     }
 }
 
+/// A row, or `None` (logged) when it can't be read, so one bad row doesn't hide the rest of a list.
+fn logged<T>(r: rusqlite::Result<T>) -> Option<T> {
+    r.inspect_err(|e| crate::elog!("db: skipped a row: {e}")).ok()
+}
+
 fn row_progress(r: &rusqlite::Row) -> rusqlite::Result<Progress> {
     Ok(Progress { key: r.get(0)?, title: r.get(1)?, source: r.get(2)?, position: r.get(3)?, duration: r.get(4)?, poster: r.get(5)? })
-}
-
-const HISTORY_MAX: usize = 10;
-const HISTORY_QUERY_MAX: usize = 100;
-
-/// Puts `q` first in `h`: trimmed, capped in length, deduped case-insensitively, list capped.
-pub fn push_history(h: &mut Vec<String>, q: &str) {
-    let q: String = q.trim().chars().take(HISTORY_QUERY_MAX).collect();
-    if q.is_empty() {
-        return;
-    }
-    h.retain(|x| x.to_lowercase() != q.to_lowercase());
-    h.insert(0, q);
-    h.truncate(HISTORY_MAX);
-}
-
-pub fn encode_history(h: &[String]) -> String {
-    h.join("\n")
-}
-
-pub fn decode_history(s: &str) -> Vec<String> {
-    let mut h = Vec::new();
-    for l in s.lines().rev() {
-        push_history(&mut h, l);
-    }
-    h
 }
 
 #[cfg(test)]
@@ -788,9 +776,8 @@ mod tests {
 
     #[test]
     fn unclean_exit_detected_and_cleared() {
-        let dir = std::env::temp_dir().join(format!("stremflix-session-{}", std::process::id()));
-        let path = dir.join("t.db");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
         let db = Db::open(&path).unwrap();
         assert!(!db.begin_session().unwrap());
         assert_eq!(db.quick_check().unwrap(), None);
@@ -799,26 +786,5 @@ mod tests {
         assert!(db.begin_session().unwrap());
         db.end_session().unwrap();
         assert!(!db.begin_session().unwrap());
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn history_push_dedupe_cap_roundtrip() {
-        let mut h = Vec::new();
-        push_history(&mut h, "  Matrix ");
-        push_history(&mut h, "   ");
-        push_history(&mut h, "dune");
-        push_history(&mut h, "MATRIX");
-        assert_eq!(h, ["MATRIX", "dune"]);
-        for i in 0..20 {
-            push_history(&mut h, &format!("q{i}"));
-        }
-        assert_eq!(h.len(), HISTORY_MAX);
-        assert_eq!(h[0], "q19");
-        push_history(&mut h, &"x".repeat(500));
-        assert_eq!(h[0].len(), HISTORY_QUERY_MAX);
-        assert_eq!(decode_history(&encode_history(&h)), h);
-        assert!(decode_history("").is_empty());
     }
 }

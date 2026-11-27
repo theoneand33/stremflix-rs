@@ -8,9 +8,6 @@ use url::Url;
 
 /// Upper bound on any addon response body.
 pub const MAX_BODY: usize = 4 * 1024 * 1024;
-/// Stremio account API. A whole library can be far larger than an addon response.
-const STREMIO_API: &str = "https://api.strem.io/api/";
-const MAX_API_BODY: usize = 64 * 1024 * 1024;
 const MAX_TEXT: usize = 300;
 const MAX_LONG_TEXT: usize = 4000;
 const MAX_ITEMS: usize = 500;
@@ -204,7 +201,7 @@ impl Manifest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MetaPreview {
     pub id: String,
     #[serde(rename = "type")]
@@ -426,10 +423,10 @@ pub fn parse_skips(v: &serde_json::Value) -> Vec<Skip> {
 
 /// TheIntroDB query for a play key (`movie:tt1` or `series:tt1:<season>:<episode>`); only IMDb ids are looked up.
 pub fn introdb_query(key: &str, dur: f64) -> Option<Vec<(&'static str, String)>> {
-    let parts: Vec<&str> = key.split(':').collect();
-    let (id, episode) = match parts[..] {
-        ["movie", id] => (id, None),
-        ["series", id, s, e] => (id, Some((s.parse::<u32>().ok()?, e.parse::<u32>().ok()?))),
+    let (kind, id) = crate::key::split(key)?;
+    let (id, episode) = match (kind, &id.split(':').collect::<Vec<_>>()[..]) {
+        ("movie", &[id]) => (id, None),
+        ("series", &[id, s, e]) => (id, Some((s.parse::<u32>().ok()?, e.parse::<u32>().ok()?))),
         _ => return None,
     };
     let digits = id.strip_prefix("tt")?;
@@ -702,15 +699,6 @@ fn from_json<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
 
 // ---------- parsers ----------
 
-/// `result` of a Stremio API response body, or an error with its (sanitized) message.
-pub fn api_result(body: &[u8]) -> Result<serde_json::Value> {
-    let mut v: serde_json::Value = serde_json::from_slice(body).context("Stremio API: invalid response")?;
-    if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
-        bail!("Stremio API: {}", sanitize_text(e["message"].as_str().unwrap_or("request failed"), 200));
-    }
-    v.get_mut("result").map(serde_json::Value::take).filter(|r| !r.is_null()).context("Stremio API: no result")
-}
-
 pub fn parse_manifest(body: &[u8]) -> Result<Manifest> {
     let mut m: Manifest = from_json(body)?;
     ensure!(valid_id(&m.id), "manifest: invalid id");
@@ -913,7 +901,7 @@ pub fn valid_user_agent(s: &str) -> Option<String> {
     (s.len() <= MAX_UA_LEN && s.bytes().all(|b| (0x20..0x7f).contains(&b))).then(|| s.to_string())
 }
 
-/// Use `ua` (already validated) for addon and download requests made from now on; addon clients built earlier keep theirs.
+/// Use `ua` (already validated) for addon and download requests made from now on.
 pub fn set_user_agent(ua: &str) {
     *USER_AGENT.write().unwrap_or_else(|e| e.into_inner()) = ua.to_string();
 }
@@ -994,7 +982,6 @@ mod proxy_tests {
         for (k, a) in [("ftp", "h:1"), ("http", "h"), ("http", ":80"), ("http", "h:0"), ("http", "h:65536"), ("http", "h:x"), ("http", "a b:80"), ("http", "h\n:80"), ("http", "u@h:80"), ("http", "h/x:80"), ("http", "a:b:80")] {
             assert!(proxy_url(k, a, "", "").is_err(), "{k} {a}");
         }
-        assert!(with_proxy(reqwest::Client::builder()).is_ok());
     }
 }
 
@@ -1168,34 +1155,6 @@ pub fn discover_path(kind: &str, id: &str, extras: &[(String, String)]) -> Strin
     format!("catalog/{}/{}/{}.json", enc(kind), enc(id), extra.join("&"))
 }
 
-/// Release this binary was built as (`nightly` or `vX.Y.Z`) and its commit; set by release.yml, absent in source builds.
-pub const RELEASE: Option<&str> = option_env!("STREMFLIX_RS_RELEASE");
-pub const COMMIT: Option<&str> = option_env!("STREMFLIX_RS_COMMIT");
-/// `owner/repo` the build was released from (forks check their own releases).
-const REPO: &str = match option_env!("STREMFLIX_RS_REPO") {
-    Some(r) => r,
-    None => "theoneand33/stremflix-rs",
-};
-
-/// Page of a newer release on `release`'s channel, given that channel's GitHub release JSON
-/// (`nightly`: any other commit; tagged: a newer latest tag).
-pub fn newer_release(release: &str, commit: &str, body: &[u8]) -> Result<Option<String>> {
-    #[derive(Deserialize)]
-    struct Rel {
-        tag_name: String,
-        target_commitish: String,
-        html_url: String,
-    }
-    let r: Rel = serde_json::from_slice(body)?;
-    let newer = if release == "nightly" {
-        // target_commitish can also be a branch name; only a full SHA is comparable
-        is_info_hash(&r.target_commitish) && r.target_commitish != commit
-    } else {
-        is_newer(&r.tag_name, release)
-    };
-    Ok(newer.then(|| safe_http_url(&r.html_url).map(String::from)).flatten())
-}
-
 #[derive(Clone)]
 pub struct AddonClient {
     /// Built on first request, off the UI thread: building it loads the system TLS roots (~4 ms at startup).
@@ -1223,7 +1182,8 @@ impl AddonClient {
         http.as_ref().map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    async fn get(&self, url: Url) -> Result<Vec<u8>> {
+    /// GET `url`; its body, capped at `MAX_BODY`.
+    pub async fn get(&self, url: Url) -> Result<Vec<u8>> {
         // Per request, not on the shared client, so a changed User-Agent applies without a restart.
         // GitHub's API rejects requests without one.
         let mut resp = self.http()?.get(url.clone()).header(reqwest::header::USER_AGENT, user_agent()).send().await.with_context(|| format!("GET {url}"))?;
@@ -1237,68 +1197,23 @@ impl AddonClient {
         Ok(body)
     }
 
+    /// POST `body` as JSON to `url`; the status and the body, whatever the status, capped at `max_body` bytes.
+    pub async fn post_json(&self, url: &str, body: &serde_json::Value, timeout: std::time::Duration, max_body: usize) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+        let req = self.http()?.post(url).header(reqwest::header::USER_AGENT, user_agent()).json(body).timeout(timeout);
+        let mut resp = req.send().await.with_context(|| format!("POST {url}"))?;
+        let mut out = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            out.extend_from_slice(&chunk);
+            ensure!(out.len() <= max_body, "response too large");
+        }
+        Ok((resp.status(), out))
+    }
+
     /// Community intro/recap/credits spans for a play key; empty for ids TheIntroDB can't look up.
     pub async fn introdb_skips(&self, key: &str, dur: f64) -> Result<Vec<Skip>> {
         let Some(query) = introdb_query(key, dur) else { return Ok(vec![]) };
         let url = Url::parse_with_params("https://api.theintrodb.org/v4/media", query)?;
         Ok(parse_introdb(&serde_json::from_slice(&self.get(url).await?)?, dur))
-    }
-
-    /// Release page of a newer build than this one and its download for this platform, or `None` (also for source builds).
-    pub async fn check_update(&self) -> Result<Option<(String, Option<String>)>> {
-        let (Some(release), Some(commit)) = (RELEASE, COMMIT) else { return Ok(None) };
-        let url = Url::parse(&format!("https://api.github.com/repos/{REPO}/releases/"))?.join(if release == "nightly" { "tags/nightly" } else { "latest" })?;
-        let body = self.get(url).await?;
-        let suffix = crate::update::asset_suffix(crate::update::appimage().is_some());
-        Ok(newer_release(release, commit, &body)?.map(|page| (page, crate::update::asset_url(&body, REPO, &suffix))))
-    }
-
-    /// POST `body` to Stremio API `method`; its `result`, or its `error` message.
-    async fn stremio_api(&self, method: &str, body: serde_json::Value) -> Result<serde_json::Value> {
-        let url = format!("{STREMIO_API}{method}");
-        // A whole library takes longer than the client's 15 s default.
-        let req = self.http()?.post(&url).header(reqwest::header::USER_AGENT, user_agent()).json(&body).timeout(std::time::Duration::from_secs(120));
-        let mut resp = req.send().await.with_context(|| format!("POST {url}"))?;
-        let status = resp.status();
-        // Errors come back as JSON `{"error": ...}`, so the body is read whatever the status.
-        let mut out = Vec::new();
-        while let Some(chunk) = resp.chunk().await? {
-            out.extend_from_slice(&chunk);
-            ensure!(out.len() <= MAX_API_BODY, "Stremio API: response too large");
-        }
-        api_result(&out).with_context(|| format!("HTTP {status}"))
-    }
-
-    /// Sign in to a Stremio account; returns its auth key.
-    pub async fn stremio_login(&self, email: &str, password: &str) -> Result<String> {
-        let r = self.stremio_api("login", serde_json::json!({"type": "Login", "email": email, "password": password, "facebook": false})).await?;
-        r["authKey"].as_str().filter(|k| !k.is_empty()).map(String::from).context("Stremio API: no auth key")
-    }
-
-    pub async fn stremio_logout(&self, auth_key: &str) -> Result<()> {
-        self.stremio_api("logout", serde_json::json!({"type": "Logout", "authKey": auth_key})).await.map(drop)
-    }
-
-    /// The account's addons and library, validated like a local Stremio import.
-    pub async fn stremio_pull(&self, auth_key: &str) -> Result<crate::stremio_import::Import> {
-        let addons = self.stremio_api("addonCollectionGet", serde_json::json!({"type": "AddonCollectionGet", "authKey": auth_key, "update": true})).await?;
-        let library = self.stremio_api("datastoreGet", serde_json::json!({"authKey": auth_key, "collection": "libraryItem", "ids": [], "all": true})).await?;
-        crate::stremio_import::from_account(&addons, &library)
-    }
-
-    /// Upload `up` to the account: its addon list becomes the local one (account-only addons kept at the end),
-    /// and changed library items are put. Returns the number of addons and library items sent.
-    pub async fn stremio_push(&self, auth_key: &str, up: &crate::stremio_import::Upload) -> Result<(usize, usize)> {
-        let remote = self.stremio_api("addonCollectionGet", serde_json::json!({"type": "AddonCollectionGet", "authKey": auth_key, "update": false})).await?;
-        let library = self.stremio_api("datastoreGet", serde_json::json!({"authKey": auth_key, "collection": "libraryItem", "ids": [], "all": true})).await?;
-        ensure!(library.is_array(), "Stremio API: unexpected library response");
-        let addons = crate::stremio_import::addon_collection(&up.addons, &remote)?;
-        let changes = crate::stremio_import::library_changes(up, &library);
-        self.stremio_api("addonCollectionSet", serde_json::json!({"type": "AddonCollectionSet", "authKey": auth_key, "addons": addons})).await?;
-        if !changes.is_empty() {
-            self.stremio_api("datastorePut", serde_json::json!({"authKey": auth_key, "collection": "libraryItem", "changes": changes})).await?;
-        }
-        Ok((addons.len(), changes.len()))
     }
 
     pub async fn fetch_manifest(&self, transport_url: &str) -> Result<Manifest> {
@@ -1338,6 +1253,20 @@ impl AddonClient {
 
     pub async fn meta(&self, transport_url: &str, kind: &str, id: &str) -> Result<Meta> {
         parse_meta(&self.get(Self::resource_url(transport_url, "meta", kind, id)?).await?)
+    }
+
+    /// Meta from the first of `addons` (in priority order) whose answer passes `accept`, else every addon's error.
+    /// An addon that answers without what is needed (e.g. no episodes) doesn't end the search.
+    pub async fn first_meta(&self, addons: &[String], kind: &str, id: &str, accept: impl Fn(&Meta) -> bool) -> std::result::Result<Meta, Vec<String>> {
+        let mut errors = Vec::new();
+        for u in addons {
+            match self.meta(u, kind, id).await {
+                Ok(m) if accept(&m) => return Ok(m),
+                Ok(_) => {}
+                Err(e) => errors.push(format!("{e:#}")),
+            }
+        }
+        Err(errors)
     }
 
     pub async fn streams(&self, transport_url: &str, kind: &str, id: &str) -> Result<Vec<Stream>> {

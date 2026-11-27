@@ -1,4 +1,5 @@
 use stremflix_rs::addon::*;
+use stremflix_rs::update::newer_release;
 
 const MANIFEST: &str = r#"{
   "id": "org.example.x", "version": "1.2.3", "name": "  Example\u0007 ",
@@ -10,7 +11,7 @@ const MANIFEST: &str = r#"{
 fn valid_manifest() {
     let m = parse_manifest(MANIFEST.as_bytes()).unwrap();
     assert_eq!(m.id, "org.example.x");
-    assert_eq!(m.name, "Example"); // control char stripped, trimmed
+    assert_eq!(m.name, "Example");
     assert!(m.has_resource("catalog") && m.has_resource("stream") && !m.has_resource("meta"));
     assert_eq!(m.catalogs.len(), 1, "catalog with empty id dropped");
     assert!(!m.catalogs[0].supports("search") && !m.catalogs[0].requires_extra());

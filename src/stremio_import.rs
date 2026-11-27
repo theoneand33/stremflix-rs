@@ -7,9 +7,10 @@
 //! Chromium (Windows WebView2, Stremio 4's QtWebEngine) as a LevelDB. Both are read from a copy,
 //! so a running Stremio is never locked or modified.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine;
 use serde::Deserialize;
+use crate::{key, settings};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Read;
@@ -17,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
-use crate::addon::{Manifest, Stream, Video, addon_base, parse_manifest, safe_http_url, sanitize_text, valid_id};
+use crate::addon::{AddonClient, Manifest, Stream, Video, addon_base, parse_manifest, safe_http_url, sanitize_text, valid_id};
 use crate::db::{Db, Progress, SavedTitle, Watched};
 
 #[derive(Debug, Default)]
@@ -41,7 +42,6 @@ impl Import {
     fn save_rows(&self, db: &Db) -> Result<()> {
         let have: Vec<String> = db.addons()?.into_iter().map(|(u, _)| u).collect();
         for (u, m) in self.addons.iter().filter(|(u, _)| !have.contains(u)) {
-            // Not one removed here.
             if db.setting(&format!("unaddon:{u}"))?.is_none() {
                 db.add_addon(u, m)?;
             }
@@ -58,7 +58,7 @@ impl Import {
         }
         // Episodes unwatched here are skipped when the bitfield is applied (`Db::apply_watched_bitfield`).
         for (key, field) in &self.bitfields {
-            db.set_setting(&format!("bitfield:{key}"), field)?;
+            settings::WATCHED_BITFIELD.set_at(db, key, &Some(field.clone()))?;
         }
         for (t, at) in &self.saved {
             if kept("unsaved", &t.key)? {
@@ -287,6 +287,19 @@ pub fn watched_episodes(field: &str) -> u32 {
     decode_bitfield(field).map_or(0, |(_, len, bits)| (0..len).filter(|&i| bit(&bits, i)).count() as u32)
 }
 
+/// Marks the episodes of series `kind`/`id` that were imported as watched from Stremio, now that its `videos` are known.
+/// They become local marks, so they can be unmarked. Returns the keys marked; an anchor missing from `videos`
+/// marks nothing and keeps the field for another source.
+pub fn apply_watched(db: &Db, kind: &str, id: &str, videos: &[Video]) -> Result<Vec<String>> {
+    let series = key::item(kind, id);
+    let Some(field) = settings::WATCHED_BITFIELD.get_at(db, &series)? else { return Ok(Vec::new()) };
+    let keys: Vec<String> = watched_videos(&field, videos).into_iter().map(|v| key::item(kind, &v)).collect();
+    if keys.is_empty() {
+        return Ok(keys);
+    }
+    db.apply_watched_bitfield(&series, &keys)
+}
+
 /// Ids of `videos` marked watched in a stremio-core bitfield. Like stremio-core, bits follow the videos
 /// sorted by (season, episode) with specials (season 0) last, then unnumbered videos by release date,
 /// re-aligned on the anchor; an unknown anchor marks nothing.
@@ -342,7 +355,7 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
         }
     }
     for it in items.into_values() {
-        let (key, title) = (format!("{}:{}", it.kind, it.id), sanitize_text(&it.name, 300));
+        let (key, title) = (key::item(&it.kind, &it.id), sanitize_text(&it.name, 300));
         let poster = it.poster.as_deref().and_then(safe_http_url).map(String::from);
         let s = &it.state;
         let at = s.last_watched.clone().unwrap_or(it.mtime.clone());
@@ -360,7 +373,7 @@ pub fn parse(kv: &HashMap<String, String>) -> Result<Import> {
         {
             let p = Progress {
                 // `<type>:<video id>` like local progress, so a series' episode resumes on its own.
-                key: format!("{}:{video}", it.kind),
+                key: key::item(&it.kind, &video),
                 title: title.clone(),
                 source: source.clone(),
                 position: s.time_offset as f64 / 1000.0,
@@ -468,11 +481,11 @@ pub fn library_changes(up: &Upload, remote: &Value) -> Vec<Value> {
         .into_iter()
         .flatten()
         .filter(|it| it["state"].is_object())
-        .filter_map(|it| Some((format!("{}:{}", it["type"].as_str()?, it["_id"].as_str()?), it.clone())))
+        .filter_map(|it| Some((key::item(it["type"].as_str()?, it["_id"].as_str()?), it.clone())))
         .collect();
     let mut changed = std::collections::BTreeSet::new();
     for t in &up.saved {
-        let Some(id) = t.key.strip_prefix(&format!("{}:", t.kind)) else { continue };
+        let Some(id) = key::id_of(&t.key, &t.kind) else { continue };
         if items.contains_key(&t.key) {
             continue;
         }
@@ -488,14 +501,16 @@ pub fn library_changes(up: &Upload, remote: &Value) -> Vec<Value> {
         let key = match known {
             Some(k) => k,
             // An episode's progress title is the episode's, so only movies are added from progress.
-            None if p.key.strip_prefix("movie:").is_some_and(valid_id) => {
-                items.insert(p.key.clone(), new_item("movie", &p.key[6..], &p.title, &p.poster, &up.now));
-                p.key.clone()
-            }
-            None => continue,
+            None => match key::id_of(&p.key, "movie").filter(|id| valid_id(id)) {
+                Some(id) => {
+                    items.insert(p.key.clone(), new_item("movie", id, &p.title, &p.poster, &up.now));
+                    p.key.clone()
+                }
+                None => continue,
+            },
         };
         let it = items.get_mut(&key).expect("found or inserted above");
-        let Some(video) = p.key.strip_prefix(&format!("{}:", it["type"].as_str().unwrap_or_default())) else { continue };
+        let Some(video) = key::id_of(&p.key, it["type"].as_str().unwrap_or_default()) else { continue };
         let video = video.to_string();
         let s = &mut it["state"];
         if p.position <= 0.0 || s["lastWatched"].as_str().is_some_and(|l| l >= at.as_str()) {
@@ -507,7 +522,7 @@ pub fn library_changes(up: &Upload, remote: &Value) -> Vec<Value> {
         s["video_id"] = video.into();
         changed.insert(key);
     }
-    for k in up.watched.iter().filter(|k| k.starts_with("movie:")) {
+    for k in up.watched.iter().filter(|k| key::id_of(k, "movie").is_some()) {
         let Some(s) = items.get_mut(k).map(|it| &mut it["state"]) else { continue };
         if s["flaggedWatched"].as_u64().unwrap_or(0) == 0 && s["timesWatched"].as_u64().unwrap_or(0) == 0 {
             (s["flaggedWatched"], s["timesWatched"]) = (1.into(), 1.into());
@@ -522,4 +537,65 @@ pub fn library_changes(up: &Upload, remote: &Value) -> Vec<Value> {
             it
         })
         .collect()
+}
+
+// ---------- Stremio account (api.strem.io) ----------
+
+const STREMIO_API: &str = "https://api.strem.io/api/";
+const MAX_API_BODY: usize = 64 * 1024 * 1024;
+
+/// `result` of a Stremio API response body, or an error with its (sanitized) message.
+pub fn api_result(body: &[u8]) -> Result<Value> {
+    let mut v: Value = serde_json::from_slice(body).context("Stremio API: invalid response")?;
+    if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
+        bail!("Stremio API: {}", sanitize_text(e["message"].as_str().unwrap_or("request failed"), 200));
+    }
+    v.get_mut("result").map(Value::take).filter(|r| !r.is_null()).context("Stremio API: no result")
+}
+
+/// POST `body` to Stremio API `method`; its `result`, or its `error` message. Errors come back as JSON whatever the status.
+async fn api(client: &AddonClient, method: &str, body: Value) -> Result<Value> {
+    // A whole library takes longer than the client's 15 s default.
+    let (status, out) = client.post_json(&format!("{STREMIO_API}{method}"), &body, std::time::Duration::from_secs(120), MAX_API_BODY).await.context("Stremio API")?;
+    api_result(&out).with_context(|| format!("HTTP {status}"))
+}
+
+fn addon_collection_get(auth_key: &str, update: bool) -> Value {
+    serde_json::json!({"type": "AddonCollectionGet", "authKey": auth_key, "update": update})
+}
+
+fn library_get(auth_key: &str) -> Value {
+    serde_json::json!({"authKey": auth_key, "collection": "libraryItem", "ids": [], "all": true})
+}
+
+/// Sign in to a Stremio account; returns its auth key.
+pub async fn login(client: &AddonClient, email: &str, password: &str) -> Result<String> {
+    let r = api(client, "login", serde_json::json!({"type": "Login", "email": email, "password": password, "facebook": false})).await?;
+    r["authKey"].as_str().filter(|k| !k.is_empty()).map(String::from).context("Stremio API: no auth key")
+}
+
+pub async fn logout(client: &AddonClient, auth_key: &str) -> Result<()> {
+    api(client, "logout", serde_json::json!({"type": "Logout", "authKey": auth_key})).await.map(drop)
+}
+
+/// The account's addons and library, validated like a local Stremio import.
+pub async fn pull(client: &AddonClient, auth_key: &str) -> Result<Import> {
+    let addons = api(client, "addonCollectionGet", addon_collection_get(auth_key, true)).await?;
+    let library = api(client, "datastoreGet", library_get(auth_key)).await?;
+    from_account(&addons, &library)
+}
+
+/// Upload `up` to the account: its addon list becomes the local one (account-only addons kept at the end),
+/// and changed library items are put. Returns the number of addons and library items sent.
+pub async fn push(client: &AddonClient, auth_key: &str, up: &Upload) -> Result<(usize, usize)> {
+    let remote = api(client, "addonCollectionGet", addon_collection_get(auth_key, false)).await?;
+    let library = api(client, "datastoreGet", library_get(auth_key)).await?;
+    ensure!(library.is_array(), "Stremio API: unexpected library response");
+    let addons = addon_collection(&up.addons, &remote)?;
+    let changes = library_changes(up, &library);
+    api(client, "addonCollectionSet", serde_json::json!({"type": "AddonCollectionSet", "authKey": auth_key, "addons": addons})).await?;
+    if !changes.is_empty() {
+        api(client, "datastorePut", serde_json::json!({"authKey": auth_key, "collection": "libraryItem", "changes": changes})).await?;
+    }
+    Ok((addons.len(), changes.len()))
 }
