@@ -195,7 +195,7 @@ impl App {
                 Ok(m) => Ok(Msg::Episodes(meta, m, nav)),
                 Err(errors) => {
                     let why = if errors.is_empty() { "no addon lists them".to_string() } else { errors.join("; ") };
-                    anyhow::bail!("no episodes for {}: {why}", meta.name)
+                    Ok(Msg::NoEpisodes(meta.id, format!("no episodes for {}: {why}", meta.name), nav))
                 }
             }
         });
@@ -206,13 +206,13 @@ impl App {
     pub(crate) fn quick_play(&mut self, ctx: &egui::Context, meta: MetaPreview) {
         let key = key::item(&meta.kind, &meta.id);
         if let Some(p) = self.recent.iter().find(|p| p.key == key).cloned() {
-            return self.play(ctx, p.key, p.title, p.source, vec![]);
+            return self.resume(ctx, p);
         }
         self.tab = Tab::Home;
         if meta.kind == "series" {
             let id = meta.id.clone();
             self.open_meta(ctx, meta, false);
-            self.pending = Some((id, None));
+            self.pending = Some((id, OnEpisodes::Next));
             return;
         }
         self.fetch_details(ctx, &meta);
@@ -232,7 +232,7 @@ impl App {
                 self.tab = Tab::Home;
                 let meta = MetaPreview { name: id.clone(), id, kind, ..Default::default() };
                 // Only an episode link opens a stream picker; `(id, None)` would autoplay the next episode.
-                let pending = video.filter(|_| meta.kind == "series").map(|v| (meta.id.clone(), Some(v)));
+                let pending = video.filter(|_| meta.kind == "series").map(|v| (meta.id.clone(), OnEpisodes::Pick(v)));
                 self.open_meta(ctx, meta, false);
                 self.pending = pending;
             }
@@ -242,17 +242,38 @@ impl App {
     /// Continue Watching card: the title's page with its stream picker (for a series, the episode's).
     /// Torrents and local files have no page, so they resume.
     pub(crate) fn open_progress(&mut self, ctx: &egui::Context, p: Progress) {
-        let Some((kind, id)) = key::addon_item(&p.key) else {
+        let Some(meta) = self.progress_meta(&p) else {
             return self.play(ctx, p.key, p.title, p.source, vec![]);
         };
+        let video = key::addon_item(&p.key).map(|(_, id)| id.to_owned());
+        let pending = video.filter(|_| meta.kind == "series").map(|v| (meta.id.clone(), OnEpisodes::Pick(v)));
+        self.open_meta(ctx, meta, false);
+        self.pending = pending;
+    }
+
+    /// Resume a Continue Watching entry with its saved stream. A series episode loads its series first,
+    /// so the player knows the next episode for autoplay and the up-next card.
+    pub(crate) fn resume(&mut self, ctx: &egui::Context, p: Progress) {
+        match self.progress_meta(&p).filter(|m| m.kind == "series") {
+            Some(meta) => {
+                self.tab = Tab::Home;
+                let id = meta.id.clone();
+                self.open_meta(ctx, meta, false);
+                self.pending = Some((id, OnEpisodes::Resume(p)));
+            }
+            None => self.play(ctx, p.key, p.title, p.source, vec![]),
+        }
+    }
+
+    /// The title a Continue Watching entry belongs to (the series, for an episode); `None` for torrents and local files.
+    fn progress_meta(&self, p: &Progress) -> Option<MetaPreview> {
+        let (kind, id) = key::addon_item(&p.key)?;
         let mut meta = MetaPreview { id: id.into(), kind: kind.into(), name: p.title.clone(), poster: p.poster.clone(), ..Default::default() };
         if kind == "series" {
             let saved = settings::EPISODE_SERIES.get_at(&self.db, &p.key).ok().flatten();
             meta.id = saved.unwrap_or_else(|| series_id(id).into());
         }
-        let pending = (kind == "series").then(|| (meta.id.clone(), Some(id.to_owned())));
-        self.open_meta(ctx, meta, false);
-        self.pending = pending;
+        Some(meta)
     }
 
     /// Fetch streams and subtitles for a movie, or for `episode` of a series.

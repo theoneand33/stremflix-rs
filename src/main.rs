@@ -61,8 +61,20 @@ const CACHE_SIZES: [(&str, u64); 5] = [("No cache", 0), ("2 GB", 2_000_000_000),
 const SEED_RATIOS: [(&str, f64); 4] = [("Off", 0.0), ("1.0", 1.0), ("2.0", 2.0), ("5.0", 5.0)];
 const SEED_TIMES: [(&str, u64); 4] = [("Off", 0), ("1 hour", 3600), ("6 hours", 21600), ("24 hours", 86400)];
 
+/// What to do once a series' episodes arrive.
+enum OnEpisodes {
+    /// Show this video's streams (Continue Watching card, episode link).
+    Pick(String),
+    /// Resume this saved episode with its stream (Continue Watching play button).
+    Resume(Progress),
+    /// Resume the series' episode in progress, else start the next one (card play button).
+    Next,
+}
+
 enum Msg {
     Error(String),
+    /// No addon listed series `id`'s episodes: why, and the navigation it was for.
+    NoEpisodes(String, String, u64),
     /// Play key and its TheIntroDB spans.
     IntroDb(String, Vec<Skip>),
     Installed(String, Manifest, Option<String>),
@@ -334,9 +346,8 @@ struct App {
     episodes: Vec<Video>,
     season: Option<u32>,
     episode: Option<Video>,
-    /// Series id whose episodes are loading, and on arrival the video id whose streams to show
-    /// (Continue Watching), or `None` to play the next episode (card play button).
-    pending: Option<(String, Option<String>)>,
+    /// Series id whose episodes are loading, and what to do once they arrive.
+    pending: Option<(String, OnEpisodes)>,
     /// Bumped by every navigation (open a title or episode, play, Back); replies for an older one are dropped.
     nav: u64,
     /// `nav` and title of a title or episode whose streams or episodes were asked for and have not arrived.
@@ -730,6 +741,17 @@ impl App {
                 self.opening = None;
                 report(&mut self.error, e);
             }
+            // A resume still plays its saved stream, only without the next episode to autoplay.
+            Msg::NoEpisodes(id, why, nav) => {
+                let resume = nav == self.nav && matches!(&self.pending, Some((p, OnEpisodes::Resume(_))) if *p == id);
+                match self.pending.take_if(|_| resume) {
+                    Some((_, OnEpisodes::Resume(p))) => {
+                        self.opening = None;
+                        self.play(ctx, p.key, p.title, p.source, vec![]);
+                    }
+                    _ => self.handle(ctx, Msg::Error(why)),
+                }
+            }
             // Only while still locked: nothing can have been removed since the fetch began.
             Msg::Rated(found) if self.locked() => {
                 for (u, m) in &found {
@@ -897,11 +919,15 @@ impl App {
                 self.selected = Some((meta.clone(), Vec::new(), Vec::new()));
                 self.scroll_top = true;
                 let Some((_, show)) = self.pending.take().filter(|(id, _)| *id == meta.id) else { return };
-                let v = match &show {
-                    Some(id) => self.episodes.iter().find(|v| v.id == *id),
-                    None => {
-                        // Resume the episode in progress with its stream, else start the next one.
-                        let resume = self.recent.iter().find(|p| self.episodes.iter().any(|v| key(v) == p.key)).cloned();
+                let pick = matches!(show, OnEpisodes::Pick(_));
+                let v = match show {
+                    OnEpisodes::Pick(id) => self.episodes.iter().find(|v| v.id == id),
+                    show => {
+                        // Resume the chosen entry, else the series' episode in progress, with its stream; else start the next one.
+                        let resume = match show {
+                            OnEpisodes::Resume(p) => Some(p),
+                            _ => self.recent.iter().find(|p| self.episodes.iter().any(|v| key(v) == p.key)).cloned(),
+                        };
                         if let Some(p) = resume {
                             // Select the episode so the player offers the next one.
                             self.episode = self.episodes.iter().find(|v| key(v) == p.key).cloned();
@@ -913,7 +939,7 @@ impl App {
                 };
                 let Some(v) = v.cloned() else { return };
                 self.season = v.season;
-                let autoplay = if show.is_some() { Autoplay::Off } else { Autoplay::Top(self.saved_binge(&meta)) };
+                let autoplay = if pick { Autoplay::Off } else { Autoplay::Top(self.saved_binge(&meta)) };
                 self.open_streams(ctx, meta, Some(v), autoplay);
             }
             Msg::Tray(tray::Action::Toggle) => self.show_window(ctx, self.hidden),
@@ -1771,6 +1797,45 @@ mod tests {
         let unnamed: Vec<_> = nodes.iter().filter(|(_, n)| matches!(n.role(), Role::Button | Role::TextInput) && !named(n)).map(|(_, n)| (n.role(), n.label().map(str::to_owned))).collect();
         assert!(unnamed.is_empty(), "unnamed controls: {unnamed:?}");
         assert!(nodes.iter().any(|(_, n)| n.label() == Some("Clear filter")));
+    }
+
+    #[test]
+    fn resuming_an_episode_selects_it_so_the_next_can_autoplay() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let prog = |e: u32| Progress { key: format!("series:tt1:1:{e}"), title: format!("E{e}"), source: format!("https://x.example/{e}"), position: 5.0, duration: 60.0, poster: None };
+        // E3 was watched last; resuming the older E1 must still play E1.
+        app.recent = vec![prog(3), prog(1)];
+        app.resume(&ctx, prog(1));
+        let series = stremflix_rs::addon::parse_meta(br#"{"meta":{"id":"tt1","type":"series","name":"S","videos":[{"id":"tt1:1:1","season":1,"episode":1},{"id":"tt1:1:2","season":1,"episode":2},{"id":"tt1:1:3","season":1,"episode":3}]}}"#).unwrap();
+        let meta = MetaPreview { id: "tt1".into(), kind: "series".into(), name: "S".into(), ..Default::default() };
+        app.handle(&ctx, Msg::Episodes(meta, series, app.nav));
+        assert_eq!(app.episode.as_ref().map(|v| v.id.as_str()), Some("tt1:1:1"));
+        assert_eq!(app.play_key().map(|(k, _)| k).as_deref(), Some("series:tt1:1:1"));
+        assert_eq!(next_episode(&app.episodes, "tt1:1:1").map(|v| v.id.as_str()), Some("tt1:1:2"));
+        // Its saved stream plays (the meta request's own reply may be queued too).
+        assert!(app.rx.try_iter().any(|m| matches!(m, Msg::Play(k, _, src, ..) if k == "series:tt1:1:1" && src == "https://x.example/1")));
+    }
+
+    #[test]
+    fn resume_plays_its_stream_when_no_addon_lists_the_series() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let p = Progress { key: "series:tt1:1:1".into(), title: "E1".into(), source: "https://x.example/1".into(), position: 5.0, duration: 60.0, poster: None };
+        // Through the API's play, like the Continue Watching play button.
+        app.recent = vec![p.clone()];
+        let (tx, _rx) = channel();
+        app.handle(&ctx, Msg::Api(api::Call::Play { kind: "series".into(), id: "tt1:1:1".into(), name: None }, tx));
+        assert!(matches!(&app.pending, Some((id, OnEpisodes::Resume(r))) if id == "tt1" && *r == p));
+        app.handle(&ctx, Msg::NoEpisodes("tt1".into(), "no episodes for E1".into(), app.nav));
+        assert!(app.pending.is_none() && app.error.is_none(), "{:?}", app.error);
+        assert!(app.rx.try_iter().any(|m| matches!(m, Msg::Play(k, ..) if k == "series:tt1:1:1")));
+        // A stale failure leaves the current request alone; opening a series page that fails still reports the error.
+        app.pending = Some(("tt3".into(), OnEpisodes::Next));
+        app.handle(&ctx, Msg::NoEpisodes("tt3".into(), "no episodes for old".into(), app.nav - 1));
+        app.handle(&ctx, Msg::NoEpisodes("tt2".into(), "no episodes for S".into(), app.nav));
+        assert!(matches!(&app.pending, Some((id, OnEpisodes::Next)) if id == "tt3"));
+        assert!(app.error.is_some());
     }
 
     #[test]
