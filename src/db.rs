@@ -112,7 +112,7 @@ impl SavedTitle {
     /// Detail-page view of the saved title; `None` if the key has no `<type>:<id>` shape.
     pub fn preview(&self) -> Option<MetaPreview> {
         let (kind, id) = self.key.split_once(':')?;
-        Some(MetaPreview { id: id.into(), kind: kind.into(), name: self.title.clone(), poster: self.poster.clone(), background: None, description: None })
+        Some(MetaPreview { id: id.into(), kind: kind.into(), name: self.title.clone(), poster: self.poster.clone(), background: None, description: None, release_info: self.year.map(|y| y.to_string()), imdb_rating: self.rating.map(|r| format!("{r:.1}")), logo: None, genres: vec![] })
     }
 }
 

@@ -217,6 +217,17 @@ pub struct MetaPreview {
     pub background: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Year or year range shown under the card, e.g. "2022–".
+    #[serde(default, rename = "releaseInfo", deserialize_with = "lenient_text")]
+    pub release_info: Option<String>,
+    /// Shown as the card's rating badge.
+    #[serde(default, rename = "imdbRating", deserialize_with = "lenient_text")]
+    pub imdb_rating: Option<String>,
+    /// Title artwork shown in place of the name on the Home banner.
+    #[serde(default, deserialize_with = "lenient_text")]
+    pub logo: Option<String>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub genres: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -761,6 +772,10 @@ fn clean_preview(mut p: MetaPreview) -> Option<MetaPreview> {
     opt_url(&mut p.poster);
     opt_url(&mut p.background);
     opt_text(&mut p.description, MAX_LONG_TEXT);
+    opt_text(&mut p.release_info, 64);
+    opt_text(&mut p.imdb_rating, 16);
+    opt_url(&mut p.logo);
+    p.genres = p.genres.iter().map(|s| sanitize_text(s, MAX_TEXT)).filter(|s| !s.is_empty()).take(MAX_TAGS).collect();
     (!p.name.is_empty()).then_some(p)
 }
 

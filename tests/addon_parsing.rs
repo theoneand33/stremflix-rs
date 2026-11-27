@@ -129,8 +129,8 @@ fn null_lists_are_empty_lists() {
 #[test]
 fn catalog_parsing_drops_bad_entries() {
     let body = r#"{"metas": [
-        {"id": "tt1", "type": "movie", "name": "One", "poster": "https://img.example/1.jpg"},
-        {"id": "tt2", "type": "movie", "name": "Two", "poster": "javascript:alert(1)", "background": "file:///etc/passwd"},
+        {"id": "tt1", "type": "movie", "name": "One", "poster": "https://img.example/1.jpg", "releaseInfo": "2024\u202e", "imdbRating": 7.5, "logo": "https://img.example/logo.png", "genres": ["Drama", 5, ""]},
+        {"id": "tt2", "type": "movie", "name": "Two", "poster": "javascript:alert(1)", "background": "file:///etc/passwd", "logo": "data:image/png;base64,AA"},
         {"id": "tt3", "type": "movie"},
         {"id": "", "type": "movie", "name": "Empty id"},
         42
@@ -138,8 +138,14 @@ fn catalog_parsing_drops_bad_entries() {
     let metas = parse_catalog(body.as_bytes()).unwrap();
     assert_eq!(metas.len(), 2);
     assert_eq!(metas[0].poster.as_deref(), Some("https://img.example/1.jpg"));
+    assert_eq!(metas[0].release_info.as_deref(), Some("2024"), "bidi override stripped");
+    assert_eq!(metas[0].imdb_rating.as_deref(), Some("7.5"), "numeric rating kept as text");
+    assert_eq!(metas[0].logo.as_deref(), Some("https://img.example/logo.png"));
+    assert_eq!(metas[0].genres, ["Drama"], "non-string and blank genres dropped");
+    assert_eq!(metas[1].imdb_rating, None);
     assert_eq!(metas[1].poster, None, "unsafe poster URL removed");
     assert_eq!(metas[1].background, None, "unsafe background URL removed");
+    assert_eq!(metas[1].logo, None, "unsafe logo URL removed");
     assert!(parse_catalog(br#"{"metas": {}}"#).is_err());
 }
 

@@ -52,7 +52,7 @@ cargo test
 
 Addons lists installed addons in priority order; Up/Down reorder them, and the stream list and Home rows follow. The All/Movies/Shows switch orders metadata, streams, and subtitles per type; catalog rows and search keep the global order. Each addon shows whether it is reachable, timed out, or unreachable. Details shows an addon's id, types, resources, and catalogs. Streams are grouped by addon. `externalUrl` streams open in the browser; `ytId` streams play through yt-dlp, as do the trailer buttons on a title's detail page (from `trailerStreams` or legacy `trailers`).
 
-Press Enter in the header search to open a results page with one row for each catalog that supports the `search` extra. Rows fill in as addons reply. `/` or Ctrl+F focuses the search box; Esc or the mouse's back button leaves a title or results page.
+The header holds the Home, Discover and Library tabs; Addons and Settings are in the profile menu (the round avatar at the right). The search button, `/` or Ctrl+F opens the search palette, which lists recent searches; press Enter there to open a results page with one row for each catalog that supports the `search` extra. Rows fill in as addons reply. Esc closes the palette; Esc or the mouse's back button leaves a title or results page. Errors and notices show as cards in the bottom-right corner.
 
 ### Playing
 
@@ -95,7 +95,7 @@ Scheme registration: the Linux AppImage declares it (installed by AppImageLaunch
 
 ### Settings and recovery
 
-Settings → Profile creates and picks household profiles; the choice takes effect at the next launch. Each profile has its own addons, library, progress, settings, and downloads, in `<data>/profiles/<name>` (the Default profile is the data folder itself). A child-safe PIN locks the current profile: the Addons tab, every other setting, and addons whose manifest flags them `adult` are hidden (addons installed by an older version are checked again on locking and stay hidden if that fetch fails), no addon can be added, and the profile can't be switched until the PIN is entered in Settings. The lock doesn't rate titles (addons don't supply ratings), reads the `adult` flag from the manifest as last installed or updated (an addon that adds the flag later stays visible until it is updated), doesn't hide titles already in that profile's library or history (lock a profile made for the child, not one you watched in), doesn't block magnets or local files, doesn't limit PIN guesses (pick a long PIN), and doesn't stop someone who can edit the data folder.
+Settings → Profile creates and picks household profiles; the choice takes effect at the next launch. Each profile has its own addons, library, progress, settings, and downloads, in `<data>/profiles/<name>` (the Default profile is the data folder itself). A child-safe PIN locks the current profile: the Addons page, every other setting, and addons whose manifest flags them `adult` are hidden (addons installed by an older version are checked again on locking and stay hidden if that fetch fails), no addon can be added, and the profile can't be switched until the PIN is entered in Settings. The lock doesn't rate titles (addons don't supply ratings), reads the `adult` flag from the manifest as last installed or updated (an addon that adds the flag later stays visible until it is updated), doesn't hide titles already in that profile's library or history (lock a profile made for the child, not one you watched in), doesn't block magnets or local files, doesn't limit PIN guesses (pick a long PIN), and doesn't stop someone who can edit the data folder.
 
 The app reopens on the tab you last used. Settings sets the HTTP User-Agent. If the last run did not exit cleanly, the next launch shows a notice. Startup also checks the database and reports corruption; neither blocks startup.
 
@@ -138,7 +138,7 @@ cargo run -p test-addon -- --port 7070 --media-dir demo-media/addon --seed   # s
 STREMFLIX_RS_DATA=/tmp/stremflix-rs-demo STREMFLIX_RS_NO_DHT=1 cargo run --bin stremflix-rs
 ```
 
-1. Addons: install `http://127.0.0.1:7070/manifest.json`.
+1. Addons (in the profile menu): install `http://127.0.0.1:7070/manifest.json`.
 2. Home: open Test Pattern in the Test Addon - Test Movies row and play the HTTP stream (subtitle loads), then the torrent stream. Or paste the printed magnet into Library → Torrent.
 3. Library: add the absolute path of `demo-media/library` and play test-pattern-local.
 4. Close and restart with the same command: Continue Watching resumes at the saved position.
