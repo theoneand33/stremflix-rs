@@ -245,7 +245,8 @@ impl App {
         let Some(meta) = self.progress_meta(&p) else {
             return self.play(ctx, p.key, p.title, p.source, vec![]);
         };
-        let pending = (meta.kind == "series").then(|| (meta.id.clone(), OnEpisodes::Pick(p.key[meta.kind.len() + 1..].to_owned())));
+        let video = key::addon_item(&p.key).map(|(_, id)| id.to_owned());
+        let pending = video.filter(|_| meta.kind == "series").map(|v| (meta.id.clone(), OnEpisodes::Pick(v)));
         self.open_meta(ctx, meta, false);
         self.pending = pending;
     }
