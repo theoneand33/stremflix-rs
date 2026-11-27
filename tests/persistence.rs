@@ -108,6 +108,9 @@ fn saved_titles_round_trip() {
     db.add_saved_title(&SavedTitle { key: "bad/key".into(), title: "Bad".into(), kind: "movie".into(), poster: None, year: None, rating: None, last_watched: None }).unwrap();
     assert_eq!(db.saved_titles().unwrap().len(), 2);
     assert_eq!(show.preview().map(|m| (m.kind, m.id, m.name)), Some(("series".to_string(), "tt2".to_string(), "Two".to_string())));
+    let card = movie.preview().unwrap();
+    assert_eq!((card.release_info.as_deref(), card.imdb_rating.as_deref()), (Some("2020"), Some("7.5")), "year and rating show on the library card");
+    assert_eq!((show.preview().unwrap().release_info, show.preview().unwrap().imdb_rating), (None, None));
     assert_eq!(SavedTitle { key: "nocolon".into(), ..show.clone() }.preview(), None);
     db.remove_saved_title("movie:tt1").unwrap();
     assert_eq!(db.saved_titles().unwrap().into_iter().map(|t| t.key).collect::<Vec<_>>(), ["series:tt2"]);

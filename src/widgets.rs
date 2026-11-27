@@ -5,6 +5,21 @@ use eframe::egui;
 use egui::{Align, Color32, Layout, RichText, Sense, pos2, vec2};
 use std::sync::Arc;
 
+/// Dark palette (warm "stone" grays): page, raised surface, hairline border, card year text.
+pub const BG: Color32 = Color32::from_rgb(12, 10, 9);
+pub const RAISED: Color32 = Color32::from_rgb(28, 25, 23);
+/// rgba(231, 229, 228, 0.08), premultiplied.
+pub const HAIRLINE: Color32 = Color32::from_rgba_premultiplied(18, 18, 18, 20);
+pub const MUTED: Color32 = Color32::from_rgb(120, 113, 108);
+/// Text on the light gray Play pill.
+const INK: Color32 = Color32::from_rgb(15, 23, 42);
+/// Fill of the dark round and pill buttons, and the hovered shade.
+const DARK_BUTTON: [Color32; 2] = [Color32::from_rgb(41, 40, 46), Color32::from_rgb(58, 56, 64)];
+/// Text and icons on the dark buttons.
+const WARM_WHITE: Color32 = Color32::from_rgb(255, 241, 225);
+/// Height of the floating header; pages without a full-bleed banner start below it.
+pub const HEADER_H: f32 = 64.0;
+
 /// Validation and failure text.
 pub const ERROR: Color32 = Color32::from_rgb(230, 90, 90);
 /// Selectable accent colors; the first is the logo's purple.
@@ -46,22 +61,23 @@ pub fn surface(alpha: u8) -> Color32 {
 pub fn apply_theme(ctx: &egui::Context, light: bool) {
     for (theme, is_light) in [(egui::Theme::Dark, false), (egui::Theme::Light, true)] {
         let mut v = if is_light { egui::Visuals::light() } else { egui::Visuals::dark() };
-        v.panel_fill = if is_light { Color32::from_gray(245) } else { Color32::from_rgb(20, 20, 20) };
-        v.window_fill = v.panel_fill;
-        v.extreme_bg_color = if is_light { Color32::WHITE } else { Color32::from_gray(32) };
+        v.panel_fill = if is_light { Color32::from_gray(245) } else { BG };
+        v.window_fill = if is_light { v.panel_fill } else { RAISED };
+        v.window_stroke = egui::Stroke::new(1.0, if is_light { Color32::from_gray(215) } else { HAIRLINE });
+        v.extreme_bg_color = if is_light { Color32::WHITE } else { RAISED };
         v.selection.bg_fill = accent();
         if !is_light {
             // Keep the old dark palette: egui's defaults are dimmer than the grays used before theming.
-            v.widgets.noninteractive.fg_stroke.color = Color32::from_gray(200);
-            v.weak_text_color = Some(Color32::from_gray(170));
+            v.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(214, 211, 209);
+            v.weak_text_color = Some(Color32::from_rgb(168, 162, 158));
         } else {
             v.weak_text_color = Some(Color32::from_gray(95));
         }
         // Netflix-style flat buttons: no outline or grow on hover, gray that dims when hovered.
         let w = &mut v.widgets;
-        let grays = if is_light { [215, 200, 185, 200] } else { [82, 56, 45, 56] };
+        let grays = if is_light { [215, 200, 185, 200].map(Color32::from_gray) } else { [DARK_BUTTON[0], DARK_BUTTON[1], RAISED, DARK_BUTTON[1]] };
         for (st, gray) in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open].into_iter().zip(grays) {
-            (st.weak_bg_fill, st.bg_stroke, st.corner_radius, st.expansion) = (Color32::from_gray(gray), egui::Stroke::NONE, 4.into(), 0.0);
+            (st.weak_bg_fill, st.bg_stroke, st.corner_radius, st.expansion) = (gray, egui::Stroke::NONE, 4.into(), 0.0);
             st.fg_stroke.color = if is_light { Color32::BLACK } else { Color32::WHITE };
         }
         ctx.set_visuals_of(theme, v);
@@ -90,12 +106,16 @@ pub mod icons {
     pub const ARROW_LEFT: &str = "\u{E058}";
     pub const ARROWS_IN: &str = "\u{E09A}";
     pub const ARROWS_OUT: &str = "\u{E0A2}";
+    pub const CARET_DOWN: &str = "\u{E136}";
     pub const CARET_LEFT: &str = "\u{E138}";
     pub const CHECK: &str = "\u{E182}";
     pub const MAGNIFYING_GLASS: &str = "\u{E30C}";
     pub const PAUSE: &str = "\u{E39E}";
     pub const PLAY: &str = "\u{E3D0}";
     pub const PLUS: &str = "\u{E3D4}";
+    pub const LIST_PLUS: &str = "\u{E2F8}";
+    pub const PUZZLE_PIECE: &str = "\u{E596}";
+    pub const STAR: &str = "\u{E46A}";
     pub const SKIP_FORWARD: &str = "\u{E5A6}";
     pub const SPEAKER_HIGH: &str = "\u{E44A}";
     pub const SPEAKER_X: &str = "\u{E45C}";
@@ -143,11 +163,12 @@ pub fn section_heading(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Resp
     ui.label(t)
 }
 
-/// Section heading spaced apart from what comes before it.
+/// Heading of a poster row: medium-size, soft white, spaced apart from what comes before it.
 pub fn row_title(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(22.0);
-    section_heading(ui, title);
-    ui.add_space(4.0);
+    ui.add_space(30.0);
+    let c = if ui.visuals().dark_mode { Color32::from_rgb(231, 229, 228) } else { ui.visuals().strong_text_color() };
+    ui.label(RichText::new(title).size(18.0).color(c));
+    ui.add_space(8.0);
 }
 
 /// Secondary line of explanation or status.
@@ -187,9 +208,6 @@ fn focus_ring(ui: &egui::Ui, r: &egui::Response, radius: u8) {
     }
 }
 
-/// Size of the hero banner's buttons.
-const HERO_BUTTON: egui::Vec2 = egui::Vec2::new(130.0, 46.0);
-
 /// Sets the fill of the button drawn next in `ui`: `fill` = [normal, hovered], no outline.
 pub fn pill_style(ui: &mut egui::Ui, fill: [Color32; 2], fg: Color32) {
     let w = &mut ui.visuals_mut().widgets;
@@ -220,11 +238,6 @@ fn with_widgets<R>(ui: &mut egui::Ui, style: impl FnOnce(&mut egui::Ui), add: im
     r
 }
 
-/// A hero-sized pill to build other controls from, such as a menu button.
-pub fn hero_pill<'a>(text: &str) -> egui::Button<'a> {
-    pill_widget(text, 18.0, HERO_BUTTON)
-}
-
 fn pill_button(ui: &mut egui::Ui, text: &str, size: f32, min: egui::Vec2, fill: [Color32; 2], fg: Color32) -> egui::Response {
     let r = with_widgets(ui, |ui| pill_style(ui, fill, fg), |ui| ui.add(pill_widget(text, size, min)));
     let name = spoken(text);
@@ -236,28 +249,24 @@ fn spoken(text: &str) -> String {
     text.chars().filter(|c| !('\u{E000}'..='\u{F8FF}').contains(c)).collect::<String>().trim().to_owned()
 }
 
-/// White primary pill (Netflix "Play") and translucent gray secondary pill.
+/// Light gray primary pill (Play) and dark secondary pill.
 pub fn white_fill() -> [Color32; 2] {
-    [Color32::WHITE, Color32::from_white_alpha(191)]
+    [Color32::from_rgba_unmultiplied(227, 227, 227, 204), Color32::from_rgb(240, 240, 240)]
 }
 pub fn gray_fill() -> [Color32; 2] {
-    [Color32::from_rgba_unmultiplied(109, 109, 110, 179), Color32::from_rgba_unmultiplied(109, 109, 110, 102)]
-}
-
-pub fn hero_button(ui: &mut egui::Ui, text: &str, fill: [Color32; 2], text_color: Color32) -> egui::Response {
-    pill_button(ui, text, 18.0, HERO_BUTTON, fill, text_color)
+    DARK_BUTTON
 }
 
 /// Small secondary pill for toolbar actions (Uninstall, Clear, Stop …).
 pub fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    let (fill, fg) = if ui.visuals().dark_mode { (gray_fill(), Color32::WHITE) } else { ([tint(ui, 34), tint(ui, 20)], ui.visuals().strong_text_color()) };
+    let (fill, fg) = if ui.visuals().dark_mode { (gray_fill(), WARM_WHITE) } else { ([tint(ui, 34), tint(ui, 20)], ui.visuals().strong_text_color()) };
     pill_button(ui, text, 14.0, vec2(0.0, 32.0), fill, fg)
 }
 
 /// Small white pill for the main action in a row (Install, Play …).
 pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     // A white pill vanishes on the light panel.
-    let (fill, fg) = if ui.visuals().dark_mode { (white_fill(), Color32::BLACK) } else { ([Color32::BLACK, Color32::from_gray(60)], Color32::WHITE) };
+    let (fill, fg) = if ui.visuals().dark_mode { (white_fill(), INK) } else { ([Color32::BLACK, Color32::from_gray(60)], Color32::WHITE) };
     pill_button(ui, text, 14.0, vec2(0.0, 32.0), fill, fg)
 }
 
@@ -512,6 +521,21 @@ pub fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Respons
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Popup menu row with a leading icon (Settings, Addons …).
+pub fn menu_item(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::MenuItem, true, label));
+    focus_ring(ui, &r, 6);
+    let p = ui.painter();
+    if r.hovered() {
+        p.rect_filled(rect, 6, tint(ui, 14));
+    }
+    let c = ui.visuals().text_color();
+    p.text(pos2(rect.left() + 12.0, rect.center().y), egui::Align2::LEFT_CENTER, icon, egui::FontId::new(16.0, phosphor()), c);
+    p.text(pos2(rect.left() + 38.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(15.0), c);
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Netflix episode-list row: index, bold name, gray details, play circle; highlights on hover.
 /// `reserve`: extra width kept free of text on the right (for an overlaid button).
 pub fn list_row(ui: &mut egui::Ui, n: usize, head: String, details: String, reserve: f32) -> egui::Response {
@@ -547,21 +571,221 @@ pub fn list_row(ui: &mut egui::Ui, n: usize, head: String, details: String, rese
     r
 }
 
+/// Vertical gradient over `rect`, `top` color fading to `bottom`.
+pub fn fade(painter: &egui::Painter, rect: egui::Rect, top: Color32, bottom: Color32) {
+    let mut m = egui::Mesh::default();
+    for (p, c) in [(rect.left_top(), top), (rect.right_top(), top), (rect.right_bottom(), bottom), (rect.left_bottom(), bottom)] {
+        m.colored_vertex(p, c);
+    }
+    m.add_triangle(0, 1, 2);
+    m.add_triangle(0, 2, 3);
+    painter.add(m);
+}
+
+/// Horizontal gradient over `rect`, `left` color fading to `right`.
+pub fn fade_x(painter: &egui::Painter, rect: egui::Rect, left: Color32, right: Color32) {
+    let mut m = egui::Mesh::default();
+    for (p, c) in [(rect.left_top(), left), (rect.right_top(), right), (rect.right_bottom(), right), (rect.left_bottom(), left)] {
+        m.colored_vertex(p, c);
+    }
+    m.add_triangle(0, 1, 2);
+    m.add_triangle(0, 2, 3);
+    painter.add(m);
+}
+
+/// Translucent, fully rounded backing of the header's nav group and search button.
+pub fn island(painter: &egui::Painter, rect: egui::Rect) {
+    let radius = (rect.height() / 2.0) as u8;
+    painter.rect(rect, radius, Color32::from_rgba_unmultiplied(12, 10, 9, 153), egui::Stroke::new(1.0, HAIRLINE), egui::StrokeKind::Inside);
+}
+
+/// Header nav tab: soft text, or a bright raised pill when `current`.
+pub fn nav_tab(ui: &mut egui::Ui, label: &str, current: bool) -> egui::Response {
+    let g = ui.painter().layout_no_wrap(label.into(), egui::FontId::proportional(14.0), Color32::WHITE);
+    let (rect, r) = ui.allocate_exact_size(vec2(g.size().x + 30.0, 34.0), Sense::click());
+    r.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, current, label));
+    let fg = if current { Color32::from_rgb(250, 250, 249) } else if r.hovered() { Color32::from_rgb(245, 245, 244) } else { Color32::from_rgb(214, 211, 209) };
+    if r.hovered() && !current {
+        ui.painter().rect_filled(rect, 17, Color32::from_white_alpha(8));
+    }
+    focus_ring(ui, &r, 17);
+    ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The current nav tab's pill; it slides between tabs, so the caller places it under them.
+pub fn nav_pill(rect: egui::Rect) -> egui::Shape {
+    egui::epaint::RectShape::new(rect, 17, Color32::from_rgba_unmultiplied(231, 229, 228, 20), egui::Stroke::new(1.0, HAIRLINE), egui::StrokeKind::Inside).into()
+}
+
+/// Round icon button on an `island`, like the header's search button.
+pub fn island_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(vec2(42.0, 42.0), Sense::click());
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    island(ui.painter(), rect);
+    if r.hovered() {
+        ui.painter().circle_filled(rect.center(), 20.0, Color32::from_white_alpha(10));
+    }
+    focus_ring(ui, &r, 21);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::new(17.0, phosphor()), Color32::from_rgb(250, 250, 249));
+    r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(label)
+}
+
+/// Round avatar with the profile's initial, ringed like the header's profile button.
+pub fn avatar(ui: &mut egui::Ui, name: &str) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Profile menu"));
+    let c = rect.center();
+    ui.painter().circle_filled(c, 17.5, Color32::from_rgba_unmultiplied(231, 229, 228, 40));
+    ui.painter().circle_filled(c, 16.5, Color32::from_black_alpha(160));
+    ui.painter().circle_filled(c, 16.0, if r.hovered() { Color32::from_rgb(130, 133, 244) } else { Color32::from_rgb(99, 102, 241) });
+    focus_ring(ui, &r, 16);
+    let initial = name.chars().next().map_or("?".to_string(), |ch| ch.to_uppercase().collect());
+    ui.painter().text(c, egui::Align2::CENTER_CENTER, initial, egui::FontId::new(14.0, bold()), Color32::WHITE);
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Width `split_button` takes for `text`.
+pub fn split_button_width(ui: &egui::Ui, text: &str) -> f32 {
+    24.0 + 22.0 + ui.painter().layout_no_wrap(text.into(), egui::FontId::new(16.0, bold()), INK).size().x + 20.0 + 44.0
+}
+
+/// Light gray split pill: a main action and a chevron for its options (Play | choose a source).
+/// Returns the main and chevron responses.
+pub fn split_button(ui: &mut egui::Ui, text: &str, arrow_label: &str) -> (egui::Response, egui::Response) {
+    let font = egui::FontId::new(16.0, bold());
+    let g = ui.painter().layout_no_wrap(text.into(), font, INK);
+    let (h, icon_w) = (46.0, 22.0);
+    let main_w = 24.0 + icon_w + g.size().x + 20.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(split_button_width(ui, text), h), Sense::hover());
+    let main_rect = egui::Rect::from_min_size(rect.min, vec2(main_w, h));
+    let arrow_rect = egui::Rect::from_min_max(pos2(main_rect.right(), rect.top()), rect.max);
+    let main = ui.interact(main_rect, ui.scope_id().with(("split", text)), Sense::click());
+    let arrow = ui.interact(arrow_rect, ui.scope_id().with(("split-arrow", text)), Sense::click());
+    main.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
+    arrow.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, arrow_label));
+    let p = ui.painter();
+    p.rect_filled(rect, 23, white_fill()[0]);
+    // Hover lightens only the half under the pointer.
+    for (r, rr, cr) in [(&main, main_rect, egui::CornerRadius { nw: 23, sw: 23, ne: 0, se: 0 }), (&arrow, arrow_rect, egui::CornerRadius { nw: 0, sw: 0, ne: 23, se: 23 })] {
+        if r.hovered() {
+            p.rect_filled(rr, cr, white_fill()[1]);
+        }
+        if r.has_focus() {
+            p.rect_stroke(rr, cr, egui::Stroke::new(2.0, accent()), egui::StrokeKind::Inside);
+        }
+    }
+    p.line_segment([pos2(main_rect.right(), rect.top() + 12.0), pos2(main_rect.right(), rect.bottom() - 12.0)], egui::Stroke::new(1.0, Color32::from_black_alpha(40)));
+    // Play triangle, centroid on its slot's center.
+    let c = pos2(main_rect.left() + 24.0 + icon_w / 2.0 - 2.0, rect.center().y);
+    p.add(egui::Shape::convex_polygon(vec![c + vec2(-5.0, -7.5), c + vec2(9.0, 0.0), c + vec2(-5.0, 7.5)], INK, egui::Stroke::NONE));
+    p.galley(pos2(main_rect.left() + 24.0 + icon_w + 2.0, rect.center().y - g.size().y / 2.0), g, INK);
+    p.text(arrow_rect.center() + vec2(-2.0, 0.0), egui::Align2::CENTER_CENTER, icons::CARET_DOWN, egui::FontId::new(16.0, phosphor()), INK);
+    (main.on_hover_cursor(egui::CursorIcon::PointingHand), arrow.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(arrow_label))
+}
+
+/// Dark round icon button beside the Play pill (add to library …).
+pub fn round_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
+    let r = with_widgets(ui, |ui| pill_style(ui, DARK_BUTTON, WARM_WHITE), |ui| ui.add(round_pill(icon)));
+    r.accessible_name(label).on_hover_text(label).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The round dark button as a widget, to build other controls from, such as a menu button.
+pub fn round_pill<'a>(icon: &str) -> egui::Button<'a> {
+    egui::Button::new(RichText::new(icon).size(18.0).family(phosphor()).color(WARM_WHITE)).min_size(vec2(47.0, 47.0)).corner_radius(24).fill(DARK_BUTTON[0])
+}
+
+/// Dark pill with an icon and label beside the Play pill (Library, Trailer).
+pub fn dark_pill(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    pill_button(ui, text, 16.0, vec2(0.0, 46.0), DARK_BUTTON, WARM_WHITE)
+}
+
+/// The dark pill as a widget, to build other controls from, such as a menu button.
+/// Sets the style of every button `ui` adds after it, so call it in a scope of its own.
+pub fn dark_pill_widget<'a>(ui: &mut egui::Ui, text: &str) -> egui::Button<'a> {
+    pill_style(ui, DARK_BUTTON, WARM_WHITE);
+    pill_widget(text, 16.0, vec2(0.0, 46.0))
+}
+
+/// Small outlined chip, such as a genre or the title's type.
+pub fn tag(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let g = ui.painter().layout_no_wrap(text.into(), egui::FontId::proportional(12.5), Color32::from_rgb(231, 229, 228));
+    let (rect, r) = ui.allocate_exact_size(g.size() + vec2(20.0, 10.0), Sense::hover());
+    ui.painter().rect(rect, (rect.height() / 2.0) as u8, Color32::from_white_alpha(8), egui::Stroke::new(1.0, Color32::from_white_alpha(24)), egui::StrokeKind::Inside);
+    ui.painter().galley(rect.center() - g.size() / 2.0, g, Color32::from_rgb(231, 229, 228));
+    r
+}
+
+/// Round initials badge with the name under it, for a cast member; clickable.
+pub fn person(ui: &mut egui::Ui, name: &str) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(vec2(84.0, 108.0), Sense::click());
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
+    let c = pos2(rect.center().x, rect.top() + 40.0);
+    let p = ui.painter();
+    p.circle(c, 39.0, if r.hovered() { DARK_BUTTON[1] } else { RAISED }, egui::Stroke::new(1.0, Color32::from_white_alpha(30)));
+    let initials: String = name.split_whitespace().filter_map(|w| w.chars().next()).take(2).flat_map(char::to_uppercase).collect();
+    p.text(c, egui::Align2::CENTER_CENTER, initials, egui::FontId::new(22.0, bold()), Color32::from_rgb(214, 211, 209));
+    let mut job = egui::text::LayoutJob::simple_singleline(name.to_owned(), egui::FontId::proportional(12.0), Color32::from_rgb(214, 211, 209));
+    job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width());
+    let g = p.layout_job(job);
+    p.galley(pos2(rect.center().x - g.size().x / 2.0, rect.top() + 90.0), g, Color32::from_rgb(214, 211, 209));
+    focus_ring(ui, &r, 12);
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 // Cards
 
 pub const CARD: egui::Vec2 = egui::Vec2::new(150.0, 225.0);
 /// A hovered or focused card's scale.
 pub const GROW: f32 = 1.06;
 
-/// Netflix-style card: no border, grows on hover/focus, shrinks while pressed.
-/// Returns the click response and the animated rect to paint into.
+/// Height of the title and year lines under a card.
+pub const CAPTION_H: f32 = 44.0;
+
+/// Poster card with room for `card_caption` under it: grows on hover/focus, shrinks while pressed.
+/// Returns the click response (poster and caption) and the animated poster rect to paint into.
 pub fn card(ui: &mut egui::Ui, size: egui::Vec2, label: &str) -> (egui::Response, egui::Rect) {
     // Reserve room for the grown card so the scroll area doesn't clip it.
-    let (slot, r) = ui.allocate_exact_size(size * GROW, Sense::click());
+    let (slot, r) = ui.allocate_exact_size(size * GROW + vec2(0.0, CAPTION_H), Sense::click());
     r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     let target = if r.is_pointer_button_down_on() { 0.96 } else if r.contains_pointer() || r.has_focus() { GROW } else { 1.0 };
     let s = ui.ctx().animate_value_with_time(r.id, target, 0.15);
-    (r, egui::Rect::from_center_size(slot.center(), size * s))
+    let poster = egui::Rect::from_min_size(slot.min, size * GROW);
+    (r, egui::Rect::from_center_size(poster.center(), size * s))
+}
+
+/// Title and a dim second line (year, progress …) under a `card`, truncated to its width.
+pub fn card_caption(ui: &egui::Ui, card: &egui::Response, title: &str, sub: &str) {
+    let slot = card.rect;
+    let x = slot.left() + slot.width() * (1.0 - 1.0 / GROW) / 2.0;
+    let w = slot.width() / GROW;
+    let top = slot.bottom() - CAPTION_H + 8.0;
+    let hover = card.contains_pointer();
+    let strong = ui.visuals().strong_text_color();
+    let title_c = if hover { strong } else { strong.gamma_multiply(0.94) };
+    let sub_c = if ui.visuals().dark_mode { MUTED } else { ui.visuals().weak_text_color() };
+    for (text, size, color, y) in [(title, 14.0, title_c, top), (sub, 12.0, sub_c, top + 19.0)] {
+        if text.is_empty() {
+            continue;
+        }
+        let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), egui::FontId::proportional(size), color);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(w);
+        let g = ui.painter().layout_job(job);
+        ui.painter().galley(pos2(x, y), g, color);
+    }
+}
+
+/// Small dark rating pill in a card's bottom-right corner.
+pub fn card_badge(ui: &egui::Ui, rect: egui::Rect, text: &str) {
+    let g = ui.painter().layout_no_wrap(text.into(), egui::FontId::proportional(10.5), Color32::WHITE);
+    let b = egui::Rect::from_min_size(rect.right_bottom() - vec2(8.0 + g.size().x + 12.0, 8.0 + 19.0), vec2(g.size().x + 12.0, 19.0));
+    ui.painter().rect_filled(b, 10, Color32::from_black_alpha(153));
+    ui.painter().galley(b.center() - g.size() / 2.0, g, Color32::WHITE);
+}
+
+/// Hairline frame over a painted card, so posters keep an edge on the dark page.
+pub fn card_edge(ui: &egui::Ui, rect: egui::Rect) {
+    ui.painter().rect_stroke(rect, 12, egui::Stroke::new(1.0, if ui.visuals().dark_mode { HAIRLINE } else { Color32::from_black_alpha(20) }), egui::StrokeKind::Inside);
 }
 
 /// Round play button in the middle of a card, shown while the card is hovered or the button focused.
@@ -585,7 +809,7 @@ pub fn card_play(ui: &mut egui::Ui, card: &egui::Response, rect: egui::Rect, lab
 pub fn card_text(ui: &egui::Ui, rect: egui::Rect, text: &str) {
     // Clipped: a very long title would otherwise spill past the card.
     let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
-    p.rect_filled(rect, 6, Color32::from_gray(40));
+    p.rect_filled(rect, 12, RAISED);
     let mut job = egui::text::LayoutJob::simple(text.to_owned(), egui::FontId::proportional(15.0), Color32::WHITE, rect.width() - 16.0);
     job.halign = Align::Center; // each line centered around x = 0
     let g = p.layout_job(job);

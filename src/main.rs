@@ -45,6 +45,9 @@ impl Tab {
     }
 }
 
+/// Side margin of every page; a banner bleeds out through it to the window edges.
+const PAGE_X: i8 = 40;
+
 /// Speed limit choices in bytes/s; 0 is unlimited.
 const SPEED_LIMITS: [(&str, u32); 6] = [("Unlimited", 0), ("500 KB/s", 500_000), ("1 MB/s", 1_000_000), ("2 MB/s", 2_000_000), ("5 MB/s", 5_000_000), ("10 MB/s", 10_000_000)];
 
@@ -622,6 +625,14 @@ fn health_error(e: &anyhow::Error) -> String {
 }
 
 /// Poster art rarely has readable text at card size, so the tooltip leads with the title.
+/// Rating badge on the poster, and the title and year under it.
+fn meta_caption(ui: &egui::Ui, r: &egui::Response, rect: egui::Rect, m: &MetaPreview) {
+    if let Some(rating) = &m.imdb_rating {
+        card_badge(ui, rect, rating);
+    }
+    card_caption(ui, r, &m.name, m.release_info.as_deref().unwrap_or(""));
+}
+
 fn card_tip(m: &MetaPreview) -> String {
     m.description.as_ref().map_or_else(|| m.name.clone(), |d| format!("{}\n\n{d}", m.name))
 }
@@ -1070,6 +1081,8 @@ struct App {
     search: String,
     /// Recent submitted queries, newest first; persisted in settings as `search_history`.
     search_history: Vec<String>,
+    /// The search palette is up.
+    search_open: bool,
     /// Fetched images by URL, or `CARD_KEY` + URL for card-sized ones; a missing key has not been requested.
     posters: HashMap<String, Poster>,
     /// Frame being drawn, stamped on the posters it uses.
@@ -1426,6 +1439,7 @@ impl App {
             magnet: String::new(),
             search: String::new(),
             search_history,
+            search_open: false,
             posters: HashMap::new(),
             poster_frame: 0,
             poster_ppp: 0.0,
@@ -2383,7 +2397,7 @@ impl App {
                     self.leave_player(ctx);
                     // Saved progress keeps this name until the addon's meta renames it.
                     let name = title.or(name).unwrap_or_else(|| id.clone());
-                    self.quick_play(ctx, MetaPreview { id, kind, name, poster: None, background: None, description: None });
+                    self.quick_play(ctx, MetaPreview { id, kind, name, poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] });
                     Ok(serde_json::json!({ "ok": true }))
                 }
             }
@@ -2505,6 +2519,225 @@ impl App {
     }
 
     /// Nav pill position: eases (cubic out) from where it is to the selected tab.
+    /// The title the Home banner shows: the open one, else the first item of the first loaded row.
+    fn featured(&self) -> Option<MetaPreview> {
+        match &self.selected {
+            Some((m, ..)) => Some(m.clone()),
+            None => self.rows.iter().find_map(|r| r.items.as_ref()?.first().cloned()),
+        }
+    }
+
+    /// A locked profile never shows the Addons page, even for one frame; a saved tab or an install link may point there.
+    fn leave_locked_tab(&mut self) {
+        if self.locked() && self.tab == Tab::Addons {
+            self.tab = Tab::Home;
+        }
+    }
+
+    /// Floating header over the page: logo, centered nav and search button, profile menu.
+    /// `scrolled`: the page's scroll offset; the header turns solid as content moves under it.
+    fn ui_header(&mut self, ui: &mut egui::Ui, full: egui::Rect, scrolled: f32) {
+        let ctx = ui.ctx().clone();
+        let bar = egui::Rect::from_min_size(full.min, vec2(full.width(), HEADER_H));
+        let bg = ui.visuals().panel_fill;
+        // Registered before the header's buttons and after the page: clicks between the buttons stop here, not on what scrolled under it.
+        ui.interact(bar, ui.make_persistent_id("header"), Sense::click());
+        // Scrim: a soft fade over a banner, solid once the page scrolls under the header.
+        ui.painter().rect_filled(bar, 0, bg.gamma_multiply((scrolled / 60.0).clamp(0.0, 1.0)));
+        fade(ui.painter(), bar.with_max_y(bar.bottom() + 24.0), bg.gamma_multiply(0.92), Color32::TRANSPARENT);
+        let inner = bar.shrink2(vec2(f32::from(PAGE_X), 0.0));
+        ui.scope_builder(UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)), |ui| {
+            ui.add(egui::Image::new((logo(ui.ctx()).id(), vec2(28.0, 28.0))).alt_text("Stremflix-rs"));
+            ui.add_space(2.0);
+            ui.label(RichText::new("Stremflix").size(17.0).family(bold()).color(ui.visuals().strong_text_color()));
+            if self.selected.is_some() && self.tab == Tab::Home {
+                ui.add_space(14.0);
+                if island_button(ui, icons::ARROW_LEFT, "Back to browse").clicked() {
+                    self.close_details();
+                }
+            }
+            // A clicked title shows no page until its addons reply.
+            if let Some(title) = self.loading() {
+                ui.add_space(12.0);
+                ui.spinner().on_hover_text(format!("Loading {title}"));
+            }
+        });
+        let locked = self.locked();
+        // Nav island and search button, centered on the window as one group.
+        let tabs = [(Tab::Home, "Home"), (Tab::Discover, "Discover"), (Tab::Library, "Library")];
+        let tab_w: f32 = tabs.iter().map(|(_, n)| ui.painter().layout_no_wrap((*n).into(), egui::FontId::proportional(14.0), Color32::WHITE).size().x + 30.0).sum();
+        let nav_w = tab_w + 2.0 * (tabs.len() - 1) as f32 + 10.0;
+        let left = bar.center().x - (nav_w + 10.0 + 42.0) / 2.0;
+        let nav = egui::Rect::from_min_size(pos2(left, bar.center().y - 22.0), vec2(nav_w, 44.0));
+        island(ui.painter(), nav);
+        let pill_slot = ui.painter().add(egui::Shape::Noop);
+        let mut sel_rect = None;
+        ui.scope_builder(UiBuilder::new().max_rect(nav.shrink(5.0)).layout(Layout::left_to_right(Align::Center)), |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (tab, name) in tabs {
+                // The search page is not a tab, so nothing is current while it is up.
+                let current = self.tab == tab && (self.search_page.is_none() || self.selected.is_some());
+                let r = nav_tab(ui, name, current);
+                if current {
+                    sel_rect = Some(r.rect);
+                }
+                if r.clicked() {
+                    self.go_tab(tab);
+                }
+            }
+        });
+        if let Some(target) = sel_rect {
+            let rect = self.pill_rect(&ctx, target);
+            ui.painter().set(pill_slot, nav_pill(rect));
+        }
+        let search = egui::Rect::from_min_size(pos2(nav.right() + 10.0, bar.center().y - 21.0), vec2(42.0, 42.0));
+        let r = ui.put(search, |ui: &mut egui::Ui| island_button(ui, icons::MAGNIFYING_GLASS, "Search"));
+        // "/" (when not typing) or Ctrl+F opens search too.
+        if r.clicked() || ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F) || (!self.had_focus && i.consume_key(egui::Modifiers::NONE, egui::Key::Slash))) {
+            // Opens empty, so recent searches show.
+            (self.search_open, self.search) = (true, String::new());
+        }
+        let shown = if self.profile.is_empty() { "Default".to_string() } else { self.profile.clone() };
+        let r = ui.put(egui::Rect::from_center_size(pos2(inner.right() - 16.0, bar.center().y), vec2(32.0, 32.0)), |ui: &mut egui::Ui| avatar(ui, &shown));
+        egui::Popup::menu(&r).align(egui::RectAlign::BOTTOM_END).show(|ui| {
+            ui.set_width(200.0);
+            menu_heading(ui, &shown);
+            if !locked && menu_item(ui, icons::PUZZLE_PIECE, "Addons").clicked() {
+                self.go_tab(Tab::Addons);
+            }
+            if menu_item(ui, icons::GEAR, "Settings").clicked() {
+                self.go_tab(Tab::Settings);
+            }
+        });
+    }
+
+    /// Search as a centered command palette over the dimmed page: query field, then recent searches.
+    fn ui_search_palette(&mut self, ctx: &egui::Context) {
+        if !self.search_open {
+            return;
+        }
+        let id = egui::Id::unique("search_palette");
+        let area = egui::Modal::default_area(id).anchor(egui::Align2::CENTER_TOP, vec2(0.0, 120.0));
+        let frame = egui::Frame::popup(&ctx.global_style()).corner_radius(14).inner_margin(0);
+        let (mut run, mut del, mut clear) = (None, None, false);
+        let resp = egui::Modal::new(id).area(area).frame(frame).backdrop_color(Color32::from_black_alpha(170)).show(ctx, |ui| {
+            ui.set_width((ctx.content_rect().width() - 32.0).min(576.0));
+            let weak = ui.visuals().weak_text_color();
+            egui::Frame::NONE.inner_margin(egui::Margin::symmetric(18, 12)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icons::MAGNIFYING_GLASS).family(phosphor()).size(18.0).color(weak));
+                    let edit = egui::TextEdit::singleline(&mut self.search).hint_text("Search titles, people, genres…").frame(egui::Frame::NONE).font(egui::FontId::proportional(16.0)).desired_width(ui.available_width() - 52.0);
+                    let r = ui.add(edit).accessible_name("Search");
+                    // Checked before focus is taken back below, which would clear `lost_focus`.
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.search.trim().is_empty() {
+                        run = Some(self.search.clone());
+                    } else if ui.memory(|m| m.focused().is_none()) {
+                        r.request_focus();
+                    }
+                    tag(ui, "ESC");
+                });
+            });
+            let line = ui.cursor().top();
+            ui.painter().hline(ui.max_rect().x_range(), line, egui::Stroke::new(1.0, HAIRLINE));
+            egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 10)).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                if !self.search.trim().is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(18.0);
+                        muted(ui, "Press Enter to search");
+                        ui.add_space(18.0);
+                    });
+                } else if self.search_history.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(28.0);
+                        muted(ui, "Start typing to search...");
+                        ui.add_space(28.0);
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        caption(ui, "Recent searches");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| clear = link_button(ui, "Clear").clicked());
+                    });
+                    for (i, q) in self.search_history.iter().enumerate() {
+                        let r = menu_item(ui, icons::MAGNIFYING_GLASS, q);
+                        let x = egui::Rect::from_center_size(pos2(r.rect.right() - 20.0, r.rect.center().y), vec2(28.0, 28.0));
+                        let xr = ui.interact(x, r.id.with("remove"), Sense::click()).on_hover_text("Remove");
+                        xr.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Remove {q} from recent searches")));
+                        if r.hovered() || xr.hovered() {
+                            ui.painter().text(x.center(), egui::Align2::CENTER_CENTER, icons::X, egui::FontId::new(14.0, phosphor()), weak);
+                        }
+                        if xr.clicked() {
+                            del = Some(i);
+                        } else if r.clicked() {
+                            run = Some(q.clone());
+                        }
+                    }
+                }
+            });
+        });
+        if clear || del.is_some() {
+            match del {
+                Some(i) => drop(self.search_history.remove(i)),
+                None => self.search_history.clear(),
+            }
+            self.save_search_history();
+        }
+        if let Some(q) = run {
+            self.search = q;
+            self.search(ctx);
+            self.search_open = false;
+        } else if resp.should_close() {
+            self.search_open = false;
+        }
+    }
+
+    /// Errors, notices and the update offer as cards in the bottom-right corner.
+    fn ui_toasts(&mut self, ctx: &egui::Context) {
+        if self.error.is_none() && self.notice.is_none() && self.update.is_none() {
+            return;
+        }
+        egui::Area::new(egui::Id::unique("toasts")).order(egui::Order::Foreground).anchor(egui::Align2::RIGHT_BOTTOM, vec2(-24.0, -24.0)).show(ctx, |ui| {
+            ui.set_max_width(440.0);
+            let toast = |ui: &mut egui::Ui| egui::Frame::popup(ui.style()).corner_radius(12).inner_margin(egui::Margin::symmetric(14, 8));
+            if let Some(e) = self.error.clone()
+                && toast(ui).show(ui, |ui| dismissible(ui, RichText::new(format!("Error: {e}")).color(ERROR))).inner
+            {
+                self.error = None;
+            }
+            if let Some(n) = self.notice.clone()
+                && toast(ui).show(ui, |ui| dismissible(ui, n)).inner
+            {
+                self.notice = None;
+            }
+            if let Some((url, asset)) = self.update.clone() {
+                toast(ui).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(32.0);
+                        ui.label("A new version is available.");
+                        if self.installing {
+                            ui.spinner();
+                            ui.label("Installing…");
+                        } else if let Some(asset) = asset
+                            && small_button(ui, "Install").on_hover_text("Download it and replace this build; it runs after a restart").clicked()
+                        {
+                            self.installing = true;
+                            let (tx, ctx) = (self.tx.clone(), ui.ctx().clone());
+                            self.rt.spawn(async move {
+                                let _ = tx.send(Msg::UpdateInstalled(stremflix_rs::update::install(&asset).await.map_err(|e| format!("{e:#}"))));
+                                ctx.request_repaint();
+                            });
+                        }
+                        ui.hyperlink_to("Release page", url);
+                        if !self.installing && small_button(ui, "Dismiss").clicked() {
+                            self.update = None;
+                        }
+                    });
+                });
+            }
+        });
+    }
+
     fn pill_rect(&mut self, ctx: &egui::Context, target: egui::Rect) -> egui::Rect {
         const DURATION: f64 = 0.35;
         let now = ctx.input(|i| i.time);
@@ -2816,7 +3049,7 @@ impl App {
     /// "Add to list" menu: a checkbox per list, plus a new list that gets `meta`.
     fn list_menu(&mut self, ui: &mut egui::Ui, meta: &MetaPreview) {
         let t = SavedTitle { key: format!("{}:{}", meta.kind, meta.id), title: meta.name.clone(), kind: meta.kind.clone(), poster: meta.poster.clone(), year: None, rating: None, last_watched: None };
-        egui::containers::menu::MenuButton::from_button(hero_pill(&format!("{}  Add to list", icons::PLUS))).ui(ui, |ui| {
+        let r = egui::containers::menu::MenuButton::from_button(round_pill(icons::LIST_PLUS)).ui(ui, |ui| {
             let mut change = None;
             for l in &self.lists {
                 let mut on = l.keys.contains(&t.key);
@@ -2842,6 +3075,7 @@ impl App {
                 self.lists_changed(res);
             }
         });
+        r.0.accessible_name("Add to list").on_hover_text("Add to list");
     }
 
     /// Progress key and player title of the selected movie or episode.
@@ -2971,7 +3205,7 @@ impl App {
             }
             DeepLink::Detail { kind, id, video } => {
                 self.tab = Tab::Home;
-                let meta = MetaPreview { name: id.clone(), id, kind, poster: None, background: None, description: None };
+                let meta = MetaPreview { name: id.clone(), id, kind, poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
                 // Only an episode link opens a stream picker; `(id, None)` would autoplay the next episode.
                 let pending = video.filter(|_| meta.kind == "series").map(|v| (meta.id.clone(), Some(v)));
                 self.open_meta(ctx, meta, false);
@@ -2986,7 +3220,7 @@ impl App {
         let Some((kind, id)) = p.key.split_once(':').filter(|(k, _)| !matches!(*k, "btih" | "file")) else {
             return self.play(ctx, p.key, p.title, p.source, vec![]);
         };
-        let mut meta = MetaPreview { id: id.into(), kind: kind.into(), name: p.title.clone(), poster: p.poster.clone(), background: None, description: None };
+        let mut meta = MetaPreview { id: id.into(), kind: kind.into(), name: p.title.clone(), poster: p.poster.clone(), background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         if kind == "series" {
             let saved = self.db.setting(&format!("series:{}", p.key)).ok().flatten();
             meta.id = saved.unwrap_or_else(|| series_id(id).into());
@@ -3130,12 +3364,9 @@ impl App {
         let ctx = ui.ctx().clone();
         let (mut want, mut open, mut play, mut quick, mut resume) = (Vec::new(), None, None, None, None);
         let mut remove: Option<String> = None;
-        let featured = match &self.selected {
-            Some((m, ..)) => Some(m.clone()),
-            None => self.rows.iter().find_map(|r| r.items.as_ref()?.first().cloned()),
-        };
-        match featured {
-            Some(meta) => self.ui_hero(ui, &meta, &mut want, &mut open, &mut play),
+        let mut trailer = None;
+        match self.featured() {
+            Some(meta) => self.ui_hero(ui, &meta, &mut want, &mut open, &mut play, &mut trailer),
             None if self.rows.is_empty() => {
                 ui.add_space(40.0);
                 muted(ui, "Install an addon with a catalog in Addons to start browsing.");
@@ -3147,12 +3378,20 @@ impl App {
         }
         let mut person = None;
         if let Some(d) = self.selected_details()
-            && let Some(t) = Self::ui_details(ui, d, &mut person)
+            && let Some(t) = trailer
             && let Some(src) = t.source()
         {
             // Not `play`: its `nav` bump would drop the title's still-loading streams and episodes.
             let key = format!("{TRAILER}{}", t.yt_id.clone().unwrap_or_default());
             let _ = self.tx.send(Msg::Play(key, format!("{} - {}", d.name, t.title.as_deref().unwrap_or("Trailer")), src.clone(), src, vec![], None, self.nav));
+        }
+        // The open title's page reads in a centered column, like its banner.
+        let col_w = ui.available_width().min(1024.0);
+        let mut col = ui.new_child(UiBuilder::new().max_rect(egui::Rect::from_min_size(pos2(ui.cursor().left() + (ui.available_width() - col_w) / 2.0, ui.cursor().top()), vec2(col_w, f32::INFINITY))));
+        let ui_outer = &mut *ui;
+        let ui = &mut col;
+        if let Some(d) = self.selected_details() {
+            Self::ui_details(ui, d, &mut person);
         }
         let mut episode = None;
         let mut fresh_click: Option<(MetaPreview, String)> = None;
@@ -3164,7 +3403,7 @@ impl App {
             && let Some(key) = self.play_key()
             && (self.episodes.is_empty() || self.episode.is_some())
         {
-            ui.add_space(16.0);
+            ui.add_space(36.0);
             ui.horizontal(|ui| {
                 let r = page_heading(ui, "Streams");
                 if std::mem::take(&mut self.show_streams) {
@@ -3217,7 +3456,7 @@ impl App {
         if let Some((meta, ..)) = &self.selected
             && !self.episodes.is_empty()
         {
-            ui.add_space(16.0);
+            ui.add_space(36.0);
             ui.horizontal(|ui| {
                 let r = page_heading(ui, "Episodes");
                 if self.episode.is_none() && std::mem::take(&mut self.show_streams) {
@@ -3261,6 +3500,11 @@ impl App {
                 }
             }
         }
+        let used = col.min_rect();
+        let ui = ui_outer;
+        if self.selected.is_some() {
+            ui.advance_cursor_after_rect(used);
+        }
         if !self.recent.is_empty() {
             row_title(ui, "Continue Watching");
             egui::ScrollArea::horizontal().id_salt("recent").show(ui, |ui| {
@@ -3270,6 +3514,7 @@ impl App {
                         self.paint_poster(ui, &r, rect, &p.poster, &p.title, &mut want);
                         // Unknown duration: no total and no progress bar.
                         let at = if p.duration > 0.0 { format!("{} / {}", fmt_time(p.position), fmt_time(p.duration)) } else { fmt_time(p.position) };
+                        card_caption(ui, &r, &p.title, &at);
                         let r = r.on_hover_text(format!("{} ({at})", p.title));
                         if p.duration > 0.0 {
                             let frac = (p.position / p.duration).clamp(0.0, 1.0) as f32;
@@ -3311,6 +3556,7 @@ impl App {
                         let label = format!("{} S{}E{}", m.name, v.season.unwrap_or(0), v.episode.unwrap_or(0));
                         let (r, rect) = card(ui, CARD, &label);
                         self.paint_poster(ui, &r, rect, &m.poster, &m.name, &mut want);
+                        card_caption(ui, &r, &m.name, &format!("S{}E{}{}", v.season.unwrap_or(0), v.episode.unwrap_or(0), v.title.as_deref().map(|t| format!(" · {t}")).unwrap_or_default()));
                         if r.on_hover_text(label).clicked() {
                             fresh_click = Some((m.clone(), v.id.clone()));
                         }
@@ -3325,7 +3571,8 @@ impl App {
                     for w in &self.watched {
                         let (r, rect) = card(ui, CARD, &w.title);
                         self.paint_poster(ui, &r, rect, &w.poster, &w.title, &mut want);
-                        let meta = w.key.split_once(':').map(|(kind, id)| MetaPreview { id: id.into(), kind: kind.into(), name: w.title.clone(), poster: w.poster.clone(), background: None, description: None });
+                        card_caption(ui, &r, &w.title, &if w.episodes > 0 { format!("{} episodes watched", w.episodes) } else { "Watched".to_string() });
+                        let meta = w.key.split_once(':').map(|(kind, id)| MetaPreview { id: id.into(), kind: kind.into(), name: w.title.clone(), poster: w.poster.clone(), background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] });
                         if card_play(ui, &r, rect, &w.title) {
                             quick = meta.clone();
                         }
@@ -3523,6 +3770,7 @@ impl App {
                         // About a row of cards before the end, so the next page is on its way when the grid runs out.
                         near_end |= i + 6 >= items.len() && ui.is_rect_visible(r.rect);
                         self.paint_poster(ui, &r, rect, &m.poster, &m.name, &mut want);
+                        meta_caption(ui, &r, rect, m);
                         if card_play(ui, &r, rect, &m.name) {
                             quick = Some(m.clone());
                         }
@@ -3572,7 +3820,7 @@ impl App {
         // Cards past the viewport are not built at all; the spare ones keep Tab able to walk into the next card.
         const SPARE: usize = 2;
         let mut near_end = false;
-        let slot = CARD * GROW;
+        let slot = CARD * GROW + vec2(0.0, CAPTION_H);
         let step = slot.x + ui.spacing().item_spacing.x;
         egui::ScrollArea::horizontal().id_salt(salt).show_viewport(ui, |ui, view| {
             ui.set_width((step * items.len() as f32 - ui.spacing().item_spacing.x).max(0.0));
@@ -3592,6 +3840,7 @@ impl App {
                     // The scroll viewport clips, so a visible third-to-last card means near the end.
                     near_end |= i + 3 >= items.len() && ui.is_rect_visible(r.rect);
                     self.paint_poster(ui, &r, rect, &m.poster, &m.name, want);
+                    meta_caption(ui, &r, rect, m);
                     if card_play(ui, &r, rect, &m.name) {
                         *quick = Some(m.clone());
                     }
@@ -3611,12 +3860,16 @@ impl App {
         let img = if ui.is_rect_visible(r.rect) { self.card_image(poster, &mut lazy) } else { None };
         want.extend(lazy);
         match img {
-            Some(t) => egui::Image::from_texture(t).alt_text(name).corner_radius(6).paint_at(ui, rect),
+            Some(t) => egui::Image::from_texture(t).alt_text(name).corner_radius(12).paint_at(ui, rect),
             None => card_text(ui, rect, name),
         }
+        card_edge(ui, rect);
     }
 
-    /// Big banner: backdrop (or poster at the right), title, description, Play / More info.
+    /// Edge-to-edge banner under the header: backdrop fading into the page, then the title.
+    /// On Home the title, Play and description are centered; on the open title's page they sit left,
+    /// with its facts and the Library and Trailer buttons. A clicked trailer goes to `trailer`.
+    #[allow(clippy::too_many_arguments)]
     fn ui_hero(
         &mut self,
         ui: &mut egui::Ui,
@@ -3624,126 +3877,256 @@ impl App {
         want: &mut Vec<String>,
         open: &mut Option<(MetaPreview, bool)>,
         play: &mut Option<(String, String, String, Subs)>,
+        trailer: &mut Option<Stream>,
     ) {
-        let w = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(vec2(w, (w * 0.42).clamp(320.0, 560.0)), Sense::hover());
+        let detail = self.selected.as_ref().is_some_and(|(m, ..)| m == meta);
+        let screen = ui.ctx().content_rect();
+        let h = if detail { (screen.height() * 0.7).clamp(440.0, 640.0) } else { (screen.height() * 0.84).clamp(480.0, 800.0) };
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
         if std::mem::take(&mut self.scroll_top) {
             ui.scroll_to_rect(rect, Some(Align::TOP));
         }
-        ui.painter().rect_filled(rect, 12, Color32::from_gray(28));
-        let details = self.selected_details();
-        let (background, logo) = (meta.background.clone().or_else(|| details?.background.clone()), details.and_then(|d| d.logo.clone()));
-        // Background first; fall back to the poster when it is missing or rejected.
-        let bg = self.image(&background, want);
-        let poster = if bg.is_none() { self.image(&meta.poster, want) } else { None };
-        if let Some(t) = bg {
-            egui::Image::from_texture(t).corner_radius(12).uv(cover_uv(rect, t.size)).paint_at(ui, rect);
-            ui.painter().rect_filled(rect, 12, Color32::from_black_alpha(120));
-        } else if let Some(t) = poster {
-            let pw = rect.height() * 2.0 / 3.0;
-            let prect = egui::Rect::from_min_max(pos2(rect.right() - pw, rect.top()), rect.max);
-            egui::Image::from_texture(t).alt_text(&meta.name).corner_radius(12).paint_at(ui, prect);
+        let (background, logo, genres, runtime, year, rating, trailers) = {
+            let d = self.selected_details();
+            (
+                meta.background.clone().or_else(|| d?.background.clone()),
+                d.and_then(|d| d.logo.clone()).or_else(|| meta.logo.clone()),
+                d.map(|d| d.genres.clone()).filter(|g| !g.is_empty()).unwrap_or_else(|| meta.genres.clone()),
+                d.and_then(|d| d.runtime.clone()),
+                d.and_then(|d| d.release_info.clone()).or_else(|| meta.release_info.clone()),
+                d.and_then(|d| d.imdb_rating.clone()).or_else(|| meta.imdb_rating.clone()),
+                d.map(|d| d.trailers.clone()).unwrap_or_default(),
+            )
+        };
+        // Out through the page margins to the window edges, and up under the header.
+        let bleed = rect.expand2(vec2(f32::from(PAGE_X), 0.0));
+        let painter = ui.painter().with_clip_rect(bleed.intersect(screen));
+        let (dark, bg) = (ui.visuals().dark_mode, ui.visuals().panel_fill);
+        painter.rect_filled(bleed, 0, if dark { RAISED } else { Color32::from_gray(225) });
+        // Backdrop first; fall back to the poster when it is missing or rejected.
+        if let Some(t) = self.image(&background, want).or_else(|| self.image(&meta.poster, want)) {
+            painter.image(t.id, bleed, cover_uv(bleed, t.size), Color32::WHITE);
         }
-        let inner = rect.shrink(36.0);
-        let col = egui::Rect::from_min_max(inner.min, pos2(inner.left() + (inner.width() * 0.55).min(620.0), inner.bottom()));
-        ui.scope_builder(UiBuilder::new().max_rect(col).layout(Layout::bottom_up(Align::LEFT)), |ui| {
-            ui.horizontal(|ui| {
-                let mut show_streams = false;
-                if hero_button(ui, &format!("{}  Play", icons::PLAY), white_fill(), Color32::BLACK).clicked() {
-                    match &self.selected {
-                        Some((m, streams, subs)) if m == meta => match (only_source(streams), self.play_key()) {
-                            (Some(src), Some((k, t))) => *play = Some((k, t, src, subs.clone())),
-                            _ => show_streams = true,
-                        },
-                        _ => *open = Some((meta.clone(), true)),
+        let wash = |a: u8| if dark { Color32::from_black_alpha(a) } else { Color32::from_white_alpha(a) };
+        painter.rect_filled(bleed, 0, wash(if detail { 150 } else { 70 }));
+        fade(&painter, egui::Rect::from_min_max(pos2(bleed.left(), bleed.bottom() - bleed.height() * 0.5), bleed.max), Color32::TRANSPARENT, bg);
+        if detail {
+            fade_x(&painter, bleed.with_max_x(bleed.left() + bleed.width() * 0.7), bg.gamma_multiply(0.85), Color32::TRANSPARENT);
+        }
+        let (strong, soft, weak) = (ui.visuals().strong_text_color(), ui.visuals().text_color(), ui.visuals().weak_text_color());
+        let kind = match meta.kind.as_str() {
+            "movie" => "Movie",
+            "series" => "Series",
+            k => k,
+        };
+        let in_lib = self.saved.iter().any(|t| t.key == format!("{}:{}", meta.kind, meta.id));
+        // Play: the only stream right away, else the title's streams; Choose source: always the streams.
+        let (mut do_play, mut choose) = (false, false);
+        let capped = |text: &str, font: egui::FontId, color, width, rows| {
+            let mut job = egui::text::LayoutJob::simple(text.to_owned(), font, color, width);
+            job.wrap.max_rows = rows;
+            egui::Label::new(job).wrap()
+        };
+        if detail {
+            let col_w = rect.width().min(1024.0);
+            let col = egui::Rect::from_min_max(pos2(rect.center().x - col_w / 2.0, rect.top() + HEADER_H + 16.0), pos2(rect.center().x + col_w / 2.0, rect.bottom() - 36.0));
+            ui.scope_builder(UiBuilder::new().max_rect(col).layout(Layout::bottom_up(Align::LEFT)), |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    let (main, arrow) = split_button(ui, "Play", "Choose source");
+                    (do_play, choose) = (main.clicked(), arrow.clicked());
+                    let label = if in_lib { format!("{}  In library", icons::CHECK) } else { format!("{}  Library", icons::PLUS) };
+                    if dark_pill(ui, &label).clicked() {
+                        self.toggle_saved(meta);
                     }
+                    // One pill: addons often send several trailers under the title's own name.
+                    match trailers.as_slice() {
+                        [] => {}
+                        [t] => {
+                            if dark_pill(ui, &format!("{}  Trailer", icons::PLAY)).clicked() {
+                                *trailer = Some(t.clone());
+                            }
+                        }
+                        // Scoped: the pill's style must not carry over to the buttons after it.
+                        many => drop(ui.scope(|ui| {
+                            let button = dark_pill_widget(ui, &format!("{}  Trailers", icons::PLAY));
+                            egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+                                ui.set_width(200.0);
+                                for (i, t) in many.iter().enumerate() {
+                                    let name = match t.title.as_deref() {
+                                        Some(title) if title != meta.name => title.to_string(),
+                                        _ => format!("Trailer {}", i + 1),
+                                    };
+                                    if menu_item(ui, icons::PLAY, &name).clicked() {
+                                        *trailer = Some(t.clone());
+                                    }
+                                }
+                            });
+                        })),
+                    }
+                    self.list_menu(ui, meta);
+                });
+                ui.add_space(22.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    if let Some(r) = &rating {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(RichText::new(icons::STAR).family(fill()).size(14.0).color(Color32::from_rgb(250, 204, 21)));
+                        ui.label(RichText::new(r).size(15.0).family(bold()).color(Color32::from_rgb(74, 222, 128)));
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                    }
+                    for fact in [&year, &runtime].into_iter().flatten() {
+                        ui.label(RichText::new(fact).size(15.0).color(soft));
+                    }
+                    tag(ui, kind);
+                    if !genres.is_empty() {
+                        ui.add(egui::Label::new(RichText::new(genres.join(", ")).size(15.0).color(weak)).truncate());
+                    }
+                });
+                ui.add_space(26.0);
+                match self.image(&logo, want) {
+                    Some(t) => ui.add(egui::Image::from_texture(t).alt_text(&meta.name).max_height(110.0).max_width(col_w.min(520.0))),
+                    None => ui.add(capped(&meta.name, egui::FontId::new(48.0, bold()), strong, col_w * 0.8, 2)),
+                };
+            });
+        } else {
+            let col_w = (rect.width() - 32.0).min(640.0);
+            let col = egui::Rect::from_min_max(pos2(rect.center().x - col_w / 2.0, rect.top() + HEADER_H + 16.0), pos2(rect.center().x + col_w / 2.0, rect.bottom() - 48.0));
+            ui.scope_builder(UiBuilder::new().max_rect(col).layout(Layout::bottom_up(Align::Center)), |ui| {
+                let facts: Vec<&String> = [&year, &runtime].into_iter().flatten().collect();
+                if !facts.is_empty() {
+                    ui.label(RichText::new(facts.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" · ")).size(13.0).color(weak));
                 }
-                self.show_streams |= show_streams;
-                // The open title's page is already showing; reopening it would reload it and reset the season.
-                let is_open = self.selected.as_ref().is_some_and(|(m, ..)| m == meta);
-                if !is_open && hero_button(ui, "More info", gray_fill(), Color32::WHITE).clicked() {
+                ui.add_space(14.0);
+                if let Some(d) = &meta.description {
+                    // Laid out here: a Label given text would wrap it to the whole column.
+                    let mut job = egui::text::LayoutJob::simple(d.clone(), egui::FontId::proportional(15.0), soft, col_w.min(460.0));
+                    (job.wrap.max_rows, job.halign) = (2, Align::Center);
+                    ui.add(egui::Label::new(ui.painter().layout_job(job)));
+                }
+                ui.add_space(18.0);
+                let row_w = split_button_width(ui, "Play") + 2.0 * (10.0 + 47.0);
+                ui.allocate_ui_with_layout(vec2(row_w, 47.0), Layout::left_to_right(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let (main, arrow) = split_button(ui, "Play", "Choose source");
+                    (do_play, choose) = (main.clicked(), arrow.clicked());
+                    let (icon, label) = if in_lib { (icons::CHECK, "Remove from library") } else { (icons::PLUS, "Add to library") };
+                    if round_button(ui, icon, label).clicked() {
+                        self.toggle_saved(meta);
+                    }
+                    self.list_menu(ui, meta);
+                });
+                ui.add_space(18.0);
+                let line: Vec<&str> = std::iter::once(kind).chain(genres.iter().take(2).map(String::as_str)).collect();
+                ui.label(RichText::new(line.join(" · ")).size(15.0).color(soft));
+                ui.add_space(10.0);
+                let r = match self.image(&logo, want) {
+                    Some(t) => ui.add(egui::Image::from_texture(t).alt_text(&meta.name).max_height(150.0).max_width(col_w.min(460.0)).sense(Sense::click())),
+                    None => ui.add(capped(&meta.name, egui::FontId::new(52.0, bold()), strong, col_w, 2).sense(Sense::click())),
+                };
+                if r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("More info").clicked() {
                     *open = Some((meta.clone(), false));
                 }
-                let in_lib = self.saved.iter().any(|t| t.key == format!("{}:{}", meta.kind, meta.id));
-                let label = if in_lib { format!("{}  In library", icons::CHECK) } else { format!("{}  Add to library", icons::PLUS) };
-                if hero_button(ui, &label, gray_fill(), Color32::WHITE).clicked() {
-                    self.toggle_saved(meta);
-                }
-                ui.scope(|ui| { pill_style(ui, gray_fill(), Color32::WHITE); self.list_menu(ui, meta) });
             });
-            ui.add_space(12.0);
-            // Row caps: this column fills bottom-up, so a long description or title would climb out of the banner's top.
-            let capped = |text: &str, font, rows| {
-                let mut job = egui::text::LayoutJob::simple(text.to_owned(), font, Color32::WHITE, col.width());
-                job.wrap.max_rows = rows;
-                egui::Label::new(job).wrap()
-            };
-            if let Some(d) = &meta.description {
-                ui.add(capped(d, egui::FontId::proportional(17.0), 3));
+        }
+        if do_play {
+            match &self.selected {
+                Some((m, streams, subs)) if m == meta => match (only_source(streams), self.play_key()) {
+                    (Some(src), Some((k, t))) => *play = Some((k, t, src, subs.clone())),
+                    _ => self.show_streams = true,
+                },
+                _ => *open = Some((meta.clone(), true)),
             }
-            ui.add_space(6.0);
-            let kind = match meta.kind.as_str() {
-                "movie" => "Movie",
-                "series" => "Show",
-                k => k,
-            };
-            ui.label(RichText::new(kind).size(15.0).strong().family(bold()).color(Color32::from_gray(220)));
-            match self.image(&logo, want) {
-                Some(t) => ui.add(egui::Image::from_texture(t).alt_text(&meta.name).max_height(120.0).max_width(col.width())),
-                None => ui.add(capped(&meta.name, egui::FontId::new(46.0, bold()), 2)),
-            };
-        });
+        }
+        if choose {
+            self.show_streams = true;
+            if !detail {
+                *open = Some((meta.clone(), false));
+            }
+        }
     }
 
-    /// Detail facts under the banner: year, runtime, rating, genres, cast, director, links, trailers.
-    /// Returns the trailer the user clicked; a clicked cast or director name goes to `search`.
-    fn ui_details<'a>(ui: &mut egui::Ui, d: &'a Meta, search: &mut Option<String>) -> Option<&'a Stream> {
-        ui.add_space(14.0);
-        let gray = ui.visuals().weak_text_color();
-        let facts: Vec<String> = [d.release_info.clone(), d.runtime.clone(), d.imdb_rating.as_ref().map(|r| format!("IMDb {r}"))]
-            .into_iter()
-            .flatten()
-            .chain((!d.genres.is_empty()).then(|| d.genres.join(", ")))
-            .collect();
-        if !facts.is_empty() {
-            ui.label(RichText::new(facts.join("  ·  ")).size(16.0).color(ui.visuals().strong_text_color()));
-        }
-        for (name, list) in [("Cast", &d.cast), ("Director", &d.director)] {
-            if !list.is_empty() {
+    /// The open title's page under its banner: description beside its facts (director, genres, links), then the cast.
+    /// A clicked cast or director name goes to `search`.
+    fn ui_details(ui: &mut egui::Ui, d: &Meta, search: &mut Option<String>) {
+        ui.add_space(32.0);
+        let (soft, weak) = (ui.visuals().text_color(), ui.visuals().weak_text_color());
+        let facts_w = if ui.available_width() > 720.0 { 300.0 } else { ui.available_width() };
+        let mut facts = |ui: &mut egui::Ui| {
+            let heading = |ui: &mut egui::Ui, t: &str| {
+                ui.label(RichText::new(t).size(12.5).color(weak));
+            };
+            if !d.director.is_empty() {
+                heading(ui, "Director");
                 ui.horizontal_wrapped(|ui| {
                     // Flush: the separators carry their own spaces.
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label(RichText::new(format!("{name}: ")).size(15.0).color(gray));
-                    for (i, person) in list.iter().enumerate() {
+                    for (i, person) in d.director.iter().enumerate() {
                         if i > 0 {
-                            ui.label(RichText::new(", ").size(15.0).color(gray));
+                            ui.label(RichText::new(", ").size(15.0).color(soft));
                         }
-                        if ui.link(RichText::new(person).size(15.0)).on_hover_text(format!("Search for {person}")).clicked() {
+                        if ui.link(RichText::new(person).size(15.0).color(soft)).on_hover_text(format!("Search for {person}")).clicked() {
                             *search = Some(person.clone());
                         }
                     }
                 });
+                ui.add_space(14.0);
             }
-        }
-        if !d.links.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                for l in &d.links {
-                    // `links` holds only http(s) URLs (checked in `parse_meta`).
-                    ui.hyperlink_to(&l.name, &l.url).on_hover_text(format!("{}: {}", l.category, l.url));
-                }
+            if !d.genres.is_empty() {
+                heading(ui, "Genre");
+                chip_row(ui, |ui| {
+                    for g in &d.genres {
+                        tag(ui, g);
+                    }
+                });
+                ui.add_space(14.0);
+            }
+            if !d.links.is_empty() {
+                heading(ui, "Links");
+                ui.horizontal_wrapped(|ui| {
+                    for l in &d.links {
+                        // `links` holds only http(s) URLs (checked in `parse_meta`).
+                        ui.hyperlink_to(&l.name, &l.url).on_hover_text(format!("{}: {}", l.category, l.url));
+                    }
+                });
+            }
+        };
+        let description = |ui: &mut egui::Ui| {
+            if let Some(text) = &d.description {
+                ui.label(RichText::new(text).size(15.5).color(soft).line_height(Some(24.0)));
+            }
+        };
+        if facts_w < ui.available_width() {
+            ui.horizontal_top(|ui| {
+                let w = ui.available_width() - facts_w - 36.0 - 2.0 * ui.spacing().item_spacing.x;
+                ui.allocate_ui_with_layout(vec2(w, 0.0), Layout::top_down(Align::LEFT), |ui| {
+                    ui.set_width(w);
+                    description(ui);
+                });
+                ui.add_space(36.0);
+                ui.allocate_ui_with_layout(vec2(facts_w, 0.0), Layout::top_down(Align::LEFT), |ui| {
+                    ui.set_width(facts_w);
+                    facts(ui);
+                });
             });
+        } else {
+            description(ui);
+            ui.add_space(20.0);
+            facts(ui);
         }
-        let mut clicked = None;
-        if !d.trailers.is_empty() {
+        if !d.cast.is_empty() {
+            ui.add_space(32.0);
+            ui.label(heading_text(ui, "Cast", 18.0));
+            ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
-                for t in &d.trailers {
-                    if small_button(ui, &format!("{}  {}", icons::PLAY, t.title.as_deref().unwrap_or("Trailer"))).clicked() {
-                        clicked = Some(t);
+                ui.spacing_mut().item_spacing = vec2(12.0, 12.0);
+                for name in &d.cast {
+                    if person(ui, name).on_hover_text(format!("Search for {name}")).clicked() {
+                        *search = Some(name.clone());
                     }
                 }
             });
         }
-        clicked
     }
 
     /// Full-window Netflix-style player: letterboxed video, controls that fade out after
@@ -4844,7 +5227,7 @@ impl App {
             let pin = std::mem::take(&mut self.pin_entry);
             self.set_child_pin(ui.ctx(), pin);
         }
-        caption(ui, "Child-safe: a PIN locks this profile. It hides the Addons tab, these settings and addons flagged adult until the PIN is entered here.");
+        caption(ui, "Child-safe: a PIN locks this profile. It hides the Addons page, these settings and addons flagged adult until the PIN is entered here.");
         self.locked()
     }
 
@@ -5602,115 +5985,19 @@ impl eframe::App for App {
         // Not a key repeat: holding Escape to leave the player must not also close the page under it. An open dropdown takes Escape for itself.
         let esc = |e: &egui::Event| matches!(e, egui::Event::Key { key: egui::Key::Escape, pressed: true, repeat: false, .. });
         let back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1) || (!self.had_focus && i.events.iter().any(esc)));
-        if back && !egui::Popup::is_any_open(&ctx) {
+        if back && !self.search_open && !egui::Popup::is_any_open(&ctx) {
             self.go_back();
         }
         // The search page lives on Home; any other tab (also set by links) closes it.
         if self.tab != Tab::Home {
             self.search_page = None;
         }
-        egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(40, 14)).show(ui, |ui| {
+        self.leave_locked_tab();
+        let full = ui.max_rect();
+        // A page with a banner runs it under the floating header; the others start below it.
+        let banner = self.tab == Tab::Home && (self.search_page.is_none() || self.selected.is_some()) && self.featured().is_some();
+        egui::Frame::central_panel(ui.style()).inner_margin(0).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
-            // Fixed-height row so the nav and search pills share one center line.
-            ui.allocate_ui_with_layout(vec2(ui.available_width(), 44.0), Layout::left_to_right(Align::Center), |ui| {
-                ui.add(egui::Image::new((logo(ui.ctx()).id(), vec2(40.0, 40.0))).alt_text("Stremflix-rs"));
-                ui.add_space(20.0);
-                // Netflix nav: current tab is bold white on a dark gray pill that slides between tabs.
-                let pill_slot = ui.painter().add(egui::Shape::Noop);
-                let mut sel_rect = None;
-                let locked = self.locked();
-                if locked && self.tab == Tab::Addons {
-                    self.tab = Tab::Home; // a saved tab or an install link
-                }
-                for (tab, name) in [(Tab::Home, "Home"), (Tab::Discover, "Discover"), (Tab::Addons, "Addons"), (Tab::Library, "Library"), (Tab::Settings, "Settings")].into_iter().filter(|t| !(locked && t.0 == Tab::Addons)) {
-                    // The search page is not a tab, so nothing is current while it is up.
-                    let current = self.tab == tab && (self.search_page.is_none() || self.selected.is_some());
-                    let text = RichText::new(name).size(15.0);
-                    let text = if current { text.strong().family(bold()).color(ui.visuals().strong_text_color()) } else { text.color(ui.visuals().weak_text_color()) };
-                    // Width of the bold label, so selecting a tab doesn't shift the ones after it.
-                    let w = ui.painter().layout_no_wrap(name.into(), egui::FontId::new(15.0, bold()), Color32::WHITE).size().x + 2.0 * ui.spacing().button_padding.x;
-                    let r = ui.add(egui::Button::new(text).fill(Color32::TRANSPARENT).min_size(vec2(w, 34.0))).on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if current {
-                        sel_rect = Some(r.rect);
-                    }
-                    if r.clicked() {
-                        self.go_tab(tab);
-                    }
-                }
-                if let Some(target) = sel_rect {
-                    let rect = self.pill_rect(&ctx, target);
-                    ui.painter().set(pill_slot, egui::epaint::RectShape::filled(rect, 17, tint(ui, 34)));
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // Search in the same dark gray pill; Enter or the icon runs it.
-                    // Right-to-left: the field is added first so the icon sits on its left.
-                    let bg = ui.painter().add(egui::Shape::Noop);
-                    ui.add_space(12.0);
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Titles, people, genres").frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 2, ..Default::default() })).desired_width((ui.available_width() - 60.0).clamp(40.0, 170.0))); // top margin: optically center the text; width leaves room for five tabs at the 1000 px default size, and shrinks in a narrower window instead of covering them
-                    let (icon, b) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
-                    b.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Search"));
-                    ui.painter().text(icon.center(), egui::Align2::CENTER_CENTER, icons::MAGNIFYING_GLASS, egui::FontId::proportional(18.0), ui.visuals().weak_text_color());
-                    let b = b.on_hover_text("Search").on_hover_cursor(egui::CursorIcon::PointingHand);
-                    let pill = r.rect.union(b.rect);
-                    ui.painter().set(bg, egui::epaint::RectShape::filled(egui::Rect::from_center_size(pos2(pill.center().x, icon.center().y), vec2(pill.width() + 24.0, 34.0)), 17, tint(ui, 34)));
-                    let r = r.labelled_by(b.id);
-                    // "/" (when not typing) or Ctrl+F jumps to the search box.
-                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F) || (!self.had_focus && i.consume_key(egui::Modifiers::NONE, egui::Key::Slash))) {
-                        r.request_focus();
-                    }
-                    if b.clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                        self.search(&ctx);
-                    }
-                    // Recent searches under the empty, focused box. The popup stays up while the pointer is on it,
-                    // since pressing it takes focus from the field before the click lands.
-                    let id = ui.make_persistent_id("search_history");
-                    let over = ui.ctx().data(|d| d.get_temp::<egui::Rect>(id)).is_some_and(|p| ui.input(|i| i.pointer.hover_pos()).is_some_and(|h| p.contains(h)));
-                    if (r.has_focus() || over) && self.search.is_empty() && !self.search_history.is_empty() {
-                        let (mut pick, mut del, mut clear) = (None, None, false);
-                        let area = egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(pos2(pill.left() - 12.0, pill.bottom() + 12.0)).show(ui.ctx(), |ui| {
-                            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                ui.set_min_width(220.0);
-                                ui.horizontal(|ui| {
-                                    ui.set_min_height(32.0);
-                                    caption(ui, "Recent searches");
-                                    if small_button(ui, "Clear").clicked() {
-                                        clear = true;
-                                    }
-                                });
-                                for (i, q) in self.search_history.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        if ui.add(egui::Button::new(q).frame(false)).clicked() {
-                                            pick = Some(q.clone());
-                                        }
-                                        if ui.add(egui::Button::new(icons::X).frame(false)).accessible_name(format!("Remove {q} from recent searches")).on_hover_text("Remove").clicked() {
-                                            del = Some(i);
-                                        }
-                                    });
-                                }
-                            });
-                        });
-                        ui.ctx().data_mut(|d| d.insert_temp(id, area.response.rect));
-                        if clear || del.is_some() {
-                            match del {
-                                Some(i) => drop(self.search_history.remove(i)),
-                                None => self.search_history.clear(),
-                            }
-                            self.save_search_history();
-                        }
-                        if let Some(q) = pick {
-                            self.search = q;
-                            self.search(&ctx);
-                        }
-                    } else {
-                        ui.ctx().data_mut(|d| d.remove::<egui::Rect>(id));
-                    }
-                    // In the header, where it shifts nothing: a clicked title shows no page until its addons reply.
-                    if let Some(title) = self.loading() {
-                        ui.add_space(24.0);
-                        ui.spinner().on_hover_text(format!("Loading {title}"));
-                    }
-                });
-            });
             let mut chosen = None;
             if let Some((_, title, _, _, files, sel)) = &mut self.file_pick {
                 let mut open = true;
@@ -5732,57 +6019,27 @@ impl eframe::App for App {
             if let (Some(idx), Some((key, title, source, subs, _, _))) = (chosen, self.file_pick.take()) {
                 self.play(&ctx, key, title, format!("{source}&so={idx}"), subs);
             }
-            if let Some(e) = self.error.clone()
-                && dismissible(ui, RichText::new(format!("Error: {e}")).color(ERROR))
-            {
-                self.error = None;
-            }
-            if let Some(n) = self.notice.clone()
-                && dismissible(ui, n)
-            {
-                self.notice = None;
-            }
-            if let Some((url, asset)) = self.update.clone() {
-                ui.horizontal(|ui| {
-                    ui.set_min_height(32.0);
-                    ui.label("A new version is available.");
-                    if self.installing {
-                        ui.spinner();
-                        ui.label("Installing…");
-                    } else if let Some(asset) = asset
-                        && small_button(ui, "Install").on_hover_text("Download it and replace this build; it runs after a restart").clicked()
-                    {
-                        self.installing = true;
-                        let (tx, ctx) = (self.tx.clone(), ui.ctx().clone());
-                        self.rt.spawn(async move {
-                            let _ = tx.send(Msg::UpdateInstalled(stremflix_rs::update::install(&asset).await.map_err(|e| format!("{e:#}"))));
-                            ctx.request_repaint();
-                        });
-                    }
-                    ui.hyperlink_to("Release page", url);
-                    if !self.installing && small_button(ui, "Dismiss").clicked() {
-                        self.update = None;
-                    }
-                });
-            }
-            ui.add_space(8.0);
-            // Back lives outside the scroll area, so it stays put while the detail page scrolls.
-            if self.selected.is_some() && self.tab == Tab::Home {
-                if small_button(ui, &format!("{}  Back", icons::ARROW_LEFT)).on_hover_text("Back to browse").clicked() {
-                    self.close_details();
-                }
-                ui.add_space(6.0);
-            }
             // No shrinking: a page of narrow rows would pull the scroll bar in from the window edge.
             // Own offset per tab and for the detail and search pages, so one page's scroll never carries into another.
-            egui::ScrollArea::vertical().id_salt((self.tab.name(), self.tab == Tab::Home && self.selected.is_some(), self.search_page.is_some())).auto_shrink(false).show(ui, |ui| match self.tab {
-                Tab::Home => self.ui_home(ui),
-                Tab::Discover => self.ui_discover(ui),
-                Tab::Addons => self.ui_addons(ui),
-                Tab::Library => self.ui_library(ui),
-                Tab::Settings => self.ui_settings(ui),
+            let page = egui::ScrollArea::vertical().id_salt((self.tab.name(), self.tab == Tab::Home && self.selected.is_some(), self.search_page.is_some())).auto_shrink(false).show(ui, |ui| {
+                egui::Frame::NONE.inner_margin(egui::Margin { left: PAGE_X, right: PAGE_X, top: 0, bottom: 32 }).show(ui, |ui| {
+                    if !banner {
+                        ui.add_space(HEADER_H + 8.0);
+                    }
+                    match self.tab {
+                        Tab::Home => self.ui_home(ui),
+                        Tab::Discover => self.ui_discover(ui),
+                        Tab::Addons => self.ui_addons(ui),
+                        Tab::Library => self.ui_library(ui),
+                        Tab::Settings => self.ui_settings(ui),
+                    }
+                });
             });
+            // After the page, so the header paints over it and takes the clicks.
+            self.ui_header(ui, full, page.state.clamped_offset().y);
         });
+        self.ui_toasts(&ctx);
+        self.ui_search_palette(&ctx);
         self.had_focus = ctx.memory(|m| m.focused().is_some());
     }
 
@@ -6180,7 +6437,7 @@ mod tests {
 
     #[test]
     fn refetch_does_not_duplicate_rows() {
-        let meta = |id: &str| MetaPreview { id: id.into(), kind: "series".into(), name: id.into(), poster: None, background: None, description: None };
+        let meta = |id: &str| MetaPreview { id: id.into(), kind: "series".into(), name: id.into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         let video = |id: &str| Video { id: id.into(), title: None, released: None, season: Some(1), episode: Some(1), thumbnail: None };
         let mut list = Vec::new();
         upsert_by_id(&mut list, meta("a"), vec![video("a1")]);
@@ -6227,7 +6484,7 @@ mod tests {
 
     #[test]
     fn calendar_window() {
-        let meta = MetaPreview { id: "tt1".into(), kind: "series".into(), name: "Show".into(), poster: None, background: None, description: None };
+        let meta = MetaPreview { id: "tt1".into(), kind: "series".into(), name: "Show".into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         let v = |id: &str, d: Option<&str>, season| Video { id: id.into(), title: None, season: Some(season), episode: Some(1), released: d.map(Into::into), thumbnail: None };
         let today = 19_800; // any fixed day
         let (t, tm, far) = (date_string(today), date_string(today + 1), date_string(today + 5));
@@ -6449,7 +6706,7 @@ mod tests {
 
     #[test]
     fn row_wants_more_only_when_it_can() {
-        let m = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
+        let m = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         let row = Row { title: String::new(), src: Default::default(), items: Some(vec![m("a")]), skippable: true, fetched: 1, loading_more: false, exhausted: false, error: None };
         assert!(row.wants_more(true));
         assert!(!row.wants_more(false), "not near the end");
@@ -6498,6 +6755,59 @@ mod tests {
         (dir, app)
     }
 
+    /// One frame of the header and search palette with `events` as input.
+    fn header_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let input = egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0))), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            let full = ui.max_rect();
+            app.ui_header(ui, full, 0.0);
+            app.ui_search_palette(ui.ctx());
+        });
+        out.textures_delta.clear();
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn slash_opens_an_empty_search_palette_and_escape_closes_it() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        app.search = "old query".into();
+        header_frame(&mut app, &ctx, vec![key(egui::Key::Slash)]);
+        assert!(app.search_open);
+        assert!(app.search.is_empty(), "opens empty so recent searches show");
+        header_frame(&mut app, &ctx, vec![]);
+        header_frame(&mut app, &ctx, vec![key(egui::Key::Escape)]);
+        assert!(!app.search_open);
+    }
+
+    #[test]
+    fn enter_in_the_search_palette_runs_only_a_real_query() {
+        let (_dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        header_frame(&mut app, &ctx, vec![key(egui::Key::Slash)]);
+        header_frame(&mut app, &ctx, vec![]); // the field takes focus
+        header_frame(&mut app, &ctx, vec![key(egui::Key::Enter)]);
+        assert!(app.search_open, "blank query: nothing to run, palette stays");
+        header_frame(&mut app, &ctx, vec![egui::Event::Text("pattern".into())]);
+        header_frame(&mut app, &ctx, vec![key(egui::Key::Enter)]);
+        assert!(!app.search_open);
+        assert_eq!(app.search_history.first().map(String::as_str), Some("pattern"));
+    }
+
+    #[test]
+    fn locked_profile_leaves_the_addons_page() {
+        let (_dir, mut app) = test_app();
+        app.tab = Tab::Addons;
+        app.leave_locked_tab();
+        assert!(app.tab == Tab::Addons, "unlocked: stays");
+        app.child_pin = "1234".into();
+        app.leave_locked_tab();
+        assert!(app.tab == Tab::Home);
+    }
+
     #[test]
     fn library_controls_have_accessible_names() {
         use egui::accesskit::Role;
@@ -6518,7 +6828,7 @@ mod tests {
     fn stale_replies_are_dropped() {
         let (_dir, mut app) = test_app();
         let ctx = egui::Context::default();
-        let m = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
+        let m = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         app.nav = 2;
         app.handle(&ctx, Msg::Streams(m("a"), None, vec![], vec![], Autoplay::Off, None, 1));
         assert!(app.selected.is_none(), "reply for an older navigation");
@@ -6554,7 +6864,7 @@ mod tests {
     fn a_title_is_loading_until_its_reply_or_another_navigation() {
         let (_dir, mut app) = test_app();
         let ctx = egui::Context::default();
-        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "A".into(), poster: None, background: None, description: None };
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "A".into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         app.open_streams(&ctx, m.clone(), None, Autoplay::Off, None);
         assert_eq!(app.loading(), Some("A"));
         app.handle(&ctx, Msg::Streams(m.clone(), None, vec![], vec![], Autoplay::Off, None, app.nav));
@@ -6570,7 +6880,7 @@ mod tests {
     #[test]
     fn home_on_home_leaves_the_title_page() {
         let (_dir, mut app) = test_app();
-        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         app.selected = Some((m, vec![], vec![]));
         app.tab = Tab::Library;
         app.go_tab(Tab::Home);
@@ -6582,7 +6892,7 @@ mod tests {
     #[test]
     fn back_closes_the_title_then_the_search_page() {
         let (_dir, mut app) = test_app();
-        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         app.tab = Tab::Home;
         app.selected = Some((m, vec![], vec![]));
         app.search_page = Some(SearchPage { query: "q".into(), rows: vec![], failed: vec![] });
@@ -6595,7 +6905,7 @@ mod tests {
     #[test]
     fn resuming_keeps_the_saved_binge_group() {
         let (_dir, mut app) = test_app();
-        let m = MetaPreview { id: "s".into(), kind: "series".into(), name: "S".into(), poster: None, background: None, description: None };
+        let m = MetaPreview { id: "s".into(), kind: "series".into(), name: "S".into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         let v: Video = serde_json::from_str(r#"{"id":"s:1:1","season":1,"episode":1}"#).unwrap();
         let hd = Stream { url: Some("https://x.example/a".into()), hints: stremflix_rs::addon::BehaviorHints { binge_group: Some("hd".into()), ..Default::default() }, ..Default::default() };
         let plain = Stream { url: Some("https://x.example/b".into()), ..Default::default() };
@@ -6615,7 +6925,7 @@ mod tests {
     fn sleep_carry_survives_autoplay_chain_only() {
         let (_dir, mut app) = test_app();
         let ctx = egui::Context::default();
-        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None };
+        let m = MetaPreview { id: "a".into(), kind: "movie".into(), name: "a".into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         let one = Stream { url: Some("https://x.example/a".into()), ..Default::default() };
         let carry = (Instant::now() + Duration::from_secs(600), 30);
         // Successful autoplay: play advances nav, the carry rides along and Msg::Play consumes it exactly once.
@@ -6677,7 +6987,7 @@ mod tests {
         let ctx = egui::Context::default();
         let src = |id: &str| ("https://a.example/manifest.json".to_string(), "movie".to_string(), id.to_string());
         let row = |id: &str| Row { title: id.into(), src: src(id), items: None, skippable: false, fetched: 0, loading_more: false, exhausted: false, error: None };
-        let hit = MetaPreview { id: "x".into(), kind: "movie".into(), name: "x".into(), poster: None, background: None, description: None };
+        let hit = MetaPreview { id: "x".into(), kind: "movie".into(), name: "x".into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         app.search_page = Some(SearchPage { query: "new".into(), rows: vec![row("a"), row("b")], failed: vec![] });
         app.handle(&ctx, Msg::Search("old".into(), src("a"), Ok(vec![hit.clone()])));
         assert!(app.search_page.as_ref().unwrap().rows[0].items.is_none(), "reply for a replaced search");
@@ -6700,7 +7010,7 @@ mod tests {
         app.handle(&ctx, Msg::Row(src.clone(), Err("boom".into())));
         assert_eq!(app.rows[0].error.as_deref(), Some("boom"));
         assert!(app.error.is_none(), "one failed row is not a page-wide error");
-        let hit = MetaPreview { id: "x".into(), kind: "movie".into(), name: "x".into(), poster: None, background: None, description: None };
+        let hit = MetaPreview { id: "x".into(), kind: "movie".into(), name: "x".into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         app.handle(&ctx, Msg::Row(src, Ok(vec![hit])));
         assert!(app.rows[0].error.is_none() && app.rows[0].fetched == 1);
     }
@@ -6709,7 +7019,7 @@ mod tests {
     fn discover_pages_append_until_one_adds_nothing() {
         let (_dir, mut app) = test_app();
         let ctx = egui::Context::default();
-        let m = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
+        let m = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         let src: DiscoverSrc = ("https://a.example/manifest.json".into(), "movie".into(), "c".into(), vec![]);
         app.discover.src = Some(src.clone());
         app.handle(&ctx, Msg::Discover(src.clone(), Ok(vec![m("a"), m("b")])));
@@ -6899,7 +7209,7 @@ mod tests {
         let ctx = egui::Context::default();
         let meta = |id: &str| stremflix_rs::addon::parse_meta(format!(r#"{{"meta":{{"id":"{id}","type":"movie","name":"Name {id}","description":"About {id}"}}}}"#).as_bytes()).unwrap();
         let name = |app: &App| app.selected.as_ref().map(|(m, ..)| m.name.clone());
-        let preview = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None };
+        let preview = |id: &str| MetaPreview { id: id.into(), kind: "movie".into(), name: id.into(), poster: None, background: None, description: None, release_info: None, imdb_rating: None, logo: None, genres: vec![] };
         // Details first, then streams.
         let (_d, mut app) = test_app();
         app.nav = 1;
