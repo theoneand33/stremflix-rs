@@ -101,7 +101,7 @@ pub fn route(method: &str, target: &str) -> Result<Call, (u16, String)> {
         },
         ("POST", "/api/play") => match (q("type"), q("id")) {
             // A local file's id is its path, so it may contain `/`.
-            (Some(kind), Some(id)) if valid_id(&kind) && (valid_id(&id) || kind == "file" && !id.chars().any(char::is_control) && id.len() <= MAX_PATH) => {
+            (Some(kind), Some(id)) if valid_id(&kind) && (valid_id(&id) || kind == crate::key::FILE && !id.chars().any(char::is_control) && id.len() <= MAX_PATH) => {
                 Ok(Call::Play { kind, id, name: q("name").map(|s| sanitize_text(&s, MAX_NAME)).filter(|s| !s.is_empty()) })
             }
             _ => bad("missing or invalid type or id"),

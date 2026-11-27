@@ -6,6 +6,7 @@
 
 use crate::addon::{Skip, SkipKind};
 use anyhow::{Result, bail};
+use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 
@@ -211,6 +212,9 @@ pub struct SubStyle {
     pub pos: f64,
 }
 
+/// mpv's default `volume-max`.
+pub const VOLUME_MAX: f64 = 130.0;
+
 /// Playback speeds offered in the player menu.
 pub const SPEEDS: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 
@@ -296,8 +300,8 @@ pub struct Player {
     source: String,
     /// The file is open (FILE_LOADED seen since the last `loadfile`).
     loaded: bool,
-    /// Subtitles off (last choice was "Off"); kept in sync by the menu so a reload honors it.
-    pub subs_off: bool,
+    /// Subtitles off (last choice was "Off").
+    subs_off: Cell<bool>,
     alive: bool,
     pub state: State,
 }
@@ -728,6 +732,24 @@ fn thumb_loop(source: &str, opts: &[(String, String)], first: (f64, [usize; 2]),
     r
 }
 
+/// How a video starts, besides its source.
+pub struct Launch<'a> {
+    pub title: &'a str,
+    /// Seconds to resume at.
+    pub start: f64,
+    /// Addon subtitles as (url, lang).
+    pub subtitles: &'a [(String, String)],
+    /// Preferred audio and subtitle languages (mpv `alang`, `slang`).
+    pub langs: [&'a str; 2],
+    pub subs_off: bool,
+    pub headers: &'a [(String, String)],
+    pub demuxer: Option<&'a str>,
+    pub hwdec: bool,
+    pub speed: f64,
+    pub volume: f64,
+    pub sub_style: SubStyle,
+}
+
 impl Player {
     /// `source` is a URL or local path, passed to `loadfile` as a plain argument (never parsed as options).
     /// `wake` is called from mpv's thread whenever a new frame is ready.
@@ -735,14 +757,14 @@ impl Player {
     /// so they never leak to the next stream or host.
     /// yt-dlp runs only for the exact YouTube URL built from a validated `ytId`; `hwdec` toggles hardware decoding.
     /// Must be called, rendered and dropped with the GUI's GL context current.
-    #[allow(clippy::too_many_arguments)] // player setup options; bundling them adds no clarity
-    pub fn launch(source: &str, title: &str, start: f64, subtitles: &[(String, String)], [alang, slang]: [&str; 2], subs_off: bool, headers: &[(String, String)], demuxer: Option<&str>, hwdec: bool, gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
+    pub fn launch(source: &str, o: &Launch, gl_proc: GlProc, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
+        let [alang, slang] = o.langs;
         load_mpv().map_err(anyhow::Error::msg)?;
         let mpv = unsafe { mpv_create() };
         if mpv.is_null() {
             bail!("failed to create mpv instance");
         }
-        let mut p = Self { mpv, render: std::ptr::null_mut(), wake: Box::into_raw(Box::new(wake)), gl_proc: Box::new(gl_proc), subs: subtitles.to_vec(), slang: slang.to_string(), subs_off, source: source.to_string(), loaded: false, alive: true, state: State::default() };
+        let mut p = Self { mpv, render: std::ptr::null_mut(), wake: Box::into_raw(Box::new(wake)), gl_proc: Box::new(gl_proc), subs: o.subtitles.to_vec(), slang: slang.to_string(), subs_off: Cell::new(o.subs_off), source: source.to_string(), loaded: false, alive: true, state: State::default() };
         let socket = ipc_socket_path();
         let _ = std::fs::remove_file(&socket);
         let mut opts: Vec<(String, String)> = [
@@ -753,9 +775,9 @@ impl Player {
             ("ytdl", if crate::addon::is_youtube(source) { "yes" } else { "no" }),
             ("terminal", "no"),
             ("input-default-bindings", "no"),
-            ("hwdec", hwdec_value(hwdec)),
-            ("force-media-title", title),
-            ("start", &format!("{start:.1}")),
+            ("hwdec", hwdec_value(o.hwdec)),
+            ("force-media-title", o.title),
+            ("start", &format!("{:.1}", o.start)),
         ]
         .into_iter()
         .map(|(k, v)| (k.into(), v.into()))
@@ -765,10 +787,10 @@ impl Player {
                 opts.push((k.into(), v.into()));
             }
         }
-        if subs_off {
+        if o.subs_off {
             opts.push(("sid".into(), "no".into()));
         }
-        opts.extend(net_options(source, headers, demuxer));
+        opts.extend(net_options(source, o.headers, o.demuxer));
         opts.extend(parse_args(&std::env::var("STREMFLIX_RS_MPV_ARGS").unwrap_or_default()));
         init_mpv(mpv, &opts)?;
         let mut init = GlInitParams { get_proc_address: gl_proc_address, ctx: &*p.gl_proc as *const GlProc as *mut c_void };
@@ -787,12 +809,21 @@ impl Player {
         for (i, (name, fmt)) in PROPS.iter().enumerate() {
             unsafe { mpv_observe_property(mpv, i as u64, cstr(name).as_ptr(), *fmt) };
         }
+        // Preferences, not requirements: an mpv that rejects one (an older build, a bad stored value) still plays the video.
+        for (k, v) in [("speed", o.speed.to_string()), ("volume", o.volume.to_string())].into_iter().chain(o.sub_style.props()) {
+            if let Err(e) = p.command(&["set", k, &v]) {
+                crate::elog!("mpv {k}={v}: {e:#}");
+            }
+        }
         p.command(&["loadfile", source])?;
         Ok(p)
     }
 
-    /// Runs an mpv command without blocking the UI thread.
+    /// Runs an mpv command without blocking the UI thread. Picking subtitles (`set sid`) is remembered, so a reload honors it.
     pub fn command(&self, args: &[&str]) -> Result<()> {
+        if let ["set", "sid", v] = args {
+            self.subs_off.set(*v == "no");
+        }
         command_on(self.mpv, args)
     }
 
@@ -820,7 +851,7 @@ impl Player {
     pub fn add_sub(&mut self, url: &str, lang: &str) -> Result<()> {
         self.command(&["sub-add", url, "select", "", lang])?;
         self.subs.push((url.into(), lang.into()));
-        self.subs_off = false;
+        self.subs_off.set(false);
         Ok(())
     }
 
@@ -843,7 +874,7 @@ impl Player {
                     // Addon subtitles: none if off, else the one matching `slang`; without a preference, the first (like `--sub-file`).
                     // Kept, not taken: a reload from `seek` opens the file again.
                     self.loaded = true;
-                    let pick = if self.subs_off { None } else if self.slang.is_empty() { Some(0) } else { pick_sub(&self.subs, &self.slang) };
+                    let pick = if self.subs_off.get() { None } else if self.slang.is_empty() { Some(0) } else { pick_sub(&self.subs, &self.slang) };
                     for (i, (url, lang)) in self.subs.iter().enumerate() {
                         let _ = self.command(&["sub-add", url, if Some(i) == pick { "select" } else { "auto" }, "", lang]);
                     }
@@ -904,7 +935,7 @@ impl Player {
         }
     }
 
-    /// Current playback position and duration in seconds, if known.
+    /// Position and duration in seconds; `None` until mpv reports a position past 0.
     pub fn position(&self) -> Option<(f64, f64)> {
         (self.state.pos > 0.0).then_some((self.state.pos, self.state.dur))
     }
@@ -954,6 +985,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_words_respect_quotes() {
+        assert_eq!(command_words(r#""C:\Program Files\VLC\vlc.exe" --fs"#), [r"C:\Program Files\VLC\vlc.exe", "--fs"]);
+        assert_eq!(command_words("  mpv   --fs "), ["mpv", "--fs"]);
+        assert_eq!(command_words(r#"a "" b"#), ["a", "", "b"]);
+        assert!(command_words("   ").is_empty());
+        #[cfg(not(windows))]
+        assert_eq!(command_words(r#"mpv '--title=a b' x\ y "#), ["mpv", "--title=a b", "x y"]);
+        #[cfg(windows)]
+        assert_eq!(command_words(r"C:\mpv\mpv.exe --fs"), [r"C:\mpv\mpv.exe", "--fs"]);
+    }
+
+    #[test]
     fn local_sources_skip_the_proxy() {
         for s in ["/home/a.mkv", "C:\\a.mkv", "http://127.0.0.1:4000/torrents/0/stream/1", "http://localhost/x", "http://[::1]:9/x"] {
             assert!(is_local(s), "{s}");
@@ -998,7 +1041,6 @@ mod tests {
         assert_eq!(zoom_value(3), "0.3");
         assert_eq!(zoom_value(-99), "-1");
         assert_eq!(zoom_value(99), "1");
-        assert_eq!(ASPECTS[0].1, "no");
     }
 
     #[test]

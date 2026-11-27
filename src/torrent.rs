@@ -143,6 +143,10 @@ pub struct TorrentEngine {
     active: std::sync::Mutex<Option<usize>>,
     /// Released, finished torrents still seeding, with when they started.
     seeding: std::sync::Mutex<std::collections::HashMap<usize, Instant>>,
+    /// Releases asked for so far, and (watched) how many have run: they run in order, and a `stream_url`
+    /// first waits for every release asked before it, so a release never stops the torrent played after it.
+    releases: std::sync::Mutex<u64>,
+    released: tokio::sync::watch::Sender<u64>,
 }
 
 impl TorrentEngine {
@@ -171,7 +175,7 @@ impl TorrentEngine {
         let api = Api::new(session.clone(), None, None);
         let server = librqbit::http_api::HttpApi::new(api, Some(librqbit::http_api::HttpApiOptions { read_only: true, ..Default::default() }));
         tokio::spawn(server.make_http_api_and_run(listener, None));
-        let engine = Arc::new(Self { session, http, cache, pinned: Default::default(), seed, active: Default::default(), seeding: Default::default() });
+        let engine = Arc::new(Self { session, http, cache, pinned: Default::default(), seed, active: Default::default(), seeding: Default::default(), releases: Default::default(), released: tokio::sync::watch::Sender::new(0) });
         // Weak: the sweep must not keep a dropped engine alive.
         let weak = Arc::downgrade(&engine);
         tokio::spawn(async move {
@@ -209,7 +213,6 @@ impl TorrentEngine {
         }
     }
 
-    /// Every torrent in the session, for the manager list.
     pub fn list(&self) -> Vec<TorrentRow> {
         self.session.with_torrents(|it| {
             it.map(|(id, h)| {
@@ -272,6 +275,8 @@ impl TorrentEngine {
     /// Add a magnet or local `.torrent` file and return a local HTTP URL streaming the chosen (or largest) file, and the torrent's id.
     /// `pin` holds the torrent for a download (see `pinned`); undo with [`unpin`](Self::unpin).
     pub async fn stream_url(&self, magnet: &str, file_idx: Option<usize>, pin: bool) -> Result<(String, usize)> {
+        let asked = *self.releases.lock().unwrap();
+        self.released_up_to(asked).await;
         let (handle, file_idx) = self.add(magnet, file_idx).await?;
         let lengths: Vec<u64> = handle.with_metadata(|m| m.file_infos.iter().map(|f| f.len).collect())?;
         let idx = match file_idx {
@@ -307,12 +312,35 @@ impl TorrentEngine {
         }
     }
 
+    /// Waits until releases `..=n` have run. Bounded: librqbit can stall deleting files on a slow disk, and playback must not hang on it.
+    async fn released_up_to(&self, n: u64) {
+        let mut rx = self.released.subscribe();
+        let _ = tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|done| *done >= n)).await;
+    }
+
     /// Stop every torrent but `keep` and pinned ones, so none keeps downloading or seeding. Stopped torrents stay on disk
-    /// while they fit in the cache; the oldest are deleted with their files first.
-    pub async fn release_except(&self, keep: Option<usize>) {
-        let pinned = self.pinned.lock().await;
+    /// while they fit in the cache; the oldest are deleted with their files first. Takes effect for `stream_url` calls
+    /// made after this call even before the returned future runs, so it can run in the background.
+    pub fn release_except(self: &Arc<Self>, keep: Option<usize>) -> impl Future<Output = ()> + Send + 'static {
         *self.active.lock().unwrap() = keep;
-        let candidates: Vec<_> = self.session.with_torrents(|it| it.filter(|(id, _)| Some(*id) != keep && !pinned.contains(id)).map(|(id, h)| (id, h.clone())).collect());
+        let n = {
+            let mut asked = self.releases.lock().unwrap();
+            *asked += 1;
+            *asked
+        };
+        let engine = self.clone();
+        async move {
+            engine.released_up_to(n - 1).await;
+            engine.release(keep).await;
+            engine.released.send_modify(|done| *done = (*done).max(n));
+        }
+    }
+
+    async fn release(&self, keep: Option<usize>) {
+        let pinned = self.pinned.lock().await;
+        // A torrent played after this release was asked (past `released_up_to`'s bound) is active by now: keep it too.
+        let active = *self.active.lock().unwrap();
+        let candidates: Vec<_> = self.session.with_torrents(|it| it.filter(|(id, _)| Some(*id) != keep && Some(*id) != active && !pinned.contains(id)).map(|(id, h)| (id, h.clone())).collect());
         // A finished torrent keeps seeding under the limit; its files stay, so it is not evicted.
         let keep_seeding = |id: usize, h: &Arc<librqbit::ManagedTorrent>, seeding: &mut std::collections::HashMap<usize, Instant>| {
             let st = h.stats();
@@ -435,6 +463,30 @@ mod tests {
         assert_eq!(engine.list().len(), 1);
         engine.remove(id).await.unwrap();
         assert!(engine.list().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_release_in_the_background_never_stops_the_torrent_played_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.mkv"), vec![7u8; 64 * 1024]).unwrap();
+        let t = librqbit::create_torrent(&src.join("a.mkv"), Default::default(), &librqbit::spawn_utils::BlockingSpawner::new(1)).await.unwrap();
+        let file = dir.path().join("a.torrent");
+        std::fs::write(&file, t.as_bytes().unwrap()).unwrap();
+        let engine = TorrentEngine::start(dir.path().join("dl"), false, u64::MAX, Profile::Default, (0, 0), Default::default()).await.unwrap();
+        let (_, id) = engine.stream_url(file.to_str().unwrap(), None, false).await.unwrap();
+        // Leave it, then play it again: the release is asked first but runs only after the new play got going.
+        let release = engine.release_except(None);
+        let play = tokio::spawn({
+            let (engine, file) = (engine.clone(), file.clone());
+            async move { engine.stream_url(file.to_str().unwrap(), None, false).await.unwrap().1 }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        release.await;
+        assert_eq!(play.await.unwrap(), id);
+        assert!(!engine.session.get(id.into()).unwrap().is_paused(), "played after the release: running");
+        assert!(engine.remove(id).await.is_err(), "it is the active torrent");
     }
 
     #[tokio::test]

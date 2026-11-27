@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use stremflix_rs::db::{Db, Progress, Watched};
 use stremflix_rs::stremio_import::Import;
 use stremflix_rs::addon::Video;
-use stremflix_rs::stremio_import::{from_account, import, parse, read_storage, watched_episodes, watched_videos};
+use stremflix_rs::stremio_import::{apply_watched, from_account, import, parse, read_storage, watched_episodes, watched_videos};
 
 /// A Stremio 5 localStorage snapshot: 2 addons (1 invalid), a movie in progress, a watched series,
 /// a watched movie, and an item with a `javascript:` poster.
@@ -155,12 +155,29 @@ fn account_sync_imports_addons_library_and_saved_titles() {
 }
 
 #[test]
+fn imported_bitfield_becomes_local_marks_once_episodes_are_known() {
+    let s = storage();
+    let field = s["library_recent"].split(r#""watched":""#).nth(1).unwrap().split('"').next().unwrap().replacen("tt2:1:1:", "tt2:1:5:", 1);
+    let ep = |id: &str, episode| Video { id: id.into(), title: None, season: Some(1), episode: Some(episode), released: None, thumbnail: None };
+    let videos: Vec<Video> = (1..=5).map(|e| ep(&format!("tt2:1:{e}"), e)).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("a.db")).unwrap();
+    let imp = Import { bitfields: vec![("series:tt2".into(), field)], ..Default::default() };
+    imp.save(&db).unwrap();
+    db.set_watched("series:tt2:1:3", false).unwrap();
+    assert!(apply_watched(&db, "series", "tt2", &[ep("other", 1)]).unwrap().is_empty(), "unknown anchor keeps the field");
+    assert_eq!(apply_watched(&db, "series", "tt2", &videos).unwrap(), ["series:tt2:1:1", "series:tt2:1:5"], "unwatched here stays unwatched");
+    assert!(db.watched_keys().unwrap().contains("series:tt2:1:5"));
+    assert!(apply_watched(&db, "series", "tt2", &videos).unwrap().is_empty(), "applied once");
+}
+
+#[test]
 fn unwatched_episode_survives_bitfield() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("a.db")).unwrap();
     db.set_watched("series:tt2:1:1", false).unwrap();
     let keys = ["series:tt2:1:1".to_string(), "series:tt2:1:2".to_string()];
-    assert_eq!(db.apply_watched_bitfield("bitfield:series:tt2", &keys).unwrap(), ["series:tt2:1:2"]);
+    assert_eq!(db.apply_watched_bitfield("series:tt2", &keys).unwrap(), ["series:tt2:1:2"]);
     assert!(!db.watched_keys().unwrap().contains("series:tt2:1:1"));
 
     // Unwatching an episode drops its imported series from Watch It Again, also across syncs.
@@ -261,7 +278,7 @@ fn upload_builds_addon_collection_and_library_changes() {
 
 #[test]
 fn api_errors_are_reported() {
-    use stremflix_rs::addon::api_result;
+    use stremflix_rs::stremio_import::api_result;
     assert_eq!(api_result(br#"{"result":{"authKey":"k"}}"#).unwrap()["authKey"], "k");
     let e = api_result(br#"{"error":{"message":"Wrong passphrase","code":2}}"#).unwrap_err().to_string();
     assert!(e.contains("Wrong passphrase"), "{e}");
@@ -325,22 +342,6 @@ fn manual_path_named_like_a_cache_is_searched() {
 fn missing_storage_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     assert!(import(Some(dir.path())).is_err());
-}
-
-/// Manual check against this machine's Stremio: `cargo test --test stremio_import -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn local_install() {
-    let (path, imp) = import(None).unwrap();
-    println!("{}: {} addons, {} in progress, {} watched", path.display(), imp.addons.len(), imp.progress.len(), imp.watched.len());
-    for (p, at) in imp.progress.iter().take(5) {
-        println!("  progress {} {:?} {:.0}/{:.0}s {at}", p.key, p.title, p.position, p.duration);
-    }
-    for (w, _) in imp.watched.iter().take(5) {
-        println!("  watched {} {:?} episodes={}", w.key, w.title, w.episodes);
-    }
-    let dir = tempfile::tempdir().unwrap();
-    imp.save(&Db::open(&dir.path().join("a.db")).unwrap()).unwrap();
 }
 
 #[test]
